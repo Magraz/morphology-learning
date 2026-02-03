@@ -1,0 +1,1 @@
+Create prev_agents list, and update with previous agents. I wanna use this for potential based rewards

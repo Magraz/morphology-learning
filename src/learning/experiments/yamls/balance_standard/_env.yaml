@@ -1,0 +1,10 @@
+map_size: [2.0, 2.0]
+observation_size: 16
+action_size: 2
+
+agents:
+  - observation_radius: 1
+    type: 0
+    position:
+      spawn_rule: fixed
+      coordinates: [0.0, 0.0]

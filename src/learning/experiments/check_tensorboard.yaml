@@ -1,0 +1,2 @@
+#Tensorboard config
+log_path: "/home/magraz/research/src/learning/experiments/results"
