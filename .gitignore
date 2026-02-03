@@ -1,0 +1,10 @@
+*.mp4
+*.mp4
+*.png
+*.html
+*.vscode
+*.venv
+*.pyc
+*.pickle
+outputs
+logs

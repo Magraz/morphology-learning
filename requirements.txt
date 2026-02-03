@@ -1,15 +1,8 @@
 torch
-torch_geometric
 numpy
 matplotlib
-tensorboard
 notebook
-deap
-pynput
-opencv-python
 PyYAML
-nbconvert
-av
 dill
 gymnasium[box2d]
 pygame
