@@ -30,7 +30,7 @@ from environments.box2d_salp.utils import (
 class SalpChainEnv(gym.Env):
     metadata = {"render_fps": 30}
 
-    def __init__(self, render_mode=None, n_agents=2, n_target_areas=1):
+    def __init__(self, render_mode=None, n_agents=2, n_target_areas=1, max_steps=512):
         super().__init__()
 
         self.n_agents = n_agents
@@ -120,7 +120,7 @@ class SalpChainEnv(gym.Env):
         )  # Default to 0 (no desire to detach)
 
         # Step tracking for truncation
-        self.max_steps = 512
+        self.max_steps = max_steps
         self.current_step = 0
 
     def _update_union_find(self):
@@ -176,8 +176,6 @@ class SalpChainEnv(gym.Env):
             fixture_def = b2FixtureDef(
                 # shape=b2PolygonShape(box=(0.3, 0.5)),
                 shape=b2CircleShape(radius=0.4),
-                density=1.0,
-                friction=1.0,
                 isSensor=False,
             )
 
@@ -191,6 +189,8 @@ class SalpChainEnv(gym.Env):
             body = self.world.CreateDynamicBody(
                 position=positions[i],
                 fixtures=fixture_def,
+                linearDamping=0.1,  # High damping prevents drifting
+                angularDamping=0.0,  # Prevents excessive spinning
             )
 
             self.agents.append(body)
@@ -203,14 +203,14 @@ class SalpChainEnv(gym.Env):
         for body in self.agents:
 
             if previous_body:
-                self._create_joint(self, bodyA=previous_body, bodyB=body)
+                self._create_joint(bodyA=previous_body, bodyB=body)
 
             previous_body = body
 
     def _create_joint(self, bodyA, bodyB):
         anchor = (bodyA.position + bodyB.position) / 2
         joint_def = b2RevoluteJointDef(
-            bodyA=bodyA, bodyB=bodyB, anchor=anchor, collideConnected=True
+            bodyA=bodyA, bodyB=bodyB, anchor=anchor, collideConnected=False
         )
         joint = self.world.CreateJoint(joint_def)
         self.joints.append(joint)
@@ -1170,9 +1170,14 @@ class SalpChainEnv(gym.Env):
         self._process_detachments()
 
         # Apply movement forces
+        force_multiplier = 20.0
         for idx, agent in enumerate(self.agents):
-            force_x = np.clip(movement_action[idx][0], -1, 1)  # X component
-            force_y = np.clip(movement_action[idx][1], -1, 1)  # Y component
+            force_x = (
+                np.clip(movement_action[idx][0], -1, 1) * force_multiplier
+            )  # X component
+            force_y = (
+                np.clip(movement_action[idx][1], -1, 1) * force_multiplier
+            )  # Y component
 
             # Store the 2D force vector for visualization
             self.applied_forces[idx] = [force_x, force_y]
@@ -1279,3 +1284,100 @@ class SalpChainEnv(gym.Env):
         if self.screen:
             pygame.quit()
             self.screen = None
+
+
+if __name__ == "__main__":
+    # Create the environment with rendering
+    env = SalpChainEnv(
+        render_mode="human", n_agents=4, n_target_areas=2, max_steps=10e5
+    )
+    obs, info = env.reset()
+
+    running = True
+    current_agent_idx = 0
+
+    print("\n" + "=" * 50)
+    print(" SALP CHAIN ENVIRONMENT DEBUGGER")
+    print("=" * 50)
+    print(f" Controlling Agent: {current_agent_idx}")
+    print(" Controls:")
+    print("  [ARROWS] : Move Active Agent")
+    print("  [SPACE]  : Switch Active Agent")
+    print("  [ESC]    : Quit")
+    print("=" * 50 + "\n")
+
+    while running:
+        # 1. Handle user input
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    current_agent_idx = (current_agent_idx + 1) % env.n_agents
+                    print(f">>> Switched control to Agent {current_agent_idx}")
+
+        # Get continuous key presses
+        keys = pygame.key.get_pressed()
+
+        # Initialize actions (n_agents, 4)
+        # [force_x, force_y, attach_signal, detach_signal]
+        # Default: No movement, Attach=1 (allow), Detach=0 (don't)
+        actions = np.zeros((env.n_agents, 4), dtype=np.float32)
+        actions[:, 2] = 1.0
+        actions[:, 3] = 0.0
+
+        # Set force for controlled agent
+        force_x = 0.0
+        force_y = 0.0
+
+        if keys[pygame.K_LEFT]:
+            force_x = -1.0
+        if keys[pygame.K_RIGHT]:
+            force_x = 1.0
+        if keys[pygame.K_UP]:
+            force_y = 1.0
+        if keys[pygame.K_DOWN]:
+            force_y = -1.0
+
+        # Apply control to the selected agent and all physically connected agents
+        # for i in range(env.n_agents):
+        #     if env.union_find.connected(current_agent_idx, i):
+        #         actions[i, 0] = force_x
+        #         actions[i, 1] = force_y
+
+        actions[current_agent_idx, 0] = force_x
+        actions[current_agent_idx, 1] = force_y
+
+        # 2. Step environment
+        obs, reward, terminated, truncated, info = env.step(actions)
+
+        # 3. Log info nicely
+        # Format observation array to be compact
+        obs_str = np.array2string(
+            obs[current_agent_idx],
+            precision=2,
+            suppress_small=True,
+            separator=",",
+            floatmode="fixed",
+            max_line_width=np.inf,
+        )
+
+        print(
+            f"{env.current_step:<5d} | "
+            f"{current_agent_idx:<3d} | "
+            f"({force_x:>4.1f}, {force_y:>4.1f})  | "
+            f"{reward:<8.4f} | "
+            f"{obs_str}"
+        )
+
+        # 4. Render
+        env.render()
+
+        # 5. Handle reset
+        if terminated or truncated:
+            print(">>> Environment Reset")
+            obs, info = env.reset()
+
+    env.close()

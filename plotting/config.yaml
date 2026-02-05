@@ -1,13 +1,13 @@
 #Experiment config
 moving_avg_window_size: 1
 datapoints: [50000, 30000]
-base_path: "/home/magraz/research/src/learning/experiments/results"
+base_path: "/home/magraz/morphology-learning/experiments/results"
 
 # batches: ["salp_navigate_8a", "salp_navigate_16a"]
-batches: ["salp_passage_3a"]
+batches: ["mpe_spread_novec"]
 
 # experiments: ["gcn", "gat", "graph_transformer", "gcn_full", "gat_full", "graph_transformer_full"]
 experiments: ["mlp"]
 
 # trials: ["0", "1", "2", "3", "4"]
-trials: ["0"]
+trials: ["test"]

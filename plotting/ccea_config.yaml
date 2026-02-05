@@ -1,7 +1,0 @@
-#Experiment config
-batch_name: "rover_static_spread"
-experiment_names: ["g_mlp"]
-trials_start: 12
-trials_finish: 13
-data_points: 10
-moving_avg_window_size: 2
