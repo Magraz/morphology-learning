@@ -3,7 +3,6 @@ from Box2D import b2ContactListener
 
 AGENT_CATEGORY = 0x0001  # Binary: 0001
 BOUNDARY_CATEGORY = 0x0002  # Binary: 0010
-OBJECT_CATEGORY = 0x0004  # New category for passive objects
 
 COLORS_LIST = [
     # Primary colors
