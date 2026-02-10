@@ -1,5 +1,5 @@
 #!/bin/bash
-ENVIRONMENT=multi_box_push
+ENVIRONMENT=multi_push_box
 BATCH_NAME=${ENVIRONMENT}_test
 EXPERIMENT=mlp_shared
 ALGORITHM=mappo
