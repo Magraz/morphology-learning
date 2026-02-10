@@ -446,7 +446,7 @@ class MultiBoxPushEnv(gym.Env):
                         2,
                     )  # Outline
 
-    def _draw_density_sensors(self, normalization_value=10):
+    def _draw_density_sensors(self):
         """Draw density sensors for each agent as sector outlines with text values"""
         # Initialize font if not already done
         if not hasattr(self, "sensor_font"):
@@ -476,22 +476,6 @@ class MultiBoxPushEnv(gym.Env):
                 start_angle = sector * sector_step + shift_degrees
                 end_angle = (sector + 1) * sector_step + shift_degrees
 
-                # Agent density (blue lines)
-                agent_density = (
-                    min(agent_densities[sector], normalization_value)
-                    / normalization_value
-                )  # Normalize to 0-1
-                agent_thickness = max(1, int(1 + 3 * agent_density))  # 1-4 pixels thick
-
-                # Target density (green lines)
-                target_density = (
-                    min(target_densities[sector], normalization_value)
-                    / normalization_value
-                )  # Normalize to 0-1
-                target_thickness = max(
-                    1, int(1 + 3 * target_density)
-                )  # 1-4 pixels thick
-
                 # Calculate arc points
                 start_rad = math.radians(start_angle)
                 end_rad = math.radians(end_angle)
@@ -510,7 +494,7 @@ class MultiBoxPushEnv(gym.Env):
                     (0, 0, 255),  # Blue color for agent density
                     (int(center_x), int(center_y)),
                     (int(start_x), int(start_y)),
-                    agent_thickness,
+                    1,
                 )
 
                 pygame.draw.line(
@@ -518,27 +502,8 @@ class MultiBoxPushEnv(gym.Env):
                     (0, 0, 255),  # Blue color for agent density
                     (int(center_x), int(center_y)),
                     (int(end_x), int(end_y)),
-                    agent_thickness,
+                    1,
                 )
-
-                # Draw target density lines (green, slightly offset)
-                if target_thickness > 1:  # Only draw if significant target density
-                    offset = 3  # Small offset for visibility
-                    pygame.draw.line(
-                        self.screen,
-                        (0, 200, 0),  # Green color for target density
-                        (int(center_x), int(center_y)),
-                        (int(start_x) + offset, int(start_y) + offset),
-                        target_thickness,
-                    )
-
-                    pygame.draw.line(
-                        self.screen,
-                        (0, 200, 0),  # Green color for target density
-                        (int(center_x), int(center_y)),
-                        (int(end_x) + offset, int(end_y) + offset),
-                        target_thickness,
-                    )
 
                 # Draw the arc connecting the two points (for agent density)
                 pygame.draw.arc(
@@ -552,7 +517,7 @@ class MultiBoxPushEnv(gym.Env):
                     ),
                     start_rad,
                     end_rad,
-                    agent_thickness,
+                    1,
                 )
 
                 # Calculate text position at the middle of the sector
@@ -865,7 +830,9 @@ class MultiBoxPushEnv(gym.Env):
             sector = int(angle / sector_radian_step) % n_sectors
 
             # Calculate density contribution (inverse square of distance)
-            density_value = 1.0 / ((distance / self.sector_sensor_radius) + 1.0)
+            density_value = (1.0 / (distance / self.sector_sensor_radius)) / (
+                self.sector_sensor_radius // 2
+            )
 
             # Add to appropriate sector
             agent_densities[sector] += density_value
@@ -903,7 +870,9 @@ class MultiBoxPushEnv(gym.Env):
             sector = int(angle / sector_radian_step) % n_sectors
 
             # Calculate object density contribution
-            density_value = 1.0 / ((distance / self.sector_sensor_radius) + 1.0)
+            density_value = (1.0 / (distance / self.sector_sensor_radius)) / (
+                self.sector_sensor_radius // 2
+            )
 
             # Set as sector value if its the highest value
             if object_densities[sector] < density_value:
@@ -1019,7 +988,6 @@ class MultiBoxPushEnv(gym.Env):
             "agent_positions": [
                 {"x": agent.position.x, "y": agent.position.y} for agent in self.agents
             ],
-            "local_rewards": individual_rewards,
             "task_reward": task_reward,
         }
 
@@ -1074,7 +1042,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=2, n_target_areas=2, max_steps=10e5
+        render_mode="human", n_agents=2, n_target_areas=2, max_steps=512
     )
     obs, info = env.reset()
 

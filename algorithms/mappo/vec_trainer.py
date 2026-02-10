@@ -155,6 +155,7 @@ class VecMAPPOTrainer:
             for env_idx in range(batch_size):
                 # Extract individual rewards for each agent from info
                 # Your SalpChainEnv returns info['local_rewards']
+                individual_rewards = [0.0 for _ in range(self.n_agents)]
                 if "local_rewards" in infos:
                     # infos['local_rewards'] has shape (n_envs, n_agents)
                     individual_rewards = infos["local_rewards"][env_idx]
@@ -256,7 +257,7 @@ class VecMAPPOTrainer:
             # Time evaluation
             eval_start = time.time()
             rew_per_episode = []
-            eval_episodes = 10
+            eval_episodes = 5
             while len(rew_per_episode) < eval_episodes:
                 rew_per_episode.append(self.evaluate())
             eval_rewards = np.array(rew_per_episode).mean()
