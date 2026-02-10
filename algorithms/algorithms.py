@@ -38,6 +38,7 @@ def run_algorithm(
 
         case (
             EnvironmentEnum.BOX2D_SALP
+            | EnvironmentEnum.MULTI_BOX
             | EnvironmentEnum.MPE_SPREAD
             | EnvironmentEnum.MPE_SIMPLE
         ):

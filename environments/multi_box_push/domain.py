@@ -40,7 +40,7 @@ class MultiBoxPushEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(self.n_agents, 4),  # (n_agents, action_dim)
+            shape=(self.n_agents, 2),  # (n_agents, action_dim)
             dtype=np.float32,
         )
 
@@ -140,8 +140,8 @@ class MultiBoxPushEnv(gym.Env):
         shapes = [
             # Square (Box)
             b2PolygonShape(box=(1.5, 1.5)),
-            b2PolygonShape(box=(1.5, 1.5)),
-            b2PolygonShape(box=(1.5, 1.5)),
+            # b2PolygonShape(box=(1.5, 1.5)),
+            # b2PolygonShape(box=(1.5, 1.5)),
             # Triangle (Polygon vertices must be CCW)
             # b2PolygonShape(vertices=[(0, 2.0), (-2.0, -1.5), (2.0, -1.5)]),
             # # Circle
@@ -179,7 +179,7 @@ class MultiBoxPushEnv(gym.Env):
             body = self.world.CreateDynamicBody(
                 position=pos,
                 fixtures=fixture_def,
-                linearDamping=4.0,
+                linearDamping=5.0,
                 angularDamping=8.0,
             )
 
@@ -558,7 +558,7 @@ class MultiBoxPushEnv(gym.Env):
                 # Calculate text position at the middle of the sector
                 mid_angle = math.radians((start_angle + end_angle) / 2)
                 text_distance = (
-                    sensor_radius * 0.2
+                    sensor_radius * 0.3
                 )  # Position text at 70% of the radius
                 text_x = center_x + text_distance * math.cos(mid_angle)
                 text_y = center_y - text_distance * math.sin(mid_angle)
@@ -742,102 +742,73 @@ class MultiBoxPushEnv(gym.Env):
 
         return np.array(observations, dtype=np.float32)
 
-    def _calculate_proximity_reward(self):
-        agent_proximity_reward = [0.0 for _ in self.agents]
-
-        target_proximity_reward = [0.0 for _ in self.agents]
-
-        # Check all pairs of agents
-        for i in range(self.n_agents):
-            agent_i_pos = np.array(
-                [self.agents[i].position.x, self.agents[i].position.y]
-            )
-
-            closest_agent_dist = float("inf")
-            closest_target_dist = float("inf")
-
-            # Calculate agent proximity reward
-            for j in range(self.n_agents):
-
-                # Skip self
-                if i == j:
-                    continue
-                # Skip if agents are already connected
-                if self.union_find.connected(i, j):
-                    continue
-
-                agent_j_pos = np.array(
-                    [self.agents[j].position.x, self.agents[j].position.y]
-                )
-
-                # Calculate distance
-                distance = np.linalg.norm(agent_i_pos - agent_j_pos)
-
-                # Update closest agent
-                if self.prev_agent_closest_distances[i] == float("inf"):
-                    self.prev_agent_closest_distances[i] = distance
-
-                if distance < closest_agent_dist:
-                    closest_agent_dist = distance
-                    # Calculate reward based on distance
-                    agent_proximity_reward[i] = (
-                        self.prev_agent_closest_distances[i] - closest_agent_dist
-                    )
-
-                    self.prev_agent_closest_distances[i] = closest_agent_dist
-
-            # Calculate target proximity reward
-            for t_area in self.target_areas:
-
-                target_pos = np.array([t_area.x, t_area.y])
-
-                # Calculate distance
-                distance = np.linalg.norm(agent_i_pos - target_pos)
-
-                # Update closest agent
-                if self.prev_target_closest_distances[i] == float("inf"):
-                    self.prev_target_closest_distances[i] = distance
-
-                if distance < closest_target_dist:
-                    closest_target_dist = distance
-                    # Calculate reward based on distance
-                    target_proximity_reward[i] = (
-                        self.prev_target_closest_distances[i] - closest_target_dist
-                    )
-                    self.prev_target_closest_distances[i] = closest_target_dist
-
-        return np.array(target_proximity_reward) + np.array(agent_proximity_reward)
-
     def _get_rewards(self):
         """Calculate combined rewards from chain size and target areas"""
         # Calculate target area rewards
+        reward, done = self._calculate_box_push_reward()
+        individual_rewards = [reward for _ in range(self.n_agents)]
+
+        return reward, individual_rewards, done
+
+    def _calculate_box_push_reward(self):
+        """Calculate reward for getting box closer to goal"""
+        # Calculate target area rewards
         task_reward = 0.0
+        done = False
 
-        individual_rewards = [0 for _ in range(self.n_agents)]
+        # 1. Check if we need to initialize previous distances (first step or reset)
+        if not hasattr(self, "prev_object_distances"):
+            self.prev_object_distances = (
+                {}
+            )  # Map object_id -> min_distance_to_any_target
 
-        # Go over all targets and get the total task reward
-        # for target_area in self.target_areas:
+        current_object_distances = {}
+        distance_reward = 0.0
 
-        #     # Calculate reward for this target area
-        #     reward_map = target_area.calculate_reward(self.agents, self.union_find)
+        # 2. Iterate over all movable objects
+        for obj_idx, obj in enumerate(self.objects):
 
-        #     task_reward += np.array(reward_map).mean()
+            target = self.target_areas[0]
+            dy = target.y - obj.position.y
+            dist = dy
 
-        # Calculate individual rewards
-        # individual_rewards = self._calculate_proximity_reward()
+            # Store current distance
+            current_object_distances[obj_idx] = dist
 
-        return task_reward, individual_rewards
+            # 3. Calculate reward based on improvement (shaping reward)
+            if obj_idx in self.prev_object_distances:
+                prev_dist = self.prev_object_distances[obj_idx]
+                improvement = prev_dist - dist
+
+                # If improvement is positive (getting closer), give reward
+                # If negative (getting farther), give penalty
+                # Scaling factor 10.0 makes the signal stronger
+                distance_reward = improvement * 10.0
+
+            # 4. Check for completion (object inside target)
+            if target.contains_object(obj):
+                # formatting reward for completion
+                distance_reward += 10.0
+                done = True
+
+        # Update previous distances for next step
+        self.prev_object_distances = current_object_distances
+
+        # Assign the distance reward as the task reward (shared by all)
+        task_reward = distance_reward
+
+        return task_reward, done
 
     def _calculate_density_sensors(self, agent_idx, sensor_radius):
         """
-        Calculate density of agents and targets in 8 sectors around an agent.
-        Also returns relative coordinates to closest non-connected agent and target.
+        Calculate density of agents and DYNAMIC OBJECTS in 8 sectors around an agent.
+        Also returns relative coordinates to closest non-connected agent and object.
 
         Returns a vector of 20 values:
         - First 8 values: agent density in sectors 0-7 (counter-clockwise from East)
-        - Next 8 values: target density in sectors 0-7
+        - Next 8 values: object density in sectors 0-7
         - Next 2 values: relative [x,y] to closest non-connected agent
-        - Last 2 values: relative [x,y] to closest target
+        - Last 2 values: relative [x,y] to closest object
         """
         agent_pos = np.array(
             [self.agents[agent_idx].position.x, self.agents[agent_idx].position.y]
@@ -849,13 +820,13 @@ class MultiBoxPushEnv(gym.Env):
 
         # Initialize densities for the 8 sectors
         agent_densities = np.zeros(n_sectors, dtype=np.float32)
-        target_densities = np.zeros(n_sectors, dtype=np.float32)
+        object_densities = np.zeros(n_sectors, dtype=np.float32)
 
-        # Variables to track closest agent and target
+        # Variables to track closest agent and object
         closest_agent_dist = float("inf")
         closest_agent_rel = np.zeros(2, dtype=np.float32)
-        closest_target_dist = float("inf")
-        closest_target_rel = np.zeros(2, dtype=np.float32)
+        closest_object_dist = float("inf")
+        closest_object_rel = np.zeros(2, dtype=np.float32)
 
         # Check each other agent
         for other_idx, other_agent in enumerate(self.agents):
@@ -899,18 +870,18 @@ class MultiBoxPushEnv(gym.Env):
             # Add to appropriate sector
             agent_densities[sector] += density_value
 
-        # Check each target area
-        for target in self.target_areas:
-            target_pos = np.array([target.x, target.y])
-            relative_pos = target_pos - agent_pos
+        # Check each dynamic object (Used to be target areas)
+        for obj in self.objects:
+            obj_pos = np.array([obj.position.x, obj.position.y])
+            relative_pos = obj_pos - agent_pos
 
             # Calculate distance
             distance = np.linalg.norm(relative_pos)
 
-            # Update closest target tracking
-            if distance < closest_target_dist:
-                closest_target_dist = distance
-                closest_target_rel = relative_pos
+            # Update closest object tracking
+            if distance < closest_object_dist:
+                closest_object_dist = distance
+                closest_object_rel = relative_pos
 
             # Skip if outside sensor radius for density calculation
             if distance > sensor_radius:
@@ -931,31 +902,32 @@ class MultiBoxPushEnv(gym.Env):
             # Determine sector (0 to 7)
             sector = int(angle / sector_radian_step) % n_sectors
 
-            # Calculate target density contribution
+            # Calculate object density contribution
             density_value = 1.0 / ((distance / self.sector_sensor_radius) + 1.0)
 
             # Set as sector value if its the highest value
-            if target_densities[sector] < density_value:
-                target_densities[sector] = density_value
+            if object_densities[sector] < density_value:
+                object_densities[sector] = density_value
 
         # Combine all values into one array
         return np.concatenate(
             [
                 agent_densities,  # 8 values
-                target_densities,  # 8 values
+                object_densities,  # 8 values
                 closest_agent_rel,  # 2 values (x,y)
-                closest_target_rel,  # 2 values (x,y)
+                closest_object_rel,  # 2 values (x,y)
             ]
         )
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Reset previous rewards
-        self.prev_rewards = dict.fromkeys(list(range(0, self.n_agents)), 0)
-
         # Reset step counter
         self.current_step = 0
+
+        # Reset distance tracking for rewards
+        if hasattr(self, "prev_object_distances"):
+            del self.prev_object_distances
 
         for body in self.agents:
             self.world.DestroyBody(body)
@@ -1028,7 +1000,7 @@ class MultiBoxPushEnv(gym.Env):
             terminated = True
         else:
             # The normal reward calculation
-            task_reward, individual_rewards = self._get_rewards()
+            task_reward, individual_rewards, terminated = self._get_rewards()
 
         # Reset collision flag for next step
         self.contact_listener.reset()
@@ -1102,7 +1074,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=4, n_target_areas=2, max_steps=10e5
+        render_mode="human", n_agents=2, n_target_areas=2, max_steps=10e5
     )
     obs, info = env.reset()
 

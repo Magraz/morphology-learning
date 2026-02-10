@@ -1,8 +1,4 @@
-torch
-numpy
-matplotlib
+dhg
 notebook
-PyYAML
 dill
 gymnasium[box2d]
-pygame

@@ -1,3 +1,2 @@
-state_representation: discrete
 n_envs: 1
 n_agents: 3

@@ -40,6 +40,9 @@ class PPOAgent:
         ):
             self.policy = MLP_AC(state_dim, action_dim, discrete=True).to(device)
             self.policy_old = MLP_AC(state_dim, action_dim, discrete=True).to(device)
+        else:
+            self.policy = MLP_AC(state_dim, action_dim).to(device)
+            self.policy_old = MLP_AC(state_dim, action_dim).to(device)
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 

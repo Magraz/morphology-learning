@@ -155,6 +155,14 @@ def create_env(env_name: EnvironmentEnum, n_agents: int, render_mode: str = None
             state_dim = env.observation_space.shape[1]
             action_dim = env.action_space.shape[1]
 
+        case EnvironmentEnum.MULTI_BOX:
+            from environments.multi_box_push.domain import MultiBoxPushEnv
+
+            # Environment configuration
+            env = MultiBoxPushEnv(n_agents=n_agents, render_mode=render_mode)
+            state_dim = env.observation_space.shape[1]
+            action_dim = env.action_space.shape[1]
+
         case EnvironmentEnum.MPE_SPREAD:
             from mpe2 import simple_spread_v3
 
@@ -214,6 +222,11 @@ def make_vec_env(
                 from environments.box2d_salp.domain import SalpChainEnv
 
                 return SalpChainEnv(n_agents=n_agents, render_mode=None)
+
+            case EnvironmentEnum.MULTI_BOX:
+                from environments.multi_box_push.domain import MultiBoxPushEnv
+
+                return MultiBoxPushEnv(n_agents=n_agents, render_mode=None)
 
             case EnvironmentEnum.MPE_SPREAD:
                 from mpe2 import simple_spread_v3

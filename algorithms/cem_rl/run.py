@@ -2,6 +2,7 @@ from environments.types import EnvironmentParams, EnvironmentEnum
 from algorithms.runner import Runner
 from pathlib import Path
 from environments.box2d_salp.domain import SalpChainEnv
+from environments.multi_box_push.domain import MultiBoxPushEnv
 
 from algorithms.cem_rl.trainer import CEMRL_Trainer
 
@@ -64,6 +65,18 @@ class CEMRL_Runner(Runner):
             case EnvironmentEnum.BOX2D_SALP:
                 # Environment configuration
                 self.env = SalpChainEnv(**self.config)
+                state_dim = self.env.observation_space.shape[1]
+
+                # Check if we're dealing with Dict action space
+                using_dict_actions = hasattr(self.env.action_space, "spaces")
+                action_dim = (
+                    self.env.action_space.shape[1] if not using_dict_actions else None
+                )
+                n_agents = self.env.n_agents
+
+            case EnvironmentEnum.MULTI_BOX:
+                # Environment configuration
+                self.env = MultiBoxPushEnv(**self.config)
                 state_dim = self.env.observation_space.shape[1]
 
                 # Check if we're dealing with Dict action space
