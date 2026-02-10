@@ -114,28 +114,75 @@ class Agent:
 
 
 class BoundaryContactListener(b2ContactListener):
-    """Contact listener to detect collisions between agents and boundaries"""
-
     def __init__(self):
         super().__init__()
         self.boundary_collision = False
+        # Track which agents are in contact with which objects
+        # Key: object_index, Value: set of agent_indices
+        self.object_agent_contacts = {}
 
     def BeginContact(self, contact):
-        # Check if this is a collision between an agent and boundary
-        fixture_a, fixture_b = contact.fixtureA, contact.fixtureB
+        body_a = contact.fixtureA.body
+        body_b = contact.fixtureB.body
 
-        category_a = fixture_a.filterData.categoryBits
-        category_b = fixture_b.filterData.categoryBits
+        # Check for boundary collision
+        cat_a = contact.fixtureA.filterData.categoryBits
+        cat_b = contact.fixtureB.filterData.categoryBits
 
-        # Check if one fixture is an agent and the other is a boundary
-        if (category_a == AGENT_CATEGORY and category_b == BOUNDARY_CATEGORY) or (
-            category_b == AGENT_CATEGORY and category_a == BOUNDARY_CATEGORY
+        if (cat_a == BOUNDARY_CATEGORY and cat_b == AGENT_CATEGORY) or (
+            cat_a == AGENT_CATEGORY and cat_b == BOUNDARY_CATEGORY
         ):
             self.boundary_collision = True
 
+        # Check for agent-object contact
+        self._handle_agent_object_contact(body_a, body_b, begin=True)
+
+    def EndContact(self, contact):
+        body_a = contact.fixtureA.body
+        body_b = contact.fixtureB.body
+
+        # Check for agent-object contact ending
+        self._handle_agent_object_contact(body_a, body_b, begin=False)
+
+    def _handle_agent_object_contact(self, body_a, body_b, begin):
+        ud_a = body_a.userData if body_a.userData else {}
+        ud_b = body_b.userData if body_b.userData else {}
+
+        agent_data = None
+        object_data = None
+
+        if ud_a.get("type") == "agent" and ud_b.get("type") == "object":
+            agent_data = ud_a
+            object_data = ud_b
+        elif ud_a.get("type") == "object" and ud_b.get("type") == "agent":
+            agent_data = ud_b
+            object_data = ud_a
+
+        if agent_data is None or object_data is None:
+            return
+
+        obj_idx = object_data["index"]
+        agent_idx = agent_data["index"]
+
+        if obj_idx not in self.object_agent_contacts:
+            self.object_agent_contacts[obj_idx] = set()
+
+        if begin:
+            self.object_agent_contacts[obj_idx].add(agent_idx)
+        else:
+            self.object_agent_contacts[obj_idx].discard(agent_idx)
+
+    def get_agents_touching_object(self, object_index):
+        """Return the set of agent indices currently in contact with the given object."""
+        return self.object_agent_contacts.get(object_index, set())
+
+    def get_num_agents_touching_object(self, object_index):
+        """Return how many agents are currently touching the given object."""
+        return len(self.get_agents_touching_object(object_index))
+
     def reset(self):
-        """Reset collision flag"""
         self.boundary_collision = False
+        self.object_agent_contacts.clear()
 
 
 def get_linear_positions(world_width, world_height, n_agents, spacing=2):

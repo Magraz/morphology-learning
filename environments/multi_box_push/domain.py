@@ -45,7 +45,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 18), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 19), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -188,7 +188,7 @@ class MultiBoxPushEnv(gym.Env):
             )
 
             # Store color in body user data for rendering
-            body.userData = {"color": colors[i]}
+            body.userData = {"type": "object", "color": colors[i], "index": i}
 
             self.objects.append(body)
 
@@ -215,6 +215,8 @@ class MultiBoxPushEnv(gym.Env):
                 linearDamping=10.0,  # High damping prevents drifting
                 angularDamping=0.0,  # Prevents excessive spinning
             )
+
+            body.userData = {"type": "agent", "index": i}
 
             self.agents.append(body)
 
@@ -678,6 +680,15 @@ class MultiBoxPushEnv(gym.Env):
                 5, dtype=np.float32
             )  # [rel_x, rel_y, rel_vx, rel_vy, distance]
 
+    def _is_agent_touching_object(self, agent_idx):
+
+        # Check all objects
+        for obj_idx in range(len(self.objects)):
+            if agent_idx in self.contact_listener.get_agents_touching_object(obj_idx):
+                return 1.0
+
+        return 0.0
+
     def _get_observation(self):
         # Get all agent states as a matrix
         all_states = np.array(
@@ -704,8 +715,11 @@ class MultiBoxPushEnv(gym.Env):
                 i, self.sector_sensor_radius
             )
 
+            # Contact with object check
+            is_touching_object = np.array([self._is_agent_touching_object(i)])
+
             # Combine all observations: own absolute state + connected relative states + density sensors
-            agent_obs = np.concatenate([own_state, density_sensors])
+            agent_obs = np.concatenate([own_state, density_sensors, is_touching_object])
 
             observations.append(agent_obs)
 
