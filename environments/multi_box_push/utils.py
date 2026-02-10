@@ -3,6 +3,7 @@ from Box2D import b2ContactListener
 
 AGENT_CATEGORY = 0x0001  # Binary: 0001
 BOUNDARY_CATEGORY = 0x0002  # Binary: 0010
+OBJECT_CATEGORY = 0x0004  # New category for passive objects
 
 COLORS_LIST = [
     # Primary colors
@@ -75,71 +76,35 @@ class UnionFind:
         return self.find(x) == self.find(y)
 
 
-class TargetArea:
-    def __init__(
-        self,
-        x,
-        y,
-        radius,
-        coupling_requirement,
-        reward_scale=1.0,
-        color=(100, 200, 100, 128),
-    ):
-        self.x = x  # Center x-coordinate
-        self.y = y  # Center y-coordinate
-        self.radius = radius  # Area of influence
-        self.coupling_requirement = coupling_requirement
-        self.reward_scale = reward_scale  # Reward scaling factor
-        self.color = color  # Semi-transparent green by default
+class ObjectTargetArea:
+    def __init__(self, x, y, width, height, color=(50, 200, 50, 128)):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.color = color
+        self.reward_scale = 1.0
+        # Needed for compatibility with agent logic
+        self.coupling_requirement = 0
+        self.radius = max(width, height) / 2
 
-    def calculate_reward(self, agents, union_find: UnionFind):
-        """Calculate reward based on proximity to center if coupling requirement is met"""
+    def contains_object(self, body):
+        """
+        Check if a Box2D body is inside the rectangular target area.
+        Args:
+            body: A Box2D body object
+        Returns:
+            bool: True if body center is inside bounds
+        """
+        pos = body.position
+        half_w = self.width / 2
+        half_h = self.height / 2
 
-        reward_map = [0 for _ in range(0, len(agents))]
+        # Check AABB (Axis-Aligned Bounding Box)
+        in_x = (self.x - half_w) <= pos.x <= (self.x + half_w)
+        in_y = (self.y - half_h) <= pos.y <= (self.y + half_h)
 
-        # Find agents within this target area
-        agents_in_area = []
-        for i, agent in enumerate(agents):
-            dist = np.sqrt(
-                (agent.position.x - self.x) ** 2 + (agent.position.y - self.y) ** 2
-            )
-            if dist <= self.radius:
-                agents_in_area.append(i)
-
-        if len(agents_in_area) < self.coupling_requirement:
-            return reward_map  # Not enough agents to meet requirement
-
-        # Group agents by their connected component using union_find
-        component_map = {}
-        for idx in agents_in_area:
-            root = union_find.find(idx)
-            if root not in component_map:
-                component_map[root] = []
-            component_map[root].append(idx)
-
-        # Check if any chain meets the coupling requirement
-        qualifying_agents = []
-        for component in component_map.values():
-            if len(component) >= self.coupling_requirement:
-                qualifying_agents.extend(component)
-
-        if not qualifying_agents:
-            return reward_map  # No component meets requirement
-
-        # # Calculate reward based on proximity
-        for i in qualifying_agents:
-            dist = np.sqrt(
-                (agents[i].position.x - self.x) ** 2
-                + (agents[i].position.y - self.y) ** 2
-            )
-            # Reward decreases with distance (10.0 at center, 0.0 at radius)
-            reward_map[i] = 1 / (dist**2 + 1)
-
-        # Give flat positive reward for being at the target
-        # for i in qualifying_agents:
-        #     reward_map[i] = 1
-
-        return reward_map
+        return in_x and in_y
 
 
 class Agent:

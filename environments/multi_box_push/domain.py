@@ -11,12 +11,12 @@ from Box2D import (
     b2CircleShape,
 )
 
-from environments.box2d_salp.utils import (
+from environments.multi_box_push.utils import (
     COLORS_LIST,
     AGENT_CATEGORY,
     BOUNDARY_CATEGORY,
     OBJECT_CATEGORY,
-    TargetArea,
+    ObjectTargetArea,
     BoundaryContactListener,
     get_scatter_positions,
     fixed_position_target_area,
@@ -45,7 +45,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 18), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -63,8 +63,8 @@ class MultiBoxPushEnv(gym.Env):
         self.world.contactListener = self.contact_listener
 
         # Boundary parameters (customize as needed)
-        self.world_width = 40
-        self.world_height = 40
+        self.world_width = 30
+        self.world_height = 30
         self.world_center_x = self.world_width // 2
         self.world_center_y = self.world_height // 2
         self.world_diagonal = np.sqrt(self.world_height**2 + self.world_width**2)
@@ -73,7 +73,7 @@ class MultiBoxPushEnv(gym.Env):
         # Pygame rendering setup
         self.screen = None
         self.clock = None
-        self.screen_size = (800, 800)
+        self.screen_size = (600, 600)
         self.scale = 20.0  # Pixels per Box2D meter
 
         # Create target areas
@@ -115,37 +115,11 @@ class MultiBoxPushEnv(gym.Env):
     def _create_target_areas(self):
         """Create target areas at random positions in the environment"""
         self.target_areas = []
-        existing_positions = []
 
-        for idx in range(self.n_target_areas):
-
-            # Get position using the new method
-            # x, y = dynamic_position_target_area(
-            #     self.world_width, self.world_height, existing_positions
-            # )
-            x, y = fixed_position_target_area(idx, self.world_width, self.world_height)
-            existing_positions.append((x, y))
-
-            # Random radius between 2 and 4
-            radius = 5
-
-            # Random coupling requirement between 2 and min(5, n_agents)
-            # coupling_req = np.random.randint(2, self.n_agents - 1)
-            coupling_req = 2
-
-            # Set reward scale based on coupling requirement
-            reward_scale = 1.0  # * coupling_req
-
-            # Random color (semi-transparent)
-            color = (
-                np.random.randint(50, 200),  # R
-                np.random.randint(50, 200),  # G
-                np.random.randint(50, 200),  # B
-                128,  # Alpha (semi-transparent)
-            )
-
-            target_area = TargetArea(x, y, radius, coupling_req, reward_scale, color)
-            self.target_areas.append(target_area)
+        target_area = ObjectTargetArea(
+            self.world_width // 2, self.world_height - 3, self.world_width - 1, 5
+        )
+        self.target_areas.append(target_area)
 
     def _init_agents(self):
         self.agents.clear()
@@ -166,10 +140,12 @@ class MultiBoxPushEnv(gym.Env):
         shapes = [
             # Square (Box)
             b2PolygonShape(box=(1.5, 1.5)),
+            b2PolygonShape(box=(1.5, 1.5)),
+            b2PolygonShape(box=(1.5, 1.5)),
             # Triangle (Polygon vertices must be CCW)
-            b2PolygonShape(vertices=[(0, 2.0), (-2.0, -1.5), (2.0, -1.5)]),
-            # Circle
-            b2CircleShape(radius=1.5),
+            # b2PolygonShape(vertices=[(0, 2.0), (-2.0, -1.5), (2.0, -1.5)]),
+            # # Circle
+            # b2CircleShape(radius=1.5),
         ]
 
         # Colors (R, G, B)
@@ -185,7 +161,7 @@ class MultiBoxPushEnv(gym.Env):
         for i, shape in enumerate(shapes):
             fixture_def = b2FixtureDef(
                 shape=shape,
-                density=3.0,
+                density=1.0,
                 friction=0.3,
                 restitution=0.2,
             )
@@ -203,8 +179,8 @@ class MultiBoxPushEnv(gym.Env):
             body = self.world.CreateDynamicBody(
                 position=pos,
                 fixtures=fixture_def,
-                linearDamping=5.0,
-                angularDamping=2.0,
+                linearDamping=4.0,
+                angularDamping=8.0,
             )
 
             # Store color in body user data for rendering
@@ -477,30 +453,29 @@ class MultiBoxPushEnv(gym.Env):
             pygame.font.init()
             self.sensor_font = pygame.font.SysFont("Arial", 12)
 
+        n_sectors = 8  # Now 8 sectors
+        sector_step = 360 / n_sectors
+        shift_degrees = 22.5  # Shift sectors counter-clockwise
+
         for idx, agent in enumerate(self.agents):
             # Get agent position in screen coordinates
             center_x = agent.position.x * self.scale
             center_y = self.screen_size[1] - agent.position.y * self.scale
 
-            # Get sensor values - now returns 8 values (4 agent densities + 4 target densities)
+            # Get sensor values - now returns 16 density values (8 agent + 8 target) + rel coords
             sensors = self._calculate_density_sensors(idx, self.sector_sensor_radius)
-            agent_densities = sensors[:4]
-            target_densities = sensors[4:]
+            agent_densities = sensors[:n_sectors]
+            target_densities = sensors[n_sectors : n_sectors * 2]
 
             sensor_radius = (
                 self.sector_sensor_radius * self.scale
             )  # Radius of detection circle
 
-            # Define sector angles
-            sector_angles = [
-                (0, 90),  # top-right
-                (90, 180),  # top-left
-                (180, 270),  # bottom-left
-                (270, 360),  # bottom-right
-            ]
-
             # Draw each sector outline
-            for sector, (start_angle, end_angle) in enumerate(sector_angles):
+            for sector in range(n_sectors):
+                start_angle = sector * sector_step + shift_degrees
+                end_angle = (sector + 1) * sector_step + shift_degrees
+
                 # Agent density (blue lines)
                 agent_density = (
                     min(agent_densities[sector], normalization_value)
@@ -610,47 +585,47 @@ class MultiBoxPushEnv(gym.Env):
             self.target_font = pygame.font.SysFont("Arial", 14)
 
         for area in self.target_areas:
-            # Draw the area as a semi-transparent circle
-            area_rect = pygame.Rect(
-                (area.x - area.radius) * self.scale,
-                self.screen_size[1] - (area.y + area.radius) * self.scale,
-                area.radius * 2 * self.scale,
-                area.radius * 2 * self.scale,
-            )
 
-            # Create a surface for the semi-transparent circle
-            circle_surface = pygame.Surface(
-                (int(area.radius * 2 * self.scale), int(area.radius * 2 * self.scale)),
-                pygame.SRCALPHA,
-            )
-            pygame.draw.circle(
-                circle_surface,
-                area.color,
-                (int(area.radius * self.scale), int(area.radius * self.scale)),
-                int(area.radius * self.scale),
-            )
-
-            # Draw the circle
-            self.screen.blit(circle_surface, area_rect)
-
-            # Draw the coupling requirement text
-            req_text = f"Req: {area.coupling_requirement}"
-            text_surface = self.target_font.render(req_text, True, (0, 0, 0))
-            text_rect = text_surface.get_rect(
-                center=(area.x * self.scale, self.screen_size[1] - area.y * self.scale)
-            )
-            self.screen.blit(text_surface, text_rect)
-
-            # Draw a small indicator of reward scale
-            scale_text = f"x{area.reward_scale:.1f}"
-            scale_surface = self.target_font.render(scale_text, True, (0, 0, 0))
-            scale_rect = scale_surface.get_rect(
-                center=(
-                    area.x * self.scale,
-                    self.screen_size[1] - area.y * self.scale + 20,
+            # Check if it's our new ObjectTargetArea (has width/height)
+            if hasattr(area, "width"):
+                # Draw Rectangle
+                rect_surface = pygame.Surface(
+                    (int(area.width * self.scale), int(area.height * self.scale)),
+                    pygame.SRCALPHA,
                 )
-            )
-            self.screen.blit(scale_surface, scale_rect)
+                # Fill with transparent color
+                rect_surface.fill(area.color)
+
+                # Position logic (Box2D center -> Pygame TopLeft)
+                screen_x = (area.x - area.width / 2) * self.scale
+                screen_y = self.screen_size[1] - (area.y + area.height / 2) * self.scale
+
+                self.screen.blit(rect_surface, (screen_x, screen_y))
+
+                # Draw outline
+                pygame.draw.rect(
+                    self.screen,
+                    (0, 100, 0),
+                    pygame.Rect(
+                        screen_x,
+                        screen_y,
+                        area.width * self.scale,
+                        area.height * self.scale,
+                    ),
+                    2,
+                )
+
+            # Draw label (Optional)
+            if hasattr(area, "contains_object"):
+                text = "DROP ZONE"
+                text_surface = self.target_font.render(text, True, (0, 0, 0))
+                text_rect = text_surface.get_rect(
+                    center=(
+                        area.x * self.scale,
+                        self.screen_size[1] - area.y * self.scale,
+                    )
+                )
+                self.screen.blit(text_surface, text_rect)
 
     def _draw_agent_indices(self):
         """Render the index of each agent on top of them for easy identification"""
@@ -767,20 +742,6 @@ class MultiBoxPushEnv(gym.Env):
 
         return np.array(observations, dtype=np.float32)
 
-    def _get_chain_size_reward(self):
-        """Calculate reward based on the largest connected component of agents"""
-        largest_component_size = self._find_largest_connected_component()
-
-        # Normalize by total number of agents to get a value between 0 and 1
-        normalized_reward = largest_component_size / self.n_agents
-
-        # Scale the reward (adjust multiplier as needed)
-        reward = normalized_reward * 1.0  # Scale to make reward more significant
-
-        terminated = self.n_agents == largest_component_size
-
-        return reward, terminated
-
     def _calculate_proximity_reward(self):
         agent_proximity_reward = [0.0 for _ in self.agents]
 
@@ -869,12 +830,12 @@ class MultiBoxPushEnv(gym.Env):
 
     def _calculate_density_sensors(self, agent_idx, sensor_radius):
         """
-        Calculate density of agents and targets in four sectors around an agent.
+        Calculate density of agents and targets in 8 sectors around an agent.
         Also returns relative coordinates to closest non-connected agent and target.
 
-        Returns a vector of 12 values:
-        - First 4 values: agent density in [top-right, top-left, bottom-left, bottom-right]
-        - Next 4 values: target density in [top-right, top-left, bottom-left, bottom-right]
+        Returns a vector of 20 values:
+        - First 8 values: agent density in sectors 0-7 (counter-clockwise from East)
+        - Next 8 values: target density in sectors 0-7
         - Next 2 values: relative [x,y] to closest non-connected agent
         - Last 2 values: relative [x,y] to closest target
         """
@@ -882,9 +843,13 @@ class MultiBoxPushEnv(gym.Env):
             [self.agents[agent_idx].position.x, self.agents[agent_idx].position.y]
         )
 
-        # Initialize densities for the 4 sectors (for both agents and targets)
-        agent_densities = np.zeros(4, dtype=np.float32)
-        target_densities = np.zeros(4, dtype=np.float32)
+        n_sectors = 8
+        sector_radian_step = (2 * np.pi) / n_sectors
+        shift_radians = np.radians(22.5)
+
+        # Initialize densities for the 8 sectors
+        agent_densities = np.zeros(n_sectors, dtype=np.float32)
+        target_densities = np.zeros(n_sectors, dtype=np.float32)
 
         # Variables to track closest agent and target
         closest_agent_dist = float("inf")
@@ -913,17 +878,20 @@ class MultiBoxPushEnv(gym.Env):
             if distance > sensor_radius:
                 continue
 
-            # Determine sector (0: top-right, 1: top-left, 2: bottom-left, 3: bottom-right)
-            sector = 0
-            if relative_pos[0] < 0:  # Left side
-                if relative_pos[1] >= 0:  # Top-left
-                    sector = 1
-                else:  # Bottom-left
-                    sector = 2
-            else:  # Right side
-                if relative_pos[1] < 0:  # Bottom-right
-                    sector = 3
-                # else it's already sector 0 (top-right)
+            # Calculate angle in range [0, 2pi)
+            angle = np.arctan2(relative_pos[1], relative_pos[0])
+
+            # Apply shift to match rotated sectors (subtract shift from point angle)
+            angle -= shift_radians
+
+            # Normalize to [0, 2pi)
+            if angle < 0:
+                angle += 2 * np.pi
+            elif angle >= 2 * np.pi:
+                angle -= 2 * np.pi
+
+            # Determine sector (0 to 7)
+            sector = int(angle / sector_radian_step) % n_sectors
 
             # Calculate density contribution (inverse square of distance)
             density_value = 1.0 / ((distance / self.sector_sensor_radius) + 1.0)
@@ -948,40 +916,33 @@ class MultiBoxPushEnv(gym.Env):
             if distance > sensor_radius:
                 continue
 
-            # Determine sector (0: top-right, 1: top-left, 2: bottom-left, 3: bottom-right)
-            sector = 0
-            if relative_pos[0] < 0:  # Left side
-                if relative_pos[1] >= 0:  # Top-left
-                    sector = 1
-                else:  # Bottom-left
-                    sector = 2
-            else:  # Right side
-                if relative_pos[1] < 0:  # Bottom-right
-                    sector = 3
-                # else it's already sector 0 (top-right)
+            # Calculate angle in range [0, 2pi)
+            angle = np.arctan2(relative_pos[1], relative_pos[0])
+
+            # Apply shift to match rotated sectors
+            angle -= shift_radians
+
+            # Normalize to [0, 2pi)
+            if angle < 0:
+                angle += 2 * np.pi
+            elif angle >= 2 * np.pi:
+                angle -= 2 * np.pi
+
+            # Determine sector (0 to 7)
+            sector = int(angle / sector_radian_step) % n_sectors
 
             # Calculate target density contribution
-            density_value = target.reward_scale * (
-                1.0 / ((distance / self.sector_sensor_radius) + 1.0)
-            )
+            density_value = 1.0 / ((distance / self.sector_sensor_radius) + 1.0)
 
             # Set as sector value if its the highest value
             if target_densities[sector] < density_value:
                 target_densities[sector] = density_value
 
-        # Normalize the relative coordinates by world dimensions
-        # closest_agent_rel = closest_agent_rel / np.array(
-        #     [self.world_width, self.world_height]
-        # )
-        # closest_target_rel = closest_target_rel / np.array(
-        #     [self.world_width, self.world_height]
-        # )
-
         # Combine all values into one array
         return np.concatenate(
             [
-                agent_densities,  # 4 values
-                target_densities,  # 4 values
+                agent_densities,  # 8 values
+                target_densities,  # 8 values
                 closest_agent_rel,  # 2 values (x,y)
                 closest_target_rel,  # 2 values (x,y)
             ]
