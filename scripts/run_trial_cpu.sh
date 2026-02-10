@@ -6,7 +6,7 @@ ENVIRONMENT=$4
 TRIAL_ID=$5
 
 SCRATCH=/nfs/stak/users/agrazvam/hpc-share/tmp
-EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/src/run_trial.py
+EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/run_trial.py
 
 sbatch <<EOT
 #!/bin/bash
