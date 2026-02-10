@@ -144,8 +144,9 @@ class PettingZooToGymWrapper(gym.Env):
         self.env.close()
 
 
-def create_env(env_name: EnvironmentEnum, n_agents: int, render_mode: str = None):
-
+def get_state_and_action_dims(
+    env_name: EnvironmentEnum, n_agents: int, render_mode: str = None
+):
     match (env_name):
         case EnvironmentEnum.BOX2D_SALP:
             from environments.box2d_salp.domain import SalpChainEnv
@@ -192,7 +193,7 @@ def create_env(env_name: EnvironmentEnum, n_agents: int, render_mode: str = None
             state_dim = env.observation_space.shape[1]
             action_dim = env.action_space.nvec[0]
 
-    return env, state_dim, action_dim
+    return state_dim, action_dim
 
 
 def make_vec_env(

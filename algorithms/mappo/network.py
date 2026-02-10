@@ -27,7 +27,6 @@ class MAPPOActor(nn.Module):
 
         self.discrete = discrete
         self.action_dim = action_dim
-        self.movement_dim = 2
 
         if not discrete:
             # For continuous actions
@@ -376,7 +375,8 @@ class MAPPONetwork(nn.Module):
                     observation_dim, action_dim, hidden_dim, self.discrete
                 )
             else:
-                self.actor = MAPPO_Hybrid_Actor(observation_dim, action_dim, hidden_dim)
+                # self.actor = MAPPO_Hybrid_Actor(observation_dim, action_dim, hidden_dim)
+                self.actor = MAPPOActor(observation_dim, action_dim, hidden_dim)
 
         else:
             # Separate actor for each agent

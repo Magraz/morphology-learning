@@ -1,4 +1,0 @@
-dhg
-notebook
-dill
-gymnasium[box2d]

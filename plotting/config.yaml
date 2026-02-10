@@ -4,10 +4,10 @@ datapoints: [50000, 30000]
 base_path: "/home/magraz/morphology-learning/experiments/results"
 
 # batches: ["salp_navigate_8a", "salp_navigate_16a"]
-batches: ["mpe_spread_novec"]
+batches: ["multi_box_push_test"]
 
 # experiments: ["gcn", "gat", "graph_transformer", "gcn_full", "gat_full", "graph_transformer_full"]
-experiments: ["mlp"]
+experiments: ["mlp_shared"]
 
 # trials: ["0", "1", "2", "3", "4"]
 trials: ["test"]

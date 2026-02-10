@@ -45,7 +45,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 18), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -127,25 +127,19 @@ class MultiBoxPushEnv(gym.Env):
         positions = get_scatter_positions(
             self.world_width, self.world_height, self.n_agents
         )
-        # positions = get_linear_positions(
-        #     self.world_width, self.world_height, self.n_agents
-        # )
+
         self._create_agents(positions)
 
     def _create_dynamic_objects(self):
         """Create the requested square, triangle, and circle objects"""
         self.objects.clear()
 
-        # Define shapes
+        # Define shapes and their half-sizes (for bounding box calculation)
         shapes = [
-            # Square (Box)
             b2PolygonShape(box=(1.5, 1.5)),
-            # b2PolygonShape(box=(1.5, 1.5)),
-            # b2PolygonShape(box=(1.5, 1.5)),
-            # Triangle (Polygon vertices must be CCW)
-            # b2PolygonShape(vertices=[(0, 2.0), (-2.0, -1.5), (2.0, -1.5)]),
-            # # Circle
-            # b2CircleShape(radius=1.5),
+        ]
+        half_sizes = [
+            (1.5, 1.5),  # Half-width, half-height of the box
         ]
 
         # Colors (R, G, B)
@@ -158,7 +152,11 @@ class MultiBoxPushEnv(gym.Env):
         center_x = self.world_width / 2
         center_y = self.world_height / 2
 
-        for i, shape in enumerate(shapes):
+        # Define the spawn area (centered at the middle of the environment)
+        spawn_width = self.world_width * 0.5  # 50% of world width
+        spawn_height = self.world_height * 0.3  # 30% of world height
+
+        for i, (shape, half_size) in enumerate(zip(shapes, half_sizes)):
             fixture_def = b2FixtureDef(
                 shape=shape,
                 density=1.0,
@@ -172,9 +170,15 @@ class MultiBoxPushEnv(gym.Env):
                 AGENT_CATEGORY | BOUNDARY_CATEGORY | OBJECT_CATEGORY
             )
 
-            # Position them slightly offset from center
-            offset_x = (i - 1) * 6.0  # Spread out along X
-            pos = (center_x + offset_x, center_y)
+            # Random position within the spawn rectangle, accounting for object size
+            min_x = center_x - spawn_width / 2 + half_size[0]
+            max_x = center_x + spawn_width / 2 - half_size[0]
+            min_y = center_y - spawn_height / 2 + half_size[1]
+            max_y = center_y + spawn_height / 2 - half_size[1]
+
+            pos_x = np.random.uniform(min_x, max_x)
+            pos_y = np.random.uniform(min_y, max_y)
+            pos = (pos_x, pos_y)
 
             body = self.world.CreateDynamicBody(
                 position=pos,
@@ -766,14 +770,13 @@ class MultiBoxPushEnv(gym.Env):
 
     def _calculate_density_sensors(self, agent_idx, sensor_radius):
         """
-        Calculate density of agents and DYNAMIC OBJECTS in 8 sectors around an agent.
-        Also returns relative coordinates to closest non-connected agent and object.
+        Calculate normalized distance to centroid of agents and objects in 8 sectors around an agent.
+        Distances are normalized by the sensor_radius so values are in [0, 1].
+        0.0 means no entities in that sector, otherwise value is distance/sensor_radius.
 
-        Returns a vector of 20 values:
-        - First 8 values: agent density in sectors 0-7 (counter-clockwise from East)
-        - Next 8 values: object density in sectors 0-7
-        - Next 2 values: relative [x,y] to closest non-connected agent
-        - Last 2 values: relative [x,y] to closest object
+        Returns a vector of 16 values:
+        - First 8 values: normalized distance to centroid of agents in sectors 0-7
+        - Next 8 values: normalized distance to centroid of objects in sectors 0-7
         """
         agent_pos = np.array(
             [self.agents[agent_idx].position.x, self.agents[agent_idx].position.y]
@@ -783,108 +786,83 @@ class MultiBoxPushEnv(gym.Env):
         sector_radian_step = (2 * np.pi) / n_sectors
         shift_radians = np.radians(22.5)
 
-        # Initialize densities for the 8 sectors
-        agent_densities = np.zeros(n_sectors, dtype=np.float32)
-        object_densities = np.zeros(n_sectors, dtype=np.float32)
-
-        # Variables to track closest agent and object
-        closest_agent_dist = float("inf")
-        closest_agent_rel = np.zeros(2, dtype=np.float32)
-        closest_object_dist = float("inf")
-        closest_object_rel = np.zeros(2, dtype=np.float32)
+        # Collect positions per sector for agents and objects
+        agent_sector_positions = [[] for _ in range(n_sectors)]
+        object_sector_positions = [[] for _ in range(n_sectors)]
 
         # Check each other agent
         for other_idx, other_agent in enumerate(self.agents):
-
             if other_idx == agent_idx:
-                continue  # Skip self
+                continue
 
             other_pos = np.array([other_agent.position.x, other_agent.position.y])
             relative_pos = other_pos - agent_pos
-
-            # Calculate distance
             distance = np.linalg.norm(relative_pos)
 
-            # Update closest agent tracking
-            if distance < closest_agent_dist:
-                closest_agent_dist = distance
-                closest_agent_rel = relative_pos
-
-            # Skip if outside sensor radius for density calculation
+            # Skip if outside sensor radius
             if distance > sensor_radius:
                 continue
 
             # Calculate angle in range [0, 2pi)
             angle = np.arctan2(relative_pos[1], relative_pos[0])
-
-            # Apply shift to match rotated sectors (subtract shift from point angle)
             angle -= shift_radians
-
-            # Normalize to [0, 2pi)
             if angle < 0:
                 angle += 2 * np.pi
             elif angle >= 2 * np.pi:
                 angle -= 2 * np.pi
 
-            # Determine sector (0 to 7)
             sector = int(angle / sector_radian_step) % n_sectors
+            agent_sector_positions[sector].append(other_pos)
 
-            # Calculate density contribution (inverse square of distance)
-            density_value = (1.0 / (distance / self.sector_sensor_radius)) / (
-                self.sector_sensor_radius // 2
-            )
-
-            # Add to appropriate sector
-            agent_densities[sector] += density_value
-
-        # Check each dynamic object (Used to be target areas)
+        # Check each dynamic object
         for obj in self.objects:
             obj_pos = np.array([obj.position.x, obj.position.y])
             relative_pos = obj_pos - agent_pos
-
-            # Calculate distance
             distance = np.linalg.norm(relative_pos)
 
-            # Update closest object tracking
-            if distance < closest_object_dist:
-                closest_object_dist = distance
-                closest_object_rel = relative_pos
-
-            # Skip if outside sensor radius for density calculation
+            # Skip if outside sensor radius
             if distance > sensor_radius:
                 continue
 
             # Calculate angle in range [0, 2pi)
             angle = np.arctan2(relative_pos[1], relative_pos[0])
-
-            # Apply shift to match rotated sectors
             angle -= shift_radians
-
-            # Normalize to [0, 2pi)
             if angle < 0:
                 angle += 2 * np.pi
             elif angle >= 2 * np.pi:
                 angle -= 2 * np.pi
 
-            # Determine sector (0 to 7)
             sector = int(angle / sector_radian_step) % n_sectors
+            object_sector_positions[sector].append(obj_pos)
 
-            # Calculate object density contribution
-            density_value = (1.0 / (distance / self.sector_sensor_radius)) / (
-                self.sector_sensor_radius // 2
-            )
+        # Compute normalized distance to centroid per sector
+        agent_centroid_distances = np.zeros(n_sectors, dtype=np.float32)
+        object_centroid_distances = np.zeros(n_sectors, dtype=np.float32)
 
-            # Set as sector value if its the highest value
-            if object_densities[sector] < density_value:
-                object_densities[sector] = density_value
+        for s in range(n_sectors):
+            # Agent centroid distance (inverted and normalized by sensor_radius)
+            if len(agent_sector_positions[s]) > 0:
+                centroid = np.mean(agent_sector_positions[s], axis=0)
+                agent_centroid_distances[s] = 1.0 - (
+                    np.linalg.norm(centroid - agent_pos) / sensor_radius
+                )
+            else:
+                agent_centroid_distances[s] = 0.0
+
+            # Object centroid distance (inverted and normalized by sensor_radius)
+            if len(object_sector_positions[s]) > 0:
+                centroid = np.mean(object_sector_positions[s], axis=0)
+                object_centroid_distances[s] = 1.0 - (
+                    np.linalg.norm(centroid - agent_pos) / sensor_radius
+                )
+            else:
+                object_centroid_distances[s] = 0.0
 
         # Combine all values into one array
         return np.concatenate(
             [
-                agent_densities,  # 8 values
-                object_densities,  # 8 values
-                closest_agent_rel,  # 2 values (x,y)
-                closest_object_rel,  # 2 values (x,y)
+                agent_centroid_distances,  # 8 values, normalized [0, 1]
+                object_centroid_distances,  # 8 values, normalized [0, 1]
             ]
         )
 
@@ -928,13 +906,6 @@ class MultiBoxPushEnv(gym.Env):
 
         # Transform actions into dictionary
         movement_action = actions[:, :2]
-        attach_action = actions[:, 2]
-        detach_action = actions[:, -1]
-
-        # Update attach and detach states - ensure we get scalar values
-        # Convert to flat numpy array if needed
-        self.attach_values = np.array(attach_action).flatten()
-        self.detach_values = np.array(detach_action).flatten()
 
         # PROCESS ENVIRONMENT ACTION
 
@@ -1042,7 +1013,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=2, n_target_areas=2, max_steps=512
+        render_mode="human", n_agents=2, n_target_areas=2, max_steps=2
     )
     obs, info = env.reset()
 

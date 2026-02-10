@@ -1,7 +1,7 @@
 from environments.types import EnvironmentParams
 from algorithms.mappo.types import Experiment, Params
 from algorithms.runner import Runner
-from algorithms.create_env import create_env
+from algorithms.create_env import get_state_and_action_dims
 from pathlib import Path
 
 from algorithms.mappo.trainer import MAPPOTrainer
@@ -56,7 +56,7 @@ class MAPPO_Runner(Runner):
         print(f"Using device: {self.exp_config.device}")
 
         # Create environment
-        self.env, state_dim, action_dim = create_env(
+        state_dim, action_dim = get_state_and_action_dims(
             self.env_config.environment, self.env_config.n_agents
         )
 
@@ -101,13 +101,7 @@ class MAPPO_Runner(Runner):
         # Save trained agents
         self.trainer.save_agent(self.dirs["models"] / "models_finished.pth")
 
-        self.env.close()
-
     def view(self):
-        self.env, _, _ = create_env(self.env_config, render_mode="human")
-
-        # Update the environment in the trainer
-        self.trainer.wrapped_env.env = self.env
 
         # Save trained agents
         self.trainer.load_agent(self.dirs["models"] / "models_checkpoint.pth")
@@ -117,8 +111,6 @@ class MAPPO_Runner(Runner):
         for i in range(10):
             rew = self.trainer.evaluate(render=True)
             print(f"REWARD: {rew}")
-
-        self.env.close()
 
     def evaluate(self):
         pass

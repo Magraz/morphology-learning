@@ -356,7 +356,8 @@ class VecMAPPOTrainer:
                 episode_rew += rewards
 
                 if render:
-                    self.eval_env.env.render()
+                    self.eval_env.envs[0].render_mode = "human"
+                    self.eval_env.envs[0].render()
 
                 if terminated or truncated:
                     break

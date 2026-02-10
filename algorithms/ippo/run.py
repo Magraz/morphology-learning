@@ -1,7 +1,7 @@
 from environments.types import EnvironmentParams, EnvironmentEnum
 from algorithms.ippo.types import Experiment, Params
 from algorithms.runner import Runner
-from algorithms.create_env import create_env
+from algorithms.create_env import get_state_and_action_dims
 from pathlib import Path
 
 from algorithms.ippo.trainer import IPPOTrainer
@@ -54,7 +54,7 @@ class IPPO_Runner(Runner):
         print(f"Using device: {self.exp_config.device}")
 
         # Create environment
-        self.env, state_dim, action_dim = create_env(env_config)
+        state_dim, action_dim = get_state_and_action_dims(env_config)
 
         # Create trainer
         self.trainer = IPPOTrainer(
