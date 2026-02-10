@@ -1,0 +1,9 @@
+#!/bin/bash
+ENVIRONMENT=multi_box_test
+BATCH_NAME=${ENVIRONMENT}_test
+EXPERIMENT=mlp_shared
+ALGORITHM=mappo
+TRIAL_ID=test
+
+bash run_trial_cpu.sh $BATCH_NAME $EXPERIMENT $ALGORITHM $ENVIRONMENT $TRIAL_ID
+
