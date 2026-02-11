@@ -3,10 +3,10 @@ from pathlib import Path
 from collections import defaultdict
 import pickle
 import time
+import psutil
 
 from algorithms.mappo.mappo import MAPPOAgent
 from environments.types import EnvironmentEnum
-from algorithms.env_wrapper import EnvWrapper
 from algorithms.create_env import make_vec_env
 
 import torch
@@ -45,7 +45,7 @@ class VecMAPPOTrainer:
             self.env_name,
             self.n_agents,
             self.n_parallel_envs,
-            use_async=True,  # Use parallel processing
+            use_async=False,  # Use parallel processing
         )
 
         # Set action bounds based on environment
@@ -281,12 +281,14 @@ class VecMAPPOTrainer:
 
             # Log progress
             if steps_completed % log_every < step_count:
+                mem = psutil.Process().memory_info().rss / 1024 / 1024  # MB
                 print(
                     f"Steps: {steps_completed}/{total_steps} ({steps_completed/total_steps*100:.1f}%) | "
                     f"Episodes: {episodes_completed} | "
                     f"Reward: {self.training_stats['reward'][-1]:.2f} | "
                     f"Time: {elapsed_time:.1f}s | "
                     f"FPS: {steps_per_second:.1f} | "
+                    f"Mem: {mem:.0f}MB | "
                     f"Collection: {collection_time:.2f}s | "
                     f"Update: {update_time:.2f}s | "
                     f"Eval: {eval_time:.2f}s"

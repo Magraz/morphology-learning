@@ -76,6 +76,8 @@ class MultiBoxPushEnv(gym.Env):
         self.screen_size = (600, 600)
         self.scale = 20.0  # Pixels per Box2D meter
 
+        self.boundary_bodies = []  # Track boundary walls
+
         # Create target areas
         self._create_target_areas()
 
@@ -122,7 +124,6 @@ class MultiBoxPushEnv(gym.Env):
         self.target_areas.append(target_area)
 
     def _init_agents(self):
-        self.agents.clear()
 
         positions = get_scatter_positions(
             self.world_width, self.world_height, self.n_agents
@@ -149,6 +150,9 @@ class MultiBoxPushEnv(gym.Env):
             (255, 165, 0),  # Orange for Circle
         ]
 
+        # Store base densities for cooperative mass reduction
+        self.object_base_densities = []
+
         center_x = self.world_width / 2
         center_y = self.world_height / 2
 
@@ -156,10 +160,12 @@ class MultiBoxPushEnv(gym.Env):
         spawn_width = self.world_width * 0.5  # 50% of world width
         spawn_height = self.world_height * 0.3  # 30% of world height
 
+        base_density = 1.0
+
         for i, (shape, half_size) in enumerate(zip(shapes, half_sizes)):
             fixture_def = b2FixtureDef(
                 shape=shape,
-                density=1.0,
+                density=base_density,
                 friction=0.3,
                 restitution=0.2,
             )
@@ -191,6 +197,60 @@ class MultiBoxPushEnv(gym.Env):
             body.userData = {"type": "object", "color": colors[i], "index": i}
 
             self.objects.append(body)
+            self.object_base_densities.append(base_density)
+
+    def _update_object_mass_from_contacts(self):
+        """
+        Reduce object mass by 10% for each additional agent pushing it.
+        Uses distance-based proximity for stable detection.
+        """
+        for obj_idx, obj in enumerate(self.objects):
+            base_density = self.object_base_densities[obj_idx]
+
+            # Count agents near this object using proximity
+            n_touching = 0
+            shape = obj.fixtures[0].shape
+
+            for agent in self.agents:
+                agent_pos = np.array([agent.position.x, agent.position.y])
+                agent_radius = agent.fixtures[0].shape.radius
+
+                if isinstance(shape, b2PolygonShape):
+                    local_pos = obj.GetLocalPoint(
+                        (float(agent_pos[0]), float(agent_pos[1]))
+                    )
+                    vertices = shape.vertices
+                    half_w = max(abs(v[0]) for v in vertices)
+                    half_h = max(abs(v[1]) for v in vertices)
+                    closest_x = np.clip(local_pos[0], -half_w, half_w)
+                    closest_y = np.clip(local_pos[1], -half_h, half_h)
+                    dist = np.sqrt(
+                        (local_pos[0] - closest_x) ** 2
+                        + (local_pos[1] - closest_y) ** 2
+                    )
+                elif isinstance(shape, b2CircleShape):
+                    obj_pos = np.array([obj.position.x, obj.position.y])
+                    dist = np.linalg.norm(agent_pos - obj_pos) - shape.radius
+                else:
+                    obj_pos = np.array([obj.position.x, obj.position.y])
+                    dist = np.linalg.norm(agent_pos - obj_pos)
+
+                touch_threshold = agent_radius + 0.3
+                if dist <= touch_threshold:
+                    n_touching += 1
+
+            if n_touching > 1:
+                reduction = 0.10 * (n_touching - 1)
+                scale = max(0.10, 1.0 - reduction)
+            else:
+                scale = 1.0
+
+            new_density = base_density * scale
+
+            for fixture in obj.fixtures:
+                fixture.density = new_density
+
+            obj.ResetMassData()
 
     def _create_agents(self, positions):
         for i in range(self.n_agents):
@@ -273,6 +333,7 @@ class MultiBoxPushEnv(gym.Env):
         )
         bottom_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
         bottom_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
+        self.boundary_bodies.append(bottom_wall)
 
         # Top wall
         top_wall = self.world.CreateStaticBody(
@@ -281,6 +342,7 @@ class MultiBoxPushEnv(gym.Env):
         )
         top_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
         top_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
+        self.boundary_bodies.append(top_wall)
 
         # Left wall
         left_wall = self.world.CreateStaticBody(
@@ -289,6 +351,7 @@ class MultiBoxPushEnv(gym.Env):
         )
         left_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
         left_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
+        self.boundary_bodies.append(left_wall)
 
         # Right wall
         right_wall = self.world.CreateStaticBody(
@@ -297,6 +360,7 @@ class MultiBoxPushEnv(gym.Env):
         )
         right_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
         right_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
+        self.boundary_bodies.append(right_wall)
 
     def _draw_boundary_walls(self):
         """Draw the actual boundary walls at their Box2D positions"""
@@ -681,10 +745,44 @@ class MultiBoxPushEnv(gym.Env):
             )  # [rel_x, rel_y, rel_vx, rel_vy, distance]
 
     def _is_agent_touching_object(self, agent_idx):
+        """
+        Check if an agent is close enough to any object to be considered 'touching' it.
+        Uses distance-based proximity instead of Box2D contacts for stability.
+        """
+        agent_pos = np.array(
+            [self.agents[agent_idx].position.x, self.agents[agent_idx].position.y]
+        )
+        agent_radius = self.agents[agent_idx].fixtures[0].shape.radius
 
-        # Check all objects
-        for obj_idx in range(len(self.objects)):
-            if agent_idx in self.contact_listener.get_agents_touching_object(obj_idx):
+        for obj in self.objects:
+            obj_pos = np.array([obj.position.x, obj.position.y])
+
+            # Get the object's half-size from its shape
+            shape = obj.fixtures[0].shape
+            if isinstance(shape, b2PolygonShape):
+                # For boxes, compute distance to the nearest edge
+                # Transform agent position into the object's local frame
+                local_pos = obj.GetLocalPoint(
+                    (float(agent_pos[0]), float(agent_pos[1]))
+                )
+                # Get the half-extents from the vertices
+                vertices = shape.vertices
+                half_w = max(abs(v[0]) for v in vertices)
+                half_h = max(abs(v[1]) for v in vertices)
+                # Clamp to the box surface
+                closest_x = np.clip(local_pos[0], -half_w, half_w)
+                closest_y = np.clip(local_pos[1], -half_h, half_h)
+                dist = np.sqrt(
+                    (local_pos[0] - closest_x) ** 2 + (local_pos[1] - closest_y) ** 2
+                )
+            elif isinstance(shape, b2CircleShape):
+                dist = np.linalg.norm(agent_pos - obj_pos) - shape.radius
+            else:
+                dist = np.linalg.norm(agent_pos - obj_pos)
+
+            # Consider "touching" if within agent_radius + small margin
+            touch_threshold = agent_radius + 0.3
+            if dist <= touch_threshold:
                 return 1.0
 
         return 0.0
@@ -890,22 +988,25 @@ class MultiBoxPushEnv(gym.Env):
         if hasattr(self, "prev_object_distances"):
             del self.prev_object_distances
 
-        for body in self.agents:
-            self.world.DestroyBody(body)
+        # Create a completely fresh Box2D world to avoid stale references
+        self.world = b2World(gravity=(0, 0))
 
-        # Clean up existing objects
-        for body in self.objects:
-            self.world.DestroyBody(body)
+        # Re-attach contact listener to new world
+        self.contact_listener = BoundaryContactListener()
+        self.world.contactListener = self.contact_listener
+
+        # Clear all body references
+        self.agents.clear()
         self.objects.clear()
+        self.boundary_bodies.clear()
 
+        # Recreate everything in the fresh world
+        self._create_boundary(
+            self.world_width, self.world_height, self.boundary_thickness
+        )
         self._init_agents()
-
-        self._create_dynamic_objects()  # Create new objects
-
+        self._create_dynamic_objects()
         self._create_target_areas()
-
-        # Reset contact listener
-        self.contact_listener.reset()
 
         obs = self._get_observation()
 
@@ -939,6 +1040,9 @@ class MultiBoxPushEnv(gym.Env):
             # Apply 2D force to agent
             agent.ApplyForceToCenter((float(force_x), float(force_y)), True)
 
+        # Adjust object mass based on how many agents are pushing
+        # self._update_object_mass_from_contacts()
+
         # Rest of the step method remains the same
         self.world.Step(self.time_step, 6, 2)
 
@@ -956,7 +1060,10 @@ class MultiBoxPushEnv(gym.Env):
             # The normal reward calculation
             task_reward, individual_rewards, terminated = self._get_rewards()
 
-        # Reset collision flag for next step
+        # Get observation BEFORE resetting contacts
+        obs = self._get_observation()
+
+        # Reset collision flag for next step (AFTER observation and rewards)
         self.contact_listener.reset()
 
         # Create info dictionary with target positions
@@ -981,7 +1088,7 @@ class MultiBoxPushEnv(gym.Env):
         truncated = self.current_step >= self.max_steps
 
         # The observation
-        return self._get_observation(), task_reward, terminated, truncated, info
+        return obs, task_reward, terminated, truncated, info
 
     def render(self):
         if self.render_mode != "human":
@@ -1027,7 +1134,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=2, n_target_areas=2, max_steps=2
+        render_mode="human", n_agents=2, n_target_areas=2, max_steps=10e5
     )
     obs, info = env.reset()
 
