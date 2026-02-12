@@ -138,16 +138,20 @@ class MultiBoxPushEnv(gym.Env):
         # Define shapes and their half-sizes (for bounding box calculation)
         shapes = [
             b2PolygonShape(box=(1.5, 1.5)),
+            b2PolygonShape(box=(1.5, 1.5)),
+            b2PolygonShape(box=(1.5, 1.5)),
         ]
         half_sizes = [
-            (1.5, 1.5),  # Half-width, half-height of the box
+            (1.5, 1.5),  # Half-width, half-height of box 1
+            (1.5, 1.5),  # Half-width, half-height of box 2
+            (1.5, 1.5),  # Half-width, half-height of box 3
         ]
 
         # Colors (R, G, B)
         colors = [
-            (100, 100, 255),  # Blue-ish for Square
-            (255, 100, 255),  # Magenta-ish for Triangle
-            (255, 165, 0),  # Orange for Circle
+            (100, 100, 255),  # Blue-ish for Box 1
+            (255, 100, 255),  # Magenta-ish for Box 2
+            (255, 165, 0),  # Orange for Box 3
         ]
 
         # Store base densities for cooperative mass reduction
@@ -156,11 +160,17 @@ class MultiBoxPushEnv(gym.Env):
         center_x = self.world_width / 2
         center_y = self.world_height / 2
 
-        # Define the spawn area (centered at the middle of the environment)
-        spawn_width = self.world_width * 0.5  # 50% of world width
-        spawn_height = self.world_height * 0.3  # 30% of world height
+        # Define the spawn area (increased to fit 3 boxes without overlap)
+        spawn_width = self.world_width * 0.7  # 70% of world width
+        spawn_height = self.world_height * 0.4  # 40% of world height
 
         base_density = 1.0
+
+        # Track placed positions to avoid overlap
+        placed_positions = []
+        min_separation = (
+            4.0  # Minimum distance between box centers (>= 2 * 1.5 + margin)
+        )
 
         for i, (shape, half_size) in enumerate(zip(shapes, half_sizes)):
             fixture_def = b2FixtureDef(
@@ -182,9 +192,27 @@ class MultiBoxPushEnv(gym.Env):
             min_y = center_y - spawn_height / 2 + half_size[1]
             max_y = center_y + spawn_height / 2 - half_size[1]
 
-            pos_x = np.random.uniform(min_x, max_x)
-            pos_y = np.random.uniform(min_y, max_y)
+            # Try to find a non-overlapping position
+            max_attempts = 100
+            for attempt in range(max_attempts):
+                pos_x = np.random.uniform(min_x, max_x)
+                pos_y = np.random.uniform(min_y, max_y)
+
+                # Check distance from all previously placed boxes
+                too_close = False
+                for prev_pos in placed_positions:
+                    dist = np.sqrt(
+                        (pos_x - prev_pos[0]) ** 2 + (pos_y - prev_pos[1]) ** 2
+                    )
+                    if dist < min_separation:
+                        too_close = True
+                        break
+
+                if not too_close:
+                    break
+
             pos = (pos_x, pos_y)
+            placed_positions.append(pos)
 
             body = self.world.CreateDynamicBody(
                 position=pos,
@@ -240,7 +268,7 @@ class MultiBoxPushEnv(gym.Env):
                     n_touching += 1
 
             if n_touching > 1:
-                reduction = 0.10 * (n_touching - 1)
+                reduction = 0.50 * (n_touching - 1)
                 scale = max(0.10, 1.0 - reduction)
             else:
                 scale = 1.0
@@ -843,11 +871,18 @@ class MultiBoxPushEnv(gym.Env):
                 {}
             )  # Map object_id -> min_distance_to_any_target
 
+        if not hasattr(self, "delivered_objects"):
+            self.delivered_objects = set()
+
         current_object_distances = {}
         distance_reward = 0.0
 
         # 2. Iterate over all movable objects
         for obj_idx, obj in enumerate(self.objects):
+
+            # Skip objects that have already been delivered
+            if obj_idx in self.delivered_objects:
+                continue
 
             target = self.target_areas[0]
             dy = target.y - obj.position.y
@@ -864,16 +899,19 @@ class MultiBoxPushEnv(gym.Env):
                 # If improvement is positive (getting closer), give reward
                 # If negative (getting farther), give penalty
                 # Scaling factor 10.0 makes the signal stronger
-                distance_reward = improvement * 10.0
+                distance_reward += improvement * 10.0
 
-            # 4. Check for completion (object inside target)
+            # 4. Check for completion (object inside target) — bonus only once
             if target.contains_object(obj):
-                # formatting reward for completion
                 distance_reward += 10.0
-                done = True
+                self.delivered_objects.add(obj_idx)
 
-        # Update previous distances for next step
+        # Update previous distances for next step (only for non-delivered objects)
         self.prev_object_distances = current_object_distances
+
+        # Terminate only when ALL objects have been delivered
+        if len(self.delivered_objects) == len(self.objects):
+            done = True
 
         # Assign the distance reward as the task reward (shared by all)
         task_reward = distance_reward
@@ -988,6 +1026,9 @@ class MultiBoxPushEnv(gym.Env):
         if hasattr(self, "prev_object_distances"):
             del self.prev_object_distances
 
+        # Reset delivered tracking
+        self.delivered_objects = set()
+
         # Create a completely fresh Box2D world to avoid stale references
         self.world = b2World(gravity=(0, 0))
 
@@ -1041,7 +1082,7 @@ class MultiBoxPushEnv(gym.Env):
             agent.ApplyForceToCenter((float(force_x), float(force_y)), True)
 
         # Adjust object mass based on how many agents are pushing
-        # self._update_object_mass_from_contacts()
+        self._update_object_mass_from_contacts()
 
         # Rest of the step method remains the same
         self.world.Step(self.time_step, 6, 2)
