@@ -86,12 +86,23 @@ class MAPPO_Runner(Runner):
         )
 
     def train(self):
-        # Train
+        resume_steps = 0
+        resume_episodes = 0
+
+        # Resume from checkpoint if requested and checkpoint exists
+        checkpoint_path = self.dirs["models"] / "models_checkpoint.pth"
+        if self.checkpoint and checkpoint_path.exists():
+            resume_steps, resume_episodes = self.trainer.load_agent(
+                checkpoint_path, restore_rng=True
+            )
+
         self.trainer.train(
             total_steps=self.params.n_total_steps,
             batch_size=self.params.batch_size,
             minibatches=self.params.n_minibatches,
             epochs=self.params.n_epochs,
+            resume_steps=resume_steps,
+            resume_episodes=resume_episodes,
         )
 
         self.trainer.save_training_stats(
@@ -103,13 +114,12 @@ class MAPPO_Runner(Runner):
 
     def view(self):
 
-        # Save trained agents
         self.trainer.load_agent(self.dirs["models"] / "models_checkpoint.pth")
 
         # Test trained agents with rendering
         print("\nTesting trained agents...")
         for i in range(10):
-            rew = self.trainer.evaluate(render=True)
+            rew = self.trainer.evaluate()
             print(f"REWARD: {rew}")
 
     def evaluate(self):

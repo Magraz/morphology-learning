@@ -3,6 +3,7 @@ from pathlib import Path
 from collections import defaultdict
 import pickle
 import time
+import random
 import psutil
 
 from algorithms.mappo.mappo import MAPPOAgent
@@ -190,15 +191,31 @@ class VecMAPPOTrainer:
 
         return total_step_count, episode_count, final_values
 
-    def train(self, total_steps, batch_size, minibatches, epochs, log_every=10000):
+    def train(
+        self,
+        total_steps,
+        batch_size,
+        minibatches,
+        epochs,
+        log_every=10000,
+        resume_steps=0,
+        resume_episodes=0,
+    ):
         """Train MAPPO agent"""
-        print(f"Starting MAPPO training for {total_steps} total environment steps...")
 
         # Start timing
         self.training_start_time = time.time()
 
-        steps_completed = 0
-        episodes_completed = 0
+        # TODO keep track of elapsed time, so that FPS calculation is correct when using checkpoints
+        steps_completed = resume_steps
+        episodes_completed = resume_episodes
+
+        if resume_steps > 0:
+            print(f"Resuming MAPPO training from step {resume_steps}/{total_steps}...")
+        else:
+            print(
+                f"Starting MAPPO training for {total_steps} total environment steps..."
+            )
 
         self.training_stats["total_steps"] = []
         self.training_stats["reward"] = []
@@ -274,7 +291,11 @@ class VecMAPPOTrainer:
                 self.save_training_stats(
                     self.dirs["logs"] / "training_stats_checkpoint.pkl"
                 )
-                self.save_agent(self.dirs["models"] / "models_checkpoint.pth")
+                self.save_agent(
+                    self.dirs["models"] / "models_checkpoint.pth",
+                    steps_completed=steps_completed,
+                    episodes_completed=episodes_completed,
+                )
 
         # Close envs
         self.close_environments()
@@ -343,23 +364,46 @@ class VecMAPPOTrainer:
         """Destructor to ensure environments are closed"""
         self.close_environments()
 
-    def save_agent(self, path):
-        """Save MAPPO agent"""
+    def save_agent(self, path, steps_completed=0, episodes_completed=0):
+        """Save MAPPO agent with RNG states and training progress"""
         torch.save(
             {
                 "network": self.agent.network_old.state_dict(),
                 "optimizer": self.agent.optimizer.state_dict(),
+                "steps_completed": steps_completed,
+                "episodes_completed": episodes_completed,
+                "rng_python": random.getstate(),
+                "rng_numpy": np.random.get_state(),
+                "rng_torch_cpu": torch.random.get_rng_state(),
+                "rng_torch_cuda": (
+                    torch.cuda.get_rng_state_all()
+                    if torch.cuda.is_available()
+                    else None
+                ),
             },
             path,
         )
 
-    def load_agent(self, filepath):
+    def load_agent(self, filepath, restore_rng=False):
         checkpoint = torch.load(filepath, map_location=self.device)
 
         self.agent.network_old.load_state_dict(checkpoint["network"])
+        self.agent.network.load_state_dict(checkpoint["network"])
         self.agent.optimizer.load_state_dict(checkpoint["optimizer"])
 
-        print(f"Agents loaded from {filepath}")
+        if restore_rng and "rng_python" in checkpoint:
+            random.setstate(checkpoint["rng_python"])
+            np.random.set_state(checkpoint["rng_numpy"])
+            torch.random.set_rng_state(checkpoint["rng_torch_cpu"].cpu())
+            if torch.cuda.is_available() and checkpoint["rng_torch_cuda"] is not None:
+                torch.cuda.set_rng_state_all(
+                    [s.cpu() for s in checkpoint["rng_torch_cuda"]]
+                )
+
+        steps = checkpoint.get("steps_completed", 0)
+        episodes = checkpoint.get("episodes_completed", 0)
+        print(f"Agents loaded from {filepath} (steps={steps}, episodes={episodes})")
+        return steps, episodes
 
     def save_training_stats(self, path):
         """Save training statistics"""
