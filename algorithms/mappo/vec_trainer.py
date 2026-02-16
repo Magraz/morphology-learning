@@ -32,12 +32,13 @@ class VecMAPPOTrainer:
         self.env_name = env_name
         self.n_parallel_envs = n_parallel_envs
 
-        # Create environment for evaluation
+        # Create environment for evaluation (parallel eval episodes)
+        self.n_eval_episodes = 10
         self.eval_env = make_vec_env(
             self.env_name,
             self.n_agents,
-            1,
-            use_async=False,
+            self.n_eval_episodes,
+            use_async=True,
         )
 
         # Create vectorized environment using Gymnasium's API
@@ -45,7 +46,7 @@ class VecMAPPOTrainer:
             self.env_name,
             self.n_agents,
             self.n_parallel_envs,
-            use_async=False,  # Use parallel processing
+            use_async=True,  # Use parallel processing
         )
 
         # Set action bounds based on environment
@@ -65,6 +66,9 @@ class VecMAPPOTrainer:
             self.discrete,
             self.n_parallel_envs,
         )
+
+        # Sync device — agent may have upgraded to CUDA in its __init__
+        self.device = self.agent.device
 
         # Training statistics
         self.episode_rewards = []
@@ -101,31 +105,15 @@ class VecMAPPOTrainer:
             # Shape: (n_envs, n_agents * obs_dim)
             global_states = obs.reshape(batch_size, -1)
 
-            # Get actions for all agents in all environments
-            all_actions = []
-            all_log_probs = []
-            all_values = []
+            # Single batched forward pass for all envs × agents
+            actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
+                obs, global_states, deterministic=False
+            )
 
-            with torch.no_grad():
-                for env_idx in range(batch_size):
-                    # Get observations for this environment
-                    env_obs = obs[env_idx]  # (n_agents, obs_dim)
-                    env_global_state = global_states[env_idx]  # (n_agents * obs_dim)
-
-                    # Get actions for all agents in this environment
-                    actions, log_probs, value = self.agent.get_actions(
-                        env_obs, env_global_state, deterministic=False
-                    )
-
-                    all_actions.append(actions)
-                    all_log_probs.append(log_probs)
-                    all_values.append(value)
-
-            # Convert to numpy arrays
-            # actions shape: (n_envs, n_agents, action_dim)
-            actions_array = np.array(all_actions)
-            log_probs_array = np.array(all_log_probs)
-            values_array = np.array(all_values)
+            # Convert to numpy; shapes: (n_envs, n_agents, action_dim), (n_envs, n_agents), (n_envs, 1)
+            actions_array = actions_t.cpu().numpy()
+            log_probs_array = log_probs_t.cpu().numpy()
+            values_array = values_t.cpu().numpy()
 
             # IMPORTANT: Reshape actions for discrete environments
             if self.discrete:
@@ -182,30 +170,23 @@ class VecMAPPOTrainer:
             total_step_count += batch_size
             current_episode_steps += 1
 
-            # Check for episode terminations
-            for env_idx in range(batch_size):
-                if dones[env_idx]:
-                    current_episode_steps[env_idx] = 0
-                    episode_count += 1
+            # Track episode terminations with vectorized ops
+            episode_count += int(dones.sum())
+            current_episode_steps[dones] = 0
 
             # Gymnasium VectorEnv automatically resets terminated environments
             # The obs returned is already the reset observation for terminated envs
 
-        # Get final values for advantage computation
+        # Compute final values for advantage computation in a single batched pass
         final_global_states = obs.reshape(batch_size, -1)
-        final_values = []
-
         with torch.no_grad():
-            for env_idx in range(batch_size):
-                global_state_tensor = (
-                    torch.FloatTensor(final_global_states[env_idx])
-                    .unsqueeze(0)
-                    .to(self.device)
-                )
-                value = (
-                    self.agent.network_old.get_value(global_state_tensor).cpu().item()
-                )
-                final_values.append(value)
+            final_gs_tensor = torch.FloatTensor(final_global_states).to(self.device)
+            final_values = (
+                self.agent.network_old.get_value(final_gs_tensor)
+                .cpu()
+                .squeeze(-1)
+                .tolist()
+            )
 
         return total_step_count, episode_count, final_values
 
@@ -256,11 +237,7 @@ class VecMAPPOTrainer:
 
             # Time evaluation
             eval_start = time.time()
-            rew_per_episode = []
-            eval_episodes = 5
-            while len(rew_per_episode) < eval_episodes:
-                rew_per_episode.append(self.evaluate())
-            eval_rewards = np.array(rew_per_episode).mean()
+            eval_rewards = self.evaluate()
             eval_time = time.time() - eval_start
 
             # Calculate elapsed time
@@ -322,52 +299,40 @@ class VecMAPPOTrainer:
         print(f"  Avg evaluation:     {avg_eval_time:.3f}s")
         print(f"{'='*60}\n")
 
-    def evaluate(self, render=False):
-        """Evaluate current policy"""
+    def evaluate(self):
+        """Evaluate current policy using parallel episodes"""
 
-        # Set policies to eval
         self.agent.network_old.eval()
+        n_eps = self.n_eval_episodes
 
         with torch.no_grad():
-
             obs, _ = self.eval_env.reset()
+            episode_rewards = np.zeros(n_eps)
+            finished = np.zeros(n_eps, dtype=bool)
 
-            episode_rew = 0
+            while not finished.all():
+                global_states = obs.reshape(n_eps, -1)
 
-            while True:
-
-                global_state = np.concatenate(obs.squeeze(0))
-
-                actions, _, _ = self.agent.get_actions(
-                    obs, global_state, deterministic=True
+                actions_t, _, _ = self.agent.get_actions_batched(
+                    obs, global_states, deterministic=True
                 )
-
-                actions = actions.cpu().detach().numpy()
+                actions = actions_t.cpu().numpy()
 
                 if self.discrete:
-                    # For discrete actions, squeeze the last dimension
-                    # Shape: (n_envs, n_agents, 1) -> (n_envs, n_agents)
                     if actions.ndim == 3 and actions.shape[-1] == 1:
                         actions = actions.squeeze(-1)
-
-                    # Ensure integer type
                     actions = actions.astype(np.int32)
 
                 obs, rewards, terminated, truncated, info = self.eval_env.step(actions)
 
-                episode_rew += rewards
+                # Only accumulate rewards for episodes not yet finished
+                dones = np.logical_or(terminated, truncated)
+                episode_rewards[~finished] += rewards[~finished]
+                finished |= dones
 
-                if render:
-                    self.eval_env.envs[0].render_mode = "human"
-                    self.eval_env.envs[0].render()
-
-                if terminated or truncated:
-                    break
-
-        # Set policies to train
         self.agent.network_old.train()
 
-        return episode_rew
+        return episode_rewards.mean()
 
     def close_environments(self):
         """Properly close all vectorized environments"""

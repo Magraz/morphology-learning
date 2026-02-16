@@ -37,7 +37,7 @@ class Runner:
         self.checkpoint = checkpoint
 
         # Set optimal thread settings
-        n_threads = 12
+        n_threads = torch.get_num_threads() // 2
         torch.set_num_threads(n_threads)
         torch.set_num_interop_threads(n_threads)
         print(f"PyTorch using {torch.get_num_threads()} threads")

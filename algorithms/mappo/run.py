@@ -20,7 +20,7 @@ def set_seeds(seed):
     torch.manual_seed(seed)  # PyTorch
     torch.cuda.manual_seed_all(seed)  # PyTorch CUDA
     # torch.backends.cudnn.deterministic = True  # Make CUDA deterministic
-    # torch.backends.cudnn.benchmark = False  # Disable CUDA benchmarking
+    # torch.backends.cudnn.benchmark = False  # Disable or enable CUDA benchmarking
 
 
 class MAPPO_Runner(Runner):

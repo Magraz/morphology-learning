@@ -903,7 +903,7 @@ class MultiBoxPushEnv(gym.Env):
 
             # 4. Check for completion (object inside target) — bonus only once
             if target.contains_object(obj):
-                distance_reward += 10.0
+                distance_reward += 100.0
                 self.delivered_objects.add(obj_idx)
 
         # Update previous distances for next step (only for non-delivered objects)

@@ -9,8 +9,6 @@ from algorithms.ippo.types import Experiment as IPPO_Experiment
 from algorithms.mappo.run import MAPPO_Runner
 from algorithms.mappo.types import Experiment as MAPPO_Experiment
 
-# from algorithms.manual.control import ManualControl
-
 from algorithms.types import AlgorithmEnum
 
 from environments.types import EnvironmentEnum, EnvironmentParams
@@ -77,21 +75,6 @@ def run_algorithm(
                 exp_config,
                 env_config,
             )
-
-        # case AlgorithmEnum.NONE:
-        #     exp_config = None
-
-        #     runner = ManualControl(
-        #         device="cpu",
-        #         batch_dir=batch_dir,
-        #         trials_dir=Path(batch_dir).parents[1]
-        #         / "results"
-        #         / batch_name
-        #         / experiment_name,
-        #         trial_id=trial_id,
-        #         trial_name=Path(exp_file).stem,
-        #         video_name=f"{experiment_name}_{trial_id}",
-        #     )
 
     if view:
         runner.view()

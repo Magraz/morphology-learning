@@ -22,7 +22,7 @@ class MAPPOAgent:
         discrete: bool,
         n_parallel_envs: int,
     ):
-        self.device = device
+        self.device = "cuda" if torch.cuda.is_available() else device
         self.n_agents = n_agents
         self.observation_dim = observation_dim
         self.global_state_dim = global_state_dim
@@ -46,7 +46,7 @@ class MAPPOAgent:
             n_agents=n_agents,
             discrete=discrete,
             share_actor=self.share_actor,
-        ).to(device)
+        ).to(self.device)
 
         # Create old network for PPO
         self.network_old = MAPPONetwork(
@@ -56,7 +56,7 @@ class MAPPOAgent:
             n_agents=n_agents,
             discrete=discrete,
             share_actor=self.share_actor,
-        ).to(device)
+        ).to(self.device)
 
         self.network_old.load_state_dict(self.network.state_dict())
 
@@ -126,6 +126,63 @@ class MAPPOAgent:
 
         return torch.stack(actions), torch.cat(log_probs), value
 
+    def get_actions_batched(
+        self, observations_batch, global_states_batch, deterministic=False
+    ):
+        """
+        Get actions for all agents in all environments in a single batched forward pass.
+
+        Args:
+            observations_batch: numpy (n_envs, n_agents, obs_dim)
+            global_states_batch: numpy (n_envs, global_state_dim)
+            deterministic: Whether to use deterministic actions
+
+        Returns:
+            actions:   tensor (n_envs, n_agents, action_dim) on self.device
+            log_probs: tensor (n_envs, n_agents)             on self.device
+            values:    tensor (n_envs, 1)                    on self.device
+        """
+        n_envs = observations_batch.shape[0]
+
+        with torch.no_grad():
+            obs_tensor = torch.FloatTensor(observations_batch).to(
+                self.device
+            )  # (n_envs, n_agents, obs_dim)
+            gs_tensor = torch.FloatTensor(global_states_batch).to(
+                self.device
+            )  # (n_envs, global_state_dim)
+
+            if self.share_actor:
+                # Fuse envs and agents into one batch: single forward pass total
+                obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+                actions_flat, log_probs_flat = self.network_old.act(
+                    obs_flat, agent_idx=0, deterministic=deterministic
+                )
+                actions = actions_flat.reshape(n_envs, self.n_agents, -1)
+                log_probs = log_probs_flat.reshape(n_envs, self.n_agents, -1).squeeze(
+                    -1
+                )
+            else:
+                # One batched pass per agent (n_agents passes, each over all envs)
+                actions_list = []
+                log_probs_list = []
+                for agent_idx in range(self.n_agents):
+                    agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
+                    a, lp = self.network_old.act(agent_obs, agent_idx, deterministic)
+                    actions_list.append(a)  # (n_envs, action_dim)
+                    log_probs_list.append(lp)  # (n_envs, 1)
+                actions = torch.stack(
+                    actions_list, dim=1
+                )  # (n_envs, n_agents, action_dim)
+                log_probs = torch.stack(log_probs_list, dim=1).squeeze(
+                    -1
+                )  # (n_envs, n_agents)
+
+            # Centralized critic: single batched pass over all envs
+            values = self.network_old.get_value(gs_tensor)  # (n_envs, 1)
+
+        return actions, log_probs, values
+
     def store_transition(
         self,
         env_idx,
@@ -137,38 +194,34 @@ class MAPPOAgent:
         value,
         dones,
     ):
-        """Store transition for a specific environment"""
+        """Store transition for a specific environment (CPU buffers to avoid small GPU transfers)"""
         # Store global state (shared)
-        self.global_states[env_idx].append(
-            torch.FloatTensor(global_state).to(self.device)
-        )
+        self.global_states[env_idx].append(torch.FloatTensor(global_state))
 
         # Store value (shared)
-        self.values[env_idx].append(
-            torch.tensor(value, dtype=torch.float32).to(self.device)
-        )
+        self.values[env_idx].append(torch.tensor(value, dtype=torch.float32))
 
         # Store per-agent data
         for agent_idx in range(self.n_agents):
             # Observation
             self.observations[env_idx][agent_idx].append(
-                torch.FloatTensor(observations[agent_idx]).to(self.device)
+                torch.FloatTensor(observations[agent_idx])
             )
 
             # Action
             self.actions[env_idx][agent_idx].append(
-                torch.FloatTensor(actions[agent_idx]).to(self.device)
+                torch.FloatTensor(actions[agent_idx])
             )
 
             # Reward, log_prob, done
             self.rewards[env_idx][agent_idx].append(
-                torch.tensor(rewards[agent_idx], dtype=torch.float32).to(self.device)
+                torch.tensor(rewards[agent_idx], dtype=torch.float32)
             )
             self.log_probs[env_idx][agent_idx].append(
-                torch.tensor(log_probs[agent_idx], dtype=torch.float32).to(self.device)
+                torch.tensor(log_probs[agent_idx], dtype=torch.float32)
             )
             self.dones[env_idx][agent_idx].append(
-                torch.tensor(dones[agent_idx], dtype=torch.float32).to(self.device)
+                torch.tensor(dones[agent_idx], dtype=torch.float32)
             )
 
     def compute_returns_and_advantages(self, next_values):
@@ -188,9 +241,7 @@ class MAPPOAgent:
 
             next_value = next_values[env_idx]
             if not torch.is_tensor(next_value):
-                next_value = torch.tensor(next_value, dtype=torch.float32).to(
-                    self.device
-                )
+                next_value = torch.tensor(next_value, dtype=torch.float32)
 
             # Use values from this environment's trajectory
             env_values = self.values[env_idx][:]
@@ -206,7 +257,7 @@ class MAPPOAgent:
                 dones = torch.cat(
                     [
                         torch.stack(self.dones[env_idx][agent_idx]),
-                        torch.zeros(1, device=self.device),
+                        torch.zeros(1),
                     ]
                 )
 
@@ -214,7 +265,7 @@ class MAPPOAgent:
                 advantages = torch.zeros_like(rewards)
 
                 # Compute GAE
-                gae = torch.tensor(0.0, device=self.device)
+                gae = torch.tensor(0.0)
                 for step in reversed(range(len(rewards))):
                     delta = (
                         rewards[step]
@@ -238,6 +289,7 @@ class MAPPOAgent:
         all_returns,
         minibatch_size,
         epochs,
+        train_device,
     ):
 
         # Training statistics
@@ -292,13 +344,17 @@ class MAPPOAgent:
                 all_returns_combined.append(returns)
                 all_advantages_combined.append(advantages)
 
-        # Concatenate all data
-        combined_obs = torch.cat(all_obs, dim=0).detach()
-        combined_global_states = torch.cat(all_global_states, dim=0).detach()
-        combined_actions = torch.cat(all_actions, dim=0).detach()
-        combined_old_log_probs = torch.cat(all_old_log_probs, dim=0).detach()
-        combined_returns = torch.cat(all_returns_combined, dim=0)
-        combined_advantages = torch.cat(all_advantages_combined, dim=0)
+        # Concatenate all data and move to training device (may be CUDA)
+        combined_obs = torch.cat(all_obs, dim=0).detach().to(train_device)
+        combined_global_states = (
+            torch.cat(all_global_states, dim=0).detach().to(train_device)
+        )
+        combined_actions = torch.cat(all_actions, dim=0).detach().to(train_device)
+        combined_old_log_probs = (
+            torch.cat(all_old_log_probs, dim=0).detach().to(train_device)
+        )
+        combined_returns = torch.cat(all_returns_combined, dim=0).to(train_device)
+        combined_advantages = torch.cat(all_advantages_combined, dim=0).to(train_device)
 
         # Create dataset
         dataset = TensorDataset(
@@ -375,6 +431,7 @@ class MAPPOAgent:
         all_returns,
         minibatch_size,
         epochs,
+        train_device,
     ):
 
         # Training statistics
@@ -425,13 +482,17 @@ class MAPPOAgent:
             if len(agent_obs) == 0:
                 continue  # No data for this agent
 
-            # Concatenate data for this agent from all environments
-            obs_combined = torch.cat(agent_obs, dim=0).detach()
-            global_states_combined = torch.cat(agent_global_states, dim=0).detach()
-            actions_combined = torch.cat(agent_actions, dim=0).detach()
-            old_log_probs_combined = torch.cat(agent_old_log_probs, dim=0).detach()
-            returns_combined = torch.cat(agent_returns, dim=0)
-            advantages_combined = torch.cat(agent_advantages, dim=0)
+            # Concatenate data for this agent from all environments and move to training device
+            obs_combined = torch.cat(agent_obs, dim=0).detach().to(train_device)
+            global_states_combined = (
+                torch.cat(agent_global_states, dim=0).detach().to(train_device)
+            )
+            actions_combined = torch.cat(agent_actions, dim=0).detach().to(train_device)
+            old_log_probs_combined = (
+                torch.cat(agent_old_log_probs, dim=0).detach().to(train_device)
+            )
+            returns_combined = torch.cat(agent_returns, dim=0).to(train_device)
+            advantages_combined = torch.cat(agent_advantages, dim=0).to(train_device)
 
             # Create dataset for this agent
             dataset = TensorDataset(
@@ -509,12 +570,12 @@ class MAPPOAgent:
         # Update each agent (or all at once if sharing actor)
         if self.share_actor:
             stats, num_updates = self.update_shared(
-                all_advantages, all_returns, minibatch_size, epochs
+                all_advantages, all_returns, minibatch_size, epochs, self.device
             )
 
         else:
             stats, num_updates = self.update_independent_actors(
-                all_advantages, all_returns, minibatch_size, epochs
+                all_advantages, all_returns, minibatch_size, epochs, self.device
             )
 
         # Update old network
