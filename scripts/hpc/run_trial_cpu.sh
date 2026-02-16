@@ -17,7 +17,7 @@ sbatch <<EOT
 #SBATCH -e ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.err           # name of error file for this submission script
 #SBATCH -c 4                                                                 # number of cores/threads per task (default 1)
 #SBATCH --cpu-freq=high
-#SBATCH --mem=24G                                                            # request gigabytes memory (per node, default depends on node)
+#SBATCH --mem=12G                                                            # request gigabytes memory (per node, default depends on node)
 #SBATCH --time=72:00:00                                                      # time needed for job (1 day)
 #SBATCH --nodelist=cn-s-[1-5],cn-t-1,cn-v-[1-8],cn-u-[1-2]
 #SBATCH --nodes=1

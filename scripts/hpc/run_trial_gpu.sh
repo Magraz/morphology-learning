@@ -6,7 +6,7 @@ ENVIRONMENT=$4
 TRIAL_ID=$5
 
 SCRATCH=/nfs/stak/users/agrazvam/hpc-share/tmp
-EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/scalable-salp-locomotion/src/run_trial.py
+EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/run_trial.py
 
 sbatch <<EOT
 #!/bin/bash
@@ -15,9 +15,9 @@ sbatch <<EOT
 #SBATCH --partition=preempt                                                  # name of partition or queue
 #SBATCH -o ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.out           # name of output file for this submission script
 #SBATCH -e ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.err           # name of error file for this submission script
-#SBATCH -c 1                                                                 # number of cores/threads per task (default 1)
+#SBATCH -c 4                                                                 # number of cores/threads per task (default 1)
 #SBATCH --cpu-freq=high
-#SBATCH --mem=16G                                                            # request gigabytes memory (per node, default depends on node)
+#SBATCH --mem=12G                                                            # request gigabytes memory (per node, default depends on node)
 #SBATCH --time=72:00:00                                                      # time needed for job (1 day)
 #SBATCH --nodelist=dgxh-[1-4],cn-w-1,cn-t-1,cn-r-[1-6],cn-s-[1-5],cn-gpu[10-12],optimus,sail-gpu0,dgx2-[1-5]
 #SBATCH --nodes=1
