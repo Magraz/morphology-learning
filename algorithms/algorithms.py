@@ -1,13 +1,5 @@
-import os
 import yaml
-import torch
 from pathlib import Path
-
-from algorithms.ippo.run import IPPO_Runner
-from algorithms.ippo.types import Experiment as IPPO_Experiment
-
-from algorithms.mappo.run import MAPPO_Runner
-from algorithms.mappo.types import Experiment as MAPPO_Experiment
 
 from algorithms.types import AlgorithmEnum
 
@@ -32,16 +24,7 @@ def run_algorithm(
     with open(env_file, "r") as file:
         env_dict = yaml.safe_load(file)
 
-    match (environment):
-
-        case (
-            EnvironmentEnum.BOX2D_SALP
-            | EnvironmentEnum.MULTI_BOX
-            | EnvironmentEnum.MPE_SPREAD
-            | EnvironmentEnum.MPE_SIMPLE
-            | EnvironmentEnum.SMACV2
-        ):
-            env_config = EnvironmentParams(**env_dict)
+    env_config = EnvironmentParams(**env_dict)
 
     env_config.environment = environment
 
@@ -54,6 +37,9 @@ def run_algorithm(
     match (algorithm):
 
         case AlgorithmEnum.IPPO:
+            from algorithms.ippo.run import IPPO_Runner
+            from algorithms.ippo.types import Experiment as IPPO_Experiment
+
             exp_config = IPPO_Experiment(**exp_dict)
             runner = IPPO_Runner(
                 exp_config.device,
@@ -66,8 +52,26 @@ def run_algorithm(
             )
 
         case AlgorithmEnum.MAPPO:
+            from algorithms.mappo.run import MAPPO_Runner
+            from algorithms.mappo.types import Experiment as MAPPO_Experiment
+
             exp_config = MAPPO_Experiment(**exp_dict)
             runner = MAPPO_Runner(
+                exp_config.device,
+                batch_dir,
+                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
+        case AlgorithmEnum.MAPPO_JAX:
+            from algorithms.mappo_jax.run import MAPPO_JAX_Runner
+            from algorithms.mappo_jax.types import Experiment as MAPPO_JAX_Experiment
+
+            exp_config = MAPPO_JAX_Experiment(**exp_dict)
+            runner = MAPPO_JAX_Runner(
                 exp_config.device,
                 batch_dir,
                 (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
