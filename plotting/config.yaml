@@ -10,4 +10,4 @@ batches: ["multi_box_push_test"]
 experiments: ["mlp_shared"]
 
 # trials: ["0", "1", "2", "3", "4"]
-trials: ["test"]
+trials: ["0", "1", "2", "3", "4"]

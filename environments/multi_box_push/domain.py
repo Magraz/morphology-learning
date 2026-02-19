@@ -267,8 +267,9 @@ class MultiBoxPushEnv(gym.Env):
                 if dist <= touch_threshold:
                     n_touching += 1
 
+            reduction_percent = 0.20
             if n_touching > 1:
-                reduction = 0.50 * (n_touching - 1)
+                reduction = reduction_percent * (n_touching - 1)
                 scale = max(0.10, 1.0 - reduction)
             else:
                 scale = 1.0
