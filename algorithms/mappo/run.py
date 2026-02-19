@@ -1,4 +1,4 @@
-from environments.types import EnvironmentParams
+from environments.types import EnvironmentParams, EnvironmentEnum
 from algorithms.mappo.types import Experiment, Params
 from algorithms.runner import Runner
 from algorithms.create_env import get_state_and_action_dims
@@ -55,10 +55,16 @@ class MAPPO_Runner(Runner):
         # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.exp_config.device}")
 
-        # Create environment
-        state_dim, action_dim = get_state_and_action_dims(
-            self.env_config.environment, self.env_config.n_agents
-        )
+        # For SMACv2, skip the probe env — VecMAPPOTrainer derives dims from the
+        # training envs it creates, avoiding a throwaway SC2 process launch.
+        if self.env_config.environment == EnvironmentEnum.SMACV2:
+            obs_dim = gs_dim = act_dim = None
+        else:
+            obs_dim, act_dim = get_state_and_action_dims(
+                self.env_config.environment, self.env_config.n_agents,
+                map_name=self.env_config.map_name,
+            )
+            gs_dim = obs_dim * self.env_config.n_agents
 
         # Create trainer
         # self.trainer = MAPPOTrainer(
@@ -76,13 +82,14 @@ class MAPPO_Runner(Runner):
         self.trainer = VecMAPPOTrainer(
             self.env_config.environment,
             self.env_config.n_agents,
-            state_dim,
-            state_dim * self.env_config.n_agents,
-            action_dim,
+            obs_dim,
+            gs_dim,
+            act_dim,
             self.params,
             self.dirs,
             self.device,
             n_parallel_envs=self.env_config.n_envs,
+            map_name=self.env_config.map_name,
         )
 
     def train(self):

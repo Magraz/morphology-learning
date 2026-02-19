@@ -18,13 +18,14 @@ class VecMAPPOTrainer:
         self,
         env_name,
         n_agents,
-        observation_dim,
-        global_state_dim,
-        action_dim,
-        params,
-        dirs,
-        device: str,
-        n_parallel_envs: int,
+        observation_dim=None,
+        global_state_dim=None,
+        action_dim=None,
+        params=None,
+        dirs=None,
+        device: str = "cpu",
+        n_parallel_envs: int = 1,
+        map_name: str = None,
     ):
         self.device = device
         self.dirs = dirs
@@ -32,6 +33,7 @@ class VecMAPPOTrainer:
         self.params = params
         self.env_name = env_name
         self.n_parallel_envs = n_parallel_envs
+        self.map_name = map_name
 
         # Create environment for evaluation (parallel eval episodes)
         self.n_eval_episodes = 10
@@ -40,6 +42,7 @@ class VecMAPPOTrainer:
             self.n_agents,
             self.n_eval_episodes,
             use_async=True,
+            map_name=self.map_name,
         )
 
         # Create vectorized environment using Gymnasium's API
@@ -48,10 +51,27 @@ class VecMAPPOTrainer:
             self.n_agents,
             self.n_parallel_envs,
             use_async=True,  # Use parallel processing
+            map_name=self.map_name,
         )
 
+        # Derive dims from the env when not provided, avoiding a separate probe env
+        if observation_dim is None:
+            import gymnasium as gym
+            obs_space = self.vec_env.single_observation_space   # Box(n_agents, obs_dim)
+            act_space = self.vec_env.single_action_space
+            observation_dim = obs_space.shape[1]
+            global_state_dim = observation_dim * n_agents
+            if isinstance(act_space, gym.spaces.MultiDiscrete):
+                action_dim = int(act_space.nvec[0])
+            else:
+                action_dim = act_space.shape[1]
+
         # Set action bounds based on environment
-        if env_name in [EnvironmentEnum.MPE_SPREAD, EnvironmentEnum.MPE_SIMPLE]:
+        if env_name in [
+            EnvironmentEnum.MPE_SPREAD,
+            EnvironmentEnum.MPE_SIMPLE,
+            EnvironmentEnum.SMACV2,
+        ]:
             self.discrete = True
         else:
             self.discrete = False
@@ -96,6 +116,10 @@ class VecMAPPOTrainer:
         obs, infos = self.vec_env.reset()
         batch_size = obs.shape[0]
 
+        # Grab initial action masks if the env provides them (e.g. SMACv2)
+        # Shape: (n_envs, n_agents, n_actions) or None
+        current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+
         total_step_count = 0
         episode_count = 0
         current_episode_steps = np.zeros(self.n_parallel_envs, dtype=np.int32)
@@ -108,7 +132,7 @@ class VecMAPPOTrainer:
 
             # Single batched forward pass for all envs × agents
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
-                obs, global_states, deterministic=False
+                obs, global_states, deterministic=False, action_masks=current_masks
             )
 
             # Convert to numpy; shapes: (n_envs, n_agents, action_dim), (n_envs, n_agents), (n_envs, 1)
@@ -155,6 +179,8 @@ class VecMAPPOTrainer:
                 if self.discrete and actions_to_store.ndim == 1:
                     actions_to_store = actions_to_store.reshape(-1, 1)
 
+                env_masks = current_masks[env_idx] if current_masks is not None else None
+
                 self.agent.store_transition(
                     env_idx,
                     obs[env_idx],
@@ -164,7 +190,15 @@ class VecMAPPOTrainer:
                     log_probs_array[env_idx],
                     values_array[env_idx],
                     np.array([dones[env_idx]] * self.n_agents),
+                    action_masks=env_masks,
                 )
+
+            # Update masks for next step.
+            # For auto-reset envs (terminated), Gymnasium VecEnv merges the reset()
+            # info into the regular infos dict, so avail_actions reflects the new episode.
+            current_masks = (
+                infos.get("avail_actions") if isinstance(infos, dict) else None
+            )
 
             # Update for next iteration
             obs = next_obs
@@ -327,7 +361,10 @@ class VecMAPPOTrainer:
         n_eps = self.n_eval_episodes
 
         with torch.no_grad():
-            obs, _ = self.eval_env.reset()
+            obs, infos = self.eval_env.reset()
+            current_masks = (
+                infos.get("avail_actions") if isinstance(infos, dict) else None
+            )
             episode_rewards = np.zeros(n_eps)
             finished = np.zeros(n_eps, dtype=bool)
 
@@ -335,7 +372,7 @@ class VecMAPPOTrainer:
                 global_states = obs.reshape(n_eps, -1)
 
                 actions_t, _, _ = self.agent.get_actions_batched(
-                    obs, global_states, deterministic=True
+                    obs, global_states, deterministic=True, action_masks=current_masks
                 )
                 actions = actions_t.cpu().numpy()
 
@@ -344,7 +381,10 @@ class VecMAPPOTrainer:
                         actions = actions.squeeze(-1)
                     actions = actions.astype(np.int32)
 
-                obs, rewards, terminated, truncated, info = self.eval_env.step(actions)
+                obs, rewards, terminated, truncated, infos = self.eval_env.step(actions)
+                current_masks = (
+                    infos.get("avail_actions") if isinstance(infos, dict) else None
+                )
 
                 # Only accumulate rewards for episodes not yet finished
                 dones = np.logical_or(terminated, truncated)

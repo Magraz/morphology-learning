@@ -59,9 +59,12 @@ class MAPPOActor(nn.Module):
             action_std = torch.exp(log_std)
             return Normal(action_params, action_std)
 
-    def act(self, obs, deterministic=False):
+    def act(self, obs, deterministic=False, action_mask=None):
         """Sample action from policy"""
         action_params = self.forward(obs)
+        if action_mask is not None and self.discrete:
+            # Zero-out unavailable actions by pushing their logits to -inf
+            action_params = action_params + (1.0 - action_mask) * (-1e9)
         dist = self.get_action_dist(action_params)
 
         if self.discrete:
@@ -82,9 +85,11 @@ class MAPPOActor(nn.Module):
 
         return action, logprob
 
-    def evaluate(self, obs, action):
+    def evaluate(self, obs, action, action_mask=None):
         """Evaluate actions for training"""
         action_params = self.forward(obs)
+        if action_mask is not None and self.discrete:
+            action_params = action_params + (1.0 - action_mask) * (-1e9)
         dist = self.get_action_dist(action_params)
 
         if self.discrete:
@@ -405,16 +410,15 @@ class MAPPONetwork(nn.Module):
         else:
             return self.actors[agent_idx]
 
-    def act(self, obs, agent_idx, deterministic=False):
+    def act(self, obs, agent_idx, deterministic=False, action_mask=None):
         """Get action for a specific agent"""
         actor = self.get_actor(agent_idx)
-        return actor.act(obs, deterministic)
+        return actor.act(obs, deterministic, action_mask=action_mask)
 
-    def evaluate_actions(self, obs, global_states, actions, agent_idx):
+    def evaluate_actions(self, obs, global_states, actions, agent_idx, action_mask=None):
         """Evaluate actions for training"""
-        # Get log probs and entropy from actor
         actor = self.get_actor(agent_idx)
-        log_probs, entropy = actor.evaluate(obs, actions)
+        log_probs, entropy = actor.evaluate(obs, actions, action_mask=action_mask)
 
         # Get values from centralized critic
         values = self.critic(global_states).squeeze(-1)

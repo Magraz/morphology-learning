@@ -39,6 +39,7 @@ def run_algorithm(
             | EnvironmentEnum.MULTI_BOX
             | EnvironmentEnum.MPE_SPREAD
             | EnvironmentEnum.MPE_SIMPLE
+            | EnvironmentEnum.SMACV2
         ):
             env_config = EnvironmentParams(**env_dict)
 

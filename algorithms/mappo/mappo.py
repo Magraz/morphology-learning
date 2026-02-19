@@ -86,6 +86,9 @@ class MAPPOAgent:
         self.dones = [
             [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
         ]
+        self.action_masks = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
 
     def get_actions(self, observations, global_state, deterministic=False):
         """
@@ -127,7 +130,7 @@ class MAPPOAgent:
         return torch.stack(actions), torch.cat(log_probs), value
 
     def get_actions_batched(
-        self, observations_batch, global_states_batch, deterministic=False
+        self, observations_batch, global_states_batch, deterministic=False, action_masks=None
     ):
         """
         Get actions for all agents in all environments in a single batched forward pass.
@@ -136,6 +139,7 @@ class MAPPOAgent:
             observations_batch: numpy (n_envs, n_agents, obs_dim)
             global_states_batch: numpy (n_envs, global_state_dim)
             deterministic: Whether to use deterministic actions
+            action_masks: numpy (n_envs, n_agents, n_actions) or None
 
         Returns:
             actions:   tensor (n_envs, n_agents, action_dim) on self.device
@@ -152,11 +156,23 @@ class MAPPOAgent:
                 self.device
             )  # (n_envs, global_state_dim)
 
+            masks_tensor = (
+                torch.FloatTensor(action_masks).to(self.device)
+                if action_masks is not None
+                else None
+            )  # (n_envs, n_agents, n_actions) or None
+
             if self.share_actor:
                 # Fuse envs and agents into one batch: single forward pass total
                 obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+                masks_flat = (
+                    masks_tensor.reshape(n_envs * self.n_agents, -1)
+                    if masks_tensor is not None
+                    else None
+                )
                 actions_flat, log_probs_flat = self.network_old.act(
-                    obs_flat, agent_idx=0, deterministic=deterministic
+                    obs_flat, agent_idx=0, deterministic=deterministic,
+                    action_mask=masks_flat,
                 )
                 actions = actions_flat.reshape(n_envs, self.n_agents, -1)
                 log_probs = log_probs_flat.reshape(n_envs, self.n_agents, -1).squeeze(
@@ -168,7 +184,14 @@ class MAPPOAgent:
                 log_probs_list = []
                 for agent_idx in range(self.n_agents):
                     agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
-                    a, lp = self.network_old.act(agent_obs, agent_idx, deterministic)
+                    agent_mask = (
+                        masks_tensor[:, agent_idx, :]
+                        if masks_tensor is not None
+                        else None
+                    )
+                    a, lp = self.network_old.act(
+                        agent_obs, agent_idx, deterministic, action_mask=agent_mask
+                    )
                     actions_list.append(a)  # (n_envs, action_dim)
                     log_probs_list.append(lp)  # (n_envs, 1)
                 actions = torch.stack(
@@ -193,6 +216,7 @@ class MAPPOAgent:
         log_probs,
         value,
         dones,
+        action_masks=None,
     ):
         """Store transition for a specific environment (CPU buffers to avoid small GPU transfers)"""
         # Store global state (shared)
@@ -223,6 +247,10 @@ class MAPPOAgent:
             self.dones[env_idx][agent_idx].append(
                 torch.tensor(dones[agent_idx], dtype=torch.float32)
             )
+            if action_masks is not None:
+                self.action_masks[env_idx][agent_idx].append(
+                    torch.FloatTensor(action_masks[agent_idx])
+                )
 
     def compute_returns_and_advantages(self, next_values):
         """
@@ -303,6 +331,9 @@ class MAPPOAgent:
         all_old_log_probs = []
         all_returns_combined = []
         all_advantages_combined = []
+        all_masks = []
+
+        has_masks = len(self.action_masks[0][0]) > 0
 
         # Iterate through each environment
         for env_idx in range(self.n_parallel_envs):
@@ -344,6 +375,9 @@ class MAPPOAgent:
                 all_returns_combined.append(returns)
                 all_advantages_combined.append(advantages)
 
+                if has_masks:
+                    all_masks.append(torch.stack(self.action_masks[env_idx][agent_idx]))
+
         # Concatenate all data and move to training device (may be CUDA)
         combined_obs = torch.cat(all_obs, dim=0).detach().to(train_device)
         combined_global_states = (
@@ -355,35 +389,55 @@ class MAPPOAgent:
         )
         combined_returns = torch.cat(all_returns_combined, dim=0).to(train_device)
         combined_advantages = torch.cat(all_advantages_combined, dim=0).to(train_device)
+        combined_masks = (
+            torch.cat(all_masks, dim=0).detach().to(train_device) if has_masks else None
+        )
 
         # Create dataset
-        dataset = TensorDataset(
+        dataset_tensors = [
             combined_obs,
             combined_global_states,
             combined_actions,
             combined_old_log_probs,
             combined_returns,
             combined_advantages,
-        )
+        ]
+        if combined_masks is not None:
+            dataset_tensors.append(combined_masks)
+
+        dataset = TensorDataset(*dataset_tensors)
 
         dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
 
         # Train for multiple epochs
         for epoch in range(epochs):
             for batch in dataloader:
-                (
-                    batch_obs,
-                    batch_global_states,
-                    batch_actions,
-                    batch_old_log_probs,
-                    batch_returns,
-                    batch_advantages,
-                ) = batch
+                if combined_masks is not None:
+                    (
+                        batch_obs,
+                        batch_global_states,
+                        batch_actions,
+                        batch_old_log_probs,
+                        batch_returns,
+                        batch_advantages,
+                        batch_masks,
+                    ) = batch
+                else:
+                    (
+                        batch_obs,
+                        batch_global_states,
+                        batch_actions,
+                        batch_old_log_probs,
+                        batch_returns,
+                        batch_advantages,
+                    ) = batch
+                    batch_masks = None
 
                 # We need to know which agent each sample belongs to
                 # For shared actor, we can use agent_idx = 0 (same for all)
                 log_probs, values, entropy = self.network.evaluate_actions(
-                    batch_obs, batch_global_states, batch_actions, agent_idx=0
+                    batch_obs, batch_global_states, batch_actions, agent_idx=0,
+                    action_mask=batch_masks,
                 )
 
                 # PPO objective
@@ -438,6 +492,8 @@ class MAPPOAgent:
         stats = {"total_loss": 0, "policy_loss": 0, "value_loss": 0, "entropy_loss": 0}
         num_updates = 0
 
+        has_masks = len(self.action_masks[0][0]) > 0
+
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
             # Collect data for this agent across all environments
@@ -447,6 +503,7 @@ class MAPPOAgent:
             agent_old_log_probs = []
             agent_returns = []
             agent_advantages = []
+            agent_masks = []
 
             for env_idx in range(self.n_parallel_envs):
                 if len(self.observations[env_idx][agent_idx]) == 0:
@@ -479,6 +536,11 @@ class MAPPOAgent:
                 agent_returns.append(returns)
                 agent_advantages.append(advantages)
 
+                if has_masks:
+                    agent_masks.append(
+                        torch.stack(self.action_masks[env_idx][agent_idx])
+                    )
+
             if len(agent_obs) == 0:
                 continue  # No data for this agent
 
@@ -493,33 +555,55 @@ class MAPPOAgent:
             )
             returns_combined = torch.cat(agent_returns, dim=0).to(train_device)
             advantages_combined = torch.cat(agent_advantages, dim=0).to(train_device)
+            masks_combined = (
+                torch.cat(agent_masks, dim=0).detach().to(train_device)
+                if has_masks
+                else None
+            )
 
             # Create dataset for this agent
-            dataset = TensorDataset(
+            dataset_tensors = [
                 obs_combined,
                 global_states_combined,
                 actions_combined,
                 old_log_probs_combined,
                 returns_combined,
                 advantages_combined,
-            )
+            ]
+            if masks_combined is not None:
+                dataset_tensors.append(masks_combined)
+
+            dataset = TensorDataset(*dataset_tensors)
             dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
 
             # Train for multiple epochs
             for epoch in range(epochs):
                 for batch in dataloader:
-                    (
-                        batch_obs,
-                        batch_global_states,
-                        batch_actions,
-                        batch_old_log_probs,
-                        batch_returns,
-                        batch_advantages,
-                    ) = batch
+                    if masks_combined is not None:
+                        (
+                            batch_obs,
+                            batch_global_states,
+                            batch_actions,
+                            batch_old_log_probs,
+                            batch_returns,
+                            batch_advantages,
+                            batch_masks,
+                        ) = batch
+                    else:
+                        (
+                            batch_obs,
+                            batch_global_states,
+                            batch_actions,
+                            batch_old_log_probs,
+                            batch_returns,
+                            batch_advantages,
+                        ) = batch
+                        batch_masks = None
 
                     # Forward pass
                     log_probs, values, entropy = self.network.evaluate_actions(
-                        batch_obs, batch_global_states, batch_actions, agent_idx
+                        batch_obs, batch_global_states, batch_actions, agent_idx,
+                        action_mask=batch_masks,
                     )
 
                     # PPO objective
