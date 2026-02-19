@@ -9,6 +9,7 @@ import psutil
 from algorithms.mappo.mappo import MAPPOAgent
 from environments.types import EnvironmentEnum
 from algorithms.create_env import make_vec_env
+import gymnasium as gym
 
 import torch
 
@@ -18,14 +19,11 @@ class VecMAPPOTrainer:
         self,
         env_name,
         n_agents,
-        observation_dim=None,
-        global_state_dim=None,
-        action_dim=None,
         params=None,
         dirs=None,
         device: str = "cpu",
         n_parallel_envs: int = 1,
-        map_name: str = None,
+        env_variant: str = None,
     ):
         self.device = device
         self.dirs = dirs
@@ -33,7 +31,7 @@ class VecMAPPOTrainer:
         self.params = params
         self.env_name = env_name
         self.n_parallel_envs = n_parallel_envs
-        self.map_name = map_name
+        self.env_variant = env_variant
 
         # Create environment for evaluation (parallel eval episodes)
         self.n_eval_episodes = 10
@@ -42,7 +40,7 @@ class VecMAPPOTrainer:
             self.n_agents,
             self.n_eval_episodes,
             use_async=True,
-            map_name=self.map_name,
+            env_variant=self.env_variant,
         )
 
         # Create vectorized environment using Gymnasium's API
@@ -51,20 +49,18 @@ class VecMAPPOTrainer:
             self.n_agents,
             self.n_parallel_envs,
             use_async=True,  # Use parallel processing
-            map_name=self.map_name,
+            env_variant=self.env_variant,
         )
 
-        # Derive dims from the env when not provided, avoiding a separate probe env
-        if observation_dim is None:
-            import gymnasium as gym
-            obs_space = self.vec_env.single_observation_space   # Box(n_agents, obs_dim)
-            act_space = self.vec_env.single_action_space
-            observation_dim = obs_space.shape[1]
-            global_state_dim = observation_dim * n_agents
-            if isinstance(act_space, gym.spaces.MultiDiscrete):
-                action_dim = int(act_space.nvec[0])
-            else:
-                action_dim = act_space.shape[1]
+        # Determine observation, action and and global state dimension
+        obs_space = self.vec_env.single_observation_space  # Box(n_agents, obs_dim)
+        act_space = self.vec_env.single_action_space
+        observation_dim = obs_space.shape[1]
+        global_state_dim = observation_dim * n_agents
+        if isinstance(act_space, gym.spaces.MultiDiscrete):
+            action_dim = int(act_space.nvec[0])
+        else:
+            action_dim = act_space.shape[1]
 
         # Set action bounds based on environment
         if env_name in [
@@ -179,7 +175,9 @@ class VecMAPPOTrainer:
                 if self.discrete and actions_to_store.ndim == 1:
                     actions_to_store = actions_to_store.reshape(-1, 1)
 
-                env_masks = current_masks[env_idx] if current_masks is not None else None
+                env_masks = (
+                    current_masks[env_idx] if current_masks is not None else None
+                )
 
                 self.agent.store_transition(
                     env_idx,
@@ -231,16 +229,17 @@ class VecMAPPOTrainer:
         batch_size,
         minibatches,
         epochs,
-        log_every=10000,
+        log_every=10e4,
         resume_steps=0,
         resume_episodes=0,
     ):
         """Train MAPPO agent"""
 
-        # Start timing
-        self.training_start_time = time.time()
+        # Track elapsed time across resumed runs so FPS remains correct with checkpoints.
+        elapsed_time_offset = self.total_training_time if resume_steps > 0 else 0.0
+        self.training_start_time = time.time() - elapsed_time_offset
+        self.total_training_time = elapsed_time_offset
 
-        # TODO keep track of elapsed time, so that FPS calculation is correct when using checkpoints
         steps_completed = resume_steps
         episodes_completed = resume_episodes
 
@@ -412,6 +411,7 @@ class VecMAPPOTrainer:
                 "optimizer": self.agent.optimizer.state_dict(),
                 "steps_completed": steps_completed,
                 "episodes_completed": episodes_completed,
+                "total_training_time": self.total_training_time,
                 "rng_python": random.getstate(),
                 "rng_numpy": np.random.get_state(),
                 "rng_torch_cpu": torch.random.get_rng_state(),
@@ -442,6 +442,7 @@ class VecMAPPOTrainer:
 
         steps = checkpoint.get("steps_completed", 0)
         episodes = checkpoint.get("episodes_completed", 0)
+        self.total_training_time = checkpoint.get("total_training_time", 0.0)
         print(f"Agents loaded from {filepath} (steps={steps}, episodes={episodes})")
         return steps, episodes
 

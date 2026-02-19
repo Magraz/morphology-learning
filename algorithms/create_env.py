@@ -145,7 +145,10 @@ class PettingZooToGymWrapper(gym.Env):
 
 
 def get_state_and_action_dims(
-    env_name: EnvironmentEnum, n_agents: int, render_mode: str = None, map_name: str = None
+    env_name: EnvironmentEnum,
+    n_agents: int,
+    render_mode: str = None,
+    env_variant: str = None,
 ):
     match (env_name):
         case EnvironmentEnum.BOX2D_SALP:
@@ -196,9 +199,9 @@ def get_state_and_action_dims(
         case EnvironmentEnum.SMACV2:
             from environments.smacv2.wrapper import SMACv2ToGymWrapper
 
-            env = SMACv2ToGymWrapper(map_name=map_name)
-            state_dim = env.observation_space.shape[1]   # obs_dim per agent
-            action_dim = env.action_space.nvec[0]        # n_actions per agent
+            env = SMACv2ToGymWrapper(map_name=env_variant)
+            state_dim = env.observation_space.shape[1]  # obs_dim per agent
+            action_dim = env.action_space.nvec[0]  # n_actions per agent
             env.close()
 
     return state_dim, action_dim
@@ -209,7 +212,7 @@ def make_vec_env(
     n_agents: int,
     n_envs: int,
     use_async: bool = True,
-    map_name: str = None,
+    env_variant: str = None,
 ):
     """
     Create a vectorized environment using Gymnasium's built-in vectorization.
@@ -266,7 +269,7 @@ def make_vec_env(
             case EnvironmentEnum.SMACV2:
                 from environments.smacv2.wrapper import SMACv2ToGymWrapper
 
-                return SMACv2ToGymWrapper(map_name=map_name)
+                return SMACv2ToGymWrapper(map_name=env_variant)
 
     # Create list of factory functions (not environment instances!)
     env_fns = [make_env_fn for _ in range(n_envs)]
