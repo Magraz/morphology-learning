@@ -4,9 +4,7 @@ from algorithms.runner import Runner
 from algorithms.create_env import get_state_and_action_dims
 from pathlib import Path
 
-from algorithms.mappo.trainer import MAPPOTrainer
 from algorithms.mappo.vec_trainer import VecMAPPOTrainer
-
 
 import torch
 import numpy as np
@@ -99,7 +97,7 @@ class MAPPO_Runner(Runner):
         # Test trained agents with rendering
         print("\nTesting trained agents...")
         for i in range(10):
-            rew = self.trainer.evaluate()
+            rew = self.trainer.render()
             print(f"REWARD: {rew}")
 
     def evaluate(self):

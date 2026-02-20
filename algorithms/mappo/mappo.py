@@ -130,7 +130,11 @@ class MAPPOAgent:
         return torch.stack(actions), torch.cat(log_probs), value
 
     def get_actions_batched(
-        self, observations_batch, global_states_batch, deterministic=False, action_masks=None
+        self,
+        observations_batch,
+        global_states_batch,
+        deterministic=False,
+        action_masks=None,
     ):
         """
         Get actions for all agents in all environments in a single batched forward pass.
@@ -149,15 +153,21 @@ class MAPPOAgent:
         n_envs = observations_batch.shape[0]
 
         with torch.no_grad():
-            obs_tensor = torch.FloatTensor(observations_batch).to(
+            obs_tensor = torch.from_numpy(
+                np.ascontiguousarray(observations_batch, dtype=np.float32)
+            ).to(
                 self.device
             )  # (n_envs, n_agents, obs_dim)
-            gs_tensor = torch.FloatTensor(global_states_batch).to(
+            gs_tensor = torch.from_numpy(
+                np.ascontiguousarray(global_states_batch, dtype=np.float32)
+            ).to(
                 self.device
             )  # (n_envs, global_state_dim)
 
             masks_tensor = (
-                torch.FloatTensor(action_masks).to(self.device)
+                torch.from_numpy(
+                    np.ascontiguousarray(action_masks, dtype=np.float32)
+                ).to(self.device)
                 if action_masks is not None
                 else None
             )  # (n_envs, n_agents, n_actions) or None
@@ -171,7 +181,9 @@ class MAPPOAgent:
                     else None
                 )
                 actions_flat, log_probs_flat = self.network_old.act(
-                    obs_flat, agent_idx=0, deterministic=deterministic,
+                    obs_flat,
+                    agent_idx=0,
+                    deterministic=deterministic,
                     action_mask=masks_flat,
                 )
                 actions = actions_flat.reshape(n_envs, self.n_agents, -1)
@@ -252,62 +264,140 @@ class MAPPOAgent:
                     torch.FloatTensor(action_masks[agent_idx])
                 )
 
+    def store_transitions_batch(
+        self,
+        obs,  # np (n_envs, n_agents, obs_dim)
+        global_states,  # np (n_envs, gs_dim)
+        actions,  # np (n_envs, n_agents) discrete or (n_envs, n_agents, action_dim)
+        log_probs,  # np (n_envs, n_agents)
+        values,  # np (n_envs, 1)
+        rewards,  # np (n_envs,)
+        dones,  # np (n_envs,)
+        infos,  # dict
+        action_masks=None,  # np (n_envs, n_agents, n_actions) or None
+    ):
+        """Store transitions for all environments in one vectorized call.
+
+        Reduces tensor-creation overhead from n_envs * n_agents * 7 calls
+        down to 7 calls (one per array), then indexes into the resulting tensors.
+        """
+        n_envs = obs.shape[0]
+
+        # Per-agent rewards: (n_envs, n_agents)
+        if "local_rewards" in infos:
+            per_agent_rewards = infos["local_rewards"].astype(np.float32) + rewards[
+                :, None
+            ].astype(np.float32)
+        else:
+            per_agent_rewards = np.tile(
+                rewards.astype(np.float32)[:, None], (1, self.n_agents)
+            )
+
+        # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete
+        if self.discrete and actions.ndim == 2:
+            actions_store = actions[:, :, None].astype(np.float32)
+        else:
+            actions_store = actions.astype(np.float32)
+
+        # Expand dones: (n_envs,) -> (n_envs, n_agents)
+        dones_expanded = np.tile(dones.astype(np.float32)[:, None], (1, self.n_agents))
+
+        # Zero-copy numpy→tensor conversion (from_numpy shares memory when array
+        # is already C-contiguous float32, which gym outputs typically are)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32))
+        gs_t = torch.from_numpy(np.ascontiguousarray(global_states, dtype=np.float32))
+        act_t = torch.from_numpy(actions_store)  # float32 C-contiguous from .astype()
+        lp_t = torch.from_numpy(np.ascontiguousarray(log_probs, dtype=np.float32))
+        val_t = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
+        rew_t = torch.from_numpy(
+            per_agent_rewards
+        )  # float32 C-contiguous from arithmetic
+        done_t = torch.from_numpy(dones_expanded)  # float32 C-contiguous from np.tile()
+        masks_t = (
+            torch.from_numpy(np.ascontiguousarray(action_masks, dtype=np.float32))
+            if action_masks is not None
+            else None
+        )
+
+        for env_idx in range(n_envs):
+            self.global_states[env_idx].append(gs_t[env_idx])
+            self.values[env_idx].append(val_t[env_idx])
+            for agent_idx in range(self.n_agents):
+                self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
+                self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
+                self.rewards[env_idx][agent_idx].append(rew_t[env_idx, agent_idx])
+                self.log_probs[env_idx][agent_idx].append(lp_t[env_idx, agent_idx])
+                self.dones[env_idx][agent_idx].append(done_t[env_idx, agent_idx])
+                if masks_t is not None:
+                    self.action_masks[env_idx][agent_idx].append(
+                        masks_t[env_idx, agent_idx]
+                    )
+
     def compute_returns_and_advantages(self, next_values):
         """
-        Compute returns and advantages using per-environment final values
+        Compute GAE returns and advantages, vectorized over all envs and agents.
 
-        Args:
-            next_values: List or array of final values, one per environment
+        Replaces three nested loops (n_envs × n_agents × T Python iterations)
+        with a single reversed loop over T, operating on (n_envs, n_agents) tensors.
+        Output list is dense: index = env_idx * n_agents + agent_idx.
         """
+        T = len(self.values[0])
+
+        # --- (n_envs, T+1) critic values ---
+        env_vals_list = []
+        for env_idx in range(self.n_parallel_envs):
+            nv = next_values[env_idx]
+            if not torch.is_tensor(nv):
+                nv = torch.tensor(nv, dtype=torch.float32)
+            # self.values[env_idx]: list of T tensors of shape (1,)
+            env_vals = torch.cat(self.values[env_idx])  # (T,)
+            env_vals_list.append(torch.cat([env_vals, nv.flatten()[:1]]))  # (T+1,)
+        values_t = torch.stack(env_vals_list)  # (n_envs, T+1)
+
+        # --- (n_envs, n_agents, T) rewards and dones ---
+        rewards_t = torch.stack(
+            [
+                torch.stack(
+                    [torch.stack(self.rewards[e][a]) for a in range(self.n_agents)]
+                )
+                for e in range(self.n_parallel_envs)
+            ]
+        )  # (n_envs, n_agents, T)
+
+        dones_t = torch.stack(
+            [
+                torch.stack(
+                    [torch.stack(self.dones[e][a]) for a in range(self.n_agents)]
+                )
+                for e in range(self.n_parallel_envs)
+            ]
+        )  # (n_envs, n_agents, T)
+
+        # --- Vectorized GAE: one reversed loop over T ---
+        # Broadcast values over agent dim: (n_envs, 1, T+1)
+        vals = values_t.unsqueeze(1)
+        advantages = torch.zeros(self.n_parallel_envs, self.n_agents, T)
+        gae = torch.zeros(self.n_parallel_envs, self.n_agents)
+
+        for step in reversed(range(T)):
+            not_done = 1.0 - dones_t[:, :, step]  # (n_envs, n_agents)
+            delta = (
+                rewards_t[:, :, step]
+                + self.gamma * vals[:, :, step + 1] * not_done
+                - vals[:, :, step]
+            )
+            gae = delta + self.gamma * self.gae_lambda * not_done * gae
+            advantages[:, :, step] = gae
+
+        returns = advantages + values_t[:, :-1].unsqueeze(1)  # (n_envs, n_agents, T)
+
+        # Flatten to list indexed by env_idx * n_agents + agent_idx
         all_returns = []
         all_advantages = []
-
-        # Process each environment separately
         for env_idx in range(self.n_parallel_envs):
-            if len(self.values[env_idx]) == 0:
-                continue  # Skip if no data for this env
-
-            next_value = next_values[env_idx]
-            if not torch.is_tensor(next_value):
-                next_value = torch.tensor(next_value, dtype=torch.float32)
-
-            # Use values from this environment's trajectory
-            env_values = self.values[env_idx][:]
-            env_values.append(next_value.unsqueeze(0))
-            env_values = torch.cat(env_values)
-
-            # Compute advantages for each agent in this environment
             for agent_idx in range(self.n_agents):
-                if len(self.rewards[env_idx][agent_idx]) == 0:
-                    continue
-
-                rewards = torch.stack(self.rewards[env_idx][agent_idx])
-                dones = torch.cat(
-                    [
-                        torch.stack(self.dones[env_idx][agent_idx]),
-                        torch.zeros(1),
-                    ]
-                )
-
-                # Initialize advantages
-                advantages = torch.zeros_like(rewards)
-
-                # Compute GAE
-                gae = torch.tensor(0.0)
-                for step in reversed(range(len(rewards))):
-                    delta = (
-                        rewards[step]
-                        + self.gamma * env_values[step + 1] * (1 - dones[step])
-                        - env_values[step]
-                    )
-                    gae = delta + self.gamma * self.gae_lambda * (1 - dones[step]) * gae
-                    advantages[step] = gae
-
-                # Compute returns
-                returns = advantages + env_values[:-1]
-
-                all_returns.append(returns.detach())
-                all_advantages.append(advantages.detach())
+                all_returns.append(returns[env_idx, agent_idx].detach())
+                all_advantages.append(advantages[env_idx, agent_idx].detach())
 
         return all_returns, all_advantages
 
@@ -436,7 +526,10 @@ class MAPPOAgent:
                 # We need to know which agent each sample belongs to
                 # For shared actor, we can use agent_idx = 0 (same for all)
                 log_probs, values, entropy = self.network.evaluate_actions(
-                    batch_obs, batch_global_states, batch_actions, agent_idx=0,
+                    batch_obs,
+                    batch_global_states,
+                    batch_actions,
+                    agent_idx=0,
                     action_mask=batch_masks,
                 )
 
@@ -463,7 +556,7 @@ class MAPPOAgent:
                 )
 
                 # Optimize
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     self.network.parameters(), self.grad_clip
@@ -602,7 +695,10 @@ class MAPPOAgent:
 
                     # Forward pass
                     log_probs, values, entropy = self.network.evaluate_actions(
-                        batch_obs, batch_global_states, batch_actions, agent_idx,
+                        batch_obs,
+                        batch_global_states,
+                        batch_actions,
+                        agent_idx,
                         action_mask=batch_masks,
                     )
 
@@ -629,7 +725,7 @@ class MAPPOAgent:
                     )
 
                     # Optimize
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         self.network.parameters(), self.grad_clip

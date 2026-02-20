@@ -34,7 +34,7 @@ class VecMAPPOTrainer:
         self.env_variant = env_variant
 
         # Create environment for evaluation (parallel eval episodes)
-        self.n_eval_episodes = 10
+        self.n_eval_episodes = 5
         self.eval_env = make_vec_env(
             self.env_name,
             self.n_agents,
@@ -108,8 +108,11 @@ class VecMAPPOTrainer:
         - info: dict with (n_envs,) arrays
         """
 
-        # Reset environment
-        obs, infos = self.vec_env.reset()
+        # Reset environment with distinct seeds so parallel envs start differently
+        train_seeds = [
+            int(np.random.randint(0, 2**31)) for _ in range(self.n_parallel_envs)
+        ]
+        obs, infos = self.vec_env.reset(seed=train_seeds)
         batch_size = obs.shape[0]
 
         # Grab initial action masks if the env provides them (e.g. SMACv2)
@@ -160,36 +163,18 @@ class VecMAPPOTrainer:
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
 
-            # Store transitions for all environments
-            for env_idx in range(batch_size):
-                # Extract individual rewards for each agent from info
-                # Your SalpChainEnv returns info['local_rewards']
-                individual_rewards = [0.0 for _ in range(self.n_agents)]
-                if "local_rewards" in infos:
-                    # infos['local_rewards'] has shape (n_envs, n_agents)
-                    individual_rewards = infos["local_rewards"][env_idx]
-
-                # For storage, we need to restore the action dimension if discrete
-                # because the buffer expects (n_agents, 1) for discrete
-                actions_to_store = actions_array[env_idx]
-                if self.discrete and actions_to_store.ndim == 1:
-                    actions_to_store = actions_to_store.reshape(-1, 1)
-
-                env_masks = (
-                    current_masks[env_idx] if current_masks is not None else None
-                )
-
-                self.agent.store_transition(
-                    env_idx,
-                    obs[env_idx],
-                    global_states[env_idx],
-                    actions_to_store,
-                    individual_rewards + rewards[env_idx],
-                    log_probs_array[env_idx],
-                    values_array[env_idx],
-                    np.array([dones[env_idx]] * self.n_agents),
-                    action_masks=env_masks,
-                )
+            # Store transitions for all environments in one vectorized call
+            self.agent.store_transitions_batch(
+                obs,
+                global_states,
+                actions_array,
+                log_probs_array,
+                values_array,
+                rewards,
+                dones,
+                infos,
+                action_masks=current_masks,
+            )
 
             # Update masks for next step.
             # For auto-reset envs (terminated), Gymnasium VecEnv merges the reset()
@@ -213,7 +198,9 @@ class VecMAPPOTrainer:
         # Compute final values for advantage computation in a single batched pass
         final_global_states = obs.reshape(batch_size, -1)
         with torch.no_grad():
-            final_gs_tensor = torch.FloatTensor(final_global_states).to(self.device)
+            final_gs_tensor = torch.from_numpy(
+                np.ascontiguousarray(final_global_states, dtype=np.float32)
+            ).to(self.device)
             final_values = (
                 self.agent.network_old.get_value(final_gs_tensor)
                 .cpu()
@@ -353,14 +340,14 @@ class VecMAPPOTrainer:
         print(f"  Avg evaluation:     {avg_eval_time:.3f}s")
         print(f"{'='*60}\n")
 
-    def evaluate(self):
-        """Evaluate current policy using parallel episodes"""
-
+    def evaluate(self, render=False):
+        """Evaluate current policy using parallel episodes."""
         self.agent.network_old.eval()
         n_eps = self.n_eval_episodes
 
         with torch.no_grad():
-            obs, infos = self.eval_env.reset()
+            eval_seeds = [int(np.random.randint(0, 2**31)) for _ in range(n_eps)]
+            obs, infos = self.eval_env.reset(seed=eval_seeds)
             current_masks = (
                 infos.get("avail_actions") if isinstance(infos, dict) else None
             )
@@ -393,6 +380,85 @@ class VecMAPPOTrainer:
         self.agent.network_old.train()
 
         return episode_rewards.mean()
+
+    def render(self):
+        """Run one episode with the current policy in a render environment.
+
+        Returns:
+            float: Total reward accumulated over the episode.
+        """
+        render_env = self._make_render_env()
+        if render_env is None:
+            return 0.0
+
+        self.agent.network_old.eval()
+        episode_reward = 0.0
+
+        seed = int(np.random.randint(0, 2**31))
+        obs, _ = render_env.reset(seed=seed)
+
+        with torch.no_grad():
+            while True:
+                # Add batch dim expected by get_actions_batched: (1, n_agents, obs_dim)
+                obs_batch = obs[np.newaxis]
+                global_states = obs_batch.reshape(1, -1)
+
+                actions_t, _, _ = self.agent.get_actions_batched(
+                    obs_batch, global_states, deterministic=True
+                )
+                actions = actions_t.cpu().numpy()[0]  # (n_agents, action_dim)
+
+                if self.discrete:
+                    if actions.ndim == 2 and actions.shape[-1] == 1:
+                        actions = actions.squeeze(-1)
+                    actions = actions.astype(np.int32)
+
+                obs, reward, terminated, truncated, _ = render_env.step(actions)
+                render_env.render()
+                episode_reward += float(reward)
+
+                if terminated or truncated:
+                    break
+
+        render_env.close()
+        return episode_reward
+
+    def _make_render_env(self):
+        """Create a single env with render_mode='human' for the current env_name."""
+        match self.env_name:
+            case EnvironmentEnum.BOX2D_SALP:
+                from environments.box2d_salp.domain import SalpChainEnv
+
+                return SalpChainEnv(n_agents=self.n_agents, render_mode="human")
+            case EnvironmentEnum.MULTI_BOX:
+                from environments.multi_box_push.domain import MultiBoxPushEnv
+
+                return MultiBoxPushEnv(n_agents=self.n_agents, render_mode="human")
+            case EnvironmentEnum.MPE_SPREAD:
+                from mpe2 import simple_spread_v3
+                from algorithms.create_env import PettingZooToGymWrapper
+
+                pz_env = simple_spread_v3.parallel_env(
+                    N=self.n_agents,
+                    local_ratio=0.5,
+                    max_cycles=25,
+                    continuous_actions=False,
+                    dynamic_rescaling=True,
+                    render_mode="human",
+                )
+                return PettingZooToGymWrapper(pz_env)
+            case EnvironmentEnum.MPE_SIMPLE:
+                from mpe2 import simple_v3
+                from algorithms.create_env import PettingZooToGymWrapper
+
+                pz_env = simple_v3.parallel_env(
+                    max_cycles=25,
+                    continuous_actions=False,
+                    render_mode="human",
+                )
+                return PettingZooToGymWrapper(pz_env)
+            case _:
+                return None
 
     def close_environments(self):
         """Properly close all vectorized environments"""

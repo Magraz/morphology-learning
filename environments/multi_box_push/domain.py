@@ -778,13 +778,11 @@ class MultiBoxPushEnv(gym.Env):
         Check if an agent is close enough to any object to be considered 'touching' it.
         Uses distance-based proximity instead of Box2D contacts for stability.
         """
-        agent_pos = np.array(
-            [self.agents[agent_idx].position.x, self.agents[agent_idx].position.y]
-        )
+        agent_pos = self._agent_pos_cache[agent_idx]  # from cache, no Box2D read
         agent_radius = self.agents[agent_idx].fixtures[0].shape.radius
 
-        for obj in self.objects:
-            obj_pos = np.array([obj.position.x, obj.position.y])
+        for obj_idx, obj in enumerate(self.objects):
+            obj_pos = self._object_pos_cache[obj_idx]  # from cache, no Box2D read
 
             # Get the object's half-size from its shape
             shape = obj.fixtures[0].shape
@@ -817,37 +815,35 @@ class MultiBoxPushEnv(gym.Env):
         return 0.0
 
     def _get_observation(self):
-        # Get all agent states as a matrix
-        all_states = np.array(
-            [
-                [
-                    (a.position.x - self.world_center_x),
-                    (a.position.y - self.world_center_y),
-                    # a.linearVelocity.x,
-                    # a.linearVelocity.y,
-                ]
-                for a in self.agents
-            ],
-            dtype=np.float32,
+        # Cache all positions once — eliminates redundant Box2D bridge calls across
+        # _calculate_density_sensors_all and _is_agent_touching_object
+        self._agent_pos_cache = np.array(
+            [[a.position.x, a.position.y] for a in self.agents], dtype=np.float32
+        )  # (n_agents, 2)
+        self._object_pos_cache = (
+            np.array(
+                [[o.position.x, o.position.y] for o in self.objects], dtype=np.float32
+            )
+            if self.objects
+            else np.empty((0, 2), dtype=np.float32)
+        )  # (n_objects, 2)
+
+        # Derive all_states from cache (no separate position reads)
+        center = np.array([self.world_center_x, self.world_center_y], dtype=np.float32)
+        all_states = self._agent_pos_cache - center  # (n_agents, 2)
+
+        # Vectorized density sensors for all agents in one pass (replaces n_agents calls)
+        all_density_sensors = self._calculate_density_sensors_all(
+            self.sector_sensor_radius
         )
 
-        # For each agent, get connected agents' states
         observations = []
         for i in range(self.n_agents):
-            # Own state (absolute)
             own_state = all_states[i]
-
-            # Calculate density sensors
-            density_sensors = self._calculate_density_sensors(
-                i, self.sector_sensor_radius
-            )
-
-            # Contact with object check
             is_touching_object = np.array([self._is_agent_touching_object(i)])
-
-            # Combine all observations: own absolute state + connected relative states + density sensors
-            agent_obs = np.concatenate([own_state, density_sensors, is_touching_object])
-
+            agent_obs = np.concatenate(
+                [own_state, all_density_sensors[i], is_touching_object]
+            )
             observations.append(agent_obs)
 
         return np.array(observations, dtype=np.float32)
@@ -918,6 +914,77 @@ class MultiBoxPushEnv(gym.Env):
         task_reward = distance_reward
 
         return task_reward, done
+
+    def _calculate_density_sensors_all(self, sensor_radius):
+        """
+        Vectorized density sensors for all agents simultaneously.
+
+        Replaces n_agents calls to _calculate_density_sensors (each with
+        O(n_agents + n_objects) Python loops) with a single numpy broadcast pass.
+
+        Returns:
+            np.ndarray of shape (n_agents, 16):
+                columns 0-7:  normalized centroid distance per sector, agents
+                columns 8-15: normalized centroid distance per sector, objects
+        """
+        n_sectors = 8
+        sector_step = (2 * np.pi) / n_sectors
+        shift = np.radians(22.5)
+
+        # Use positions cached by _get_observation (zero Box2D reads here)
+        agent_pos = self._agent_pos_cache  # (A, 2)
+
+        sensors = np.zeros((self.n_agents, 16), dtype=np.float32)
+
+        # === Agent-to-agent ===
+        # rel_aa[i, j] = pos[j] - pos[i]: position of j relative to i
+        rel_aa = agent_pos[np.newaxis, :, :] - agent_pos[:, np.newaxis, :]  # (A, A, 2)
+        dist_aa = np.linalg.norm(rel_aa, axis=-1)  # (A, A)
+        in_aa = (dist_aa > 0) & (dist_aa < sensor_radius)  # exclude self & out-of-range
+
+        angle_aa = (np.arctan2(rel_aa[..., 1], rel_aa[..., 0]) - shift) % (2 * np.pi)
+        sect_aa = (angle_aa / sector_step).astype(np.int32) % n_sectors  # (A, A)
+
+        for s in range(n_sectors):
+            mask = in_aa & (sect_aa == s)  # (A, A)
+            count = mask.sum(axis=1)  # (A,)
+            has = count > 0
+            if not has.any():
+                continue
+            sum_rel = (rel_aa * mask[:, :, np.newaxis]).sum(axis=1)  # (A, 2)
+            denom = np.where(count > 0, count, 1).astype(np.float32)
+            centroid_dist = np.linalg.norm(sum_rel / denom[:, np.newaxis], axis=1)
+            sensors[:, s] = np.where(has, 1.0 - centroid_dist / sensor_radius, 0.0)
+
+        # === Agent-to-object ===
+        if self.objects:
+            obj_pos = self._object_pos_cache  # (O, 2)
+
+            rel_ao = (
+                obj_pos[np.newaxis, :, :] - agent_pos[:, np.newaxis, :]
+            )  # (A, O, 2)
+            dist_ao = np.linalg.norm(rel_ao, axis=-1)  # (A, O)
+            in_ao = dist_ao < sensor_radius
+
+            angle_ao = (np.arctan2(rel_ao[..., 1], rel_ao[..., 0]) - shift) % (
+                2 * np.pi
+            )
+            sect_ao = (angle_ao / sector_step).astype(np.int32) % n_sectors  # (A, O)
+
+            for s in range(n_sectors):
+                mask = in_ao & (sect_ao == s)  # (A, O)
+                count = mask.sum(axis=1)  # (A,)
+                has = count > 0
+                if not has.any():
+                    continue
+                sum_rel = (rel_ao * mask[:, :, np.newaxis]).sum(axis=1)  # (A, 2)
+                denom = np.where(count > 0, count, 1).astype(np.float32)
+                centroid_dist = np.linalg.norm(sum_rel / denom[:, np.newaxis], axis=1)
+                sensors[:, n_sectors + s] = np.where(
+                    has, 1.0 - centroid_dist / sensor_radius, 0.0
+                )
+
+        return sensors  # (n_agents, 16)
 
     def _calculate_density_sensors(self, agent_idx, sensor_radius):
         """
@@ -1176,12 +1243,13 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=2, n_target_areas=2, max_steps=10e5
+        render_mode="human", n_agents=2, n_target_areas=2, max_steps=512
     )
     obs, info = env.reset()
 
     running = True
     current_agent_idx = 0
+    cum_rew = 0
     group_control = False  # Toggle for group replication
 
     print("\n" + "=" * 50)
@@ -1260,6 +1328,8 @@ if __name__ == "__main__":
         # 2. Step environment
         obs, reward, terminated, truncated, info = env.step(actions)
 
+        cum_rew += reward
+
         # 3. Log info nicely
         # Format observation array to be compact
         obs_str = np.array2string(
@@ -1271,13 +1341,15 @@ if __name__ == "__main__":
             max_line_width=np.inf,
         )
 
-        print(
-            f"{env.current_step:<5d} | "
-            f"{current_agent_idx:<3d} | "
-            f"({force_x:>4.1f}, {force_y:>4.1f})  | "
-            f"{reward:<8.4f} | "
-            f"{obs_str}"
-        )
+        # print(
+        #     f"{env.current_step:<5d} | "
+        #     f"{current_agent_idx:<3d} | "
+        #     f"({force_x:>4.1f}, {force_y:>4.1f})  | "
+        #     f"{reward:<8.4f} | "
+        #     f"{obs_str}"
+        # )
+
+        print(cum_rew)
 
         # 4. Render
         env.render()
@@ -1285,6 +1357,7 @@ if __name__ == "__main__":
         # 5. Handle reset
         if terminated or truncated:
             print(">>> Environment Reset")
+            cum_rew = 0
             obs, info = env.reset()
 
     env.close()
