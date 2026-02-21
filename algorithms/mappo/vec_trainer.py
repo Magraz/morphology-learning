@@ -9,6 +9,12 @@ import psutil
 from algorithms.mappo.mappo import MAPPOAgent
 from environments.types import EnvironmentEnum
 from algorithms.create_env import make_vec_env
+from functools import partial
+from algorithms.mappo.hypergraph import (
+    build_hypergraph_from_obs,
+    compute_hyperedge_structural_entropy_batch,
+    distance_based_hyperedges,
+)
 import gymnasium as gym
 
 import torch
@@ -159,6 +165,8 @@ class VecMAPPOTrainer:
             next_obs, rewards, terminateds, truncateds, infos = self.vec_env.step(
                 actions_array
             )
+
+            hypergraphs = build_hypergraph_from_obs(next_obs, partial(distance_based_hyperedges, threshold=1.0))
 
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
@@ -385,14 +393,18 @@ class VecMAPPOTrainer:
         """Run one episode with the current policy in a render environment.
 
         Returns:
-            float: Total reward accumulated over the episode.
+            rewards:     np.ndarray of shape (n_steps,), per-step rewards.
+            entropy_log: np.ndarray of shape (n_steps, 2), per-step
+                         [S_e, S_normalized] hyperedge structural entropies.
         """
         render_env = self._make_render_env()
         if render_env is None:
-            return 0.0
+            return np.empty(0), np.empty((0, 2))
 
         self.agent.network_old.eval()
-        episode_reward = 0.0
+        episode_reward = []
+        cum_sum = 0.0
+        entropy_log = []
 
         seed = int(np.random.randint(0, 2**31))
         obs, _ = render_env.reset(seed=seed)
@@ -415,13 +427,21 @@ class VecMAPPOTrainer:
 
                 obs, reward, terminated, truncated, _ = render_env.step(actions)
                 render_env.render()
-                episode_reward += float(reward)
+
+                cum_sum += float(reward)
+                episode_reward.append(cum_sum)
+
+                # obs shape: (n_agents, obs_dim) — add env batch dim for hypergraph API
+                hgs = build_hypergraph_from_obs(obs[np.newaxis], partial(distance_based_hyperedges, threshold=1.0))
+                entropies = compute_hyperedge_structural_entropy_batch(hgs)
+                entropy_log.append(entropies[0])  # [S_e, S_normalized]
 
                 if terminated or truncated:
                     break
 
         render_env.close()
-        return episode_reward
+
+        return np.array(episode_reward), np.array(entropy_log)
 
     def _make_render_env(self):
         """Create a single env with render_mode='human' for the current env_name."""

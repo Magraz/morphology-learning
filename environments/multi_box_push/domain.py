@@ -1,8 +1,15 @@
+import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
 import math
+from functools import partial
+from algorithms.mappo.hypergraph import (
+    build_hypergraph_from_obs,
+    compute_hyperedge_structural_entropy_batch,
+    distance_based_hyperedges,
+)
 
 from Box2D import (
     b2World,
@@ -19,17 +26,17 @@ from environments.multi_box_push.utils import (
     ObjectTargetArea,
     BoundaryContactListener,
     get_scatter_positions,
-    fixed_position_target_area,
 )
 
 
 class MultiBoxPushEnv(gym.Env):
     metadata = {"render_fps": 30}
 
-    def __init__(self, render_mode=None, n_agents=2, n_target_areas=1, max_steps=512):
+    def __init__(self, render_mode=None, n_agents=3, n_target_areas=1, max_steps=512):
         super().__init__()
 
         self.n_agents = n_agents
+        self.n_objects = 3
         self.render_mode = render_mode
 
         # Add target areas parameters
@@ -87,6 +94,11 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self._init_agents()
+
+        # Create boxes coupling reqs
+        self.objects_push_coupling_list = np.random.default_rng(42).integers(
+            2, self.n_agents, (self.n_objects)
+        )
 
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
@@ -161,10 +173,10 @@ class MultiBoxPushEnv(gym.Env):
         center_y = self.world_height / 2
 
         # Define the spawn area (increased to fit 3 boxes without overlap)
-        spawn_width = self.world_width * 0.7  # 70% of world width
-        spawn_height = self.world_height * 0.4  # 40% of world height
+        spawn_width = self.world_width * 0.8  # 70% of world width
+        spawn_height = self.world_height * 0.3  # 40% of world height
 
-        base_density = 1.0
+        base_density = 2.0
 
         # Track placed positions to avoid overlap
         placed_positions = []
@@ -222,14 +234,19 @@ class MultiBoxPushEnv(gym.Env):
             )
 
             # Store color in body user data for rendering
-            body.userData = {"type": "object", "color": colors[i], "index": i}
+            body.userData = {
+                "type": "object",
+                "color": colors[i],
+                "index": i,
+                "coupling": self.objects_push_coupling_list[i],
+            }
 
             self.objects.append(body)
             self.object_base_densities.append(base_density)
 
     def _update_object_mass_from_contacts(self):
         """
-        Reduce object mass by 10% for each additional agent pushing it.
+        Reduce object mass for each additional agent pushing it.
         Uses distance-based proximity for stable detection.
         """
         for obj_idx, obj in enumerate(self.objects):
@@ -263,18 +280,14 @@ class MultiBoxPushEnv(gym.Env):
                     obj_pos = np.array([obj.position.x, obj.position.y])
                     dist = np.linalg.norm(agent_pos - obj_pos)
 
-                touch_threshold = agent_radius + 0.3
+                touch_threshold = agent_radius + 0.2
                 if dist <= touch_threshold:
                     n_touching += 1
 
-            reduction_percent = 0.20
-            if n_touching > 1:
-                reduction = reduction_percent * (n_touching - 1)
-                scale = max(0.10, 1.0 - reduction)
+            if obj.userData["coupling"] <= n_touching:
+                new_density = 0.1 * obj.userData["coupling"]
             else:
-                scale = 1.0
-
-            new_density = base_density * scale
+                new_density = base_density
 
             for fixture in obj.fixtures:
                 fixture.density = new_density
@@ -808,7 +821,7 @@ class MultiBoxPushEnv(gym.Env):
                 dist = np.linalg.norm(agent_pos - obj_pos)
 
             # Consider "touching" if within agent_radius + small margin
-            touch_threshold = agent_radius + 0.3
+            touch_threshold = agent_radius + 0.2
             if dist <= touch_threshold:
                 return 1.0
 
@@ -1243,7 +1256,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=2, n_target_areas=2, max_steps=512
+        render_mode="human", n_agents=3, n_target_areas=1, max_steps=512
     )
     obs, info = env.reset()
 
@@ -1262,6 +1275,8 @@ if __name__ == "__main__":
     print("  [G]      : Toggle Group Control (Radius 5)")
     print("  [ESC]    : Quit")
     print("=" * 50 + "\n")
+
+    entropy_log = []  # list of [S_e, S_normalized] per step
 
     while running:
         # 1. Handle user input
@@ -1328,6 +1343,12 @@ if __name__ == "__main__":
         # 2. Step environment
         obs, reward, terminated, truncated, info = env.step(actions)
 
+        # Hypergraph testing
+        obs = np.expand_dims(obs, axis=0)
+        hypergraphs = build_hypergraph_from_obs(obs, partial(distance_based_hyperedges, threshold=1.0))
+        entropies = compute_hyperedge_structural_entropy_batch(hypergraphs)
+        entropy_log.append(entropies[0])  # [S_e, S_normalized] for this step
+
         cum_rew += reward
 
         # 3. Log info nicely
@@ -1358,6 +1379,22 @@ if __name__ == "__main__":
         if terminated or truncated:
             print(">>> Environment Reset")
             cum_rew = 0
+            break
             obs, info = env.reset()
 
     env.close()
+
+    entropy_array = np.array(entropy_log)  # (n_steps, 2)
+    steps = np.arange(len(entropy_array))
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    axes[0].plot(steps, entropy_array[:, 0])
+    axes[0].set_ylabel("$S_e$ (nats)")
+    axes[0].set_title("Hyperedge Structural Entropy")
+
+    axes[1].plot(steps, entropy_array[:, 1])
+    axes[1].set_ylabel("$S_{\\mathrm{norm}}$")
+    axes[1].set_xlabel("Step")
+
+    plt.tight_layout()
+    plt.savefig("entropy.png")

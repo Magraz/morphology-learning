@@ -4,10 +4,10 @@ from environments.types import EnvironmentEnum
 from dataclasses import asdict
 
 # EXPERIMENT SETTINGS
-ENVIRONMENT = EnvironmentEnum.BOX2D_SALP
+ENVIRONMENT = EnvironmentEnum.MULTI_BOX
 BATCH_NAME = f"{ENVIRONMENT}_test"
 # EXPERIMENTS_LIST = ["mlp", "gru"]
-EXPERIMENTS_LIST = ["mlp"]
+EXPERIMENTS_LIST = ["mlp_shared"]
 DEVICE = "cpu"
 MODELS = ["mlp"]
 
@@ -19,7 +19,7 @@ for i, experiment_name in enumerate(EXPERIMENTS_LIST):
         model=MODELS[i],
         params=Params(
             n_epochs=10,
-            n_total_steps=2e8,
+            n_total_steps=1e8,
             n_minibatches=4,
             batch_size=5120,
             parameter_sharing=True,

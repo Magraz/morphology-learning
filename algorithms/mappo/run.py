@@ -9,6 +9,7 @@ from algorithms.mappo.vec_trainer import VecMAPPOTrainer
 import torch
 import numpy as np
 import random
+import matplotlib.pyplot as plt
 
 
 def set_seeds(seed):
@@ -96,9 +97,30 @@ class MAPPO_Runner(Runner):
 
         # Test trained agents with rendering
         print("\nTesting trained agents...")
-        for i in range(10):
-            rew = self.trainer.render()
-            print(f"REWARD: {rew}")
+        for episode in range(10):
+            rewards, entropies = self.trainer.render()
+            print(f"REWARD: {rewards.sum():.4f}")
+
+            if rewards.shape[0] > 0:
+                steps = np.arange(len(rewards))
+                fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+                axes[0].plot(steps, rewards)
+                axes[0].set_ylabel("Reward")
+                axes[0].set_title(f"Episode {episode} — Reward & Hyperedge Structural Entropy")
+
+                axes[1].plot(steps, entropies[:, 0])
+                axes[1].set_ylabel("$S_e$ (nats)")
+
+                axes[2].plot(steps, entropies[:, 1])
+                axes[2].set_ylabel("$S_{\\mathrm{norm}}$")
+                axes[2].set_xlabel("Step")
+
+                plt.tight_layout()
+                fig_path = self.dirs["logs"] / f"entropy_episode_{episode}.png"
+                plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                print(f"Plot saved to {fig_path}")
 
     def evaluate(self):
         pass
