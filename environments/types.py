@@ -16,5 +16,6 @@ class EnvironmentEnum(StrEnum):
     BOX2D_SALP = "box2d_salp"
     MULTI_BOX = "multi_box_push"
     SMACV2 = "smacv2"
+    SMACLITE = "smaclite"
     # JAXMARL
     SMAX = "SMAX"

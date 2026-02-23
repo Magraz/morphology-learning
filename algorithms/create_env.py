@@ -204,6 +204,14 @@ def get_state_and_action_dims(
             action_dim = env.action_space.nvec[0]  # n_actions per agent
             env.close()
 
+        case EnvironmentEnum.SMACLITE:
+            from environments.smaclite.wrapper import SmacliteToGymWrapper
+
+            env = SmacliteToGymWrapper(map_name=env_variant)
+            state_dim = env.observation_space.shape[1]
+            action_dim = env.action_space.nvec[0]
+            env.close()
+
     return state_dim, action_dim
 
 
@@ -270,6 +278,11 @@ def make_vec_env(
                 from environments.smacv2.wrapper import SMACv2ToGymWrapper
 
                 return SMACv2ToGymWrapper(map_name=env_variant)
+
+            case EnvironmentEnum.SMACLITE:
+                from environments.smaclite.wrapper import SmacliteToGymWrapper
+
+                return SmacliteToGymWrapper(map_name=env_variant)
 
     # Create list of factory functions (not environment instances!)
     env_fns = [make_env_fn for _ in range(n_envs)]

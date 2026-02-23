@@ -73,6 +73,7 @@ class VecMAPPOTrainer:
             EnvironmentEnum.MPE_SPREAD,
             EnvironmentEnum.MPE_SIMPLE,
             EnvironmentEnum.SMACV2,
+            EnvironmentEnum.SMACLITE,
         ]:
             self.discrete = True
         else:
@@ -166,7 +167,9 @@ class VecMAPPOTrainer:
                 actions_array
             )
 
-            hypergraphs = build_hypergraph_from_obs(next_obs, partial(distance_based_hyperedges, threshold=1.0))
+            hypergraphs = build_hypergraph_from_obs(
+                next_obs, partial(distance_based_hyperedges, threshold=1.0)
+            )
 
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
@@ -224,7 +227,7 @@ class VecMAPPOTrainer:
         batch_size,
         minibatches,
         epochs,
-        log_every=10e4,
+        log_every=10e3,
         resume_steps=0,
         resume_episodes=0,
     ):
@@ -348,7 +351,7 @@ class VecMAPPOTrainer:
         print(f"  Avg evaluation:     {avg_eval_time:.3f}s")
         print(f"{'='*60}\n")
 
-    def evaluate(self, render=False):
+    def evaluate(self):
         """Evaluate current policy using parallel episodes."""
         self.agent.network_old.eval()
         n_eps = self.n_eval_episodes
@@ -407,7 +410,10 @@ class VecMAPPOTrainer:
         entropy_log = []
 
         seed = int(np.random.randint(0, 2**31))
-        obs, _ = render_env.reset(seed=seed)
+        obs, infos = render_env.reset(seed=seed)
+        current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+        if current_masks is not None:
+            current_masks = current_masks[np.newaxis]  # add env batch dim
 
         with torch.no_grad():
             while True:
@@ -416,7 +422,7 @@ class VecMAPPOTrainer:
                 global_states = obs_batch.reshape(1, -1)
 
                 actions_t, _, _ = self.agent.get_actions_batched(
-                    obs_batch, global_states, deterministic=True
+                    obs_batch, global_states, deterministic=True, action_masks=current_masks
                 )
                 actions = actions_t.cpu().numpy()[0]  # (n_agents, action_dim)
 
@@ -425,14 +431,19 @@ class VecMAPPOTrainer:
                         actions = actions.squeeze(-1)
                     actions = actions.astype(np.int32)
 
-                obs, reward, terminated, truncated, _ = render_env.step(actions)
+                obs, reward, terminated, truncated, infos = render_env.step(actions)
+                current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+                if current_masks is not None:
+                    current_masks = current_masks[np.newaxis]
                 render_env.render()
 
                 cum_sum += float(reward)
                 episode_reward.append(cum_sum)
 
                 # obs shape: (n_agents, obs_dim) — add env batch dim for hypergraph API
-                hgs = build_hypergraph_from_obs(obs[np.newaxis], partial(distance_based_hyperedges, threshold=1.0))
+                hgs = build_hypergraph_from_obs(
+                    obs[np.newaxis], partial(distance_based_hyperedges, threshold=1.0)
+                )
                 entropies = compute_hyperedge_structural_entropy_batch(hgs)
                 entropy_log.append(entropies[0])  # [S_e, S_normalized]
 
@@ -477,6 +488,10 @@ class VecMAPPOTrainer:
                     render_mode="human",
                 )
                 return PettingZooToGymWrapper(pz_env)
+            case EnvironmentEnum.SMACLITE:
+                from environments.smaclite.wrapper import SmacliteToGymWrapper
+
+                return SmacliteToGymWrapper(map_name=self.env_variant)
             case _:
                 return None
 
