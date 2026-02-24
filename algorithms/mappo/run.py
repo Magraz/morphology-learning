@@ -98,23 +98,34 @@ class MAPPO_Runner(Runner):
         # Test trained agents with rendering
         print("\nTesting trained agents...")
         for episode in range(10):
-            rewards, entropies = self.trainer.render()
-            print(f"REWARD: {rewards.sum():.4f}")
+            rewards, entropy_logs = self.trainer.render()
+
+            print(f"REWARD: {rewards[-1]:.4f}")
 
             if rewards.shape[0] > 0:
                 steps = np.arange(len(rewards))
-                fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+                n_types = len(entropy_logs)
+                # 1 row for reward + 2 rows per hyperedge type (S_e and S_norm)
+                n_rows = 1 + 2 * n_types
+                fig, axes = plt.subplots(n_rows, 1, figsize=(10, 3 * n_rows), sharex=True)
 
                 axes[0].plot(steps, rewards)
                 axes[0].set_ylabel("Reward")
-                axes[0].set_title(f"Episode {episode} — Reward & Hyperedge Structural Entropy")
+                axes[0].set_title(
+                    f"Episode {episode} — Reward & Hyperedge Structural Entropy"
+                )
 
-                axes[1].plot(steps, entropies[:, 0])
-                axes[1].set_ylabel("$S_e$ (nats)")
+                row = 1
+                for htype, ent in entropy_logs.items():
+                    axes[row].plot(steps, ent[:, 0])
+                    axes[row].set_ylabel(f"$S_e$ ({htype})")
+                    row += 1
 
-                axes[2].plot(steps, entropies[:, 1])
-                axes[2].set_ylabel("$S_{\\mathrm{norm}}$")
-                axes[2].set_xlabel("Step")
+                    axes[row].plot(steps, ent[:, 1])
+                    axes[row].set_ylabel(f"$S_{{\\mathrm{{norm}}}}$ ({htype})")
+                    row += 1
+
+                axes[-1].set_xlabel("Step")
 
                 plt.tight_layout()
                 fig_path = self.dirs["logs"] / f"entropy_episode_{episode}.png"

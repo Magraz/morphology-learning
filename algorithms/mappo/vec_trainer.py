@@ -11,9 +11,10 @@ from environments.types import EnvironmentEnum
 from algorithms.create_env import make_vec_env
 from functools import partial
 from algorithms.mappo.hypergraph import (
-    build_hypergraph_from_obs,
+    build_hypergraph,
     compute_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
+    object_contact_hyperedges,
 )
 import gymnasium as gym
 
@@ -69,7 +70,7 @@ class VecMAPPOTrainer:
             action_dim = act_space.shape[1]
 
         # Set action bounds based on environment
-        if env_name in [
+        if self.env_name in [
             EnvironmentEnum.MPE_SPREAD,
             EnvironmentEnum.MPE_SIMPLE,
             EnvironmentEnum.SMACV2,
@@ -167,8 +168,11 @@ class VecMAPPOTrainer:
                 actions_array
             )
 
-            hypergraphs = build_hypergraph_from_obs(
-                next_obs, partial(distance_based_hyperedges, threshold=1.0)
+            hypergraphs = build_hypergraph(
+                next_obs.shape[0],
+                next_obs.shape[1],
+                next_obs,
+                partial(distance_based_hyperedges, threshold=1.0),
             )
 
             # Compute dones for each environment
@@ -396,18 +400,21 @@ class VecMAPPOTrainer:
         """Run one episode with the current policy in a render environment.
 
         Returns:
-            rewards:     np.ndarray of shape (n_steps,), per-step rewards.
-            entropy_log: np.ndarray of shape (n_steps, 2), per-step
-                         [S_e, S_normalized] hyperedge structural entropies.
+            rewards:      np.ndarray of shape (n_steps,), per-step rewards.
+            entropy_logs: dict mapping hyperedge type ("proximity", "object")
+                          to np.ndarray of shape (n_steps, 2) with
+                          [S_e, S_normalized] per step.
         """
         render_env = self._make_render_env()
         if render_env is None:
-            return np.empty(0), np.empty((0, 2))
+            empty = np.empty((0, 2))
+            return np.empty(0), {"proximity": empty, "object": empty}
 
         self.agent.network_old.eval()
         episode_reward = []
         cum_sum = 0.0
-        entropy_log = []
+        entropy_proximity_log = []
+        entropy_object_log = []
 
         seed = int(np.random.randint(0, 2**31))
         obs, infos = render_env.reset(seed=seed)
@@ -422,7 +429,10 @@ class VecMAPPOTrainer:
                 global_states = obs_batch.reshape(1, -1)
 
                 actions_t, _, _ = self.agent.get_actions_batched(
-                    obs_batch, global_states, deterministic=True, action_masks=current_masks
+                    obs_batch,
+                    global_states,
+                    deterministic=True,
+                    action_masks=current_masks,
                 )
                 actions = actions_t.cpu().numpy()[0]  # (n_agents, action_dim)
 
@@ -432,7 +442,9 @@ class VecMAPPOTrainer:
                     actions = actions.astype(np.int32)
 
                 obs, reward, terminated, truncated, infos = render_env.step(actions)
-                current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+                current_masks = (
+                    infos.get("avail_actions") if isinstance(infos, dict) else None
+                )
                 if current_masks is not None:
                     current_masks = current_masks[np.newaxis]
                 render_env.render()
@@ -440,19 +452,42 @@ class VecMAPPOTrainer:
                 cum_sum += float(reward)
                 episode_reward.append(cum_sum)
 
+                # Hypergraph creation and entropy calculation
                 # obs shape: (n_agents, obs_dim) — add env batch dim for hypergraph API
-                hgs = build_hypergraph_from_obs(
-                    obs[np.newaxis], partial(distance_based_hyperedges, threshold=1.0)
+                hgs_proximity = build_hypergraph(
+                    1,
+                    self.n_agents,
+                    obs[np.newaxis],
+                    partial(distance_based_hyperedges, threshold=1.0),
                 )
-                entropies = compute_hyperedge_structural_entropy_batch(hgs)
-                entropy_log.append(entropies[0])  # [S_e, S_normalized]
+                entropies_proximity = compute_hyperedge_structural_entropy_batch(
+                    hgs_proximity
+                )
+                entropy_proximity_log.append(
+                    entropies_proximity[0]
+                )  # [S_e, S_normalized]
+
+                hgs_object = build_hypergraph(
+                    1,
+                    self.n_agents,
+                    [infos["agents_2_objects"]],
+                    object_contact_hyperedges,
+                )
+                entropies_object = compute_hyperedge_structural_entropy_batch(
+                    hgs_object
+                )
+                entropy_object_log.append(entropies_object[0])
 
                 if terminated or truncated:
                     break
 
         render_env.close()
 
-        return np.array(episode_reward), np.array(entropy_log)
+        entropy_logs = {
+            "proximity": np.array(entropy_proximity_log),
+            "object": np.array(entropy_object_log),
+        }
+        return np.array(episode_reward), entropy_logs
 
     def _make_render_env(self):
         """Create a single env with render_mode='human' for the current env_name."""

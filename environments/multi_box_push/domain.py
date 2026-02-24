@@ -6,7 +6,7 @@ import pygame
 import math
 from functools import partial
 from algorithms.mappo.hypergraph import (
-    build_hypergraph_from_obs,
+    build_hypergraph,
     compute_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
 )
@@ -244,6 +244,24 @@ class MultiBoxPushEnv(gym.Env):
             self.objects.append(body)
             self.object_base_densities.append(base_density)
 
+    def _agent_object_distance(self, agent_pos, obj, obj_pos):
+        """Compute the surface distance between an agent position and an object."""
+        shape = obj.fixtures[0].shape
+        if isinstance(shape, b2PolygonShape):
+            local_pos = obj.GetLocalPoint((float(agent_pos[0]), float(agent_pos[1])))
+            vertices = shape.vertices
+            half_w = max(abs(v[0]) for v in vertices)
+            half_h = max(abs(v[1]) for v in vertices)
+            closest_x = np.clip(local_pos[0], -half_w, half_w)
+            closest_y = np.clip(local_pos[1], -half_h, half_h)
+            return np.sqrt(
+                (local_pos[0] - closest_x) ** 2 + (local_pos[1] - closest_y) ** 2
+            )
+        elif isinstance(shape, b2CircleShape):
+            return np.linalg.norm(agent_pos - obj_pos) - shape.radius
+        else:
+            return np.linalg.norm(agent_pos - obj_pos)
+
     def _update_object_mass_from_contacts(self):
         """
         Reduce object mass for each additional agent pushing it.
@@ -252,36 +270,15 @@ class MultiBoxPushEnv(gym.Env):
         for obj_idx, obj in enumerate(self.objects):
             base_density = self.object_base_densities[obj_idx]
 
-            # Count agents near this object using proximity
             n_touching = 0
-            shape = obj.fixtures[0].shape
+            obj_pos = np.array([obj.position.x, obj.position.y])
 
             for agent in self.agents:
                 agent_pos = np.array([agent.position.x, agent.position.y])
                 agent_radius = agent.fixtures[0].shape.radius
+                dist = self._agent_object_distance(agent_pos, obj, obj_pos)
 
-                if isinstance(shape, b2PolygonShape):
-                    local_pos = obj.GetLocalPoint(
-                        (float(agent_pos[0]), float(agent_pos[1]))
-                    )
-                    vertices = shape.vertices
-                    half_w = max(abs(v[0]) for v in vertices)
-                    half_h = max(abs(v[1]) for v in vertices)
-                    closest_x = np.clip(local_pos[0], -half_w, half_w)
-                    closest_y = np.clip(local_pos[1], -half_h, half_h)
-                    dist = np.sqrt(
-                        (local_pos[0] - closest_x) ** 2
-                        + (local_pos[1] - closest_y) ** 2
-                    )
-                elif isinstance(shape, b2CircleShape):
-                    obj_pos = np.array([obj.position.x, obj.position.y])
-                    dist = np.linalg.norm(agent_pos - obj_pos) - shape.radius
-                else:
-                    obj_pos = np.array([obj.position.x, obj.position.y])
-                    dist = np.linalg.norm(agent_pos - obj_pos)
-
-                touch_threshold = agent_radius + 0.2
-                if dist <= touch_threshold:
+                if dist <= agent_radius + 0.2:
                     n_touching += 1
 
             if obj.userData["coupling"] <= n_touching:
@@ -791,41 +788,30 @@ class MultiBoxPushEnv(gym.Env):
         Check if an agent is close enough to any object to be considered 'touching' it.
         Uses distance-based proximity instead of Box2D contacts for stability.
         """
-        agent_pos = self._agent_pos_cache[agent_idx]  # from cache, no Box2D read
+        agent_pos = self._agent_pos_cache[agent_idx]
         agent_radius = self.agents[agent_idx].fixtures[0].shape.radius
 
         for obj_idx, obj in enumerate(self.objects):
-            obj_pos = self._object_pos_cache[obj_idx]  # from cache, no Box2D read
-
-            # Get the object's half-size from its shape
-            shape = obj.fixtures[0].shape
-            if isinstance(shape, b2PolygonShape):
-                # For boxes, compute distance to the nearest edge
-                # Transform agent position into the object's local frame
-                local_pos = obj.GetLocalPoint(
-                    (float(agent_pos[0]), float(agent_pos[1]))
-                )
-                # Get the half-extents from the vertices
-                vertices = shape.vertices
-                half_w = max(abs(v[0]) for v in vertices)
-                half_h = max(abs(v[1]) for v in vertices)
-                # Clamp to the box surface
-                closest_x = np.clip(local_pos[0], -half_w, half_w)
-                closest_y = np.clip(local_pos[1], -half_h, half_h)
-                dist = np.sqrt(
-                    (local_pos[0] - closest_x) ** 2 + (local_pos[1] - closest_y) ** 2
-                )
-            elif isinstance(shape, b2CircleShape):
-                dist = np.linalg.norm(agent_pos - obj_pos) - shape.radius
-            else:
-                dist = np.linalg.norm(agent_pos - obj_pos)
-
-            # Consider "touching" if within agent_radius + small margin
-            touch_threshold = agent_radius + 0.2
-            if dist <= touch_threshold:
+            obj_pos = self._object_pos_cache[obj_idx]
+            dist = self._agent_object_distance(agent_pos, obj, obj_pos)
+            if dist <= agent_radius + 0.2:
                 return 1.0
 
         return 0.0
+
+    def get_agents_touching_objects(self):
+        """Return a list of lists where result[obj_idx] contains the indices
+        of agents currently touching that object."""
+        result = [[] for _ in range(len(self.objects))]
+        for obj_idx, obj in enumerate(self.objects):
+            obj_pos = np.array([obj.position.x, obj.position.y])
+            for agent_idx, agent in enumerate(self.agents):
+                agent_pos = np.array([agent.position.x, agent.position.y])
+                agent_radius = agent.fixtures[0].shape.radius
+                dist = self._agent_object_distance(agent_pos, obj, obj_pos)
+                if dist <= agent_radius + 0.2:
+                    result[obj_idx].append(agent_idx)
+        return result
 
     def _get_observation(self):
         # Cache all positions once — eliminates redundant Box2D bridge calls across
@@ -1203,6 +1189,7 @@ class MultiBoxPushEnv(gym.Env):
                 {"x": agent.position.x, "y": agent.position.y} for agent in self.agents
             ],
             "task_reward": task_reward,
+            "agents_2_objects": self.get_agents_touching_objects(),
         }
 
         self.current_step += 1
@@ -1345,7 +1332,10 @@ if __name__ == "__main__":
 
         # Hypergraph testing
         obs = np.expand_dims(obs, axis=0)
-        hypergraphs = build_hypergraph_from_obs(obs, partial(distance_based_hyperedges, threshold=1.0))
+        hypergraphs = build_hypergraph(
+            1, env.n_agents,
+            obs, partial(distance_based_hyperedges, threshold=1.0)
+        )
         entropies = compute_hyperedge_structural_entropy_batch(hypergraphs)
         entropy_log.append(entropies[0])  # [S_e, S_normalized] for this step
 

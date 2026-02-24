@@ -5,7 +5,7 @@ from typing import Callable
 
 
 def distance_based_hyperedges(
-    obs: np.ndarray, threshold: float
+    obs: np.ndarray, n_agents: int, threshold: float
 ) -> list[tuple]:
     """
     Build a hyperedge list from agent observations using a distance threshold.
@@ -24,12 +24,11 @@ def distance_based_hyperedges(
     Returns:
         List of tuples, each tuple being a hyperedge (sequence of agent indices).
     """
-    n_agents = obs.shape[0]
     pos = obs[:, :2]  # (n_agents, 2)
 
     # Vectorised pairwise distance matrix: (n_agents, n_agents)
     diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]  # (N, N, 2)
-    dist_matrix = np.linalg.norm(diff, axis=-1)            # (N, N)
+    dist_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
 
     hyperedge_list = []
     for i in range(n_agents):
@@ -47,30 +46,72 @@ def distance_based_hyperedges(
     return hyperedge_list
 
 
-def build_hypergraph_from_obs(
-    obs: np.ndarray,
-    hyperedge_fn: Callable[[np.ndarray], list[tuple]],
-) -> list[dhg.Hypergraph]:
+def object_contact_hyperedges(
+    agents_2_objects: list[list[int]],
+    n_agents: int,
+) -> list[tuple]:
     """
-    Build hypergraphs from vectorised environment observations.
+    Build hyperedges from agent-object contact information.
+
+    Each object that has 2+ agents touching it produces one hyperedge
+    containing those agent indices. Agents not touching any object
+    (or alone on an object) get isolated self-loop hyperedges.
 
     Args:
-        obs:          Observations of shape (n_envs, n_agents, obs_dim).
-        hyperedge_fn: Callable that accepts a full observation slice of shape
-                      (n_agents, obs_dim) and returns a list of hyperedge tuples.
-                      The function is responsible for extracting whatever fields
-                      it needs from the observation. Use functools.partial to
-                      bind extra parameters, e.g.:
+        n_agents:        Total number of agents.
+        agents_2_objects: List of lists where agents_2_objects[obj_idx]
+                         contains the agent indices touching that object.
+
+    Returns:
+        List of tuples, each tuple being a hyperedge (sequence of agent indices).
+    """
+    hyperedge_list = []
+    grouped_agents = set()
+
+    for agent_indices in agents_2_objects:
+        if len(agent_indices) >= 2:
+            edge = tuple(sorted(agent_indices))
+            hyperedge_list.append(edge)
+            grouped_agents.update(agent_indices)
+
+    # Deduplicate
+    hyperedge_list = list(set(hyperedge_list))
+
+    # Isolated self-loops for agents not in any multi-agent hyperedge
+    for i in range(n_agents):
+        if i not in grouped_agents:
+            hyperedge_list.append((i,))
+
+    return hyperedge_list
+
+
+def build_hypergraph(
+    n_envs: int,
+    n_agents: int,
+    data,
+    hyperedge_fn: Callable,
+) -> list[dhg.Hypergraph]:
+    """
+    Build hypergraphs from per-environment data.
+
+    Args:
+        n_envs:       Number of environments.
+        n_agents:     Number of agents per environment.
+        data:         Any indexable object where data[env_idx] yields the
+                      per-environment slice passed to hyperedge_fn.
+                      E.g. an obs array of shape (n_envs, n_agents, obs_dim),
+                      or an info list/array indexed by env.
+        hyperedge_fn: Callable that accepts data[env_idx] and returns a list
+                      of hyperedge tuples. Use functools.partial to bind
+                      extra parameters, e.g.:
                         partial(distance_based_hyperedges, threshold=1.0)
 
     Returns:
         A list of dhg.Hypergraph objects, one per environment.
     """
-    n_envs, n_agents, _ = obs.shape
-
     hypergraphs = []
     for env_idx in range(n_envs):
-        hyperedge_list = hyperedge_fn(obs[env_idx])  # (n_agents, obs_dim)
+        hyperedge_list = hyperedge_fn(data[env_idx], n_agents)
         hg = dhg.Hypergraph(n_agents, hyperedge_list)
         hypergraphs.append(hg)
 
