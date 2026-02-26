@@ -67,23 +67,25 @@ class MAPPO_Runner(Runner):
         )
 
     def train(self):
-        resume_steps = 0
-        resume_episodes = 0
 
         # Resume from checkpoint if requested and checkpoint exists
         checkpoint_path = self.dirs["models"] / "models_checkpoint.pth"
-        if self.checkpoint and checkpoint_path.exists():
-            resume_steps, resume_episodes = self.trainer.load_agent(
-                checkpoint_path, restore_rng=True
-            )
+        stats_checkpoint_path = self.dirs["logs"] / "training_stats_checkpoint.pkl"
+
+        if (
+            self.checkpoint
+            and checkpoint_path.exists()
+            and stats_checkpoint_path.exists()
+        ):
+            self.trainer.load_agent(checkpoint_path, restore_rng=True)
+            self.trainer.load_checkpoint_progress(stats_checkpoint_path)
 
         self.trainer.train(
             total_steps=self.params.n_total_steps,
             batch_size=self.params.batch_size,
             minibatches=self.params.n_minibatches,
             epochs=self.params.n_epochs,
-            resume_steps=resume_steps,
-            resume_episodes=resume_episodes,
+            checkpoint=self.checkpoint,
         )
 
         self.trainer.save_training_stats(
@@ -99,7 +101,7 @@ class MAPPO_Runner(Runner):
 
         # Test trained agents with rendering
         print("\nTesting trained agents...")
-        for episode in range(10):
+        for episode in range(2):
             rewards, entropy_logs = self.trainer.render()
 
             print(f"REWARD: {rewards[-1]:.4f}")

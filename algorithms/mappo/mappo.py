@@ -75,6 +75,13 @@ class MAPPOAgent:
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
 
+        # Hypergraph structure caches (persist across steps within a trajectory,
+        # cleared each reset_buffers call so they don't grow unbounded).
+        # signature -> id, id -> representative edge_lists, (type,key) -> dhg.Hypergraph
+        self.hg_signature_to_id: dict[tuple, int] = {}
+        self.hg_unique_edge_lists: list[list[list[tuple]]] = []
+        self.hg_object_cache: dict[tuple, object] = {}
+
         # Buffers for each agent
         self.reset_buffers()
 
@@ -101,10 +108,15 @@ class MAPPOAgent:
         self.action_masks = [
             [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
         ]
-        # Lightweight hypergraph info buffer: [env_idx][timestep] -> dict
-        # Stores only the info-dict data needed by non-obs hyperedge fns.
-        # Observations (needed by obs-based fns) are already in self.observations.
-        self.hypergraph_infos = [[] for _ in range(self.n_parallel_envs)]
+        # Per-(env, timestep) hypergraph signature IDs computed during collection.
+        # Avoids recomputing edge lists from observations during the update phase.
+        # [env_idx][timestep] -> int (index into hg_unique_edge_lists)
+        self.hg_signature_ids = [[] for _ in range(self.n_parallel_envs)]
+
+        # Clear hypergraph structure caches for the new trajectory
+        self.hg_signature_to_id.clear()
+        self.hg_unique_edge_lists.clear()
+        self.hg_object_cache.clear()
 
     def get_actions(
         self, observations, global_state, deterministic=False, hypergraphs=None
@@ -309,7 +321,7 @@ class MAPPOAgent:
         dones,  # np (n_envs,)
         infos,  # dict
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
-        hypergraph_infos=None,  # dict {info_key: data[n_envs]} or None
+        hg_signature_ids=None,  # list[int] of length n_envs or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -357,10 +369,8 @@ class MAPPOAgent:
         for env_idx in range(n_envs):
             self.global_states[env_idx].append(gs_t[env_idx])
             self.values[env_idx].append(val_t[env_idx])
-            if hypergraph_infos is not None:
-                self.hypergraph_infos[env_idx].append(
-                    {k: v[env_idx] for k, v in hypergraph_infos.items()}
-                )
+            if hg_signature_ids is not None:
+                self.hg_signature_ids[env_idx].append(hg_signature_ids[env_idx])
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
                 self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
@@ -440,99 +450,38 @@ class MAPPOAgent:
 
         return all_returns, all_advantages
 
-    def _build_flat_hyperedge_lists(self):
-        """Rebuild hyperedge lists from stored observations and info data.
+    def _get_flat_signature_ids(self):
+        """Return a flat list of signature IDs for all (env, timestep) pairs.
 
-        For each (env, timestep) pair, reconstructs the per-agent observation
-        matrix and calls each hyperedge function to produce raw hyperedge
-        tuples (lightweight, suitable for batching later).
-
-        Returns:
-            all_edge_lists: list where all_edge_lists[i] is a list of
-                            hyperedge-tuple lists (one per type) for the
-                            i-th (env, timestep) pair.
-        """
-        all_edge_lists = []
-        for env_idx in range(self.n_parallel_envs):
-            T = len(self.observations[env_idx][0])
-            for t in range(T):
-                obs_np = (
-                    torch.stack(
-                        [self.observations[env_idx][a][t] for a in range(self.n_agents)]
-                    )
-                    .numpy()
-                )
-                info_data = (
-                    self.hypergraph_infos[env_idx][t]
-                    if self.hypergraph_infos[env_idx]
-                    else {}
-                )
-                edge_lists = []
-                for fn, source in self.hyperedge_fns:
-                    if source == "obs":
-                        edges = fn(obs_np, self.n_agents)
-                    elif source in info_data:
-                        edges = fn(info_data[source], self.n_agents)
-                    else:
-                        continue
-                    edge_lists.append(edges)
-                all_edge_lists.append(edge_lists)
-        return all_edge_lists
-
-    @staticmethod
-    def _canonicalize_hyperedge_type(edge_list):
-        """Return a hashable, order-invariant representation of one edge type."""
-        return tuple(
-            sorted(tuple(sorted(int(v) for v in edge)) for edge in edge_list)
-        )
-
-    def _build_hyperedge_structure_index(self, all_edge_lists):
-        """Deduplicate per-timestep hyperedge structures.
-
-        Args:
-            all_edge_lists: list where each item is a list of edge-lists
-                            (one edge-list per hyperedge type).
+        Reads directly from the buffer populated during collection, avoiding
+        the expensive reconstruction of edge lists from observations.
 
         Returns:
-            unique_edge_lists: representative edge-lists for each unique structure.
-            ts_to_signature_ids: list mapping timestep index -> signature id.
+            ts_to_signature_ids: list of int, length = sum of T across envs.
         """
-        signature_to_id = {}
-        unique_edge_lists = []
         ts_to_signature_ids = []
-
-        for edge_lists in all_edge_lists:
-            signature = tuple(
-                self._canonicalize_hyperedge_type(type_edges) for type_edges in edge_lists
-            )
-            sig_id = signature_to_id.get(signature)
-            if sig_id is None:
-                sig_id = len(unique_edge_lists)
-                signature_to_id[signature] = sig_id
-                unique_edge_lists.append(edge_lists)
-            ts_to_signature_ids.append(sig_id)
-
-        return unique_edge_lists, ts_to_signature_ids
+        for env_idx in range(self.n_parallel_envs):
+            ts_to_signature_ids.extend(self.hg_signature_ids[env_idx])
+        return ts_to_signature_ids
 
     def _compute_hgnn_critic_values(
         self,
         batch_global_states,
         batch_ts_indices,
-        unique_edge_lists,
         ts_to_signature_ids,
         hgnn_batch_cache,
     ):
         """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
 
-        Reuses cached block-diagonal batched hypergraphs keyed by hyperedge
-        structure signatures (not raw timestep ids), runs one critic forward
-        pass over unique timesteps, then scatters values back to batch order.
+        Uses hg_unique_edge_lists (populated during collection) to look up
+        representative edge-lists by signature ID.  Reuses cached
+        block-diagonal batched hypergraphs keyed by the set of signature IDs
+        in the minibatch.
 
         Args:
             batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
             batch_ts_indices: (B,) int tensor mapping each sample to an index
                               in ts_to_signature_ids.
-            unique_edge_lists: representative edge-lists per unique signature.
             ts_to_signature_ids: list mapping timestep index -> signature id.
             hgnn_batch_cache: dict mapping tuple(signature ids in minibatch) to
                               pre-built list[dhg.Hypergraph] batched by type.
@@ -561,11 +510,12 @@ class MAPPOAgent:
         cache_key = tuple(unique_sig_ids)
         batched_hgs = hgnn_batch_cache.get(cache_key)
         if batched_hgs is None:
-            n_types = len(unique_edge_lists[0])
+            n_types = len(self.hg_unique_edge_lists[0])
             batched_hgs = []
             for type_idx in range(n_types):
                 edge_lists = [
-                    unique_edge_lists[sig_id][type_idx] for sig_id in unique_sig_ids
+                    self.hg_unique_edge_lists[sig_id][type_idx]
+                    for sig_id in unique_sig_ids
                 ]
                 batched_hgs.append(
                     batch_hypergraphs(edge_lists, self.n_agents, device=self.device)
@@ -605,13 +555,10 @@ class MAPPOAgent:
         has_masks = len(self.action_masks[0][0]) > 0
         use_hgnn = self.critic_type == "multi_hgnn"
 
-        # Build flat hyperedge list once, then deduplicate by structure.
-        # Minibatches reuse cached batched hypergraphs by signature-id pattern.
+        # Read pre-computed signature IDs from the buffer (populated during
+        # collection) instead of rebuilding edge lists from observations.
         if use_hgnn:
-            all_edge_lists = self._build_flat_hyperedge_lists()
-            unique_edge_lists, ts_to_signature_ids = self._build_hyperedge_structure_index(
-                all_edge_lists
-            )
+            ts_to_signature_ids = self._get_flat_signature_ids()
             hgnn_batch_cache = {}
 
         # Iterate through each environment
@@ -721,7 +668,6 @@ class MAPPOAgent:
                     values = self._compute_hgnn_critic_values(
                         batch_global_states,
                         batch_ts_idx,
-                        unique_edge_lists,
                         ts_to_signature_ids,
                         hgnn_batch_cache,
                     )
@@ -784,10 +730,7 @@ class MAPPOAgent:
         use_hgnn = self.critic_type == "multi_hgnn"
 
         if use_hgnn:
-            all_edge_lists = self._build_flat_hyperedge_lists()
-            unique_edge_lists, ts_to_signature_ids = self._build_hyperedge_structure_index(
-                all_edge_lists
-            )
+            ts_to_signature_ids = self._get_flat_signature_ids()
             hgnn_batch_cache = {}
 
         # Update each agent separately (independent actors)
@@ -907,7 +850,6 @@ class MAPPOAgent:
                         values = self._compute_hgnn_critic_values(
                             batch_global_states,
                             batch_ts_idx,
-                            unique_edge_lists,
                             ts_to_signature_ids,
                             hgnn_batch_cache,
                         )

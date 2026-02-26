@@ -4,6 +4,19 @@ from collections import Counter
 from typing import Callable
 
 
+def canonicalize_edge_lists(edge_lists: list[list[tuple]]) -> tuple:
+    """Return a hashable, order-invariant signature for a list of edge-lists.
+
+    Each element of *edge_lists* corresponds to one hyperedge type and is
+    itself a list of hyperedge tuples.  The returned tuple can be used as a
+    dictionary key for deduplication / caching.
+    """
+    return tuple(
+        tuple(sorted(tuple(sorted(int(v) for v in edge)) for edge in type_edges))
+        for type_edges in edge_lists
+    )
+
+
 def distance_based_hyperedges(
     obs: np.ndarray, n_agents: int, threshold: float
 ) -> list[tuple]:
@@ -187,7 +200,9 @@ def compute_hyperedge_structural_entropy(hg: dhg.Hypergraph):
         weights:      np.ndarray of per-hyperedge weights.
     """
     # A: (E_total, |V|) incidence matrix
-    A = hg.H_T.to_dense().numpy().astype(np.float64)  # H_T shape is (num_e, num_v)
+    A = (
+        hg.H_T.to_dense().cpu().numpy().astype(np.float64)
+    )  # H_T shape is (num_e, num_v)
     E_total = hg.num_e
 
     # Step 1: Node hyperdegrees D(i) = column sums of A

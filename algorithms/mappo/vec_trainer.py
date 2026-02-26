@@ -13,6 +13,7 @@ from functools import partial
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
     build_hypergraph,
+    canonicalize_edge_lists,
     compute_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
     object_contact_hyperedges,
@@ -125,14 +126,18 @@ class VecMAPPOTrainer:
     def _build_inference_hypergraphs(self, obs, infos, n_envs):
         """Build batched block-diagonal hypergraphs for critic inference.
 
-        Returns None when the critic doesn't need hypergraphs,
-        otherwise a list of dhg.Hypergraph (one per hyperedge type),
-        each a block-diagonal graph batching all n_envs together.
+        Returns (None, None) when the critic doesn't need hypergraphs,
+        otherwise (batched_hgs, per_env_sig_ids) where:
+        - batched_hgs: list of dhg.Hypergraph (one per hyperedge type),
+          each a block-diagonal graph batching all n_envs together.
+        - per_env_sig_ids: list of int signature IDs, one per env,
+          usable for buffer storage to avoid recomputation during update.
         """
         if self.critic_type != "multi_hgnn":
-            return None
+            return None, None
 
-        batched_hgs = []
+        # Compute per-env edge lists for each hyperedge type
+        all_type_edge_lists = []  # [type_idx][env_idx] -> edge_list
         for fn, source in self.hyperedge_fns:
             if source == "obs":
                 data = obs
@@ -140,12 +145,46 @@ class VecMAPPOTrainer:
                 data = infos.get(source) if isinstance(infos, dict) else None
                 if data is None:
                     continue
-            edge_lists = [fn(data[e], self.n_agents) for e in range(n_envs)]
-            batched_hgs.append(
-                batch_hypergraphs(edge_lists, self.n_agents, device=self.device)
+            all_type_edge_lists.append(
+                [fn(data[e], self.n_agents) for e in range(n_envs)]
             )
 
-        return batched_hgs
+        # Transpose to per-env: [env_idx] -> [type_edges_0, type_edges_1, ...]
+        n_types = len(all_type_edge_lists)
+        per_env_edge_lists = [
+            [all_type_edge_lists[t][e] for t in range(n_types)] for e in range(n_envs)
+        ]
+
+        # Canonicalize and deduplicate via the shared agent-level cache
+        per_env_sig_ids = []
+        for edge_lists in per_env_edge_lists:
+            sig = canonicalize_edge_lists(edge_lists)
+            sig_id = self.agent.hg_signature_to_id.get(sig)
+            if sig_id is None:
+                sig_id = len(self.agent.hg_unique_edge_lists)
+                self.agent.hg_signature_to_id[sig] = sig_id
+                self.agent.hg_unique_edge_lists.append(edge_lists)
+            per_env_sig_ids.append(sig_id)
+
+        # Build batched hypergraphs, one per type, using the dhg cache
+        batched_hgs = []
+        for type_idx in range(n_types):
+            type_edge_lists = [
+                self.agent.hg_unique_edge_lists[sid][type_idx]
+                for sid in per_env_sig_ids
+            ]
+            cache_key = tuple(per_env_sig_ids)
+            cached = self.agent.hg_object_cache.get((type_idx, cache_key))
+            if cached is not None:
+                batched_hgs.append(cached)
+            else:
+                hg = batch_hypergraphs(
+                    type_edge_lists, self.n_agents, device=self.device
+                )
+                self.agent.hg_object_cache[(type_idx, cache_key)] = hg
+                batched_hgs.append(hg)
+
+        return batched_hgs, per_env_sig_ids
 
     def collect_trajectory(self, max_steps):
         """
@@ -181,7 +220,9 @@ class VecMAPPOTrainer:
             global_states = obs.reshape(batch_size, -1)
 
             # Build hypergraphs only when the critic requires them
-            per_env_hgs = self._build_inference_hypergraphs(obs, infos, batch_size)
+            per_env_hgs, per_env_sig_ids = self._build_inference_hypergraphs(
+                obs, infos, batch_size
+            )
 
             # Single batched forward pass for all envs × agents
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
@@ -221,14 +262,6 @@ class VecMAPPOTrainer:
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
 
-            # Extract lightweight info-dict data for non-obs hyperedge fns
-            hg_infos = {}
-            for _, source in self.hyperedge_fns:
-                if source != "obs" and isinstance(infos, dict):
-                    val = infos.get(source)
-                    if val is not None:
-                        hg_infos[source] = val
-
             # Store transitions for all environments in one vectorized call
             self.agent.store_transitions_batch(
                 obs,
@@ -240,7 +273,7 @@ class VecMAPPOTrainer:
                 dones,
                 infos,
                 action_masks=current_masks,
-                hypergraph_infos=hg_infos if hg_infos else None,
+                hg_signature_ids=per_env_sig_ids,
             )
 
             # Update masks for next step.
@@ -270,7 +303,7 @@ class VecMAPPOTrainer:
             ).to(self.device)
 
             if self.agent.critic_type == "multi_hgnn":
-                final_batched_hgs = self._build_inference_hypergraphs(
+                final_batched_hgs, _ = self._build_inference_hypergraphs(
                     obs, infos, batch_size
                 )
                 obs_tensor = torch.from_numpy(
@@ -301,11 +334,27 @@ class VecMAPPOTrainer:
         batch_size,
         minibatches,
         epochs,
-        log_every=10e3,
-        resume_steps=0,
-        resume_episodes=0,
+        checkpoint: bool = False,
+        log_every: int = 10e3,
     ):
         """Train MAPPO agent"""
+
+        if not checkpoint:
+            self.training_stats["total_steps"] = []
+            self.training_stats["reward"] = []
+            self.training_stats["episodes"] = []
+            self.training_stats["training_time"] = []
+            self.training_stats["collection_time"] = []
+            self.training_stats["update_time"] = []
+            self.training_stats["eval_time"] = []
+
+            self.total_training_time = 0
+            resume_steps = 0
+            resume_episodes = 0
+        else:
+            self.total_training_time = self.training_stats["training_time"][-1]
+            resume_steps = self.training_stats["total_steps"][-1]
+            resume_episodes = self.training_stats["episodes"][-1]
 
         # Track elapsed time across resumed runs so FPS remains correct with checkpoints.
         elapsed_time_offset = self.total_training_time if resume_steps > 0 else 0.0
@@ -321,14 +370,6 @@ class VecMAPPOTrainer:
             print(
                 f"Starting MAPPO training for {total_steps} total environment steps..."
             )
-
-        self.training_stats["total_steps"] = []
-        self.training_stats["reward"] = []
-        self.training_stats["episodes"] = []
-        self.training_stats["training_time"] = []
-        self.training_stats["collection_time"] = []
-        self.training_stats["update_time"] = []
-        self.training_stats["eval_time"] = []
 
         while steps_completed < total_steps:
             steps_to_collect = min(batch_size, total_steps - steps_completed)
@@ -396,11 +437,7 @@ class VecMAPPOTrainer:
                 self.save_training_stats(
                     self.dirs["logs"] / "training_stats_checkpoint.pkl"
                 )
-                self.save_agent(
-                    self.dirs["models"] / "models_checkpoint.pth",
-                    steps_completed=steps_completed,
-                    episodes_completed=episodes_completed,
-                )
+                self.save_agent(self.dirs["models"] / "models_checkpoint.pth")
 
         # Close envs
         self.close_environments()
@@ -442,7 +479,7 @@ class VecMAPPOTrainer:
             while not finished.all():
                 global_states = obs.reshape(n_eps, -1)
 
-                eval_hgs = self._build_inference_hypergraphs(obs, infos, n_eps)
+                eval_hgs, _ = self._build_inference_hypergraphs(obs, infos, n_eps)
 
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
@@ -500,7 +537,7 @@ class VecMAPPOTrainer:
                 # Add batch dim expected by get_actions_batched: (1, n_agents, obs_dim)
                 global_states = obs.reshape(1, -1)
 
-                render_hgs = self._build_inference_hypergraphs(obs, infos, 1)
+                render_hgs, _ = self._build_inference_hypergraphs(obs, infos, 1)
 
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
@@ -605,15 +642,12 @@ class VecMAPPOTrainer:
         """Destructor to ensure environments are closed"""
         self.close_environments()
 
-    def save_agent(self, path, steps_completed=0, episodes_completed=0):
-        """Save MAPPO agent with RNG states and training progress"""
+    def save_agent(self, path):
+        """Save MAPPO agent weights, optimizer state, and RNG states."""
         torch.save(
             {
                 "network": self.agent.network_old.state_dict(),
                 "optimizer": self.agent.optimizer.state_dict(),
-                "steps_completed": steps_completed,
-                "episodes_completed": episodes_completed,
-                "total_training_time": self.total_training_time,
                 "rng_python": random.getstate(),
                 "rng_numpy": np.random.get_state(),
                 "rng_torch_cpu": torch.random.get_rng_state(),
@@ -642,11 +676,21 @@ class VecMAPPOTrainer:
                     [s.cpu() for s in checkpoint["rng_torch_cuda"]]
                 )
 
-        steps = checkpoint.get("steps_completed", 0)
-        episodes = checkpoint.get("episodes_completed", 0)
-        self.total_training_time = checkpoint.get("total_training_time", 0.0)
-        print(f"Agents loaded from {filepath} (steps={steps}, episodes={episodes})")
-        return steps, episodes
+        print(f"Agents loaded from {filepath}")
+
+    def load_checkpoint_progress(self, path):
+        """Load training progress counters from training stats checkpoint."""
+
+        with path.open("rb") as f:
+            stats = pickle.load(f)
+
+        self.training_stats["total_steps"] = stats.get("total_steps", [])
+        self.training_stats["reward"] = stats.get("reward", [])
+        self.training_stats["episodes"] = stats.get("episodes", [])
+        self.training_stats["training_time"] = stats.get("training_time", [])
+        self.training_stats["collection_time"] = stats.get("collection_time", [])
+        self.training_stats["update_time"] = stats.get("update_time", [])
+        self.training_stats["eval_time"] = stats.get("eval_time", [])
 
     def save_training_stats(self, path):
         """Save training statistics"""
