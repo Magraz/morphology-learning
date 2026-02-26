@@ -72,6 +72,7 @@ class MAPPO_Runner(Runner):
         checkpoint_path = self.dirs["models"] / "models_checkpoint.pth"
         stats_checkpoint_path = self.dirs["logs"] / "training_stats_checkpoint.pkl"
 
+        checkpoint_loaded = False
         if (
             self.checkpoint
             and checkpoint_path.exists()
@@ -79,13 +80,14 @@ class MAPPO_Runner(Runner):
         ):
             self.trainer.load_agent(checkpoint_path, restore_rng=True)
             self.trainer.load_checkpoint_progress(stats_checkpoint_path)
+            checkpoint_loaded = True
 
         self.trainer.train(
             total_steps=self.params.n_total_steps,
             batch_size=self.params.batch_size,
             minibatches=self.params.n_minibatches,
             epochs=self.params.n_epochs,
-            checkpoint=self.checkpoint,
+            checkpoint=checkpoint_loaded,
         )
 
         self.trainer.save_training_stats(
