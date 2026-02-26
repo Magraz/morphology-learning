@@ -3,7 +3,7 @@ from typing import Optional
 
 
 @dataclass
-class Params:
+class MAPPO_Params:
     # Training Params
     n_epochs: int
     n_total_steps: int
@@ -23,7 +23,15 @@ class Params:
 
 
 @dataclass
+class Model_Params:
+    model_name: str
+    critic_type: str
+    # For HGNN
+    n_hyperedge_types: int
+
+
+@dataclass
 class Experiment:
     device: str
-    model: str
-    params: Params
+    model_params: Model_Params
+    params: MAPPO_Params

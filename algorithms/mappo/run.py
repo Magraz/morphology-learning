@@ -1,5 +1,5 @@
 from environments.types import EnvironmentParams, EnvironmentEnum
-from algorithms.mappo.types import Experiment, Params
+from algorithms.mappo.types import Experiment, MAPPO_Params, Model_Params
 from algorithms.runner import Runner
 from algorithms.create_env import get_state_and_action_dims
 from pathlib import Path
@@ -39,8 +39,8 @@ class MAPPO_Runner(Runner):
         self.env_config = env_config
 
         # Set params
-        self.params = Params(**self.exp_config.params)
-
+        self.params = MAPPO_Params(**self.exp_config.params)
+        self.model_params = Model_Params(**self.exp_config.model_params)
         # Set seeds
         random_seed = self.params.random_seeds[0]
 
@@ -62,6 +62,8 @@ class MAPPO_Runner(Runner):
             self.device,
             n_parallel_envs=self.env_config.n_envs,
             env_variant=self.env_config.env_variant,
+            critic_type=self.model_params.critic_type,
+            n_hyperedge_types=self.model_params.n_hyperedge_types,
         )
 
     def train(self):
@@ -107,7 +109,9 @@ class MAPPO_Runner(Runner):
                 n_types = len(entropy_logs)
                 # 1 row for reward + 2 rows per hyperedge type (S_e and S_norm)
                 n_rows = 1 + 2 * n_types
-                fig, axes = plt.subplots(n_rows, 1, figsize=(10, 3 * n_rows), sharex=True)
+                fig, axes = plt.subplots(
+                    n_rows, 1, figsize=(10, 3 * n_rows), sharex=True
+                )
 
                 axes[0].plot(steps, rewards)
                 axes[0].set_ylabel("Reward")

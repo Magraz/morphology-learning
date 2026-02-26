@@ -3,9 +3,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-
-from algorithms.mappo.types import Params
+from algorithms.mappo.types import MAPPO_Params
 from algorithms.mappo.network import MAPPONetwork
+from algorithms.mappo.hypergraph import batch_hypergraphs
 
 
 class MAPPOAgent:
@@ -17,10 +17,13 @@ class MAPPOAgent:
         global_state_dim: int,
         action_dim: int,
         n_agents: int,
-        params: Params,
+        params: MAPPO_Params,
         device: str,
         discrete: bool,
         n_parallel_envs: int,
+        critic_type: str = "mlp",
+        n_hyperedge_types: int = 1,
+        hyperedge_fns: list[tuple] = None,
     ):
         self.device = "cuda" if torch.cuda.is_available() else device
         self.n_agents = n_agents
@@ -29,6 +32,11 @@ class MAPPOAgent:
         self.discrete = discrete
         self.share_actor = params.parameter_sharing
         self.n_parallel_envs = n_parallel_envs
+        self.critic_type = critic_type
+        self.n_hyperedge_types = n_hyperedge_types
+        # Hyperedge builder specs: list of (fn, source) where source is "obs"
+        # or an info-dict key name (e.g. "agents_2_objects")
+        self.hyperedge_fns = hyperedge_fns or []
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -46,6 +54,8 @@ class MAPPOAgent:
             n_agents=n_agents,
             discrete=discrete,
             share_actor=self.share_actor,
+            critic_type=critic_type,
+            n_hyperedge_types=n_hyperedge_types,
         ).to(self.device)
 
         # Create old network for PPO
@@ -56,6 +66,8 @@ class MAPPOAgent:
             n_agents=n_agents,
             discrete=discrete,
             share_actor=self.share_actor,
+            critic_type=critic_type,
+            n_hyperedge_types=n_hyperedge_types,
         ).to(self.device)
 
         self.network_old.load_state_dict(self.network.state_dict())
@@ -89,8 +101,14 @@ class MAPPOAgent:
         self.action_masks = [
             [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
         ]
+        # Lightweight hypergraph info buffer: [env_idx][timestep] -> dict
+        # Stores only the info-dict data needed by non-obs hyperedge fns.
+        # Observations (needed by obs-based fns) are already in self.observations.
+        self.hypergraph_infos = [[] for _ in range(self.n_parallel_envs)]
 
-    def get_actions(self, observations, global_state, deterministic=False):
+    def get_actions(
+        self, observations, global_state, deterministic=False, hypergraphs=None
+    ):
         """
         Get actions for all agents
 
@@ -98,6 +116,8 @@ class MAPPOAgent:
             observations: List of observations, one per agent
             global_state: Concatenated global state (all agent observations)
             deterministic: Whether to use deterministic actions
+            hypergraphs: list of dhg.Hypergraph (one per type) or None.
+                         Required when critic_type="multi_hgnn".
 
         Returns:
             actions: List of actions for each agent
@@ -125,7 +145,11 @@ class MAPPOAgent:
                 log_probs.append(log_prob)
 
             # Get value from centralized critic
-            value = self.network_old.get_value(global_state_tensor)
+            if self.critic_type == "multi_hgnn":
+                obs_full = torch.stack(obs_tensors)  # (n_agents, obs_dim)
+                value = self.network_old.get_value(obs_full, hypergraphs=hypergraphs)
+            else:
+                value = self.network_old.get_value(global_state_tensor)
 
         return torch.stack(actions), torch.cat(log_probs), value
 
@@ -135,6 +159,7 @@ class MAPPOAgent:
         global_states_batch,
         deterministic=False,
         action_masks=None,
+        hypergraphs=None,
     ):
         """
         Get actions for all agents in all environments in a single batched forward pass.
@@ -144,6 +169,9 @@ class MAPPOAgent:
             global_states_batch: numpy (n_envs, global_state_dim)
             deterministic: Whether to use deterministic actions
             action_masks: numpy (n_envs, n_agents, n_actions) or None
+            hypergraphs: list[dhg.Hypergraph] of shape [n_hyperedge_types] or None.
+                         Each is a block-diagonal batched hypergraph over n_envs.
+                         Required when critic_type="multi_hgnn".
 
         Returns:
             actions:   tensor (n_envs, n_agents, action_dim) on self.device
@@ -213,8 +241,14 @@ class MAPPOAgent:
                     -1
                 )  # (n_envs, n_agents)
 
-            # Centralized critic: single batched pass over all envs
-            values = self.network_old.get_value(gs_tensor)  # (n_envs, 1)
+            # Centralized critic
+            if self.critic_type == "multi_hgnn":
+                obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+                values = self.network_old.get_value_batched(
+                    obs_flat, hypergraphs, n_envs
+                )  # (n_envs, 1)
+            else:
+                values = self.network_old.get_value(gs_tensor)  # (n_envs, 1)
 
         return actions, log_probs, values
 
@@ -275,6 +309,7 @@ class MAPPOAgent:
         dones,  # np (n_envs,)
         infos,  # dict
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
+        hypergraph_infos=None,  # dict {info_key: data[n_envs]} or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -322,6 +357,10 @@ class MAPPOAgent:
         for env_idx in range(n_envs):
             self.global_states[env_idx].append(gs_t[env_idx])
             self.values[env_idx].append(val_t[env_idx])
+            if hypergraph_infos is not None:
+                self.hypergraph_infos[env_idx].append(
+                    {k: v[env_idx] for k, v in hypergraph_infos.items()}
+                )
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
                 self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
@@ -401,6 +440,89 @@ class MAPPOAgent:
 
         return all_returns, all_advantages
 
+    def _build_flat_hyperedge_lists(self):
+        """Rebuild hyperedge lists from stored observations and info data.
+
+        For each (env, timestep) pair, reconstructs the per-agent observation
+        matrix and calls each hyperedge function to produce raw hyperedge
+        tuples (lightweight, suitable for batching later).
+
+        Returns:
+            all_edge_lists: list where all_edge_lists[i] is a list of
+                            hyperedge-tuple lists (one per type) for the
+                            i-th (env, timestep) pair.
+        """
+        all_edge_lists = []
+        for env_idx in range(self.n_parallel_envs):
+            T = len(self.observations[env_idx][0])
+            for t in range(T):
+                obs_np = (
+                    torch.stack(
+                        [self.observations[env_idx][a][t] for a in range(self.n_agents)]
+                    )
+                    .numpy()
+                )
+                info_data = (
+                    self.hypergraph_infos[env_idx][t]
+                    if self.hypergraph_infos[env_idx]
+                    else {}
+                )
+                edge_lists = []
+                for fn, source in self.hyperedge_fns:
+                    if source == "obs":
+                        edges = fn(obs_np, self.n_agents)
+                    elif source in info_data:
+                        edges = fn(info_data[source], self.n_agents)
+                    else:
+                        continue
+                    edge_lists.append(edges)
+                all_edge_lists.append(edge_lists)
+        return all_edge_lists
+
+    def _compute_hgnn_critic_values(
+        self, batch_global_states, batch_ts_indices, all_edge_lists
+    ):
+        """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
+
+        Batches all unique timesteps into a single block-diagonal hypergraph
+        per type, runs one forward pass, then scatters values back.
+
+        Args:
+            batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
+            batch_ts_indices: (B,) int tensor mapping each sample to an index
+                              in all_edge_lists.
+            all_edge_lists: flat list of hyperedge-tuple lists from
+                            _build_flat_hyperedge_lists.
+
+        Returns:
+            values: (B,) tensor of critic values.
+        """
+        unique_ts, inverse = batch_ts_indices.unique(return_inverse=True)
+        n_unique = unique_ts.shape[0]
+
+        # Gather obs for unique timesteps: (n_unique, n_agents * obs_dim)
+        obs_unique = torch.stack(
+            [batch_global_states[batch_ts_indices == idx][0] for idx in unique_ts]
+        )
+        obs_flat = obs_unique.reshape(n_unique * self.n_agents, self.observation_dim)
+
+        # Batch hyperedge lists per type into block-diagonal hypergraphs
+        n_types = len(all_edge_lists[0])
+        batched_hgs = []
+        for type_idx in range(n_types):
+            edge_lists = [all_edge_lists[idx.item()][type_idx] for idx in unique_ts]
+            batched_hg = batch_hypergraphs(
+                edge_lists, self.n_agents, device=str(batch_global_states.device)
+            )
+            batched_hgs.append(batched_hg)
+
+        # Single batched forward pass
+        unique_values = self.network.critic.forward_batched(
+            obs_flat, batched_hgs, n_unique
+        )  # (n_unique, 1)
+
+        return unique_values.squeeze(-1)[inverse]
+
     def update_shared(
         self,
         all_advantages,
@@ -422,13 +544,22 @@ class MAPPOAgent:
         all_returns_combined = []
         all_advantages_combined = []
         all_masks = []
+        all_ts_indices = []  # maps each sample to its (env, timestep) index
 
         has_masks = len(self.action_masks[0][0]) > 0
+        use_hgnn = self.critic_type == "multi_hgnn"
+
+        # Build flat hypergraph list for index-based lookup during training
+        if use_hgnn:
+            all_edge_lists = self._build_flat_hyperedge_lists()
 
         # Iterate through each environment
+        ts_offset = 0  # running offset for timestep indices
         for env_idx in range(self.n_parallel_envs):
             if len(self.values[env_idx]) == 0:
                 continue  # Skip empty environments
+
+            T = len(self.values[env_idx])  # timesteps for this env
 
             # For this environment, iterate through each agent
             for agent_idx in range(self.n_agents):
@@ -468,6 +599,12 @@ class MAPPOAgent:
                 if has_masks:
                     all_masks.append(torch.stack(self.action_masks[env_idx][agent_idx]))
 
+                if use_hgnn:
+                    # Each agent's T samples map to timestep indices ts_offset..ts_offset+T-1
+                    all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
+
+            ts_offset += T
+
         # Concatenate all data and move to training device (may be CUDA)
         combined_obs = torch.cat(all_obs, dim=0).detach().to(train_device)
         combined_global_states = (
@@ -482,6 +619,9 @@ class MAPPOAgent:
         combined_masks = (
             torch.cat(all_masks, dim=0).detach().to(train_device) if has_masks else None
         )
+        combined_ts_indices = (
+            torch.cat(all_ts_indices).to(train_device) if use_hgnn else None
+        )
 
         # Create dataset
         dataset_tensors = [
@@ -494,6 +634,8 @@ class MAPPOAgent:
         ]
         if combined_masks is not None:
             dataset_tensors.append(combined_masks)
+        if combined_ts_indices is not None:
+            dataset_tensors.append(combined_ts_indices)
 
         dataset = TensorDataset(*dataset_tensors)
 
@@ -502,36 +644,24 @@ class MAPPOAgent:
         # Train for multiple epochs
         for epoch in range(epochs):
             for batch in dataloader:
-                if combined_masks is not None:
-                    (
-                        batch_obs,
-                        batch_global_states,
-                        batch_actions,
-                        batch_old_log_probs,
-                        batch_returns,
-                        batch_advantages,
-                        batch_masks,
-                    ) = batch
-                else:
-                    (
-                        batch_obs,
-                        batch_global_states,
-                        batch_actions,
-                        batch_old_log_probs,
-                        batch_returns,
-                        batch_advantages,
-                    ) = batch
-                    batch_masks = None
+                # Unpack batch — order matches dataset_tensors above
+                batch_obs, batch_global_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages, *extra = batch
+                batch_masks = extra.pop(0) if combined_masks is not None else None
+                batch_ts_idx = extra[0].long() if use_hgnn else None
 
-                # We need to know which agent each sample belongs to
-                # For shared actor, we can use agent_idx = 0 (same for all)
-                log_probs, values, entropy = self.network.evaluate_actions(
-                    batch_obs,
-                    batch_global_states,
-                    batch_actions,
-                    agent_idx=0,
-                    action_mask=batch_masks,
+                # Actor evaluation (batched over individual agent observations)
+                actor = self.network.get_actor(0)
+                log_probs, entropy = actor.evaluate(
+                    batch_obs, batch_actions, action_mask=batch_masks
                 )
+
+                # Critic evaluation
+                if use_hgnn:
+                    values = self._compute_hgnn_critic_values(
+                        batch_global_states, batch_ts_idx, all_edge_lists
+                    )
+                else:
+                    values = self.network.critic(batch_global_states).squeeze(-1)
 
                 # PPO objective
                 ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs)
@@ -586,6 +716,10 @@ class MAPPOAgent:
         num_updates = 0
 
         has_masks = len(self.action_masks[0][0]) > 0
+        use_hgnn = self.critic_type == "multi_hgnn"
+
+        if use_hgnn:
+            all_edge_lists = self._build_flat_hyperedge_lists()
 
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
@@ -597,15 +731,21 @@ class MAPPOAgent:
             agent_returns = []
             agent_advantages = []
             agent_masks = []
+            agent_ts_indices = []
 
+            ts_offset = 0
             for env_idx in range(self.n_parallel_envs):
+                T = len(self.values[env_idx]) if len(self.values[env_idx]) > 0 else 0
+
                 if len(self.observations[env_idx][agent_idx]) == 0:
-                    continue  # Skip if no data for this agent in this environment
+                    ts_offset += T
+                    continue
 
                 # Get the index in the flattened advantages/returns list
                 data_idx = env_idx * self.n_agents + agent_idx
 
                 if data_idx >= len(all_advantages):
+                    ts_offset += T
                     continue
 
                 # Normalize advantages for this agent in this environment
@@ -634,6 +774,11 @@ class MAPPOAgent:
                         torch.stack(self.action_masks[env_idx][agent_idx])
                     )
 
+                if use_hgnn:
+                    agent_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
+
+                ts_offset += T
+
             if len(agent_obs) == 0:
                 continue  # No data for this agent
 
@@ -653,6 +798,9 @@ class MAPPOAgent:
                 if has_masks
                 else None
             )
+            ts_indices_combined = (
+                torch.cat(agent_ts_indices).to(train_device) if use_hgnn else None
+            )
 
             # Create dataset for this agent
             dataset_tensors = [
@@ -665,6 +813,8 @@ class MAPPOAgent:
             ]
             if masks_combined is not None:
                 dataset_tensors.append(masks_combined)
+            if ts_indices_combined is not None:
+                dataset_tensors.append(ts_indices_combined)
 
             dataset = TensorDataset(*dataset_tensors)
             dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
@@ -672,35 +822,24 @@ class MAPPOAgent:
             # Train for multiple epochs
             for epoch in range(epochs):
                 for batch in dataloader:
-                    if masks_combined is not None:
-                        (
-                            batch_obs,
-                            batch_global_states,
-                            batch_actions,
-                            batch_old_log_probs,
-                            batch_returns,
-                            batch_advantages,
-                            batch_masks,
-                        ) = batch
-                    else:
-                        (
-                            batch_obs,
-                            batch_global_states,
-                            batch_actions,
-                            batch_old_log_probs,
-                            batch_returns,
-                            batch_advantages,
-                        ) = batch
-                        batch_masks = None
+                    # Unpack batch — order matches dataset_tensors above
+                    batch_obs, batch_global_states, batch_actions, batch_old_log_probs, batch_returns, batch_advantages, *extra = batch
+                    batch_masks = extra.pop(0) if masks_combined is not None else None
+                    batch_ts_idx = extra[0].long() if use_hgnn else None
 
-                    # Forward pass
-                    log_probs, values, entropy = self.network.evaluate_actions(
-                        batch_obs,
-                        batch_global_states,
-                        batch_actions,
-                        agent_idx,
-                        action_mask=batch_masks,
+                    # Actor evaluation
+                    actor = self.network.get_actor(agent_idx)
+                    log_probs, entropy = actor.evaluate(
+                        batch_obs, batch_actions, action_mask=batch_masks
                     )
+
+                    # Critic evaluation
+                    if use_hgnn:
+                        values = self._compute_hgnn_critic_values(
+                            batch_global_states, batch_ts_idx, all_edge_lists
+                        )
+                    else:
+                        values = self.network.critic(batch_global_states).squeeze(-1)
 
                     # PPO objective
                     ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs)

@@ -68,11 +68,12 @@ def object_contact_hyperedges(
     hyperedge_list = []
     grouped_agents = set()
 
-    for agent_indices in agents_2_objects:
-        if len(agent_indices) >= 2:
-            edge = tuple(sorted(agent_indices))
-            hyperedge_list.append(edge)
-            grouped_agents.update(agent_indices)
+    for agents_per_object in agents_2_objects:
+        for agent_idxs in agents_per_object:
+            if len(agents_per_object) >= 2:
+                edge = tuple(sorted(agent_idxs))
+                hyperedge_list.append(edge)
+                grouped_agents.update(agent_idxs)
 
     # Deduplicate
     hyperedge_list = list(set(hyperedge_list))
@@ -86,10 +87,7 @@ def object_contact_hyperedges(
 
 
 def build_hypergraph(
-    n_envs: int,
-    n_agents: int,
-    data,
-    hyperedge_fn: Callable,
+    n_envs: int, n_agents: int, data, hyperedge_fn: Callable, device: str
 ) -> list[dhg.Hypergraph]:
     """
     Build hypergraphs from per-environment data.
@@ -112,10 +110,45 @@ def build_hypergraph(
     hypergraphs = []
     for env_idx in range(n_envs):
         hyperedge_list = hyperedge_fn(data[env_idx], n_agents)
-        hg = dhg.Hypergraph(n_agents, hyperedge_list)
+        hg = dhg.Hypergraph(n_agents, hyperedge_list, device=device)
         hypergraphs.append(hg)
 
     return hypergraphs
+
+
+def batch_hypergraphs(
+    edge_lists: list[list[tuple]],
+    n_vertices_per_graph: int,
+    device: str = "cpu",
+) -> dhg.Hypergraph:
+    """Merge multiple hypergraphs into a single block-diagonal hypergraph.
+
+    Each graph's vertex indices are offset by ``i * n_vertices_per_graph`` so
+    that the resulting incidence / Laplacian matrices are block-diagonal.
+    A single ``smoothing_with_HGNN`` call on the merged graph is equivalent
+    to running it on each sub-graph independently, but executes as one sparse
+    matmul.
+
+    Args:
+        edge_lists:  List of hyperedge lists, one per graph.  Each hyperedge
+                     list is a sequence of tuples of vertex indices (0-based
+                     within their own graph).
+        n_vertices_per_graph:  Number of vertices in each sub-graph (typically
+                               ``n_agents``).
+        device:      Torch device string.
+
+    Returns:
+        A single ``dhg.Hypergraph`` with
+        ``len(edge_lists) * n_vertices_per_graph`` vertices.
+    """
+    merged_edges: list[tuple] = []
+    for i, edges in enumerate(edge_lists):
+        offset = i * n_vertices_per_graph
+        for edge in edges:
+            merged_edges.append(tuple(v + offset for v in edge))
+
+    total_vertices = len(edge_lists) * n_vertices_per_graph
+    return dhg.Hypergraph(total_vertices, merged_edges, device=device)
 
 
 def compute_hyperedge_structural_entropy_batch(

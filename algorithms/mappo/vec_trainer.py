@@ -11,6 +11,7 @@ from environments.types import EnvironmentEnum
 from algorithms.create_env import make_vec_env
 from functools import partial
 from algorithms.mappo.hypergraph import (
+    batch_hypergraphs,
     build_hypergraph,
     compute_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
@@ -31,6 +32,8 @@ class VecMAPPOTrainer:
         device: str = "cpu",
         n_parallel_envs: int = 1,
         env_variant: str = None,
+        critic_type: str = "mlp",
+        n_hyperedge_types: int = 0,
     ):
         self.device = device
         self.dirs = dirs
@@ -39,6 +42,8 @@ class VecMAPPOTrainer:
         self.env_name = env_name
         self.n_parallel_envs = n_parallel_envs
         self.env_variant = env_variant
+        self.critic_type = critic_type
+        self.n_hyperedge_types = n_hyperedge_types
 
         # Create environment for evaluation (parallel eval episodes)
         self.n_eval_episodes = 5
@@ -80,6 +85,14 @@ class VecMAPPOTrainer:
         else:
             self.discrete = False
 
+        # Hyperedge builder specs: (fn, source) pairs
+        # "obs" means the fn receives the (n_agents, obs_dim) observation array;
+        # any other string is looked up in the info dict.
+        self.hyperedge_fns = [
+            (partial(distance_based_hyperedges, threshold=1.0), "obs"),
+            (object_contact_hyperedges, "agents_2_objects"),
+        ]
+
         # Create MAPPO agent
         self.agent = MAPPOAgent(
             observation_dim,
@@ -90,6 +103,11 @@ class VecMAPPOTrainer:
             self.device,
             self.discrete,
             self.n_parallel_envs,
+            critic_type=self.critic_type,
+            n_hyperedge_types=self.n_hyperedge_types,
+            hyperedge_fns=(
+                self.hyperedge_fns if self.critic_type == "multi_hgnn" else None
+            ),
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__
@@ -103,6 +121,31 @@ class VecMAPPOTrainer:
         # Timing statistics
         self.training_start_time = None
         self.total_training_time = 0.0
+
+    def _build_inference_hypergraphs(self, obs, infos, n_envs):
+        """Build batched block-diagonal hypergraphs for critic inference.
+
+        Returns None when the critic doesn't need hypergraphs,
+        otherwise a list of dhg.Hypergraph (one per hyperedge type),
+        each a block-diagonal graph batching all n_envs together.
+        """
+        if self.critic_type != "multi_hgnn":
+            return None
+
+        batched_hgs = []
+        for fn, source in self.hyperedge_fns:
+            if source == "obs":
+                data = obs
+            else:
+                data = infos.get(source) if isinstance(infos, dict) else None
+                if data is None:
+                    continue
+            edge_lists = [fn(data[e], self.n_agents) for e in range(n_envs)]
+            batched_hgs.append(
+                batch_hypergraphs(edge_lists, self.n_agents, device=self.device)
+            )
+
+        return batched_hgs
 
     def collect_trajectory(self, max_steps):
         """
@@ -137,9 +180,16 @@ class VecMAPPOTrainer:
             # Shape: (n_envs, n_agents * obs_dim)
             global_states = obs.reshape(batch_size, -1)
 
+            # Build hypergraphs only when the critic requires them
+            per_env_hgs = self._build_inference_hypergraphs(obs, infos, batch_size)
+
             # Single batched forward pass for all envs × agents
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
-                obs, global_states, deterministic=False, action_masks=current_masks
+                obs,
+                global_states,
+                deterministic=False,
+                action_masks=current_masks,
+                hypergraphs=per_env_hgs,
             )
 
             # Convert to numpy; shapes: (n_envs, n_agents, action_dim), (n_envs, n_agents), (n_envs, 1)
@@ -168,15 +218,16 @@ class VecMAPPOTrainer:
                 actions_array
             )
 
-            hypergraphs = build_hypergraph(
-                next_obs.shape[0],
-                next_obs.shape[1],
-                next_obs,
-                partial(distance_based_hyperedges, threshold=1.0),
-            )
-
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
+
+            # Extract lightweight info-dict data for non-obs hyperedge fns
+            hg_infos = {}
+            for _, source in self.hyperedge_fns:
+                if source != "obs" and isinstance(infos, dict):
+                    val = infos.get(source)
+                    if val is not None:
+                        hg_infos[source] = val
 
             # Store transitions for all environments in one vectorized call
             self.agent.store_transitions_batch(
@@ -189,6 +240,7 @@ class VecMAPPOTrainer:
                 dones,
                 infos,
                 action_masks=current_masks,
+                hypergraph_infos=hg_infos if hg_infos else None,
             )
 
             # Update masks for next step.
@@ -216,12 +268,30 @@ class VecMAPPOTrainer:
             final_gs_tensor = torch.from_numpy(
                 np.ascontiguousarray(final_global_states, dtype=np.float32)
             ).to(self.device)
-            final_values = (
-                self.agent.network_old.get_value(final_gs_tensor)
-                .cpu()
-                .squeeze(-1)
-                .tolist()
-            )
+
+            if self.agent.critic_type == "multi_hgnn":
+                final_batched_hgs = self._build_inference_hypergraphs(
+                    obs, infos, batch_size
+                )
+                obs_tensor = torch.from_numpy(
+                    np.ascontiguousarray(obs, dtype=np.float32)
+                ).to(self.device)
+                obs_flat = obs_tensor.reshape(batch_size * self.n_agents, -1)
+                final_values = (
+                    self.agent.network_old.get_value_batched(
+                        obs_flat, final_batched_hgs, batch_size
+                    )
+                    .cpu()
+                    .squeeze(-1)
+                    .tolist()
+                )
+            else:
+                final_values = (
+                    self.agent.network_old.get_value(final_gs_tensor)
+                    .cpu()
+                    .squeeze(-1)
+                    .tolist()
+                )
 
         return total_step_count, episode_count, final_values
 
@@ -372,8 +442,14 @@ class VecMAPPOTrainer:
             while not finished.all():
                 global_states = obs.reshape(n_eps, -1)
 
+                eval_hgs = self._build_inference_hypergraphs(obs, infos, n_eps)
+
                 actions_t, _, _ = self.agent.get_actions_batched(
-                    obs, global_states, deterministic=True, action_masks=current_masks
+                    obs,
+                    global_states,
+                    deterministic=True,
+                    action_masks=current_masks,
+                    hypergraphs=eval_hgs,
                 )
                 actions = actions_t.cpu().numpy()
 
@@ -428,11 +504,14 @@ class VecMAPPOTrainer:
                 obs_batch = obs[np.newaxis]
                 global_states = obs_batch.reshape(1, -1)
 
+                render_hgs = self._build_inference_hypergraphs(obs_batch, infos, 1)
+
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs_batch,
                     global_states,
                     deterministic=True,
                     action_masks=current_masks,
+                    hypergraphs=render_hgs,
                 )
                 actions = actions_t.cpu().numpy()[0]  # (n_agents, action_dim)
 

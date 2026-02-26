@@ -1,4 +1,4 @@
-from algorithms.ippo.types import Experiment, Params
+from algorithms.mappo.types import Experiment, MAPPO_Params, Model_Params
 from environments.types import EnvironmentEnum
 
 from dataclasses import asdict
@@ -7,17 +7,18 @@ from dataclasses import asdict
 ENVIRONMENT = EnvironmentEnum.MULTI_BOX
 BATCH_NAME = f"{ENVIRONMENT}_test"
 # EXPERIMENTS_LIST = ["mlp", "gru"]
-EXPERIMENTS_LIST = ["mlp_shared"]
+EXPERIMENTS_LIST = ["mlp_shared", "hgnn_shared"]
 DEVICE = "cpu"
-MODELS = ["mlp"]
 
 # EXPERIMENTS
 experiments = []
 for i, experiment_name in enumerate(EXPERIMENTS_LIST):
     experiment = Experiment(
         device=DEVICE,
-        model=MODELS[i],
-        params=Params(
+        model_params=Model_Params(
+            model_name="mlp", critic_type="mlp", n_hyperedge_types=2
+        ),
+        params=MAPPO_Params(
             n_epochs=10,
             n_total_steps=1e8,
             n_minibatches=4,

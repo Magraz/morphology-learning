@@ -1083,6 +1083,26 @@ class MultiBoxPushEnv(gym.Env):
             ]
         )
 
+    def _get_info(self, task_reward=0.0):
+        """Build the info dictionary returned by reset() and step()."""
+        return {
+            "target_positions": [
+                {
+                    "x": target.x,
+                    "y": target.y,
+                    "radius": target.radius,
+                    "requirement": target.coupling_requirement,
+                }
+                for target in self.target_areas
+            ],
+            "agent_positions": [
+                {"x": agent.position.x, "y": agent.position.y}
+                for agent in self.agents
+            ],
+            "task_reward": task_reward,
+            "agents_2_objects": self.get_agents_touching_objects(),
+        }
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
@@ -1121,7 +1141,7 @@ class MultiBoxPushEnv(gym.Env):
         if self.render_mode == "human":
             self.render()
 
-        return obs, {}
+        return obs, self._get_info()
 
     def step(self, actions):
 
@@ -1174,23 +1194,7 @@ class MultiBoxPushEnv(gym.Env):
         # Reset collision flag for next step (AFTER observation and rewards)
         self.contact_listener.reset()
 
-        # Create info dictionary with target positions
-        info = {
-            "target_positions": [
-                {
-                    "x": target.x,
-                    "y": target.y,
-                    "radius": target.radius,
-                    "requirement": target.coupling_requirement,
-                }
-                for target in self.target_areas
-            ],
-            "agent_positions": [
-                {"x": agent.position.x, "y": agent.position.y} for agent in self.agents
-            ],
-            "task_reward": task_reward,
-            "agents_2_objects": self.get_agents_touching_objects(),
-        }
+        info = self._get_info(task_reward=task_reward)
 
         self.current_step += 1
 

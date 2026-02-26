@@ -1,8 +1,11 @@
+import dhg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Categorical
 import numpy as np
+
+from hypergraphs.hgnn_conv_layer import HGNNConv
 
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
 
@@ -354,6 +357,158 @@ class MAPPOCritic(nn.Module):
         return self.critic(global_state)
 
 
+class HGNNCritic(nn.Module):
+    """Centralized critic that uses hypergraph neural network convolution
+    to aggregate information across agents before producing value estimates.
+
+    Input X has shape (n_agents, observation_dim) — one feature vector per agent node.
+    A dhg.Hypergraph encodes the relational structure between agents.
+    """
+
+    def __init__(
+        self,
+        observation_dim: int,
+        hidden_dim: int = 256,
+        n_hgnn_layers: int = 2,
+        drop_rate: float = 0.5,
+        value_mode: str = "shared",
+    ):
+        super(HGNNCritic, self).__init__()
+
+        assert value_mode in (
+            "shared",
+            "per_agent",
+        ), f"value_mode must be 'shared' or 'per_agent', got '{value_mode}'"
+        self.value_mode = value_mode
+
+        # HGNN convolution layers
+        self.convs = nn.ModuleList()
+        self.convs.append(HGNNConv(observation_dim, hidden_dim, drop_rate=drop_rate))
+        for _ in range(n_hgnn_layers - 1):
+            self.convs.append(HGNNConv(hidden_dim, hidden_dim, drop_rate=drop_rate))
+
+        # Value head
+        self.value_head = nn.Linear(hidden_dim, 1)
+
+    def forward(self, X: torch.Tensor, hg: dhg.Hypergraph) -> torch.Tensor:
+        """
+        Args:
+            X: Node feature matrix of shape (n_agents, observation_dim).
+            hg: Hypergraph structure over the n_agents vertices.
+
+        Returns:
+            If value_mode == "shared":    shape (1,)
+            If value_mode == "per_agent": shape (n_agents, 1)
+        """
+        for conv in self.convs:
+            X = conv(X, hg)
+
+        if self.value_mode == "shared":
+            # Mean-pool over agent nodes, then project to scalar
+            pooled = X.mean(dim=0, keepdim=True)  # (1, hidden_dim)
+            return self.value_head(pooled).squeeze(0)  # (1,)
+        else:
+            # Per-agent value estimate
+            return self.value_head(X)  # (n_agents, 1)
+
+
+class MultiHGNNCritic(nn.Module):
+    """Combines multiple HGNNCritics (one per hyperedge type) with an
+    additional type-feature input vector through a linear MLP.
+
+    Each hyperedge type gets its own HGNNCritic that processes the same
+    agent features X but with a different hypergraph structure. The scalar
+    outputs from all critics and mapped to a final value estimate.
+    """
+
+    def __init__(
+        self,
+        n_hyperedge_types: int,
+        n_agents: int,
+        observation_dim: int,
+        hidden_dim: int = 128,
+        n_hgnn_layers: int = 2,
+        drop_rate: float = 0.5,
+    ):
+        super(MultiHGNNCritic, self).__init__()
+
+        self.n_hyperedge_types = n_hyperedge_types
+
+        # One HGNNCritic per hyperedge type
+        self.critics = nn.ModuleList(
+            [
+                HGNNCritic(
+                    observation_dim,
+                    hidden_dim=hidden_dim,
+                    n_hgnn_layers=n_hgnn_layers,
+                    drop_rate=drop_rate,
+                    value_mode="per_agent",
+                )
+                for _ in range(n_hyperedge_types)
+            ]
+        )
+
+        # Combination layer: critic values + processed type features -> scalar
+        self.mixer = nn.Linear(n_hyperedge_types * n_agents, 1)
+
+        # Larger network for centralized critic
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(n_hyperedge_types * n_agents, 64)),
+            nn.ReLU(),
+            layer_init(nn.Linear(64, 1)),
+        )
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        hypergraphs: list,
+    ) -> torch.Tensor:
+        """
+        Args:
+            X: Node feature matrix of shape (n_agents, observation_dim).
+            hypergraphs: List of dhg.Hypergraph, one per hyperedge type.
+
+        Returns:
+            Scalar value estimate of shape (1,).
+        """
+        # Get a value from each type-specific critic and flatten
+        critic_values = torch.cat(
+            [critic(X, hg).flatten() for critic, hg in zip(self.critics, hypergraphs)]
+        )  # (n_hyperedge_types * n_agents,)
+
+        return self.mixer(critic_values)  # (1,)
+
+    def forward_batched(
+        self,
+        X: torch.Tensor,
+        batched_hgs: list,
+        n_graphs: int,
+    ) -> torch.Tensor:
+        """Batched forward pass over multiple environments/timesteps.
+
+        Args:
+            X: Node features of shape (n_graphs * n_agents, obs_dim).
+            batched_hgs: List of block-diagonal dhg.Hypergraph (one per
+                         hyperedge type), each with n_graphs * n_agents vertices.
+            n_graphs: Number of graphs batched together.
+
+        Returns:
+            Value estimates of shape (n_graphs, 1).
+        """
+        n_agents = X.shape[0] // n_graphs
+
+        per_type_values = []
+        for critic, hg in zip(self.critics, batched_hgs):
+            # Single forward pass through block-diagonal hypergraph
+            v = critic(X, hg)  # (n_graphs * n_agents, 1)
+            v = v.view(n_graphs, n_agents)  # (n_graphs, n_agents)
+            per_type_values.append(v)
+
+        # (n_graphs, n_types * n_agents)
+        combined = torch.cat(per_type_values, dim=1)
+        return self.mixer(combined)  # (n_graphs, 1)
+
+
 class MAPPONetwork(nn.Module):
     """Combined MAPPO network with shared/individual actors and centralized critic"""
 
@@ -366,12 +521,15 @@ class MAPPONetwork(nn.Module):
         hidden_dim: int = 128,
         discrete: bool = False,
         share_actor: bool = True,  # Whether to share actor parameters
+        critic_type: str = "mlp",  # "mlp" or "multi_hgnn"
+        n_hyperedge_types: int = 0,  # Required when critic_type="multi_hgnn"
     ):
         super(MAPPONetwork, self).__init__()
 
         self.n_agents = n_agents
         self.discrete = discrete
         self.share_actor = share_actor
+        self.critic_type = critic_type
 
         if share_actor:
             # Single shared actor for all agents
@@ -401,7 +559,18 @@ class MAPPONetwork(nn.Module):
                 )
 
         # Centralized critic (always shared)
-        self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
+        if critic_type == "multi_hgnn":
+            assert (
+                n_hyperedge_types > 0
+            ), "n_hyperedge_types must be > 0 for multi_hgnn critic"
+            self.critic = MultiHGNNCritic(
+                n_hyperedge_types,
+                n_agents,
+                observation_dim,
+                hidden_dim=hidden_dim * 2,
+            )
+        else:
+            self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
 
     def get_actor(self, agent_idx):
         """Get the actor for a specific agent"""
@@ -415,16 +584,56 @@ class MAPPONetwork(nn.Module):
         actor = self.get_actor(agent_idx)
         return actor.act(obs, deterministic, action_mask=action_mask)
 
-    def evaluate_actions(self, obs, global_states, actions, agent_idx, action_mask=None):
-        """Evaluate actions for training"""
+    def evaluate_actions(
+        self,
+        obs,
+        global_states,
+        actions,
+        agent_idx,
+        action_mask=None,
+        hypergraphs=None,
+    ):
+        """Evaluate actions for training
+
+        Args:
+            obs: Agent observations.
+            global_states: Global state for MLP critic.
+            actions: Actions to evaluate.
+            agent_idx: Agent index for actor selection.
+            action_mask: Optional action mask for discrete actions.
+            hypergraphs: List of dhg.Hypergraph (required for multi_hgnn critic).
+        """
         actor = self.get_actor(agent_idx)
         log_probs, entropy = actor.evaluate(obs, actions, action_mask=action_mask)
 
         # Get values from centralized critic
-        values = self.critic(global_states).squeeze(-1)
+        if self.critic_type == "multi_hgnn":
+            values = self.critic(obs, hypergraphs).squeeze(-1)
+        else:
+            values = self.critic(global_states).squeeze(-1)
 
         return log_probs, values, entropy
 
-    def get_value(self, global_state):
-        """Get value from centralized critic"""
+    def get_value(self, global_state, hypergraphs=None):
+        """Get value from centralized critic
+
+        Args:
+            global_state: Global state for MLP critic, or per-agent obs (n_agents, obs_dim) for multi_hgnn.
+            hypergraphs: List of dhg.Hypergraph (required for multi_hgnn critic).
+        """
+        if self.critic_type == "multi_hgnn":
+            return self.critic(global_state, hypergraphs)
         return self.critic(global_state)
+
+    def get_value_batched(self, obs_flat, batched_hgs, n_graphs):
+        """Batched value estimation for multi_hgnn critic.
+
+        Args:
+            obs_flat: (n_graphs * n_agents, obs_dim) concatenated observations.
+            batched_hgs: List of block-diagonal dhg.Hypergraph, one per type.
+            n_graphs: Number of graphs batched together.
+
+        Returns:
+            Value estimates of shape (n_graphs, 1).
+        """
+        return self.critic.forward_batched(obs_flat, batched_hgs, n_graphs)
