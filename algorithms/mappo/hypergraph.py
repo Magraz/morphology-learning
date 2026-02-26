@@ -31,17 +31,21 @@ def distance_based_hyperedges(
     dist_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
 
     hyperedge_list = []
+    grouped_agents = set()
+
     for i in range(n_agents):
         members = tuple(np.where(dist_matrix[i] <= threshold)[0].tolist())
         if len(members) > 1:
             hyperedge_list.append(members)
+            grouped_agents.update(members)
 
     # Deduplicate: symmetric neighbourhoods produce identical hyperedges
     hyperedge_list = list(set(hyperedge_list))
 
-    # Fallback: if no group hyperedges exist, every agent is isolated
-    if not hyperedge_list:
-        hyperedge_list = [(i,) for i in range(n_agents)]
+    # Isolated self-loops for agents not in any multi-agent hyperedge
+    for i in range(n_agents):
+        if i not in grouped_agents:
+            hyperedge_list.append((i,))
 
     return hyperedge_list
 
@@ -69,25 +73,23 @@ def object_contact_hyperedges(
     grouped_agents = set()
 
     for agents_per_object in agents_2_objects:
-        for agent_idxs in agents_per_object:
-            if len(agents_per_object) >= 2:
-                edge = tuple(sorted(agent_idxs))
-                hyperedge_list.append(edge)
-                grouped_agents.update(agent_idxs)
+        if len(agents_per_object) > 0:
+            edge = tuple(sorted(agents_per_object))
+            hyperedge_list.append(edge)
+            grouped_agents.update(agents_per_object)
 
     # Deduplicate
     hyperedge_list = list(set(hyperedge_list))
 
-    # Isolated self-loops for agents not in any multi-agent hyperedge
-    for i in range(n_agents):
-        if i not in grouped_agents:
-            hyperedge_list.append((i,))
+    # Fallback: if no group hyperedges exist, every agent is isolated
+    if not hyperedge_list:
+        hyperedge_list = [()]
 
     return hyperedge_list
 
 
 def build_hypergraph(
-    n_envs: int, n_agents: int, data, hyperedge_fn: Callable, device: str
+    n_envs: int, n_agents: int, data, hyperedge_fn: Callable, device: str = "cpu"
 ) -> list[dhg.Hypergraph]:
     """
     Build hypergraphs from per-environment data.

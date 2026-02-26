@@ -448,11 +448,7 @@ class MultiHGNNCritic(nn.Module):
             ]
         )
 
-        # Combination layer: critic values + processed type features -> scalar
-        self.mixer = nn.Linear(n_hyperedge_types * n_agents, 1)
-
-        # Larger network for centralized critic
-        self.critic = nn.Sequential(
+        self.mixer = nn.Sequential(
             layer_init(nn.Linear(n_hyperedge_types * n_agents, 64)),
             nn.ReLU(),
             layer_init(nn.Linear(64, 1)),

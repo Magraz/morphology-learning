@@ -479,42 +479,98 @@ class MAPPOAgent:
                 all_edge_lists.append(edge_lists)
         return all_edge_lists
 
+    @staticmethod
+    def _canonicalize_hyperedge_type(edge_list):
+        """Return a hashable, order-invariant representation of one edge type."""
+        return tuple(
+            sorted(tuple(sorted(int(v) for v in edge)) for edge in edge_list)
+        )
+
+    def _build_hyperedge_structure_index(self, all_edge_lists):
+        """Deduplicate per-timestep hyperedge structures.
+
+        Args:
+            all_edge_lists: list where each item is a list of edge-lists
+                            (one edge-list per hyperedge type).
+
+        Returns:
+            unique_edge_lists: representative edge-lists for each unique structure.
+            ts_to_signature_ids: list mapping timestep index -> signature id.
+        """
+        signature_to_id = {}
+        unique_edge_lists = []
+        ts_to_signature_ids = []
+
+        for edge_lists in all_edge_lists:
+            signature = tuple(
+                self._canonicalize_hyperedge_type(type_edges) for type_edges in edge_lists
+            )
+            sig_id = signature_to_id.get(signature)
+            if sig_id is None:
+                sig_id = len(unique_edge_lists)
+                signature_to_id[signature] = sig_id
+                unique_edge_lists.append(edge_lists)
+            ts_to_signature_ids.append(sig_id)
+
+        return unique_edge_lists, ts_to_signature_ids
+
     def _compute_hgnn_critic_values(
-        self, batch_global_states, batch_ts_indices, all_edge_lists
+        self,
+        batch_global_states,
+        batch_ts_indices,
+        unique_edge_lists,
+        ts_to_signature_ids,
+        hgnn_batch_cache,
     ):
         """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
 
-        Batches all unique timesteps into a single block-diagonal hypergraph
-        per type, runs one forward pass, then scatters values back.
+        Reuses cached block-diagonal batched hypergraphs keyed by hyperedge
+        structure signatures (not raw timestep ids), runs one critic forward
+        pass over unique timesteps, then scatters values back to batch order.
 
         Args:
             batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
             batch_ts_indices: (B,) int tensor mapping each sample to an index
-                              in all_edge_lists.
-            all_edge_lists: flat list of hyperedge-tuple lists from
-                            _build_flat_hyperedge_lists.
+                              in ts_to_signature_ids.
+            unique_edge_lists: representative edge-lists per unique signature.
+            ts_to_signature_ids: list mapping timestep index -> signature id.
+            hgnn_batch_cache: dict mapping tuple(signature ids in minibatch) to
+                              pre-built list[dhg.Hypergraph] batched by type.
 
         Returns:
             values: (B,) tensor of critic values.
         """
+        B = batch_global_states.shape[0]
         unique_ts, inverse = batch_ts_indices.unique(return_inverse=True)
         n_unique = unique_ts.shape[0]
 
-        # Gather obs for unique timesteps: (n_unique, n_agents * obs_dim)
-        obs_unique = torch.stack(
-            [batch_global_states[batch_ts_indices == idx][0] for idx in unique_ts]
+        # Vectorized first-occurrence gathering (replaces Python loop)
+        first_occ = torch.full(
+            (n_unique,), B, dtype=torch.long, device=batch_ts_indices.device
         )
+        arange = torch.arange(B, device=batch_ts_indices.device)
+        first_occ.scatter_reduce_(0, inverse, arange, reduce="amin")
+        obs_unique = batch_global_states[first_occ]
         obs_flat = obs_unique.reshape(n_unique * self.n_agents, self.observation_dim)
 
-        # Batch hyperedge lists per type into block-diagonal hypergraphs
-        n_types = len(all_edge_lists[0])
-        batched_hgs = []
-        for type_idx in range(n_types):
-            edge_lists = [all_edge_lists[idx.item()][type_idx] for idx in unique_ts]
-            batched_hg = batch_hypergraphs(
-                edge_lists, self.n_agents, device=str(batch_global_states.device)
-            )
-            batched_hgs.append(batched_hg)
+        unique_ts_list = [idx.item() for idx in unique_ts]
+        unique_sig_ids = [ts_to_signature_ids[ts] for ts in unique_ts_list]
+
+        # Cache by structural signature ids so different timesteps with the
+        # same hyperedge structure can reuse the same batched dhg objects.
+        cache_key = tuple(unique_sig_ids)
+        batched_hgs = hgnn_batch_cache.get(cache_key)
+        if batched_hgs is None:
+            n_types = len(unique_edge_lists[0])
+            batched_hgs = []
+            for type_idx in range(n_types):
+                edge_lists = [
+                    unique_edge_lists[sig_id][type_idx] for sig_id in unique_sig_ids
+                ]
+                batched_hgs.append(
+                    batch_hypergraphs(edge_lists, self.n_agents, device=self.device)
+                )
+            hgnn_batch_cache[cache_key] = batched_hgs
 
         # Single batched forward pass
         unique_values = self.network.critic.forward_batched(
@@ -549,9 +605,14 @@ class MAPPOAgent:
         has_masks = len(self.action_masks[0][0]) > 0
         use_hgnn = self.critic_type == "multi_hgnn"
 
-        # Build flat hypergraph list for index-based lookup during training
+        # Build flat hyperedge list once, then deduplicate by structure.
+        # Minibatches reuse cached batched hypergraphs by signature-id pattern.
         if use_hgnn:
             all_edge_lists = self._build_flat_hyperedge_lists()
+            unique_edge_lists, ts_to_signature_ids = self._build_hyperedge_structure_index(
+                all_edge_lists
+            )
+            hgnn_batch_cache = {}
 
         # Iterate through each environment
         ts_offset = 0  # running offset for timestep indices
@@ -658,7 +719,11 @@ class MAPPOAgent:
                 # Critic evaluation
                 if use_hgnn:
                     values = self._compute_hgnn_critic_values(
-                        batch_global_states, batch_ts_idx, all_edge_lists
+                        batch_global_states,
+                        batch_ts_idx,
+                        unique_edge_lists,
+                        ts_to_signature_ids,
+                        hgnn_batch_cache,
                     )
                 else:
                     values = self.network.critic(batch_global_states).squeeze(-1)
@@ -720,6 +785,10 @@ class MAPPOAgent:
 
         if use_hgnn:
             all_edge_lists = self._build_flat_hyperedge_lists()
+            unique_edge_lists, ts_to_signature_ids = self._build_hyperedge_structure_index(
+                all_edge_lists
+            )
+            hgnn_batch_cache = {}
 
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
@@ -836,7 +905,11 @@ class MAPPOAgent:
                     # Critic evaluation
                     if use_hgnn:
                         values = self._compute_hgnn_critic_values(
-                            batch_global_states, batch_ts_idx, all_edge_lists
+                            batch_global_states,
+                            batch_ts_idx,
+                            unique_edge_lists,
+                            ts_to_signature_ids,
+                            hgnn_batch_cache,
                         )
                     else:
                         values = self.network.critic(batch_global_states).squeeze(-1)

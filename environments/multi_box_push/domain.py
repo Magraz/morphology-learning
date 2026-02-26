@@ -9,6 +9,7 @@ from algorithms.mappo.hypergraph import (
     build_hypergraph,
     compute_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
+    object_contact_hyperedges,
 )
 
 from Box2D import (
@@ -1096,8 +1097,7 @@ class MultiBoxPushEnv(gym.Env):
                 for target in self.target_areas
             ],
             "agent_positions": [
-                {"x": agent.position.x, "y": agent.position.y}
-                for agent in self.agents
+                {"x": agent.position.x, "y": agent.position.y} for agent in self.agents
             ],
             "task_reward": task_reward,
             "agents_2_objects": self.get_agents_touching_objects(),
@@ -1247,7 +1247,7 @@ class MultiBoxPushEnv(gym.Env):
 if __name__ == "__main__":
     # Create the environment with rendering
     env = MultiBoxPushEnv(
-        render_mode="human", n_agents=3, n_target_areas=1, max_steps=512
+        render_mode="human", n_agents=5, n_target_areas=1, max_steps=512
     )
     obs, info = env.reset()
 
@@ -1336,9 +1336,11 @@ if __name__ == "__main__":
 
         # Hypergraph testing
         obs = np.expand_dims(obs, axis=0)
+        # hypergraphs = build_hypergraph(
+        #     1, env.n_agents, obs, partial(distance_based_hyperedges, threshold=1.0)
+        # )
         hypergraphs = build_hypergraph(
-            1, env.n_agents,
-            obs, partial(distance_based_hyperedges, threshold=1.0)
+            1, env.n_agents, [info["agents_2_objects"]], object_contact_hyperedges
         )
         entropies = compute_hyperedge_structural_entropy_batch(hypergraphs)
         entropy_log.append(entropies[0])  # [S_e, S_normalized] for this step
