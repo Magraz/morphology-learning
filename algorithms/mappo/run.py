@@ -103,7 +103,7 @@ class MAPPO_Runner(Runner):
 
         # Test trained agents with rendering
         print("\nTesting trained agents...")
-        for episode in range(2):
+        for episode in range(10):
             rewards, entropy_logs = self.trainer.render()
 
             print(f"REWARD: {rewards[-1]:.4f}")
@@ -125,12 +125,21 @@ class MAPPO_Runner(Runner):
 
                 row = 1
                 for htype, ent in entropy_logs.items():
+                    is_soft = htype.startswith("soft_")
+                    prefix = r"$\tilde{S}_e$" if is_soft else "$S_e$"
+                    prefix_norm = (
+                        r"$\tilde{S}_{\mathrm{norm}}$"
+                        if is_soft
+                        else r"$S_{\mathrm{norm}}$"
+                    )
+                    label = htype.removeprefix("soft_")
+
                     axes[row].plot(steps, ent[:, 0])
-                    axes[row].set_ylabel(f"$S_e$ ({htype})")
+                    axes[row].set_ylabel(f"{prefix} ({label})")
                     row += 1
 
                     axes[row].plot(steps, ent[:, 1])
-                    axes[row].set_ylabel(f"$S_{{\\mathrm{{norm}}}}$ ({htype})")
+                    axes[row].set_ylabel(f"{prefix_norm} ({label})")
                     row += 1
 
                 axes[-1].set_xlabel("Step")

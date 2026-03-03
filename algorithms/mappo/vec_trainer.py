@@ -15,6 +15,7 @@ from algorithms.mappo.hypergraph import (
     build_hypergraph,
     canonicalize_edge_lists,
     compute_hyperedge_structural_entropy_batch,
+    compute_soft_hyperedge_structural_entropy_batch,
     distance_based_hyperedges,
     object_contact_hyperedges,
 )
@@ -514,9 +515,10 @@ class VecMAPPOTrainer:
 
         Returns:
             rewards:      np.ndarray of shape (n_steps,), per-step rewards.
-            entropy_logs: dict mapping hyperedge type ("proximity", "object")
-                          to np.ndarray of shape (n_steps, 2) with
-                          [S_e, S_normalized] per step.
+            entropy_logs: dict mapping hyperedge type to np.ndarray of shape
+                          (n_steps, 2). Keys: "proximity", "object" (hard-count
+                          entropy with [S_e, S_normalized]) and "soft_proximity",
+                          "soft_object" (smooth surrogate with [S_soft, S_soft_norm]).
         """
         render_env = self._make_render_env()
 
@@ -525,6 +527,8 @@ class VecMAPPOTrainer:
         cum_sum = 0.0
         entropy_proximity_log = []
         entropy_object_log = []
+        soft_entropy_proximity_log = []
+        soft_entropy_object_log = []
 
         seed = int(np.random.randint(0, 2**31))
         obs, infos = render_env.reset(seed=seed)
@@ -569,6 +573,10 @@ class VecMAPPOTrainer:
                 entropy_proximity_log.append(entropies[0])  # [S_e, S_normalized]
                 entropy_object_log.append(entropies[1])
 
+                soft_entropies = compute_soft_hyperedge_structural_entropy_batch(render_hgs)
+                soft_entropy_proximity_log.append(soft_entropies[0])
+                soft_entropy_object_log.append(soft_entropies[1])
+
                 if terminated or truncated:
                     break
 
@@ -577,6 +585,8 @@ class VecMAPPOTrainer:
         entropy_logs = {
             "proximity": np.array(entropy_proximity_log),
             "object": np.array(entropy_object_log),
+            "soft_proximity": np.array(soft_entropy_proximity_log),
+            "soft_object": np.array(soft_entropy_object_log),
         }
         return np.array(episode_reward), entropy_logs
 
