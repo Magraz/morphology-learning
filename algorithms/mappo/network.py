@@ -681,7 +681,7 @@ class MAPPONetwork(nn.Module):
         self.share_actor = share_actor
         self.critic_type = critic_type
         # Extra actor input features from predicted entropy: [mean, log_var] per type
-        self.entropy_pred_dim = 2 * n_hyperedge_types if n_hyperedge_types > 0 else 0
+        self.entropy_pred_dim = 2 * n_hyperedge_types if entropy_conditioning and n_hyperedge_types > 0 else 0
 
         if share_actor:
             # Single shared actor for all agents
@@ -744,7 +744,7 @@ class MAPPONetwork(nn.Module):
             HypergraphEntropyPredictor(
                 n_agents, observation_dim, n_hyperedge_types, hidden_dim=64
             )
-            if n_hyperedge_types > 0
+            if entropy_conditioning and n_hyperedge_types > 0
             else None
         )
 
