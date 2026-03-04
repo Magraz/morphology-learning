@@ -36,6 +36,9 @@ class VecMAPPOTrainer:
         env_variant: str = None,
         critic_type: str = "mlp",
         n_hyperedge_types: int = 0,
+        entropy_pred_seq_len: int = 32,
+        entropy_pred_coef: float = 0.01,
+        entropy_conditioning: bool = True,
     ):
         self.device = device
         self.dirs = dirs
@@ -46,6 +49,9 @@ class VecMAPPOTrainer:
         self.env_variant = env_variant
         self.critic_type = critic_type
         self.n_hyperedge_types = n_hyperedge_types
+        self.entropy_pred_seq_len = entropy_pred_seq_len
+        self.entropy_pred_coef = entropy_pred_coef
+        self.entropy_conditioning = entropy_conditioning
 
         # Create environment for evaluation (parallel eval episodes)
         self.n_eval_episodes = 5
@@ -110,6 +116,9 @@ class VecMAPPOTrainer:
             hyperedge_fns=(
                 self.hyperedge_fns if self.critic_type == "multi_hgnn" else None
             ),
+            entropy_pred_seq_len=self.entropy_pred_seq_len,
+            entropy_pred_coef=self.entropy_pred_coef,
+            entropy_conditioning=self.entropy_conditioning,
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__
@@ -187,6 +196,24 @@ class VecMAPPOTrainer:
 
         return batched_hgs, per_env_sig_ids
 
+    def _compute_entropies_for_critic(self, per_env_sig_ids):
+        """Compute structural entropy values for critic conditioning.
+
+        Args:
+            per_env_sig_ids: list of int signature IDs (one per env), or None.
+
+        Returns:
+            Tensor of shape (n_envs, n_types) on self.device, or None.
+        """
+        if per_env_sig_ids is None:
+            return None
+        entropies = []
+        for sig_id in per_env_sig_ids:
+            entropies.append(self.agent.get_or_compute_entropy(sig_id))
+        return torch.tensor(
+            np.stack(entropies), dtype=torch.float32
+        ).to(self.agent.device)
+
     def collect_trajectory(self, max_steps):
         """
         Collect trajectory using Gymnasium's vectorized environments.
@@ -214,6 +241,9 @@ class VecMAPPOTrainer:
         episode_count = 0
         current_episode_steps = np.zeros(self.n_parallel_envs, dtype=np.int32)
 
+        # Reset rolling obs history for entropy predictor at trajectory start
+        self.agent.reset_obs_history()
+
         while total_step_count <= max_steps:
 
             # Construct global states for each environment
@@ -225,6 +255,12 @@ class VecMAPPOTrainer:
                 obs, infos, batch_size
             )
 
+            # Compute structural entropies for critic conditioning
+            per_env_entropies = (
+                self._compute_entropies_for_critic(per_env_sig_ids)
+                if self.entropy_conditioning else None
+            )
+
             # Single batched forward pass for all envs × agents
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
                 obs,
@@ -232,6 +268,7 @@ class VecMAPPOTrainer:
                 deterministic=False,
                 action_masks=current_masks,
                 hypergraphs=per_env_hgs,
+                entropies=per_env_entropies,
             )
 
             # Convert to numpy; shapes: (n_envs, n_agents, action_dim), (n_envs, n_agents), (n_envs, 1)
@@ -263,6 +300,10 @@ class VecMAPPOTrainer:
             # Compute dones for each environment
             dones = np.logical_or(terminateds, truncateds)
 
+            # Reset obs history for terminated envs so predictor starts fresh
+            if dones.any():
+                self.agent.reset_obs_history(env_mask=dones)
+
             # Store transitions for all environments in one vectorized call
             self.agent.store_transitions_batch(
                 obs,
@@ -275,6 +316,7 @@ class VecMAPPOTrainer:
                 infos,
                 action_masks=current_masks,
                 hg_signature_ids=per_env_sig_ids,
+                entropies=per_env_entropies,
             )
 
             # Update masks for next step.
@@ -304,8 +346,12 @@ class VecMAPPOTrainer:
             ).to(self.device)
 
             if self.agent.critic_type == "multi_hgnn":
-                final_batched_hgs, _ = self._build_inference_hypergraphs(
+                final_batched_hgs, final_sig_ids = self._build_inference_hypergraphs(
                     obs, infos, batch_size
+                )
+                final_entropies = (
+                    self._compute_entropies_for_critic(final_sig_ids)
+                    if self.entropy_conditioning else None
                 )
                 obs_tensor = torch.from_numpy(
                     np.ascontiguousarray(obs, dtype=np.float32)
@@ -313,7 +359,7 @@ class VecMAPPOTrainer:
                 obs_flat = obs_tensor.reshape(batch_size * self.n_agents, -1)
                 final_values = (
                     self.agent.network_old.get_value_batched(
-                        obs_flat, final_batched_hgs, batch_size
+                        obs_flat, final_batched_hgs, batch_size, entropies=final_entropies
                     )
                     .cpu()
                     .squeeze(-1)
@@ -480,7 +526,11 @@ class VecMAPPOTrainer:
             while not finished.all():
                 global_states = obs.reshape(n_eps, -1)
 
-                eval_hgs, _ = self._build_inference_hypergraphs(obs, infos, n_eps)
+                eval_hgs, eval_sig_ids = self._build_inference_hypergraphs(obs, infos, n_eps)
+                eval_entropies = (
+                    self._compute_entropies_for_critic(eval_sig_ids)
+                    if self.entropy_conditioning else None
+                )
 
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
@@ -488,6 +538,7 @@ class VecMAPPOTrainer:
                     deterministic=True,
                     action_masks=current_masks,
                     hypergraphs=eval_hgs,
+                    entropies=eval_entropies,
                 )
                 actions = actions_t.cpu().numpy()
 
@@ -541,7 +592,11 @@ class VecMAPPOTrainer:
                 # Add batch dim expected by get_actions_batched: (1, n_agents, obs_dim)
                 global_states = obs.reshape(1, -1)
 
-                render_hgs, _ = self._build_inference_hypergraphs(obs, infos, 1)
+                render_hgs, render_sig_ids = self._build_inference_hypergraphs(obs, infos, 1)
+                render_entropies = (
+                    self._compute_entropies_for_critic(render_sig_ids)
+                    if self.entropy_conditioning else None
+                )
 
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
@@ -549,6 +604,7 @@ class VecMAPPOTrainer:
                     deterministic=True,
                     action_masks=current_masks,
                     hypergraphs=render_hgs,
+                    entropies=render_entropies,
                 )
                 actions = actions_t.cpu().numpy()  # (n_agents, action_dim)
 

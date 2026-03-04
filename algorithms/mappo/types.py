@@ -28,6 +28,11 @@ class Model_Params:
     critic_type: str
     # For HGNN
     n_hyperedge_types: int
+    # Entropy conditioning of HGNN critics
+    entropy_conditioning: bool = False
+    # Auxiliary LSTM entropy predictor
+    entropy_pred_seq_len: int = 32
+    entropy_pred_coef: float = 0.01
 
 
 @dataclass

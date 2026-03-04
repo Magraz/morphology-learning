@@ -64,6 +64,9 @@ class MAPPO_Runner(Runner):
             env_variant=self.env_config.env_variant,
             critic_type=self.model_params.critic_type,
             n_hyperedge_types=self.model_params.n_hyperedge_types,
+            entropy_pred_seq_len=self.model_params.entropy_pred_seq_len,
+            entropy_pred_coef=self.model_params.entropy_pred_coef,
+            entropy_conditioning=self.model_params.entropy_conditioning,
         )
 
     def train(self):

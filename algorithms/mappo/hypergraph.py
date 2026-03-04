@@ -189,7 +189,7 @@ def compute_hyperedge_structural_entropy_batch(
 
 def compute_soft_hyperedge_structural_entropy_batch(
     hypergraphs: list,
-    n_bins: int = 4,
+    n_bins: int = 30,
     sigma: float | None = None,
     use_log_binning: bool = True,
 ) -> np.ndarray:
@@ -339,3 +339,79 @@ def calculate_soft_hyperedge_structural_entropy(
     S_soft_norm = S_soft / S_max if S_max > 0 else 0.0
 
     return S_soft, S_soft_norm, weights
+
+
+def soft_entropy_from_edges(
+    edge_list: list[tuple],
+    n_vertices: int,
+    n_bins: int = 30,
+    sigma: float | None = None,
+    use_log_binning: bool = True,
+    log_delta: float = 1.0,
+    eps: float = 1e-12,
+) -> tuple[float, float]:
+    """Fast soft structural entropy computed directly from an edge list.
+
+    Equivalent to ``calculate_soft_hyperedge_structural_entropy`` but avoids
+    constructing a ``dhg.Hypergraph`` and the expensive sparse→dense
+    incidence-matrix conversion.
+
+    Args:
+        edge_list:       List of hyperedge tuples (vertex indices).
+        n_vertices:      Number of vertices in the hypergraph.
+        n_bins:          Number of histogram bins B.
+        sigma:           Gaussian RBF bandwidth (None = auto).
+        use_log_binning: Bin in log-space if True.
+        log_delta:       Offset before log transform.
+        eps:             Numerical stability constant.
+
+    Returns:
+        (S_soft, S_soft_norm) — smoothed entropy and normalised version.
+    """
+    E_total = len(edge_list)
+    if E_total <= 1:
+        return 0.0, 0.0
+
+    # Node hyperdegrees
+    D = np.zeros(n_vertices, dtype=np.float64)
+    for edge in edge_list:
+        for v in edge:
+            D[v] += 1.0
+
+    # Per-edge weights: w(e) = |e| * sum_{v in e} D(v)
+    weights = np.empty(E_total, dtype=np.float64)
+    for i, edge in enumerate(edge_list):
+        weights[i] = len(edge) * sum(D[v] for v in edge)
+
+    # Bin centers
+    if use_log_binning:
+        values = np.log(weights + log_delta)
+    else:
+        values = weights
+
+    v_min, v_max = values.min(), values.max()
+    if v_max - v_min < eps:
+        return 0.0, 0.0
+
+    centers = np.linspace(v_min, v_max, n_bins)
+    bin_spacing = centers[1] - centers[0] if n_bins > 1 else 1.0
+
+    if sigma is None:
+        sigma = 0.75 * bin_spacing
+
+    # Soft-assign via Gaussian RBF
+    diffs = values[:, np.newaxis] - centers[np.newaxis, :]
+    log_assignments = -(diffs**2) / (2.0 * sigma**2)
+    log_assignments -= log_assignments.max(axis=1, keepdims=True)
+    assignments = np.exp(log_assignments)
+    assignments /= assignments.sum(axis=1, keepdims=True)
+
+    # Smoothed entropy
+    soft_counts = assignments.sum(axis=0)
+    P_soft = soft_counts / E_total
+    S_soft = -np.sum(P_soft * np.log(P_soft + eps))
+
+    S_max = np.log(n_bins)
+    S_soft_norm = S_soft / S_max if S_max > 0 else 0.0
+
+    return S_soft, S_soft_norm
