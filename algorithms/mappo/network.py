@@ -379,7 +379,7 @@ class HGNNCritic(nn.Module):
         n_hgnn_layers: int = 2,
         drop_rate: float = 0.5,
         value_mode: str = "shared",
-        entropy_conditioning: bool = True,
+        entropy_conditioning: bool = False,
     ):
         super(HGNNCritic, self).__init__()
 
@@ -470,7 +470,7 @@ class MultiHGNNCritic(nn.Module):
         hidden_dim: int = 128,
         n_hgnn_layers: int = 2,
         drop_rate: float = 0.5,
-        entropy_conditioning: bool = True,
+        entropy_conditioning: bool = False,
     ):
         super(MultiHGNNCritic, self).__init__()
 
@@ -594,9 +594,7 @@ class HypergraphEntropyPredictor(nn.Module):
             n_lstm_layers,
             batch_first=True,
         )
-        self.mean_head = layer_init(
-            nn.Linear(hidden_dim, n_hyperedge_types), std=0.01
-        )
+        self.mean_head = layer_init(nn.Linear(hidden_dim, n_hyperedge_types), std=0.01)
         self.log_var_head = layer_init(
             nn.Linear(hidden_dim, n_hyperedge_types), std=0.01
         )
@@ -674,7 +672,7 @@ class MAPPONetwork(nn.Module):
         share_actor: bool = True,  # Whether to share actor parameters
         critic_type: str = "mlp",  # "mlp" or "multi_hgnn"
         n_hyperedge_types: int = 0,  # Required when critic_type="multi_hgnn"
-        entropy_conditioning: bool = True,
+        entropy_conditioning: bool = False,
     ):
         super(MAPPONetwork, self).__init__()
 
@@ -689,12 +687,17 @@ class MAPPONetwork(nn.Module):
             # Single shared actor for all agents
             if self.discrete:
                 self.actor = MAPPOActor(
-                    observation_dim, action_dim, hidden_dim, self.discrete,
+                    observation_dim,
+                    action_dim,
+                    hidden_dim,
+                    self.discrete,
                     entropy_pred_dim=self.entropy_pred_dim,
                 )
             else:
                 self.actor = MAPPOActor(
-                    observation_dim, action_dim, hidden_dim,
+                    observation_dim,
+                    action_dim,
+                    hidden_dim,
                     entropy_pred_dim=self.entropy_pred_dim,
                 )
 
@@ -704,7 +707,10 @@ class MAPPONetwork(nn.Module):
                 self.actors = nn.ModuleList(
                     [
                         MAPPOActor(
-                            observation_dim, action_dim, hidden_dim, discrete,
+                            observation_dim,
+                            action_dim,
+                            hidden_dim,
+                            discrete,
                             entropy_pred_dim=self.entropy_pred_dim,
                         )
                         for _ in range(n_agents)

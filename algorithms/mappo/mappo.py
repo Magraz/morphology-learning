@@ -31,7 +31,7 @@ class MAPPOAgent:
         hyperedge_fns: list[tuple] = None,
         entropy_pred_seq_len: int = 32,
         entropy_pred_coef: float = 0.01,
-        entropy_conditioning: bool = True,
+        entropy_conditioning: bool = False,
     ):
         self.device = "cuda" if torch.cuda.is_available() else device
         self.n_agents = n_agents

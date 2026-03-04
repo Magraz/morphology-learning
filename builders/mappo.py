@@ -7,7 +7,7 @@ from dataclasses import asdict
 ENVIRONMENT = EnvironmentEnum.MULTI_BOX
 BATCH_NAME = f"{ENVIRONMENT}_test"
 # EXPERIMENTS_LIST = ["mlp", "gru"]
-EXPERIMENTS_LIST = ["mlp_shared", "hgnn_shared"]
+EXPERIMENTS_LIST = ["hgnn_shared", "hgnn_shared_entropy"]
 DEVICE = "cpu"
 
 # EXPERIMENTS
@@ -16,11 +16,16 @@ for i, experiment_name in enumerate(EXPERIMENTS_LIST):
     experiment = Experiment(
         device=DEVICE,
         model_params=Model_Params(
-            model_name="mlp", critic_type="mlp", n_hyperedge_types=2
+            model_name="mlp",
+            critic_type="multi_hgnn",
+            n_hyperedge_types=2,
+            entropy_conditioning=True,
+            entropy_pred_seq_len=32,
+            entropy_pred_coef=0.01,
         ),
         params=MAPPO_Params(
             n_epochs=10,
-            n_total_steps=1e8,
+            n_total_steps=1e7,
             n_minibatches=4,
             batch_size=5120,
             parameter_sharing=True,
@@ -29,8 +34,8 @@ for i, experiment_name in enumerate(EXPERIMENTS_LIST):
             grad_clip=0.5,
             gamma=0.99,
             lmbda=0.95,
-            ent_coef=1e-2,
-            val_coef=0.5,
+            ent_coef=0.01,
+            val_coef=0.8,
             std_coef=0.0,
             lr=3e-4,
         ),

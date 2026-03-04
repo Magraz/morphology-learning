@@ -31,5 +31,8 @@ showjob $SLURM_JOBID
 # Set temporary directory for the job, so that is doesn't use the default /tmp that gets filled up which causes issues during training
 export TMPDIR="$SCRATCH"
 
+which python3
+python3 --version
+
 DISPLAY=":0" python3 $EXPERIMENT_SCRIPT --batch $BATCH_NAME --name $EXPERIMENT_NAME --algorithm $ALGORITHM --environment $ENVIRONMENT --trial_id $TRIAL_ID --checkpoint
 EOT

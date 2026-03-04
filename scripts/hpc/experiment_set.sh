@@ -1,10 +1,10 @@
 #!/bin/bash
 ENVIRONMENT=multi_box_push
 BATCH_NAME=${ENVIRONMENT}_test
-EXPERIMENT_NAMES=("mlp_shared")
+EXPERIMENT_NAMES=("mlp_shared" "hgnn_shared" "hgnn_shared_entropy")
 ALGORITHM=mappo
 TRIAL_START=0
-TRIAL_END=4
+TRIAL_END=9
 SBATCH_SCRIPT="run_trial_gpu.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

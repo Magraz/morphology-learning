@@ -32,5 +32,12 @@ showjob $SLURM_JOBID
 # Set temporary directory for the job, so that is doesn't use the default /tmp that gets filled up which causes issues during training
 export TMPDIR="$SCRATCH"
 
-DISPLAY=":0" python3 $EXPERIMENT_SCRIPT --batch $BATCH_NAME --name $EXPERIMENT_NAME --algorithm $ALGORITHM --environment $ENVIRONMENT --trial_id $TRIAL_ID --checkpoint
+module purge
+module load python/3.11   # same Python used to create venv
+
+which python
+python --version
+echo "VIRTUAL_ENV=$VIRTUAL_ENV"
+
+DISPLAY=":0" uv run python3 $EXPERIMENT_SCRIPT --batch $BATCH_NAME --name $EXPERIMENT_NAME --algorithm $ALGORITHM --environment $ENVIRONMENT --trial_id $TRIAL_ID --checkpoint
 EOT

@@ -38,7 +38,7 @@ class VecMAPPOTrainer:
         n_hyperedge_types: int = 0,
         entropy_pred_seq_len: int = 32,
         entropy_pred_coef: float = 0.01,
-        entropy_conditioning: bool = True,
+        entropy_conditioning: bool = False,
     ):
         self.device = device
         self.dirs = dirs
@@ -210,9 +210,9 @@ class VecMAPPOTrainer:
         entropies = []
         for sig_id in per_env_sig_ids:
             entropies.append(self.agent.get_or_compute_entropy(sig_id))
-        return torch.tensor(
-            np.stack(entropies), dtype=torch.float32
-        ).to(self.agent.device)
+        return torch.tensor(np.stack(entropies), dtype=torch.float32).to(
+            self.agent.device
+        )
 
     def collect_trajectory(self, max_steps):
         """
@@ -258,7 +258,8 @@ class VecMAPPOTrainer:
             # Compute structural entropies for critic conditioning
             per_env_entropies = (
                 self._compute_entropies_for_critic(per_env_sig_ids)
-                if self.entropy_conditioning else None
+                if self.entropy_conditioning
+                else None
             )
 
             # Single batched forward pass for all envs × agents
@@ -351,7 +352,8 @@ class VecMAPPOTrainer:
                 )
                 final_entropies = (
                     self._compute_entropies_for_critic(final_sig_ids)
-                    if self.entropy_conditioning else None
+                    if self.entropy_conditioning
+                    else None
                 )
                 obs_tensor = torch.from_numpy(
                     np.ascontiguousarray(obs, dtype=np.float32)
@@ -359,7 +361,10 @@ class VecMAPPOTrainer:
                 obs_flat = obs_tensor.reshape(batch_size * self.n_agents, -1)
                 final_values = (
                     self.agent.network_old.get_value_batched(
-                        obs_flat, final_batched_hgs, batch_size, entropies=final_entropies
+                        obs_flat,
+                        final_batched_hgs,
+                        batch_size,
+                        entropies=final_entropies,
                     )
                     .cpu()
                     .squeeze(-1)
@@ -526,10 +531,13 @@ class VecMAPPOTrainer:
             while not finished.all():
                 global_states = obs.reshape(n_eps, -1)
 
-                eval_hgs, eval_sig_ids = self._build_inference_hypergraphs(obs, infos, n_eps)
+                eval_hgs, eval_sig_ids = self._build_inference_hypergraphs(
+                    obs, infos, n_eps
+                )
                 eval_entropies = (
                     self._compute_entropies_for_critic(eval_sig_ids)
-                    if self.entropy_conditioning else None
+                    if self.entropy_conditioning
+                    else None
                 )
 
                 actions_t, _, _ = self.agent.get_actions_batched(
@@ -592,10 +600,13 @@ class VecMAPPOTrainer:
                 # Add batch dim expected by get_actions_batched: (1, n_agents, obs_dim)
                 global_states = obs.reshape(1, -1)
 
-                render_hgs, render_sig_ids = self._build_inference_hypergraphs(obs, infos, 1)
+                render_hgs, render_sig_ids = self._build_inference_hypergraphs(
+                    obs, infos, 1
+                )
                 render_entropies = (
                     self._compute_entropies_for_critic(render_sig_ids)
-                    if self.entropy_conditioning else None
+                    if self.entropy_conditioning
+                    else None
                 )
 
                 actions_t, _, _ = self.agent.get_actions_batched(
@@ -629,7 +640,9 @@ class VecMAPPOTrainer:
                 entropy_proximity_log.append(entropies[0])  # [S_e, S_normalized]
                 entropy_object_log.append(entropies[1])
 
-                soft_entropies = compute_soft_hyperedge_structural_entropy_batch(render_hgs)
+                soft_entropies = compute_soft_hyperedge_structural_entropy_batch(
+                    render_hgs
+                )
                 soft_entropy_proximity_log.append(soft_entropies[0])
                 soft_entropy_object_log.append(soft_entropies[1])
 
