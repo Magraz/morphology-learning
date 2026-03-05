@@ -33,15 +33,14 @@ from environments.multi_box_push.utils import (
 class MultiBoxPushEnv(gym.Env):
     metadata = {"render_fps": 30}
 
-    def __init__(self, render_mode=None, n_agents=3, n_target_areas=1, max_steps=512):
+    def __init__(self, render_mode=None, n_agents=3, n_objects=3, max_steps=512):
         super().__init__()
 
         self.n_agents = n_agents
-        self.n_objects = 3
+        self.n_objects = n_objects
         self.render_mode = render_mode
 
         # Add target areas parameters
-        self.n_target_areas = n_target_areas
         self.target_areas = []
 
         # Update action space to include detach action
@@ -70,9 +69,11 @@ class MultiBoxPushEnv(gym.Env):
         self.contact_listener = BoundaryContactListener()
         self.world.contactListener = self.contact_listener
 
-        # Boundary parameters (customize as needed)
-        self.world_width = 30
-        self.world_height = 30
+        # Auto-scale world size based on entity count
+        # Reference: 8 entities (5 agents + 3 objects) -> 30x30
+        _total_entities = self.n_agents + self.n_objects
+        self.world_width = int(30 * max(1.0, _total_entities / 8) ** 0.5)
+        self.world_height = self.world_width
         self.world_center_x = self.world_width // 2
         self.world_center_y = self.world_height // 2
         self.world_diagonal = np.sqrt(self.world_height**2 + self.world_width**2)
@@ -81,8 +82,8 @@ class MultiBoxPushEnv(gym.Env):
         # Pygame rendering setup
         self.screen = None
         self.clock = None
-        self.screen_size = (600, 600)
-        self.scale = 20.0  # Pixels per Box2D meter
+        self.screen_size = (700, 700)
+        self.scale = self.screen_size[0] / self.world_width
 
         self.boundary_bodies = []  # Track boundary walls
 
@@ -105,8 +106,8 @@ class MultiBoxPushEnv(gym.Env):
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
         self.force_scale = 2.0  # Scale factor for visualizing forces
 
-        # Add sector sensing threshold
-        self.sector_sensor_radius = 10
+        # Scale sector sensor radius proportionally to world size
+        self.sector_sensor_radius = self.world_width / 3.0
 
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
@@ -128,11 +129,17 @@ class MultiBoxPushEnv(gym.Env):
         self.objects = []  # Track dynamic objects
 
     def _create_target_areas(self):
-        """Create target areas at random positions in the environment"""
+        """Create target areas scaled proportionally to world size."""
         self.target_areas = []
 
+        bt = self.boundary_thickness
+        target_h = max(5.0, 5.0 * self.world_height / 30.0)
+        inner_w = self.world_width - 2 * bt
         target_area = ObjectTargetArea(
-            self.world_width // 2, self.world_height - 3, self.world_width - 1, 5
+            self.world_width / 2,
+            self.world_height - bt - target_h / 2,
+            inner_w,
+            target_h,
         )
         self.target_areas.append(target_area)
 
@@ -145,47 +152,34 @@ class MultiBoxPushEnv(gym.Env):
         self._create_agents(positions)
 
     def _create_dynamic_objects(self):
-        """Create the requested square, triangle, and circle objects"""
+        """Create n_objects square boxes with dynamically assigned colors."""
         self.objects.clear()
 
-        # Define shapes and their half-sizes (for bounding box calculation)
-        shapes = [
-            b2PolygonShape(box=(1.5, 1.5)),
-            b2PolygonShape(box=(1.5, 1.5)),
-            b2PolygonShape(box=(1.5, 1.5)),
-        ]
-        half_sizes = [
-            (1.5, 1.5),  # Half-width, half-height of box 1
-            (1.5, 1.5),  # Half-width, half-height of box 2
-            (1.5, 1.5),  # Half-width, half-height of box 3
-        ]
+        half_size = (1.5, 1.5)
 
-        # Colors (R, G, B)
+        # Assign colors from COLORS_LIST, offset by n_agents to avoid collision
+        color_offset = self.n_agents
         colors = [
-            (100, 100, 255),  # Blue-ish for Box 1
-            (255, 100, 255),  # Magenta-ish for Box 2
-            (255, 165, 0),  # Orange for Box 3
+            COLORS_LIST[(color_offset + i) % len(COLORS_LIST)]
+            for i in range(self.n_objects)
         ]
 
-        # Store base densities for cooperative mass reduction
         self.object_base_densities = []
 
         center_x = self.world_width / 2
         center_y = self.world_height / 2
 
-        # Define the spawn area (increased to fit 3 boxes without overlap)
-        spawn_width = self.world_width * 0.8  # 70% of world width
-        spawn_height = self.world_height * 0.3  # 40% of world height
+        spawn_width = self.world_width * 0.8
+        spawn_height = self.world_height * 0.3
 
         base_density = 2.0
 
-        # Track placed positions to avoid overlap
         placed_positions = []
-        min_separation = (
-            4.0  # Minimum distance between box centers (>= 2 * 1.5 + margin)
-        )
+        min_separation = 4.0
 
-        for i, (shape, half_size) in enumerate(zip(shapes, half_sizes)):
+        for i in range(self.n_objects):
+            shape = b2PolygonShape(box=half_size)
+
             fixture_def = b2FixtureDef(
                 shape=shape,
                 density=base_density,
@@ -193,31 +187,31 @@ class MultiBoxPushEnv(gym.Env):
                 restitution=0.2,
             )
 
-            # Setup collisions
             fixture_def.filter.categoryBits = OBJECT_CATEGORY
             fixture_def.filter.maskBits = (
                 AGENT_CATEGORY | BOUNDARY_CATEGORY | OBJECT_CATEGORY
             )
 
-            # Random position within the spawn rectangle, accounting for object size
             min_x = center_x - spawn_width / 2 + half_size[0]
             max_x = center_x + spawn_width / 2 - half_size[0]
             min_y = center_y - spawn_height / 2 + half_size[1]
             max_y = center_y + spawn_height / 2 - half_size[1]
 
-            # Try to find a non-overlapping position
+            # Minimum horizontal separation so boxes don't stack vertically
+            min_x_separation = half_size[0] * 2 + 1.0
+
             max_attempts = 100
             for attempt in range(max_attempts):
                 pos_x = np.random.uniform(min_x, max_x)
                 pos_y = np.random.uniform(min_y, max_y)
 
-                # Check distance from all previously placed boxes
                 too_close = False
                 for prev_pos in placed_positions:
+                    dx = abs(pos_x - prev_pos[0])
                     dist = np.sqrt(
                         (pos_x - prev_pos[0]) ** 2 + (pos_y - prev_pos[1]) ** 2
                     )
-                    if dist < min_separation:
+                    if dist < min_separation or dx < min_x_separation:
                         too_close = True
                         break
 
@@ -234,7 +228,6 @@ class MultiBoxPushEnv(gym.Env):
                 angularDamping=8.0,
             )
 
-            # Store color in body user data for rendering
             body.userData = {
                 "type": "object",
                 "color": colors[i],
@@ -403,44 +396,18 @@ class MultiBoxPushEnv(gym.Env):
         self.boundary_bodies.append(right_wall)
 
     def _draw_boundary_walls(self):
-        """Draw the actual boundary walls at their Box2D positions"""
-        thickness = self.boundary_thickness
+        """Draw boundary walls flush with screen edges."""
+        sw, sh = self.screen_size
+        t = max(1, int(self.boundary_thickness * self.scale))
 
         # Bottom wall
-        bottom_rect = pygame.Rect(
-            0,  # Left edge
-            self.screen_size[1] - thickness * self.scale,  # Bottom of screen
-            self.world_width * self.scale,  # Full width
-            thickness * self.scale,  # Wall thickness
-        )
-        pygame.draw.rect(self.screen, (0, 0, 0), bottom_rect)
-
+        pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(0, sh - t, sw, t))
         # Top wall
-        top_rect = pygame.Rect(
-            0,  # Left edge
-            self.screen_size[1] - self.world_height * self.scale,  # Top position
-            self.world_width * self.scale,  # Full width
-            thickness * self.scale,  # Wall thickness
-        )
-        pygame.draw.rect(self.screen, (0, 0, 0), top_rect)
-
+        pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(0, 0, sw, t))
         # Left wall
-        left_rect = pygame.Rect(
-            0,  # Left edge of screen
-            self.screen_size[1] - self.world_height * self.scale,  # Top position
-            thickness * self.scale,  # Wall thickness
-            self.world_height * self.scale,  # Full height
-        )
-        pygame.draw.rect(self.screen, (0, 0, 0), left_rect)
-
+        pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(0, 0, t, sh))
         # Right wall
-        right_rect = pygame.Rect(
-            self.world_width * self.scale - thickness * self.scale,  # Right position
-            self.screen_size[1] - self.world_height * self.scale,  # Top position
-            thickness * self.scale,  # Wall thickness
-            self.world_height * self.scale,  # Full height
-        )
-        pygame.draw.rect(self.screen, (0, 0, 0), right_rect)
+        pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(sw - t, 0, t, sh))
 
     def _draw_force_vectors(self):
         """Draw force vectors for each agent with enhanced 2D visualization"""
@@ -663,30 +630,26 @@ class MultiBoxPushEnv(gym.Env):
 
             # Check if it's our new ObjectTargetArea (has width/height)
             if hasattr(area, "width"):
-                # Draw Rectangle
-                rect_surface = pygame.Surface(
-                    (int(area.width * self.scale), int(area.height * self.scale)),
-                    pygame.SRCALPHA,
+                # Compute pixel bounds from Box2D coords
+                left = int((area.x - area.width / 2) * self.scale)
+                right = int((area.x + area.width / 2) * self.scale)
+                top = int(self.screen_size[1] - (area.y + area.height / 2) * self.scale)
+                bottom = int(
+                    self.screen_size[1] - (area.y - area.height / 2) * self.scale
                 )
-                # Fill with transparent color
+                px_w = right - left
+                px_h = bottom - top
+
+                # Draw filled transparent rectangle
+                rect_surface = pygame.Surface((px_w, px_h), pygame.SRCALPHA)
                 rect_surface.fill(area.color)
-
-                # Position logic (Box2D center -> Pygame TopLeft)
-                screen_x = (area.x - area.width / 2) * self.scale
-                screen_y = self.screen_size[1] - (area.y + area.height / 2) * self.scale
-
-                self.screen.blit(rect_surface, (screen_x, screen_y))
+                self.screen.blit(rect_surface, (left, top))
 
                 # Draw outline
                 pygame.draw.rect(
                     self.screen,
                     (0, 100, 0),
-                    pygame.Rect(
-                        screen_x,
-                        screen_y,
-                        area.width * self.scale,
-                        area.height * self.scale,
-                    ),
+                    pygame.Rect(left, top, px_w, px_h),
                     2,
                 )
 
@@ -1246,9 +1209,7 @@ class MultiBoxPushEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = MultiBoxPushEnv(
-        render_mode="human", n_agents=5, n_target_areas=1, max_steps=512
-    )
+    env = MultiBoxPushEnv(render_mode="human", n_agents=16, n_objects=7, max_steps=512)
     obs, info = env.reset()
 
     running = True
