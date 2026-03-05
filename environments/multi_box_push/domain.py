@@ -1209,7 +1209,7 @@ class MultiBoxPushEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = MultiBoxPushEnv(render_mode="human", n_agents=16, n_objects=7, max_steps=512)
+    env = MultiBoxPushEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=512)
     obs, info = env.reset()
 
     running = True
