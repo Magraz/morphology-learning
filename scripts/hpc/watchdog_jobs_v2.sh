@@ -17,7 +17,8 @@ usage() {
 Usage: $(basename "$0") [batch_name] [--dry-run] [--run-script PATH]
 
 Checks each expected job in a ledger and resubmits any job that is not
-currently present in squeue for this user.
+currently present in squeue for this user, unless the ledger job already
+finished with state COMPLETED in sacct.
 
 Options:
   batch_name         Optional batch name. If provided, uses
@@ -94,12 +95,18 @@ if ! command -v squeue >/dev/null 2>&1; then
     echo "error: squeue command not found in PATH" >&2
     exit 1
 fi
+if ! command -v sacct >/dev/null 2>&1; then
+    echo "error: sacct command not found in PATH" >&2
+    exit 1
+fi
 
 mkdir -p "${TRACKING_DIR}"
 CHECK_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 WATCHDOG_LOG="${TRACKING_DIR}/watchdog_${CHECK_TIMESTAMP}.csv"
 echo "timestamp,job_name,batch_name,experiment,trial_id,status,old_job_id,new_job_id" > "${WATCHDOG_LOG}"
 
+declare -A LEDGER_IDS
+declare -A COMPLETED_IDS
 declare -A ACTIVE_IDS
 declare -A ACTIVE_NAMES
 
@@ -108,8 +115,31 @@ while IFS='|' read -r ACTIVE_ID ACTIVE_NAME; do
     [[ -n "${ACTIVE_NAME}" ]] && ACTIVE_NAMES["${ACTIVE_NAME}"]=1
 done < <(squeue -h -u "${USER}" -o "%A|%j")
 
+while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME _ENVIRONMENT _ALGORITHM _EXPERIMENT _TRIAL_ID _JOB_NAME JOB_ID _SUBMISSION_OK; do
+    JOB_ID="${JOB_ID%$'\r'}"
+    [[ "${JOB_ID}" =~ ^[0-9]+$ ]] && LEDGER_IDS["${JOB_ID}"]=1
+done < "${LEDGER_PATH}"
+
+LEDGER_JOB_IDS=("${!LEDGER_IDS[@]}")
+if [[ ${#LEDGER_JOB_IDS[@]} -gt 0 ]]; then
+    OLD_IFS="${IFS}"
+    IFS=,
+    JOB_ID_LIST="${LEDGER_JOB_IDS[*]}"
+    IFS="${OLD_IFS}"
+
+    while IFS='|' read -r ACCOUNT_JOB_ID ACCOUNT_STATE; do
+        ACCOUNT_JOB_ID="${ACCOUNT_JOB_ID%$'\r'}"
+        ACCOUNT_STATE="${ACCOUNT_STATE%$'\r'}"
+        [[ -z "${ACCOUNT_JOB_ID}" || -z "${ACCOUNT_STATE}" ]] && continue
+        if [[ "${ACCOUNT_STATE}" == COMPLETED* ]]; then
+            COMPLETED_IDS["${ACCOUNT_JOB_ID}"]=1
+        fi
+    done < <(sacct -n -P -X -j "${JOB_ID_LIST}" -o JobIDRaw,State 2>/dev/null)
+fi
+
 TOTAL=0
 RUNNING=0
+COMPLETED=0
 RESUBMITTED=0
 WOULD_RESUBMIT=0
 FAILED=0
@@ -147,6 +177,13 @@ while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERI
         RUNNING=$((RUNNING + 1))
         echo "running ${JOB_NAME} (${JOB_ID})"
         echo "${LOG_TS},${JOB_NAME},${BATCH_NAME},${EXPERIMENT},${TRIAL_ID},running,${JOB_ID}," >> "${WATCHDOG_LOG}"
+        continue
+    fi
+
+    if [[ -n "${JOB_ID}" && "${JOB_ID}" != "UNKNOWN" && -n "${COMPLETED_IDS[${JOB_ID}]+x}" ]]; then
+        COMPLETED=$((COMPLETED + 1))
+        echo "completed ${JOB_NAME} (${JOB_ID})"
+        echo "${LOG_TS},${JOB_NAME},${BATCH_NAME},${EXPERIMENT},${TRIAL_ID},completed,${JOB_ID}," >> "${WATCHDOG_LOG}"
         continue
     fi
 
@@ -192,6 +229,7 @@ echo "  ledger:      ${LEDGER_PATH}"
 echo "  actions log: ${WATCHDOG_LOG}"
 echo "  total jobs:  ${TOTAL}"
 echo "  running:     ${RUNNING}"
+echo "  completed:   ${COMPLETED}"
 if [[ ${DRY_RUN} -eq 1 ]]; then
     echo "  would_resubmit: ${WOULD_RESUBMIT}"
 else
