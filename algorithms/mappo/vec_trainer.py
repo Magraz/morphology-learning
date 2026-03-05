@@ -34,6 +34,7 @@ class VecMAPPOTrainer:
         device: str = "cpu",
         n_parallel_envs: int = 1,
         env_variant: str = None,
+        n_objects: int = 3,
         critic_type: str = "mlp",
         n_hyperedge_types: int = 0,
         entropy_pred_seq_len: int = 32,
@@ -47,6 +48,7 @@ class VecMAPPOTrainer:
         self.env_name = env_name
         self.n_parallel_envs = n_parallel_envs
         self.env_variant = env_variant
+        self.n_objects = n_objects
         self.critic_type = critic_type
         self.n_hyperedge_types = n_hyperedge_types
         self.entropy_pred_seq_len = entropy_pred_seq_len
@@ -61,6 +63,7 @@ class VecMAPPOTrainer:
             self.n_eval_episodes,
             use_async=True,
             env_variant=self.env_variant,
+            n_objects=self.n_objects,
         )
 
         # Create vectorized environment using Gymnasium's API
@@ -70,6 +73,7 @@ class VecMAPPOTrainer:
             self.n_parallel_envs,
             use_async=True,  # Use parallel processing
             env_variant=self.env_variant,
+            n_objects=self.n_objects,
         )
 
         # Determine observation, action and and global state dimension
@@ -676,6 +680,7 @@ class VecMAPPOTrainer:
                     1,
                     use_async=True,  # Use parallel processing
                     env_variant=self.env_variant,
+                    n_objects=self.n_objects,
                 )
 
                 render_env.envs[0].render_mode = "human"

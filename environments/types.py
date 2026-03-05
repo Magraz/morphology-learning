@@ -7,6 +7,7 @@ class EnvironmentParams:
     environment: str = None
     n_envs: int = 1
     n_agents: int = 1
+    n_objects: int = 3
     env_variant: str = None
 
 

@@ -62,6 +62,7 @@ class MAPPO_Runner(Runner):
             self.device,
             n_parallel_envs=self.env_config.n_envs,
             env_variant=self.env_config.env_variant,
+            n_objects=self.env_config.n_objects,
             critic_type=self.model_params.critic_type,
             n_hyperedge_types=self.model_params.n_hyperedge_types,
             entropy_pred_seq_len=self.model_params.entropy_pred_seq_len,

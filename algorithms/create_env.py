@@ -149,6 +149,7 @@ def get_state_and_action_dims(
     n_agents: int,
     render_mode: str = None,
     env_variant: str = None,
+    n_objects: int = 3,
 ):
     match (env_name):
         case EnvironmentEnum.BOX2D_SALP:
@@ -163,7 +164,7 @@ def get_state_and_action_dims(
             from environments.multi_box_push.domain import MultiBoxPushEnv
 
             # Environment configuration
-            env = MultiBoxPushEnv(n_agents=n_agents, render_mode=render_mode)
+            env = MultiBoxPushEnv(n_agents=n_agents, n_objects=n_objects, render_mode=render_mode)
             state_dim = env.observation_space.shape[1]
             action_dim = env.action_space.shape[1]
 
@@ -221,6 +222,7 @@ def make_vec_env(
     n_envs: int,
     use_async: bool = True,
     env_variant: str = None,
+    n_objects: int = 3,
 ):
     """
     Create a vectorized environment using Gymnasium's built-in vectorization.
@@ -247,7 +249,7 @@ def make_vec_env(
             case EnvironmentEnum.MULTI_BOX:
                 from environments.multi_box_push.domain import MultiBoxPushEnv
 
-                return MultiBoxPushEnv(n_agents=n_agents, render_mode=None)
+                return MultiBoxPushEnv(n_agents=n_agents, n_objects=n_objects, render_mode=None)
 
             case EnvironmentEnum.MPE_SPREAD:
                 from mpe2 import simple_spread_v3
