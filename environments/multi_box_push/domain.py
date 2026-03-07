@@ -33,7 +33,7 @@ from environments.multi_box_push.utils import (
 class MultiBoxPushEnv(gym.Env):
     metadata = {"render_fps": 30}
 
-    def __init__(self, render_mode=None, n_agents=3, n_objects=3, max_steps=512):
+    def __init__(self, render_mode=None, n_agents=3, n_objects=3, max_steps=1024):
         super().__init__()
 
         self.n_agents = n_agents
@@ -1209,7 +1209,7 @@ class MultiBoxPushEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = MultiBoxPushEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=512)
+    env = MultiBoxPushEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=1024)
     obs, info = env.reset()
 
     running = True
