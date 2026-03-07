@@ -55,19 +55,11 @@ class MAPPO_Runner(Runner):
         print(f"Using device: {self.exp_config.device}")
 
         self.trainer = VecMAPPOTrainer(
-            self.env_config.environment,
-            self.env_config.n_agents,
             self.params,
             self.dirs,
             self.device,
-            n_parallel_envs=self.env_config.n_envs,
-            env_variant=self.env_config.env_variant,
-            n_objects=self.env_config.n_objects,
-            critic_type=self.model_params.critic_type,
-            n_hyperedge_types=self.model_params.n_hyperedge_types,
-            entropy_pred_seq_len=self.model_params.entropy_pred_seq_len,
-            entropy_pred_coef=self.model_params.entropy_pred_coef,
-            entropy_conditioning=self.model_params.entropy_conditioning,
+            env_params=self.env_config,
+            model_params=self.model_params,
         )
 
     def train(self):
@@ -114,9 +106,13 @@ class MAPPO_Runner(Runner):
 
             if rewards.shape[0] > 0:
                 steps = np.arange(len(rewards))
-                n_types = len(entropy_logs)
+                plot_types = {
+                    k: v
+                    for k, v in entropy_logs.items()
+                    if k != "predicted_per_agent" and v is not None
+                }
                 # 1 row for reward + 2 rows per hyperedge type (S_e and S_norm)
-                n_rows = 1 + 2 * n_types
+                n_rows = 1 + 2 * len(plot_types)
                 fig, axes = plt.subplots(
                     n_rows, 1, figsize=(10, 3 * n_rows), sharex=True
                 )
@@ -129,6 +125,8 @@ class MAPPO_Runner(Runner):
 
                 row = 1
                 for htype, ent in entropy_logs.items():
+                    if htype == "predicted_per_agent" or ent is None:
+                        continue
                     is_soft = htype.startswith("soft_")
                     prefix = r"$\tilde{S}_e$" if is_soft else "$S_e$"
                     prefix_norm = (
@@ -153,6 +151,65 @@ class MAPPO_Runner(Runner):
                 plt.savefig(fig_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)
                 print(f"Plot saved to {fig_path}")
+
+                # Plot predicted vs actual entropy and prediction error
+                # predicted_per_agent shape: (n_steps, n_agents, n_types)
+                pred_per_agent = entropy_logs.get("predicted_per_agent")
+                if pred_per_agent is not None:
+                    type_names = ["proximity", "object"]
+                    n_agents = pred_per_agent.shape[1]
+                    n_types = pred_per_agent.shape[2]
+                    pred_mean = pred_per_agent.mean(axis=1)  # (n_steps, n_types)
+                    fig2, axes2 = plt.subplots(
+                        2, n_types, figsize=(6 * n_types, 6), sharex=True
+                    )
+                    if n_types == 1:
+                        axes2 = axes2[:, np.newaxis]
+
+                    for t in range(n_types):
+                        name = type_names[t] if t < len(type_names) else f"type_{t}"
+                        # Predictor targets S_soft_norm (index 1)
+                        actual = entropy_logs[f"soft_{name}"][:, 1]
+
+                        # Per-agent predictions (thin, transparent)
+                        for a in range(n_agents):
+                            axes2[0, t].plot(
+                                steps,
+                                pred_per_agent[:, a, t],
+                                alpha=0.3,
+                                lw=0.8,
+                                color="tab:orange",
+                                label=f"Agents" if a == 0 else None,
+                            )
+                        # Mean prediction and actual
+                        axes2[0, t].plot(
+                            steps,
+                            pred_mean[:, t],
+                            lw=2,
+                            color="tab:orange",
+                            label="Predicted (mean)",
+                        )
+                        axes2[0, t].plot(
+                            steps, actual, lw=2, color="tab:blue", label="Actual"
+                        )
+                        axes2[0, t].set_ylabel(r"$\tilde{S}_{\mathrm{norm}}$")
+                        axes2[0, t].set_title(f"{name} — Predicted vs Actual")
+                        axes2[0, t].legend()
+
+                        error = actual - pred_mean[:, t]
+                        axes2[1, t].plot(steps, error, color="tab:red")
+                        axes2[1, t].axhline(0, color="grey", ls="--", lw=0.8)
+                        axes2[1, t].set_ylabel("Error (actual - mean predicted)")
+                        axes2[1, t].set_xlabel("Step")
+                        axes2[1, t].set_title(f"{name} — Prediction Error")
+
+                    plt.tight_layout()
+                    fig2_path = (
+                        self.dirs["logs"] / f"entropy_pred_episode_{episode}.png"
+                    )
+                    plt.savefig(fig2_path, dpi=150, bbox_inches="tight")
+                    plt.close(fig2)
+                    print(f"Prediction plot saved to {fig2_path}")
 
     def evaluate(self):
         pass

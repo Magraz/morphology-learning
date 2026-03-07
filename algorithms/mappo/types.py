@@ -24,7 +24,7 @@ class MAPPO_Params:
 
 @dataclass
 class Model_Params:
-    model_name: str
+    hidden_dim: int
     critic_type: str
     # For HGNN
     n_hyperedge_types: int = 0

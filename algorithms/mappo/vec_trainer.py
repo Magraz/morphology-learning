@@ -7,7 +7,8 @@ import random
 import psutil
 
 from algorithms.mappo.mappo import MAPPOAgent
-from environments.types import EnvironmentEnum
+from environments.types import EnvironmentEnum, EnvironmentParams
+from algorithms.mappo.types import Model_Params
 from algorithms.create_env import make_vec_env
 from functools import partial
 from algorithms.mappo.hypergraph import (
@@ -27,33 +28,23 @@ import torch
 class VecMAPPOTrainer:
     def __init__(
         self,
-        env_name,
-        n_agents,
         params=None,
         dirs=None,
         device: str = "cpu",
-        n_parallel_envs: int = 1,
-        env_variant: str = None,
-        n_objects: int = 3,
-        critic_type: str = "mlp",
-        n_hyperedge_types: int = 0,
-        entropy_pred_seq_len: int = 32,
-        entropy_pred_coef: float = 0.01,
-        entropy_conditioning: bool = False,
+        env_params: EnvironmentParams = None,
+        model_params: Model_Params = None,
     ):
         self.device = device
         self.dirs = dirs
-        self.n_agents = n_agents
+        self.n_agents = env_params.n_agents
         self.params = params
-        self.env_name = env_name
-        self.n_parallel_envs = n_parallel_envs
-        self.env_variant = env_variant
-        self.n_objects = n_objects
-        self.critic_type = critic_type
-        self.n_hyperedge_types = n_hyperedge_types
-        self.entropy_pred_seq_len = entropy_pred_seq_len
-        self.entropy_pred_coef = entropy_pred_coef
-        self.entropy_conditioning = entropy_conditioning
+        self.env_name = env_params.environment
+        self.n_parallel_envs = env_params.n_envs
+        self.env_variant = env_params.env_variant
+        self.n_objects = env_params.n_objects
+        self.critic_type = model_params.critic_type
+        self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
+        self.entropy_conditioning = model_params.entropy_conditioning
 
         # Create environment for evaluation (parallel eval episodes)
         self.n_eval_episodes = 5
@@ -80,7 +71,7 @@ class VecMAPPOTrainer:
         obs_space = self.vec_env.single_observation_space  # Box(n_agents, obs_dim)
         act_space = self.vec_env.single_action_space
         observation_dim = obs_space.shape[1]
-        global_state_dim = observation_dim * n_agents
+        global_state_dim = observation_dim * self.n_agents
         if isinstance(act_space, gym.spaces.MultiDiscrete):
             action_dim = int(act_space.nvec[0])
         else:
@@ -115,14 +106,10 @@ class VecMAPPOTrainer:
             self.device,
             self.discrete,
             self.n_parallel_envs,
-            critic_type=self.critic_type,
-            n_hyperedge_types=self.n_hyperedge_types,
+            model_params=model_params,
             hyperedge_fns=(
                 self.hyperedge_fns if self.critic_type == "multi_hgnn" else None
             ),
-            entropy_pred_seq_len=self.entropy_pred_seq_len,
-            entropy_pred_coef=self.entropy_pred_coef,
-            entropy_conditioning=self.entropy_conditioning,
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__
@@ -592,6 +579,15 @@ class VecMAPPOTrainer:
         entropy_object_log = []
         soft_entropy_proximity_log = []
         soft_entropy_object_log = []
+        predicted_entropy_log = []
+
+        # Rolling obs history for entropy predictor (mirrors _update_obs_history)
+        predictor = self.agent.network_old.entropy_predictor
+        if predictor is not None:
+            obs_dim = self.agent.observation_dim
+            obs_history = torch.zeros(
+                1, self.n_agents, self.agent.entropy_pred_seq_len, obs_dim
+            )
 
         seed = int(np.random.randint(0, 2**31))
         obs, infos = render_env.reset(seed=seed)
@@ -650,6 +646,23 @@ class VecMAPPOTrainer:
                 soft_entropy_proximity_log.append(soft_entropies[0])
                 soft_entropy_object_log.append(soft_entropies[1])
 
+                # Predict entropies using rolling obs history
+                if predictor is not None:
+                    obs_tensor = torch.from_numpy(
+                        np.ascontiguousarray(obs, dtype=np.float32)
+                    )
+                    if obs_tensor.dim() == 2:
+                        obs_tensor = obs_tensor.unsqueeze(0)  # (1, n_agents, obs_dim)
+                    obs_history = torch.roll(obs_history, -1, dims=2)
+                    obs_history[:, :, -1, :] = obs_tensor
+                    obs_seqs_flat = obs_history.reshape(
+                        self.n_agents, self.agent.entropy_pred_seq_len, -1
+                    ).to(self.device)
+                    agent_ids = torch.arange(self.n_agents, device=self.device)
+                    pred_mean, _ = predictor.forward_batch(obs_seqs_flat, agent_ids)
+                    # Store per-agent predictions: (n_agents, n_types)
+                    predicted_entropy_log.append(pred_mean.cpu().numpy())
+
                 if terminated or truncated:
                     break
 
@@ -660,6 +673,9 @@ class VecMAPPOTrainer:
             "object": np.array(entropy_object_log),
             "soft_proximity": np.array(soft_entropy_proximity_log),
             "soft_object": np.array(soft_entropy_object_log),
+            "predicted_per_agent": (
+                np.array(predicted_entropy_log) if predicted_entropy_log else None
+            ),
         }
         return np.array(episode_reward), entropy_logs
 

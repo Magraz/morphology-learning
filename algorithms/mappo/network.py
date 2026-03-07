@@ -1,7 +1,6 @@
 import dhg
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Normal, Categorical
 import numpy as np
 
@@ -481,7 +480,7 @@ class MultiHGNNCritic(nn.Module):
             [
                 HGNNCritic(
                     observation_dim,
-                    hidden_dim=hidden_dim,
+                    hidden_dim=round(hidden_dim * 0.85),
                     n_hgnn_layers=n_hgnn_layers,
                     drop_rate=drop_rate,
                     value_mode="per_agent",
@@ -681,7 +680,11 @@ class MAPPONetwork(nn.Module):
         self.share_actor = share_actor
         self.critic_type = critic_type
         # Extra actor input features from predicted entropy: [mean, log_var] per type
-        self.entropy_pred_dim = 2 * n_hyperedge_types if entropy_conditioning and n_hyperedge_types > 0 else 0
+        self.entropy_pred_dim = (
+            2 * n_hyperedge_types
+            if entropy_conditioning and n_hyperedge_types > 0
+            else 0
+        )
 
         if share_actor:
             # Single shared actor for all agents
@@ -819,3 +822,70 @@ class MAPPONetwork(nn.Module):
         return self.critic.forward_batched(
             obs_flat, batched_hgs, n_graphs, entropies=entropies
         )
+
+
+if __name__ == "__main__":
+    obs_dim = 18
+    n_agents = 5
+    action_dim = 5
+    hidden_dim = 168
+    n_hyperedge_types = 2
+
+    def count_params(module):
+        return sum(p.numel() for p in module.parameters())
+
+    def print_breakdown(net, label):
+        print(f"\n{'='*60}")
+        print(f"  {label}")
+        print(f"{'='*60}")
+        actor = net.actor if net.share_actor else net.actors
+        print(f"  Actor:              {count_params(actor):>10,}")
+        print(f"  Critic:             {count_params(net.critic):>10,}")
+        if net.entropy_predictor is not None:
+            print(f"  Entropy Predictor:  {count_params(net.entropy_predictor):>10,}")
+        print(f"  {'─'*40}")
+        print(f"  Total:              {count_params(net):>10,}")
+
+    # 1) MLP critic, no hypergraph
+    net1 = MAPPONetwork(
+        obs_dim,
+        obs_dim * n_agents,
+        action_dim,
+        n_agents,
+        hidden_dim=round(hidden_dim * 1.09),
+        discrete=True,
+        critic_type="mlp",
+    )
+    print_breakdown(net1, "Condition 1: MLP Critic (no hypergraph)")
+
+    # 2) Multi-HGNN critic, no entropy conditioning
+    net2 = MAPPONetwork(
+        obs_dim,
+        obs_dim * n_agents,
+        action_dim,
+        n_agents,
+        hidden_dim=hidden_dim,
+        discrete=True,
+        critic_type="multi_hgnn",
+        n_hyperedge_types=n_hyperedge_types,
+        entropy_conditioning=False,
+    )
+    print_breakdown(net2, "Condition 2: Multi-HGNN Critic (no entropy conditioning)")
+
+    # 3) Multi-HGNN critic + entropy conditioning + entropy predictor
+    net3 = MAPPONetwork(
+        obs_dim,
+        obs_dim * n_agents,
+        action_dim,
+        n_agents,
+        hidden_dim=hidden_dim,
+        discrete=True,
+        critic_type="multi_hgnn",
+        n_hyperedge_types=n_hyperedge_types,
+        entropy_conditioning=True,
+    )
+    print_breakdown(
+        net3, "Condition 3: Multi-HGNN Critic + Entropy Conditioning + Predictor"
+    )
+
+    print()

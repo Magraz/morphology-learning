@@ -3,12 +3,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from algorithms.mappo.types import MAPPO_Params
+from algorithms.mappo.types import MAPPO_Params, Model_Params
 from algorithms.mappo.network import MAPPONetwork
-import dhg
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
-    calculate_soft_hyperedge_structural_entropy,
     soft_entropy_from_edges,
 )
 
@@ -26,12 +24,8 @@ class MAPPOAgent:
         device: str,
         discrete: bool,
         n_parallel_envs: int,
-        critic_type: str = "mlp",
-        n_hyperedge_types: int = 1,
+        model_params: Model_Params,
         hyperedge_fns: list[tuple] = None,
-        entropy_pred_seq_len: int = 32,
-        entropy_pred_coef: float = 0.01,
-        entropy_conditioning: bool = False,
     ):
         self.device = "cuda" if torch.cuda.is_available() else device
         self.n_agents = n_agents
@@ -40,16 +34,16 @@ class MAPPOAgent:
         self.discrete = discrete
         self.share_actor = params.parameter_sharing
         self.n_parallel_envs = n_parallel_envs
-        self.critic_type = critic_type
-        self.n_hyperedge_types = n_hyperedge_types
+        self.critic_type = model_params.critic_type
+        self.n_hyperedge_types = model_params.n_hyperedge_types
         # Hyperedge builder specs: list of (fn, source) where source is "obs"
         # or an info-dict key name (e.g. "agents_2_objects")
         self.hyperedge_fns = hyperedge_fns or []
         # Entropy conditioning of HGNN critics
-        self.entropy_conditioning = entropy_conditioning
+        self.entropy_conditioning = model_params.entropy_conditioning
         # Auxiliary LSTM entropy predictor config
-        self.entropy_pred_seq_len = entropy_pred_seq_len
-        self.entropy_pred_coef = entropy_pred_coef
+        self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
+        self.entropy_pred_coef = model_params.entropy_pred_coef
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -65,11 +59,16 @@ class MAPPOAgent:
             global_state_dim=global_state_dim,
             action_dim=action_dim,
             n_agents=n_agents,
+            hidden_dim=(
+                round(model_params.hidden_dim * 1.09)
+                if self.critic_type == "mlp"
+                else model_params.hidden_dim
+            ),
             discrete=discrete,
             share_actor=self.share_actor,
-            critic_type=critic_type,
-            n_hyperedge_types=n_hyperedge_types,
-            entropy_conditioning=entropy_conditioning,
+            critic_type=self.critic_type,
+            n_hyperedge_types=self.n_hyperedge_types,
+            entropy_conditioning=self.entropy_conditioning,
         ).to(self.device)
 
         # Create old network for PPO
@@ -78,11 +77,16 @@ class MAPPOAgent:
             global_state_dim=global_state_dim,
             action_dim=action_dim,
             n_agents=n_agents,
+            hidden_dim=(
+                round(model_params.hidden_dim * 1.09)
+                if self.critic_type == "mlp"
+                else model_params.hidden_dim
+            ),
             discrete=discrete,
             share_actor=self.share_actor,
-            critic_type=critic_type,
-            n_hyperedge_types=n_hyperedge_types,
-            entropy_conditioning=entropy_conditioning,
+            critic_type=self.critic_type,
+            n_hyperedge_types=self.n_hyperedge_types,
+            entropy_conditioning=self.entropy_conditioning,
         ).to(self.device)
 
         self.network_old.load_state_dict(self.network.state_dict())
@@ -102,7 +106,7 @@ class MAPPOAgent:
         # Rolling observation history for entropy predictor during collection.
         # Persists across reset_buffers calls (running inference state, not trajectory data).
         self._obs_history = torch.zeros(
-            n_parallel_envs, n_agents, entropy_pred_seq_len, observation_dim
+            n_parallel_envs, n_agents, self.entropy_pred_seq_len, observation_dim
         )
 
         # Buffers for each agent
