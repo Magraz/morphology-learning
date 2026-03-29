@@ -10,6 +10,7 @@ import torch
 import numpy as np
 import random
 import matplotlib.pyplot as plt
+import imageio
 
 
 def set_seeds(seed):
@@ -100,7 +101,7 @@ class MAPPO_Runner(Runner):
         # Test trained agents with rendering
         print("\nTesting trained agents...")
         for episode in range(10):
-            rewards, entropy_logs = self.trainer.render()
+            rewards, entropy_logs, frames = self.trainer.render(capture_video=True)
 
             print(f"REWARD: {rewards[-1]:.4f}")
 
@@ -109,13 +110,14 @@ class MAPPO_Runner(Runner):
                 plot_types = {
                     k: v
                     for k, v in entropy_logs.items()
-                    if k != "predicted_per_agent" and v is not None
+                    if k != "predicted_per_agent" and v is not None and v.size > 0
                 }
                 # 1 row for reward + 2 rows per hyperedge type (S_e and S_norm)
                 n_rows = 1 + 2 * len(plot_types)
                 fig, axes = plt.subplots(
-                    n_rows, 1, figsize=(10, 3 * n_rows), sharex=True
+                    n_rows, 1, figsize=(10, 3 * n_rows), sharex=True, squeeze=False
                 )
+                axes = axes[:, 0]
 
                 axes[0].plot(steps, rewards)
                 axes[0].set_ylabel("Reward")
@@ -124,9 +126,7 @@ class MAPPO_Runner(Runner):
                 )
 
                 row = 1
-                for htype, ent in entropy_logs.items():
-                    if htype == "predicted_per_agent" or ent is None:
-                        continue
+                for htype, ent in plot_types.items():
                     is_soft = htype.startswith("soft_")
                     prefix = r"$\tilde{S}_e$" if is_soft else "$S_e$"
                     prefix_norm = (
@@ -151,6 +151,12 @@ class MAPPO_Runner(Runner):
                 plt.savefig(fig_path, dpi=150, bbox_inches="tight")
                 plt.close(fig)
                 print(f"Plot saved to {fig_path}")
+
+                # Save video of the episode
+                if frames:
+                    video_path = self.dirs["logs"] / f"episode_{episode}.mp4"
+                    imageio.mimwrite(video_path, frames, fps=30, macro_block_size=1)
+                    print(f"Video saved to {video_path}")
 
                 # Plot predicted vs actual entropy and prediction error
                 # predicted_per_agent shape: (n_steps, n_agents, n_types)

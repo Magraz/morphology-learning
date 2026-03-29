@@ -123,6 +123,17 @@ class VecMAPPOTrainer:
         # Timing statistics
         self.training_start_time = None
         self.total_training_time = 0.0
+        self._process = psutil.Process()
+
+    def _get_total_memory_mb(self):
+        """Return RSS for the trainer process and all live child processes."""
+        total_rss = self._process.memory_info().rss
+        for child in self._process.children(recursive=True):
+            try:
+                total_rss += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return total_rss / 1024 / 1024
 
     def _build_inference_hypergraphs(self, obs, infos, n_envs):
         """Build batched block-diagonal hypergraphs for critic inference.
@@ -464,7 +475,7 @@ class VecMAPPOTrainer:
 
             # Log progress
             if steps_completed % log_every < step_count:
-                mem = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+                mem = self._get_total_memory_mb()
                 print(
                     f"Steps: {steps_completed}/{total_steps} ({steps_completed/total_steps*100:.1f}%) | "
                     f"Episodes: {episodes_completed} | "
@@ -560,8 +571,11 @@ class VecMAPPOTrainer:
 
         return episode_rewards.mean()
 
-    def render(self):
+    def render(self, capture_video=False):
         """Run one episode with the current policy in a render environment.
+
+        Args:
+            capture_video: If True, capture frames from the pygame surface.
 
         Returns:
             rewards:      np.ndarray of shape (n_steps,), per-step rewards.
@@ -569,11 +583,13 @@ class VecMAPPOTrainer:
                           (n_steps, 2). Keys: "proximity", "object" (hard-count
                           entropy with [S_e, S_normalized]) and "soft_proximity",
                           "soft_object" (smooth surrogate with [S_soft, S_soft_norm]).
+            frames:       list of np.ndarray (H, W, 3) if capture_video, else None.
         """
         render_env = self._make_render_env()
 
         self.agent.network_old.eval()
         episode_reward = []
+        frames = [] if capture_video else None
         cum_sum = 0.0
         entropy_proximity_log = []
         entropy_object_log = []
@@ -605,7 +621,7 @@ class VecMAPPOTrainer:
                 )
                 render_entropies = (
                     self._compute_entropies_for_critic(render_sig_ids)
-                    if self.entropy_conditioning
+                    if self.entropy_conditioning and render_sig_ids is not None
                     else None
                 )
 
@@ -632,19 +648,29 @@ class VecMAPPOTrainer:
                     current_masks = current_masks[np.newaxis]
                 render_env.render()
 
+                if capture_video:
+                    import pygame
+
+                    surface = pygame.display.get_surface()
+                    if surface is not None:
+                        frame = pygame.surfarray.array3d(surface)
+                        frame = np.transpose(frame, (1, 0, 2))
+                        frames.append(frame.copy())
+
                 cum_sum += float(reward)
                 episode_reward.append(cum_sum)
 
                 # Hypergraph creation and entropy calculation
-                entropies = compute_hyperedge_structural_entropy_batch(render_hgs)
-                entropy_proximity_log.append(entropies[0])  # [S_e, S_normalized]
-                entropy_object_log.append(entropies[1])
+                if render_hgs is not None:
+                    entropies = compute_hyperedge_structural_entropy_batch(render_hgs)
+                    entropy_proximity_log.append(entropies[0])  # [S_e, S_normalized]
+                    entropy_object_log.append(entropies[1])
 
-                soft_entropies = compute_soft_hyperedge_structural_entropy_batch(
-                    render_hgs
-                )
-                soft_entropy_proximity_log.append(soft_entropies[0])
-                soft_entropy_object_log.append(soft_entropies[1])
+                    soft_entropies = compute_soft_hyperedge_structural_entropy_batch(
+                        render_hgs
+                    )
+                    soft_entropy_proximity_log.append(soft_entropies[0])
+                    soft_entropy_object_log.append(soft_entropies[1])
 
                 # Predict entropies using rolling obs history
                 if predictor is not None:
@@ -677,7 +703,7 @@ class VecMAPPOTrainer:
                 np.array(predicted_entropy_log) if predicted_entropy_log else None
             ),
         }
-        return np.array(episode_reward), entropy_logs
+        return np.array(episode_reward), entropy_logs, frames
 
     def _make_render_env(self):
         """Create a single env with render_mode='human' for the current env_name."""

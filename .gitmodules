@@ -1,3 +1,6 @@
 [submodule "smaclite"]
 	path = smaclite
 	url = https://github.com/uoe-agents/smaclite.git
+[submodule "HYGMA"]
+	path = HYGMA
+	url = https://github.com/mysteryelder/HYGMA.git

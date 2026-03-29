@@ -697,6 +697,28 @@ class MultiBoxPushEnv(gym.Env):
             # Draw the actual text
             self.screen.blit(text_surface, text_rect)
 
+    def _draw_object_coupling(self):
+        """Render the coupling requirement on top of each object."""
+        if not hasattr(self, "coupling_font"):
+            pygame.font.init()
+            self.coupling_font = pygame.font.SysFont("Arial", 14, bold=True)
+
+        for body in self.objects:
+            center_x = body.position.x * self.scale
+            center_y = self.screen_size[1] - body.position.y * self.scale
+
+            coupling = body.userData["coupling"]
+            text = str(coupling)
+            text_surface = self.coupling_font.render(text, True, (255, 255, 255))
+            text_rect = text_surface.get_rect(center=(int(center_x), int(center_y)))
+
+            for offset in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                outline_rect = text_rect.move(offset)
+                outline_surface = self.coupling_font.render(text, True, (0, 0, 0))
+                self.screen.blit(outline_surface, outline_rect)
+
+            self.screen.blit(text_surface, text_rect)
+
     def _get_nearest_non_connected_agent_relative(
         self, agent_idx, all_states, neighbor_detection_range
     ):
@@ -1186,6 +1208,7 @@ class MultiBoxPushEnv(gym.Env):
 
         # Draw objects
         self._draw_dynamic_objects()
+        self._draw_object_coupling()
 
         # Draw agents
         self._render_agents_as_circles()
@@ -1193,7 +1216,7 @@ class MultiBoxPushEnv(gym.Env):
         # Draw agent indices on top of agents
         self._draw_agent_indices()
 
-        self._draw_density_sensors()  # Add this before or after drawing agents
+        # self._draw_density_sensors()  # Add this before or after drawing agents
 
         # Draw force vectors
         # self._draw_force_vectors()
