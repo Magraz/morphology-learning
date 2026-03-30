@@ -96,6 +96,39 @@ class VecMAPPOTrainer:
             (object_contact_hyperedges, "agents_2_objects"),
         ]
 
+        self.hypergraph_mode = model_params.hypergraph_mode
+        if self.hypergraph_mode == "hygma":
+            from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
+
+            assert (
+                self.critic_type == "multi_hgnn"
+            ), "HYGMA mode requires critic_type='multi_hgnn'"
+            assert (
+                model_params.n_hyperedge_types == 1
+            ), "HYGMA mode requires n_hyperedge_types=1"
+
+            max_k = model_params.hygma_max_clusters or (self.n_agents - 1)
+            self._dynamic_grouping = DynamicSpectralGrouping(
+                n_agents=self.n_agents,
+                n_envs=self.n_parallel_envs,
+                obs_dim=observation_dim,
+                history_len=model_params.hygma_history_len,
+                clustering_interval=model_params.hygma_clustering_interval,
+                min_clusters=model_params.hygma_min_clusters,
+                max_clusters=max_k,
+                stability_threshold=model_params.hygma_stability_threshold,
+            )
+            # Keep "proximity" keys for compatibility with existing plotting code.
+            self._entropy_type_names = ["proximity"]
+        elif self.hypergraph_mode == "predefined":
+            self._dynamic_grouping = None
+            self._entropy_type_names = ["proximity", "object"]
+        else:
+            raise ValueError(
+                f"Unknown hypergraph_mode: {self.hypergraph_mode!r}. "
+                "Expected 'predefined' or 'hygma'."
+            )
+
         # Create MAPPO agent
         self.agent = MAPPOAgent(
             observation_dim,
@@ -149,17 +182,21 @@ class VecMAPPOTrainer:
             return None, None
 
         # Compute per-env edge lists for each hyperedge type
-        all_type_edge_lists = []  # [type_idx][env_idx] -> edge_list
-        for fn, source in self.hyperedge_fns:
-            if source == "obs":
-                data = obs
-            else:
-                data = infos.get(source) if isinstance(infos, dict) else None
-                if data is None:
-                    continue
-            all_type_edge_lists.append(
-                [fn(data[e], self.n_agents) for e in range(n_envs)]
-            )
+        if self.hypergraph_mode == "hygma":
+            spectral_edges = self._dynamic_grouping.get_edge_lists(n_envs)
+            all_type_edge_lists = [spectral_edges]  # [type_idx][env_idx] -> edge_list
+        else:
+            all_type_edge_lists = []  # [type_idx][env_idx] -> edge_list
+            for fn, source in self.hyperedge_fns:
+                if source == "obs":
+                    data = obs
+                else:
+                    data = infos.get(source) if isinstance(infos, dict) else None
+                    if data is None:
+                        continue
+                all_type_edge_lists.append(
+                    [fn(data[e], self.n_agents) for e in range(n_envs)]
+                )
 
         # Transpose to per-env: [env_idx] -> [type_edges_0, type_edges_1, ...]
         n_types = len(all_type_edge_lists)
@@ -234,6 +271,8 @@ class VecMAPPOTrainer:
         ]
         obs, infos = self.vec_env.reset(seed=train_seeds)
         batch_size = obs.shape[0]
+        if self._dynamic_grouping is not None:
+            self._dynamic_grouping.reset_history()
 
         # Grab initial action masks if the env provides them (e.g. SMACv2)
         # Shape: (n_envs, n_agents, n_actions) or None
@@ -251,6 +290,9 @@ class VecMAPPOTrainer:
             # Construct global states for each environment
             # Shape: (n_envs, n_agents * obs_dim)
             global_states = obs.reshape(batch_size, -1)
+            if self._dynamic_grouping is not None:
+                self._dynamic_grouping.update_history(obs)
+                self._dynamic_grouping.maybe_update_groups()
 
             # Build hypergraphs only when the critic requires them
             per_env_hgs, per_env_sig_ids = self._build_inference_hypergraphs(
@@ -306,6 +348,8 @@ class VecMAPPOTrainer:
             # Reset obs history for terminated envs so predictor starts fresh
             if dones.any():
                 self.agent.reset_obs_history(env_mask=dones)
+                if self._dynamic_grouping is not None:
+                    self._dynamic_grouping.reset_history(env_mask=dones)
 
             # Store transitions for all environments in one vectorized call
             self.agent.store_transitions_batch(
@@ -521,6 +565,8 @@ class VecMAPPOTrainer:
         self.agent.network_old.eval()
         n_eps = self.n_eval_episodes
 
+        # HYGMA mode intentionally keeps groups frozen during eval.
+        # Hypergraphs come from the latest discovered grouping state.
         with torch.no_grad():
             eval_seeds = [int(np.random.randint(0, 2**31)) for _ in range(n_eps)]
             obs, infos = self.eval_env.reset(seed=eval_seeds)
@@ -580,9 +626,9 @@ class VecMAPPOTrainer:
         Returns:
             rewards:      np.ndarray of shape (n_steps,), per-step rewards.
             entropy_logs: dict mapping hyperedge type to np.ndarray of shape
-                          (n_steps, 2). Keys: "proximity", "object" (hard-count
-                          entropy with [S_e, S_normalized]) and "soft_proximity",
-                          "soft_object" (smooth surrogate with [S_soft, S_soft_norm]).
+                          (n_steps, 2). Hard-count keys are type names from
+                          ``self._entropy_type_names`` and soft keys are
+                          prefixed with ``soft_``.
             frames:       list of np.ndarray (H, W, 3) if capture_video, else None.
         """
         render_env = self._make_render_env()
@@ -591,10 +637,9 @@ class VecMAPPOTrainer:
         episode_reward = []
         frames = [] if capture_video else None
         cum_sum = 0.0
-        entropy_proximity_log = []
-        entropy_object_log = []
-        soft_entropy_proximity_log = []
-        soft_entropy_object_log = []
+        n_types = len(self._entropy_type_names)
+        entropy_type_logs = [[] for _ in range(n_types)]
+        soft_entropy_type_logs = [[] for _ in range(n_types)]
         predicted_entropy_log = []
 
         # Rolling obs history for entropy predictor (mirrors _update_obs_history)
@@ -611,6 +656,8 @@ class VecMAPPOTrainer:
         if current_masks is not None:
             current_masks = current_masks[np.newaxis]  # add env batch dim
 
+        # HYGMA mode intentionally keeps groups frozen during render.
+        # Hypergraphs come from the latest discovered grouping state.
         with torch.no_grad():
             while True:
                 # Add batch dim expected by get_actions_batched: (1, n_agents, obs_dim)
@@ -663,14 +710,12 @@ class VecMAPPOTrainer:
                 # Hypergraph creation and entropy calculation
                 if render_hgs is not None:
                     entropies = compute_hyperedge_structural_entropy_batch(render_hgs)
-                    entropy_proximity_log.append(entropies[0])  # [S_e, S_normalized]
-                    entropy_object_log.append(entropies[1])
-
                     soft_entropies = compute_soft_hyperedge_structural_entropy_batch(
                         render_hgs
                     )
-                    soft_entropy_proximity_log.append(soft_entropies[0])
-                    soft_entropy_object_log.append(soft_entropies[1])
+                    for t in range(min(len(render_hgs), n_types)):
+                        entropy_type_logs[t].append(entropies[t])
+                        soft_entropy_type_logs[t].append(soft_entropies[t])
 
                 # Predict entropies using rolling obs history
                 if predictor is not None:
@@ -694,15 +739,13 @@ class VecMAPPOTrainer:
 
         render_env.close()
 
-        entropy_logs = {
-            "proximity": np.array(entropy_proximity_log),
-            "object": np.array(entropy_object_log),
-            "soft_proximity": np.array(soft_entropy_proximity_log),
-            "soft_object": np.array(soft_entropy_object_log),
-            "predicted_per_agent": (
-                np.array(predicted_entropy_log) if predicted_entropy_log else None
-            ),
-        }
+        entropy_logs = {}
+        for t, name in enumerate(self._entropy_type_names):
+            entropy_logs[name] = np.array(entropy_type_logs[t])
+            entropy_logs[f"soft_{name}"] = np.array(soft_entropy_type_logs[t])
+        entropy_logs["predicted_per_agent"] = (
+            np.array(predicted_entropy_log) if predicted_entropy_log else None
+        )
         return np.array(episode_reward), entropy_logs, frames
 
     def _make_render_env(self):

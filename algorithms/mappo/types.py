@@ -27,12 +27,19 @@ class Model_Params:
     hidden_dim: int
     critic_type: str
     # For HGNN
-    n_hyperedge_types: int = 0
+    n_hyperedge_types: int = 1
     # Entropy conditioning of HGNN critics
     entropy_conditioning: bool = False
     # Auxiliary LSTM entropy predictor
     entropy_pred_seq_len: int = 32
     entropy_pred_coef: float = 0.01
+    # HYGMA dynamic spectral clustering mode
+    hypergraph_mode: str = "predefined"  # "predefined" | "hygma"
+    hygma_history_len: int = 50
+    hygma_clustering_interval: int = 100  # rollout steps
+    hygma_min_clusters: int = 2
+    hygma_max_clusters: int = 0  # 0 = auto (n_agents - 1)
+    hygma_stability_threshold: float = 0.6
 
 
 @dataclass
