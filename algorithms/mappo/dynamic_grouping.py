@@ -87,8 +87,12 @@ class DynamicSpectralClustering:
             return 0
 
         moved = 0
-        old_group_map = {agent: frozenset(group) for group in old_groups for agent in group}
-        new_group_map = {agent: frozenset(group) for group in new_groups for agent in group}
+        old_group_map = {
+            agent: frozenset(group) for group in old_groups for agent in group
+        }
+        new_group_map = {
+            agent: frozenset(group) for group in new_groups for agent in group
+        }
         for agent in range(self.n_agents):
             if old_group_map[agent] != new_group_map[agent]:
                 moved += 1
@@ -152,7 +156,9 @@ class DynamicSpectralGrouping:
                 f"obs shape must be {(self.n_envs, self.n_agents, self.obs_dim)}, "
                 f"got {obs.shape}"
             )
-        self._history = np.roll(self._history, -1, axis=2)
+        self._history = np.roll(
+            self._history, -1, axis=2
+        )  # FIFO sliding window buffer, contains only the most recent observations
         self._history[:, :, -1, :] = obs
         self._env_steps = np.minimum(self._env_steps + 1, self.history_len)
         self._rollout_steps += 1
@@ -170,7 +176,9 @@ class DynamicSpectralGrouping:
 
         env_mask = np.asarray(env_mask, dtype=bool)
         if env_mask.shape != (self.n_envs,):
-            raise ValueError(f"env_mask shape must be {(self.n_envs,)}, got {env_mask.shape}")
+            raise ValueError(
+                f"env_mask shape must be {(self.n_envs,)}, got {env_mask.shape}"
+            )
         self._history[env_mask] = 0.0
         self._env_steps[env_mask] = 0
 

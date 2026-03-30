@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from algorithms.mappo.types import MAPPO_Params, Model_Params
-from algorithms.mappo.network import MAPPONetwork
+from algorithms.mappo.networks.models import MAPPONetwork
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
     soft_entropy_from_edges,

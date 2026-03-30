@@ -52,7 +52,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 19), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 21), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -105,6 +105,10 @@ class MultiBoxPushEnv(gym.Env):
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
         self.force_scale = 2.0  # Scale factor for visualizing forces
+
+        # Velocity normalization constant (agents have linear damping=10.0,
+        # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
+        self.velocity_norm = self.world_width / 10.0
 
         # Scale sector sensor radius proportionally to world size
         self.sector_sensor_radius = self.world_width / 3.0
@@ -817,6 +821,12 @@ class MultiBoxPushEnv(gym.Env):
         center = np.array([self.world_center_x, self.world_center_y], dtype=np.float32)
         all_states = self._agent_pos_cache - center  # (n_agents, 2)
 
+        # Agent velocities normalized to ~[-1, 1]
+        all_velocities = np.array(
+            [[a.linearVelocity.x, a.linearVelocity.y] for a in self.agents],
+            dtype=np.float32,
+        ) / self.velocity_norm  # (n_agents, 2)
+
         # Vectorized density sensors for all agents in one pass (replaces n_agents calls)
         all_density_sensors = self._calculate_density_sensors_all(
             self.sector_sensor_radius
@@ -825,9 +835,10 @@ class MultiBoxPushEnv(gym.Env):
         observations = []
         for i in range(self.n_agents):
             own_state = all_states[i]
+            own_velocity = all_velocities[i]
             is_touching_object = np.array([self._is_agent_touching_object(i)])
             agent_obs = np.concatenate(
-                [own_state, all_density_sensors[i], is_touching_object]
+                [own_state, own_velocity, all_density_sensors[i], is_touching_object]
             )
             observations.append(agent_obs)
 
