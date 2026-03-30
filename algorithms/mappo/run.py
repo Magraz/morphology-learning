@@ -1,26 +1,14 @@
 from environments.types import EnvironmentParams, EnvironmentEnum
 from algorithms.mappo.types import Experiment, MAPPO_Params, Model_Params
 from algorithms.runner import Runner
-from algorithms.create_env import get_state_and_action_dims
 from pathlib import Path
 
 from algorithms.mappo.vec_trainer import VecMAPPOTrainer
+from algorithms.mappo.utils import set_global_seeds
 
-import torch
 import numpy as np
-import random
 import matplotlib.pyplot as plt
 import imageio
-
-
-def set_seeds(seed):
-    """Set random seeds for reproducibility"""
-    random.seed(seed)  # Python's random module
-    np.random.seed(seed)  # NumPy
-    torch.manual_seed(seed)  # PyTorch
-    torch.cuda.manual_seed_all(seed)  # PyTorch CUDA
-    # torch.backends.cudnn.deterministic = True  # Make CUDA deterministic
-    # torch.backends.cudnn.benchmark = False  # Disable or enable CUDA benchmarking
 
 
 class MAPPO_Runner(Runner):
@@ -49,7 +37,7 @@ class MAPPO_Runner(Runner):
             random_seed = self.params.random_seeds[int(self.trial_id)]
 
         # Set all random seeds for reproducibility
-        set_seeds(random_seed)
+        set_global_seeds(random_seed)
 
         # Device configuration
         # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

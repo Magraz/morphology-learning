@@ -10,7 +10,7 @@ if [[ ${#BATCH_NAMES[@]} -eq 0 ]]; then
 fi
 
 SCRATCH=/nfs/stak/users/agrazvam/hpc-share/tmp
-EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/scripts/hpc/watchdog_loop.py
+SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/scripts/hpc/watchdog_loop.py
 LOG_STEM="${BATCH_NAMES[0]}"
 BATCH_NAMES_ESCAPED="$(printf '%q ' "${BATCH_NAMES[@]}")"
 
@@ -46,5 +46,5 @@ which sacct
 which python
 python --version
 
-DISPLAY=":0" uv run python3 $EXPERIMENT_SCRIPT $BATCH_NAMES_ESCAPED
+DISPLAY=":0" uv run python3 $SCRIPT $BATCH_NAMES_ESCAPED
 EOT
