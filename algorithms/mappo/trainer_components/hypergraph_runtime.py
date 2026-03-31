@@ -111,27 +111,28 @@ class HypergraphRuntime:
         ]
 
         per_env_sig_ids = []
+        hg_cache = self.agent.hg_cache
         for edge_lists in per_env_edge_lists:
             sig = canonicalize_edge_lists(edge_lists)
-            sig_id = self.agent.hg_signature_to_id.get(sig)
+            sig_id = hg_cache.signature_to_id.get(sig)
             if sig_id is None:
-                sig_id = len(self.agent.hg_unique_edge_lists)
-                self.agent.hg_signature_to_id[sig] = sig_id
-                self.agent.hg_unique_edge_lists.append(edge_lists)
+                sig_id = len(hg_cache.unique_edge_lists)
+                hg_cache.signature_to_id[sig] = sig_id
+                hg_cache.unique_edge_lists.append(edge_lists)
             per_env_sig_ids.append(sig_id)
 
         batched_hgs = []
         for type_idx in range(n_types):
             type_edge_lists = [
-                self.agent.hg_unique_edge_lists[sid][type_idx] for sid in per_env_sig_ids
+                hg_cache.unique_edge_lists[sid][type_idx] for sid in per_env_sig_ids
             ]
             cache_key = tuple(per_env_sig_ids)
-            cached = self.agent.hg_object_cache.get((type_idx, cache_key))
+            cached = hg_cache.object_cache.get((type_idx, cache_key))
             if cached is not None:
                 batched_hgs.append(cached)
             else:
                 hg = batch_hypergraphs(type_edge_lists, self.n_agents, device=self.device)
-                self.agent.hg_object_cache[(type_idx, cache_key)] = hg
+                hg_cache.object_cache[(type_idx, cache_key)] = hg
                 batched_hgs.append(hg)
 
         return batched_hgs, per_env_sig_ids
@@ -141,5 +142,7 @@ class HypergraphRuntime:
         if per_env_sig_ids is None:
             return None
 
-        entropies = [self.agent.get_or_compute_entropy(sig_id) for sig_id in per_env_sig_ids]
+        entropies = [
+            self.agent.hg_cache.get_or_compute_entropy(sig_id) for sig_id in per_env_sig_ids
+        ]
         return torch.tensor(np.stack(entropies), dtype=torch.float32).to(self.agent.device)

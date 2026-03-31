@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-
+from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
 import numpy as np
 import torch
 
@@ -22,7 +22,7 @@ class RolloutCollector:
         n_parallel_envs: int,
         discrete: bool,
         entropy_conditioning: bool,
-        hypergraph_runtime,
+        hypergraph_runtime: HypergraphRuntime,
     ):
         self.vec_env = vec_env
         self.agent = agent
@@ -35,7 +35,9 @@ class RolloutCollector:
 
     def collect(self, max_steps: int) -> RolloutResult:
         """Collect trajectory using Gymnasium vectorized environments."""
-        train_seeds = [int(np.random.randint(0, 2**31)) for _ in range(self.n_parallel_envs)]
+        train_seeds = [
+            int(np.random.randint(0, 2**31)) for _ in range(self.n_parallel_envs)
+        ]
         obs, infos = self.vec_env.reset(seed=train_seeds)
         batch_size = obs.shape[0]
 
@@ -52,8 +54,10 @@ class RolloutCollector:
             global_states = obs.reshape(batch_size, -1)
             self.hypergraph_runtime.on_rollout_step(obs)
 
-            per_env_hgs, per_env_sig_ids = self.hypergraph_runtime.build_inference_hypergraphs(
-                obs, infos, batch_size
+            per_env_hgs, per_env_sig_ids = (
+                self.hypergraph_runtime.build_inference_hypergraphs(
+                    obs, infos, batch_size
+                )
             )
 
             per_env_entropies = (
@@ -80,7 +84,9 @@ class RolloutCollector:
                     actions_array = actions_array.squeeze(-1)
                 actions_array = actions_array.astype(np.int32)
 
-            next_obs, rewards, terminateds, truncateds, infos = self.vec_env.step(actions_array)
+            next_obs, rewards, terminateds, truncateds, infos = self.vec_env.step(
+                actions_array
+            )
             dones = np.logical_or(terminateds, truncateds)
 
             if dones.any():
@@ -101,7 +107,9 @@ class RolloutCollector:
                 entropies=per_env_entropies,
             )
 
-            current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+            current_masks = (
+                infos.get("avail_actions") if isinstance(infos, dict) else None
+            )
             obs = next_obs
             total_step_count += batch_size
             current_episode_steps += 1
@@ -134,9 +142,9 @@ class RolloutCollector:
                     if self.entropy_conditioning
                     else None
                 )
-                obs_tensor = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32)).to(
-                    self.device
-                )
+                obs_tensor = torch.from_numpy(
+                    np.ascontiguousarray(obs, dtype=np.float32)
+                ).to(self.device)
                 obs_flat = obs_tensor.reshape(batch_size * self.n_agents, -1)
                 final_values = (
                     self.agent.network_old.get_value_batched(

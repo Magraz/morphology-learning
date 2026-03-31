@@ -19,6 +19,7 @@ class PolicyRenderer:
         env_variant,
         n_agents: int,
         n_objects: int,
+        reward_mode: str,
         discrete: bool,
         entropy_conditioning: bool,
         hypergraph_runtime,
@@ -29,6 +30,7 @@ class PolicyRenderer:
         self.env_variant = env_variant
         self.n_agents = n_agents
         self.n_objects = n_objects
+        self.reward_mode = reward_mode
         self.discrete = discrete
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
@@ -158,6 +160,7 @@ class PolicyRenderer:
                     use_async=True,
                     env_variant=self.env_variant,
                     n_objects=self.n_objects,
+                    reward_mode=self.reward_mode,
                 )
                 render_env.envs[0].render_mode = "human"
                 return render_env

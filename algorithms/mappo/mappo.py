@@ -5,10 +5,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from algorithms.mappo.types import MAPPO_Params, Model_Params
 from algorithms.mappo.networks.models import MAPPONetwork
-from algorithms.mappo.hypergraph import (
-    batch_hypergraphs,
-    soft_entropy_from_edges,
-)
+from algorithms.mappo.hg_cache import HypergraphCache
+from algorithms.mappo.entropy_helpers import EntropyPredictorHelper
 
 
 class MAPPOAgent:
@@ -94,19 +92,18 @@ class MAPPOAgent:
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
 
-        # Hypergraph structure caches (persist across steps within a trajectory,
-        # cleared each reset_buffers call so they don't grow unbounded).
-        # signature -> id, id -> representative edge_lists, (type,key) -> dhg.Hypergraph
-        self.hg_signature_to_id: dict[tuple, int] = {}
-        self.hg_unique_edge_lists: list[list[list[tuple]]] = []
-        self.hg_object_cache: dict[tuple, object] = {}
-        # sig_id -> np.ndarray of shape (n_types, 2) with [S_soft, S_soft_norm]
-        self.hg_entropy_cache: dict[int, np.ndarray] = {}
+        # Hypergraph cache (owns signature maps, edge lists, dhg objects, entropy values)
+        self.hg_cache = HypergraphCache(
+            n_agents=n_agents,
+            n_parallel_envs=n_parallel_envs,
+        )
 
-        # Rolling observation history for entropy predictor during collection.
-        # Persists across reset_buffers calls (running inference state, not trajectory data).
-        self._obs_history = torch.zeros(
-            n_parallel_envs, n_agents, self.entropy_pred_seq_len, observation_dim
+        # Entropy predictor helper (owns obs history, sequence building, loss)
+        self.entropy_helper = EntropyPredictorHelper(
+            n_parallel_envs=n_parallel_envs,
+            n_agents=n_agents,
+            observation_dim=observation_dim,
+            seq_len=self.entropy_pred_seq_len,
         )
 
         # Buffers for each agent
@@ -135,110 +132,12 @@ class MAPPOAgent:
         self.action_masks = [
             [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
         ]
-        # Per-(env, timestep) hypergraph signature IDs computed during collection.
-        # Avoids recomputing edge lists from observations during the update phase.
-        # [env_idx][timestep] -> int (index into hg_unique_edge_lists)
-        self.hg_signature_ids = [[] for _ in range(self.n_parallel_envs)]
-        # Per-(env, timestep) soft hyperedge structural entropy (normalised).
-        # [env_idx][timestep] -> np.ndarray of shape (n_types,) with S_soft_norm per type
-        self.hg_entropies = [[] for _ in range(self.n_parallel_envs)]
-
-        # Clear hypergraph structure caches for the new trajectory
-        self.hg_signature_to_id.clear()
-        self.hg_unique_edge_lists.clear()
-        self.hg_object_cache.clear()
-        self.hg_entropy_cache.clear()
-
-    def _update_obs_history(self, obs_tensor: torch.Tensor) -> torch.Tensor:
-        """Shift obs history left and append new obs.
-
-        Args:
-            obs_tensor: (n_envs, n_agents, obs_dim)
-        Returns:
-            (n_envs, n_agents, seq_len, obs_dim) current sequences.
-        """
-        self._obs_history = torch.roll(self._obs_history, -1, dims=2)
-        self._obs_history[:, :, -1, :] = obs_tensor
-        return self._obs_history.clone()
+        # Clear hypergraph caches and per-trajectory buffers
+        self.hg_cache.reset()
 
     def reset_obs_history(self, env_mask=None):
         """Zero out obs history. If env_mask given, only reset those envs."""
-        if env_mask is None:
-            self._obs_history.zero_()
-        else:
-            self._obs_history[env_mask] = 0.0
-
-    def get_or_compute_entropy(self, sig_id: int) -> np.ndarray:
-        """Return cached soft structural entropy for a hypergraph signature.
-
-        On a cache miss, computes soft entropy directly from edge lists
-        (avoids dhg.Hypergraph construction and sparse→dense conversion).
-
-        Args:
-            sig_id: Index into hg_unique_edge_lists.
-
-        Returns:
-            np.ndarray of shape (n_types,) with S_soft_norm per hyperedge type.
-        """
-        cached = self.hg_entropy_cache.get(sig_id)
-        if cached is not None:
-            return cached
-
-        edge_lists = self.hg_unique_edge_lists[sig_id]
-        n_types = len(edge_lists)
-        entropies = np.empty(n_types, dtype=np.float64)
-
-        for type_idx, edges in enumerate(edge_lists):
-            _, S_soft_norm = soft_entropy_from_edges(edges, self.n_agents)
-            entropies[type_idx] = S_soft_norm
-
-        self.hg_entropy_cache[sig_id] = entropies
-        return entropies
-
-    def _build_obs_sequences(self, obs_stacked: torch.Tensor) -> torch.Tensor:
-        """Build zero-padded sliding-window observation sequences.
-
-        Args:
-            obs_stacked: (T, obs_dim) tensor of observations for one
-                         (env, agent) trajectory.
-
-        Returns:
-            sequences: (T, seq_len, obs_dim) tensor where sequences[t]
-                       contains obs[max(0, t-seq_len+1) : t+1], left-padded
-                       with zeros when t < seq_len - 1.
-        """
-        _, obs_dim = obs_stacked.shape
-        seq_len = self.entropy_pred_seq_len
-
-        # Pre-pad with seq_len-1 zeros at the front
-        padding = torch.zeros(seq_len - 1, obs_dim, dtype=obs_stacked.dtype)
-        padded = torch.cat([padding, obs_stacked], dim=0)  # (seq_len-1+T, obs_dim)
-
-        # Use unfold to create sliding windows efficiently
-        # After padding, window starting at index t gives obs[t-seq_len+1 : t+1]
-        sequences = padded.unfold(0, seq_len, 1)  # (T, obs_dim, seq_len)
-        sequences = sequences.permute(0, 2, 1)  # (T, seq_len, obs_dim)
-
-        return sequences
-
-    def _build_obs_sequences_batched(self, obs_batched: torch.Tensor) -> torch.Tensor:
-        """Build sliding-window sequences for a batch of trajectories at once.
-
-        Args:
-            obs_batched: (B, T, obs_dim) — B trajectories stacked.
-
-        Returns:
-            (B * T, seq_len, obs_dim) — ready for dataset construction.
-        """
-        B, T, obs_dim = obs_batched.shape
-        seq_len = self.entropy_pred_seq_len
-
-        padding = torch.zeros(B, seq_len - 1, obs_dim, dtype=obs_batched.dtype)
-        padded = torch.cat([padding, obs_batched], dim=1)  # (B, seq_len-1+T, obs_dim)
-
-        sequences = padded.unfold(1, seq_len, 1)  # (B, T, obs_dim, seq_len)
-        sequences = sequences.permute(0, 1, 3, 2)  # (B, T, seq_len, obs_dim)
-        return sequences.reshape(B * T, seq_len, obs_dim)
+        self.entropy_helper.reset_obs_history(env_mask)
 
     def get_actions(
         self, observations, global_state, deterministic=False, hypergraphs=None
@@ -342,17 +241,10 @@ class MAPPOAgent:
             if self.network_old.entropy_predictor is not None:
                 if n_envs == self.n_parallel_envs:
                     # Training collection — use persistent rolling buffer
-                    obs_seqs = self._update_obs_history(obs_tensor)
+                    obs_seqs = self.entropy_helper.update_obs_history(obs_tensor)
                 else:
                     # Eval/render — use obs as single-step sequence (zero-padded)
-                    obs_seqs = torch.zeros(
-                        n_envs,
-                        self.n_agents,
-                        self.entropy_pred_seq_len,
-                        self.observation_dim,
-                        device=obs_tensor.device,
-                    )
-                    obs_seqs[:, :, -1, :] = obs_tensor
+                    obs_seqs = self.entropy_helper.make_eval_sequences(obs_tensor)
                 obs_seqs_flat = obs_seqs.reshape(
                     n_envs * self.n_agents, self.entropy_pred_seq_len, -1
                 ).to(self.device)
@@ -370,7 +262,9 @@ class MAPPOAgent:
                 # Fuse envs and agents into one batch: single forward pass total
                 obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
                 if pred_entropy_flat is not None:
-                    obs_flat = torch.cat([obs_flat, pred_entropy_flat], dim=-1)
+                    obs_flat = self.entropy_helper.condition_obs(
+                        obs_flat, pred_entropy_flat
+                    )
                 masks_flat = (
                     masks_tensor.reshape(n_envs * self.n_agents, -1)
                     if masks_tensor is not None
@@ -398,8 +292,8 @@ class MAPPOAgent:
                 for agent_idx in range(self.n_agents):
                     agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
                     if pred_entropy_per_agent is not None:
-                        agent_obs = torch.cat(
-                            [agent_obs, pred_entropy_per_agent[:, agent_idx, :]], dim=-1
+                        agent_obs = self.entropy_helper.condition_obs(
+                            agent_obs, pred_entropy_per_agent[:, agent_idx, :]
                         )
                     agent_mask = (
                         masks_tensor[:, agent_idx, :]
@@ -536,16 +430,12 @@ class MAPPOAgent:
             self.global_states[env_idx].append(gs_t[env_idx])
             self.values[env_idx].append(val_t[env_idx])
             if hg_signature_ids is not None:
-                self.hg_signature_ids[env_idx].append(hg_signature_ids[env_idx])
-                if self.entropy_conditioning:
-                    if entropies is not None:
-                        self.hg_entropies[env_idx].append(
-                            entropies[env_idx].cpu().numpy()
-                        )
-                    else:
-                        self.hg_entropies[env_idx].append(
-                            self.get_or_compute_entropy(hg_signature_ids[env_idx])
-                        )
+                self.hg_cache.store_transition(
+                    env_idx=env_idx,
+                    sig_id=hg_signature_ids[env_idx],
+                    entropy_conditioning=self.entropy_conditioning,
+                    entropy_tensor=entropies[env_idx] if entropies is not None else None,
+                )
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
                 self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
@@ -625,106 +515,6 @@ class MAPPOAgent:
 
         return all_returns, all_advantages
 
-    def _get_flat_signature_ids(self):
-        """Return a flat list of signature IDs for all (env, timestep) pairs.
-
-        Reads directly from the buffer populated during collection, avoiding
-        the expensive reconstruction of edge lists from observations.
-
-        Returns:
-            ts_to_signature_ids: list of int, length = sum of T across envs.
-        """
-        ts_to_signature_ids = []
-        for env_idx in range(self.n_parallel_envs):
-            ts_to_signature_ids.extend(self.hg_signature_ids[env_idx])
-        return ts_to_signature_ids
-
-    def _get_flat_entropies(self, device):
-        """Return a flat (N_total_ts, n_types) tensor of structural entropy
-        values aligned with ``_get_flat_signature_ids``.
-
-        Returns None if entropy conditioning is disabled or buffer is empty.
-        """
-        if not self.entropy_conditioning or len(self.hg_entropies[0]) == 0:
-            return None
-        all_ent = []
-        for env_idx in range(self.n_parallel_envs):
-            all_ent.extend(self.hg_entropies[env_idx])
-        return torch.tensor(np.stack(all_ent), dtype=torch.float32).to(device)
-
-    def _compute_hgnn_critic_values(
-        self,
-        batch_global_states,
-        batch_ts_indices,
-        ts_to_signature_ids,
-        hgnn_batch_cache,
-        ts_to_entropies=None,
-    ):
-        """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
-
-        Uses hg_unique_edge_lists (populated during collection) to look up
-        representative edge-lists by signature ID.  Reuses cached
-        block-diagonal batched hypergraphs keyed by the set of signature IDs
-        in the minibatch.
-
-        Args:
-            batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
-            batch_ts_indices: (B,) int tensor mapping each sample to an index
-                              in ts_to_signature_ids.
-            ts_to_signature_ids: list mapping timestep index -> signature id.
-            hgnn_batch_cache: dict mapping tuple(signature ids in minibatch) to
-                              pre-built list[dhg.Hypergraph] batched by type.
-            ts_to_entropies: Optional (N_total_ts, n_types) tensor of structural
-                             entropy values aligned with ts_to_signature_ids.
-
-        Returns:
-            values: (B,) tensor of critic values.
-        """
-        B = batch_global_states.shape[0]
-        unique_ts, inverse = batch_ts_indices.unique(return_inverse=True)
-        n_unique = unique_ts.shape[0]
-
-        # Vectorized first-occurrence gathering (replaces Python loop)
-        first_occ = torch.full(
-            (n_unique,), B, dtype=torch.long, device=batch_ts_indices.device
-        )
-        arange = torch.arange(B, device=batch_ts_indices.device)
-        first_occ.scatter_reduce_(0, inverse, arange, reduce="amin")
-        obs_unique = batch_global_states[first_occ]
-        obs_flat = obs_unique.reshape(n_unique * self.n_agents, self.observation_dim)
-
-        unique_ts_list = [idx.item() for idx in unique_ts]
-        unique_sig_ids = [ts_to_signature_ids[ts] for ts in unique_ts_list]
-
-        # Cache by structural signature ids so different timesteps with the
-        # same hyperedge structure can reuse the same batched dhg objects.
-        cache_key = tuple(unique_sig_ids)
-        batched_hgs = hgnn_batch_cache.get(cache_key)
-        if batched_hgs is None:
-            n_types = len(self.hg_unique_edge_lists[0])
-            batched_hgs = []
-            for type_idx in range(n_types):
-                edge_lists = [
-                    self.hg_unique_edge_lists[sig_id][type_idx]
-                    for sig_id in unique_sig_ids
-                ]
-                batched_hgs.append(
-                    batch_hypergraphs(edge_lists, self.n_agents, device=self.device)
-                )
-            hgnn_batch_cache[cache_key] = batched_hgs
-
-        # Gather per-unique-timestep entropy values for conditioning
-        unique_entropies = None
-        if ts_to_entropies is not None:
-            unique_entropies = ts_to_entropies[unique_ts]  # (n_unique, n_types)
-
-        # Single batched forward pass
-        unique_values = self.network.critic.forward_batched(
-            obs_flat, batched_hgs, n_unique, entropies=unique_entropies
-        )  # (n_unique, 1)
-
-        return unique_values.squeeze(-1)[inverse]
-
     def update_shared(
         self,
         all_advantages,
@@ -760,14 +550,15 @@ class MAPPOAgent:
         has_masks = len(self.action_masks[0][0]) > 0
         use_hgnn = self.critic_type == "multi_hgnn"
         use_entropy_pred = (
-            self.network.entropy_predictor is not None and len(self.hg_entropies[0]) > 0
+            self.network.entropy_predictor is not None
+            and len(self.hg_cache.entropies[0]) > 0
         )
 
-        # Read pre-computed signature IDs from the buffer (populated during
-        # collection) instead of rebuilding edge lists from observations.
         if use_hgnn:
-            ts_to_signature_ids = self._get_flat_signature_ids()
-            ts_to_entropies = self._get_flat_entropies(train_device)
+            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
+            ts_to_entropies = self.hg_cache.get_flat_entropies(
+                train_device, self.entropy_conditioning
+            )
             hgnn_batch_cache = {}
 
         # Iterate through each environment
@@ -783,8 +574,6 @@ class MAPPOAgent:
                 if len(self.observations[env_idx][agent_idx]) == 0:
                     continue  # Skip if no data for this agent
 
-                # Get the index in the flattened advantages/returns list
-                # The compute_returns_and_advantages returns a flat list combining all envs and agents
                 data_idx = env_idx * self.n_agents + agent_idx
 
                 if data_idx >= len(all_advantages):
@@ -802,10 +591,8 @@ class MAPPOAgent:
                 old_log_probs = torch.stack(self.log_probs[env_idx][agent_idx])
                 returns = all_returns[data_idx]
 
-                # Get corresponding global states (repeated for each agent's timestep)
                 global_states = torch.stack(self.global_states[env_idx])
 
-                # Append to combined lists
                 all_obs.append(obs)
                 all_global_states.append(global_states)
                 all_actions.append(actions)
@@ -817,13 +604,12 @@ class MAPPOAgent:
                     all_masks.append(torch.stack(self.action_masks[env_idx][agent_idx]))
 
                 if use_hgnn:
-                    # Each agent's T samples map to timestep indices ts_offset..ts_offset+T-1
                     all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
 
                 if use_entropy_pred:
                     all_raw_obs_for_seq.append(obs)  # (T, obs_dim)
                     entropy_t = torch.tensor(
-                        np.stack(self.hg_entropies[env_idx]), dtype=torch.float32
+                        np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
                     )  # (T, n_types)
                     all_entropy_targets.append(entropy_t)
                     all_agent_indices.append(
@@ -850,7 +636,9 @@ class MAPPOAgent:
             torch.cat(all_ts_indices).to(train_device) if use_hgnn else None
         )
         combined_obs_sequences = (
-            self._build_obs_sequences_batched(torch.stack(all_raw_obs_for_seq))
+            self.entropy_helper.build_obs_sequences_batched(
+                torch.stack(all_raw_obs_for_seq)
+            )
             .detach()
             .to(train_device)
             if use_entropy_pred
@@ -916,8 +704,8 @@ class MAPPOAgent:
                         )
                     )
                     pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
-                    batch_obs_conditioned = torch.cat(
-                        [batch_obs, pred_entropy.detach()], dim=-1
+                    batch_obs_conditioned = self.entropy_helper.condition_obs(
+                        batch_obs, pred_entropy.detach()
                     )
                 else:
                     batch_obs_conditioned = batch_obs
@@ -930,11 +718,14 @@ class MAPPOAgent:
 
                 # Critic evaluation
                 if use_hgnn:
-                    values = self._compute_hgnn_critic_values(
-                        batch_global_states,
-                        batch_ts_idx,
-                        ts_to_signature_ids,
-                        hgnn_batch_cache,
+                    values = self.hg_cache.compute_hgnn_critic_values(
+                        network_critic=self.network.critic,
+                        batch_global_states=batch_global_states,
+                        batch_ts_indices=batch_ts_idx,
+                        ts_to_signature_ids=ts_to_signature_ids,
+                        hgnn_batch_cache=hgnn_batch_cache,
+                        observation_dim=self.observation_dim,
+                        device=self.device,
                         ts_to_entropies=ts_to_entropies,
                     )
                 else:
@@ -964,8 +755,10 @@ class MAPPOAgent:
 
                 # Auxiliary entropy prediction loss (Gaussian NLL)
                 if use_entropy_pred:
-                    entropy_pred_loss = F.gaussian_nll_loss(
-                        pred_mean, batch_entropy_targets, pred_log_var.exp()
+                    entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
+                        pred_mean=pred_mean,
+                        pred_log_var=pred_log_var,
+                        targets=batch_entropy_targets,
                     )
                     loss = loss + self.entropy_pred_coef * entropy_pred_loss
 
@@ -1010,12 +803,15 @@ class MAPPOAgent:
         has_masks = len(self.action_masks[0][0]) > 0
         use_hgnn = self.critic_type == "multi_hgnn"
         use_entropy_pred = (
-            self.network.entropy_predictor is not None and len(self.hg_entropies[0]) > 0
+            self.network.entropy_predictor is not None
+            and len(self.hg_cache.entropies[0]) > 0
         )
 
         if use_hgnn:
-            ts_to_signature_ids = self._get_flat_signature_ids()
-            ts_to_entropies = self._get_flat_entropies(train_device)
+            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
+            ts_to_entropies = self.hg_cache.get_flat_entropies(
+                train_device, self.entropy_conditioning
+            )
             hgnn_batch_cache = {}
 
         # Update each agent separately (independent actors)
@@ -1079,7 +875,7 @@ class MAPPOAgent:
                 if use_entropy_pred:
                     agent_raw_obs_for_seq.append(obs)  # (T, obs_dim)
                     entropy_t = torch.tensor(
-                        np.stack(self.hg_entropies[env_idx]), dtype=torch.float32
+                        np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
                     )  # (T, n_types)
                     agent_entropy_targets.append(entropy_t)
 
@@ -1108,7 +904,9 @@ class MAPPOAgent:
                 torch.cat(agent_ts_indices).to(train_device) if use_hgnn else None
             )
             obs_sequences_combined = (
-                self._build_obs_sequences_batched(torch.stack(agent_raw_obs_for_seq))
+                self.entropy_helper.build_obs_sequences_batched(
+                    torch.stack(agent_raw_obs_for_seq)
+                )
                 .detach()
                 .to(train_device)
                 if use_entropy_pred
@@ -1166,8 +964,8 @@ class MAPPOAgent:
                             batch_obs_seq, agent_idx
                         )
                         pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
-                        batch_obs_conditioned = torch.cat(
-                            [batch_obs, pred_entropy.detach()], dim=-1
+                        batch_obs_conditioned = self.entropy_helper.condition_obs(
+                            batch_obs, pred_entropy.detach()
                         )
                     else:
                         batch_obs_conditioned = batch_obs
@@ -1180,11 +978,14 @@ class MAPPOAgent:
 
                     # Critic evaluation
                     if use_hgnn:
-                        values = self._compute_hgnn_critic_values(
-                            batch_global_states,
-                            batch_ts_idx,
-                            ts_to_signature_ids,
-                            hgnn_batch_cache,
+                        values = self.hg_cache.compute_hgnn_critic_values(
+                            network_critic=self.network.critic,
+                            batch_global_states=batch_global_states,
+                            batch_ts_indices=batch_ts_idx,
+                            ts_to_signature_ids=ts_to_signature_ids,
+                            hgnn_batch_cache=hgnn_batch_cache,
+                            observation_dim=self.observation_dim,
+                            device=self.device,
                             ts_to_entropies=ts_to_entropies,
                         )
                     else:
@@ -1214,8 +1015,10 @@ class MAPPOAgent:
 
                     # Auxiliary entropy prediction loss (Gaussian NLL)
                     if use_entropy_pred:
-                        entropy_pred_loss = F.gaussian_nll_loss(
-                            pred_mean, batch_entropy_targets, pred_log_var.exp()
+                        entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
+                            pred_mean=pred_mean,
+                            pred_log_var=pred_log_var,
+                            targets=batch_entropy_targets,
                         )
                         loss = loss + self.entropy_pred_coef * entropy_pred_loss
 
