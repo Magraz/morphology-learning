@@ -45,6 +45,8 @@ class MAPPOAgent:
         self.entropy_pred_coef = model_params.entropy_pred_coef
         # Standalone intrinsic reward config
         self.use_intrinsic_reward = model_params.use_intrinsic_reward
+        self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
+        self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
         self.intrinsic_reward_encoder_dim = model_params.intrinsic_reward_encoder_dim
         self.intrinsic_reward_k = model_params.intrinsic_reward_k
         self.intrinsic_reward_memory_capacity = (
@@ -170,17 +172,32 @@ class MAPPOAgent:
             ).to(self.device)
             n_envs = obs_tensor.shape[0]
             obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
-            encoded = torch.stack(
-                [
-                    self.local_state_encoder.embedding(obs_flat[idx])
-                    for idx in range(obs_flat.shape[0])
-                ],
-                dim=0,
-            )
-            encoded = encoded.reshape(
-                n_envs, self.n_agents, self.intrinsic_reward_encoder_dim
-            )
+            encoded = self.local_state_encoder.embedding(obs_flat)
             return encoded.reshape(n_envs, self.intrinsic_reward_obs_dim).cpu().numpy()
+
+    def encode_agent_observations(self, obs_batch: np.ndarray) -> np.ndarray:
+        """Encode per-agent observations individually.
+
+        Returns:
+            np.ndarray of shape (n_envs, n_agents, encoder_dim)
+        """
+        if self.local_state_encoder is None:
+            raise RuntimeError(
+                "Intrinsic reward encoder is not initialized for this agent."
+            )
+
+        with torch.no_grad():
+            obs_tensor = torch.from_numpy(
+                np.ascontiguousarray(obs_batch, dtype=np.float32)
+            ).to(self.device)
+            n_envs = obs_tensor.shape[0]
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
+            encoded = self.local_state_encoder.embedding(obs_flat)
+            return (
+                encoded.reshape(n_envs, self.n_agents, self.intrinsic_reward_encoder_dim)
+                .cpu()
+                .numpy()
+            )
 
     def get_actions(
         self, observations, global_state, deterministic=False, hypergraphs=None
@@ -425,6 +442,7 @@ class MAPPOAgent:
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
         hg_signature_ids=None,  # list[int] of length n_envs or None
         entropies=None,  # torch tensor (n_envs, n_types) or None
+        per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -441,6 +459,11 @@ class MAPPOAgent:
         else:
             per_agent_rewards = np.tile(
                 rewards.astype(np.float32)[:, None], (1, self.n_agents)
+            )
+
+        if per_agent_intrinsic_rewards is not None:
+            per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
+                np.float32
             )
 
         # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete

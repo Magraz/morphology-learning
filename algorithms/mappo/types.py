@@ -30,9 +30,11 @@ class Model_Params:
     n_hyperedge_types: int = 1
     # Standalone episodic intrinsic reward
     use_intrinsic_reward: bool = False
+    intrinsic_reward_mode: str = "agent"  # "team" | "agent"
+    intrinsic_reward_coef: float = 1.0
     intrinsic_reward_encoder_dim: int = 64
     intrinsic_reward_k: int = 4
-    intrinsic_reward_memory_capacity: int = 600
+    intrinsic_reward_memory_capacity: int = 1024
     # Entropy conditioning of HGNN critics
     entropy_conditioning: bool = False
     # Auxiliary LSTM entropy predictor

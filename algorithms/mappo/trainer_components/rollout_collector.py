@@ -34,15 +34,32 @@ class RolloutCollector:
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
         self.intrinsic_rewarders = None
+        self.agent_intrinsic_rewarders = None
+        self.intrinsic_reward_mode = (
+            self.agent.intrinsic_reward_mode if self.agent.use_intrinsic_reward else None
+        )
         if self.agent.use_intrinsic_reward:
-            self.intrinsic_rewarders = [
-                IntrinsicReward(
-                    obs_dim=self.agent.intrinsic_reward_obs_dim,
-                    k=self.agent.intrinsic_reward_k,
-                    memory_capacity=self.agent.intrinsic_reward_memory_capacity,
-                )
-                for _ in range(self.n_parallel_envs)
-            ]
+            if self.intrinsic_reward_mode == "agent":
+                self.agent_intrinsic_rewarders = [
+                    [
+                        IntrinsicReward(
+                            obs_dim=self.agent.intrinsic_reward_encoder_dim,
+                            k=self.agent.intrinsic_reward_k,
+                            memory_capacity=self.agent.intrinsic_reward_memory_capacity,
+                        )
+                        for _ in range(self.n_agents)
+                    ]
+                    for _ in range(self.n_parallel_envs)
+                ]
+            else:
+                self.intrinsic_rewarders = [
+                    IntrinsicReward(
+                        obs_dim=self.agent.intrinsic_reward_obs_dim,
+                        k=self.agent.intrinsic_reward_k,
+                        memory_capacity=self.agent.intrinsic_reward_memory_capacity,
+                    )
+                    for _ in range(self.n_parallel_envs)
+                ]
 
     def collect(self, max_steps: int) -> RolloutResult:
         """Collect trajectory using Gymnasium vectorized environments."""
@@ -56,6 +73,10 @@ class RolloutCollector:
         if self.intrinsic_rewarders is not None:
             for rewarder in self.intrinsic_rewarders:
                 rewarder.reset()
+        if self.agent_intrinsic_rewarders is not None:
+            for env_rewarders in self.agent_intrinsic_rewarders:
+                for rewarder in env_rewarders:
+                    rewarder.reset()
 
         current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
         total_step_count = 0
@@ -103,11 +124,17 @@ class RolloutCollector:
             )
             dones = np.logical_or(terminateds, truncateds)
 
+            per_agent_intrinsic = None
             if self.intrinsic_rewarders is not None:
-                rewards = self._apply_intrinsic_rewards(
+                rewards = self._apply_team_intrinsic_rewards(
                     next_obs=next_obs,
                     dones=dones,
                     rewards=rewards,
+                )
+            elif self.agent_intrinsic_rewarders is not None:
+                per_agent_intrinsic = self._apply_agent_intrinsic_rewards(
+                    next_obs=next_obs,
+                    dones=dones,
                 )
 
             if dones.any():
@@ -126,6 +153,7 @@ class RolloutCollector:
                 action_masks=current_masks,
                 hg_signature_ids=per_env_sig_ids,
                 entropies=per_env_entropies,
+                per_agent_intrinsic_rewards=per_agent_intrinsic,
             )
 
             current_masks = (
@@ -145,20 +173,50 @@ class RolloutCollector:
             final_values=final_values,
         )
 
-    def _apply_intrinsic_rewards(self, next_obs, dones, rewards) -> np.ndarray:
-        intrinsic_obs = np.ascontiguousarray(next_obs, dtype=np.float32)
-        encoded_obs = self.agent.encode_team_observations(intrinsic_obs)
+    def _apply_team_intrinsic_rewards(self, next_obs, dones, rewards) -> np.ndarray:
+        encoded_obs = self.agent.encode_team_observations(
+            np.ascontiguousarray(next_obs, dtype=np.float32)
+        )
 
         intrinsic_rewards = np.zeros(self.n_parallel_envs, dtype=np.float32)
         for env_idx, rewarder in enumerate(self.intrinsic_rewarders):
-            intrinsic_rewards[env_idx] = rewarder.compute_reward(encoded_obs[env_idx])
-            rewarder.on_rollout_step(encoded_obs[env_idx])
             if dones[env_idx]:
                 rewarder.reset()
+            else:
+                intrinsic_rewards[env_idx] = rewarder.compute_reward(
+                    encoded_obs[env_idx]
+                )
+                rewarder.on_rollout_step(encoded_obs[env_idx])
 
-        updated_rewards = np.ascontiguousarray(rewards, dtype=np.float32).copy()
-        updated_rewards += intrinsic_rewards
+        updated_rewards = np.array(rewards, dtype=np.float32)
+        updated_rewards += self.agent.intrinsic_reward_coef * intrinsic_rewards
         return updated_rewards
+
+    def _apply_agent_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+        """Compute per-agent intrinsic rewards.
+
+        Returns:
+            np.ndarray of shape (n_envs, n_agents) — scaled intrinsic rewards.
+        """
+        encoded_obs = self.agent.encode_agent_observations(
+            np.ascontiguousarray(next_obs, dtype=np.float32)
+        )  # (n_envs, n_agents, encoder_dim)
+
+        intrinsic_rewards = np.zeros(
+            (self.n_parallel_envs, self.n_agents), dtype=np.float32
+        )
+        for env_idx, env_rewarders in enumerate(self.agent_intrinsic_rewarders):
+            if dones[env_idx]:
+                for rewarder in env_rewarders:
+                    rewarder.reset()
+            else:
+                for agent_idx, rewarder in enumerate(env_rewarders):
+                    intrinsic_rewards[env_idx, agent_idx] = rewarder.compute_reward(
+                        encoded_obs[env_idx, agent_idx]
+                    )
+                    rewarder.on_rollout_step(encoded_obs[env_idx, agent_idx])
+
+        return self.agent.intrinsic_reward_coef * intrinsic_rewards
 
     def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
         final_global_states = obs.reshape(batch_size, -1)

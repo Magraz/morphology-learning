@@ -37,8 +37,8 @@ class LocalStateEncoder(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def embedding(self, x: torch.Tensor) -> torch.Tensor:
-        # Shape guard
-        if x.dim() == 1:
+        squeeze = x.dim() == 1
+        if squeeze:
             x = x.unsqueeze(0)
         x = self.init(x)
         x = self.ln0(x)
@@ -52,8 +52,9 @@ class LocalStateEncoder(nn.Module):
         x = self.fc3(x)
         # Keep embeddings scale-stable for kNN / dot products
         x = F.normalize(x, dim=-1)  # unit-norm features
-
-        return x[0]
+        if squeeze:
+            x = x.squeeze(0)
+        return x
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         e1 = self.embedding(x1)
