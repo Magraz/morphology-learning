@@ -33,12 +33,20 @@ from environments.multi_box_push.utils import (
 class MultiBoxPushEnv(gym.Env):
     metadata = {"render_fps": 30}
 
-    def __init__(self, render_mode=None, n_agents=3, n_objects=3, max_steps=1024):
+    def __init__(
+        self,
+        render_mode=None,
+        n_agents=3,
+        n_objects=3,
+        max_steps=1024,
+        reward_mode="dense",
+    ):
         super().__init__()
 
         self.n_agents = n_agents
         self.n_objects = n_objects
         self.render_mode = render_mode
+        self.reward_mode = reward_mode
 
         # Add target areas parameters
         self.target_areas = []
@@ -822,10 +830,13 @@ class MultiBoxPushEnv(gym.Env):
         all_states = self._agent_pos_cache - center  # (n_agents, 2)
 
         # Agent velocities normalized to ~[-1, 1]
-        all_velocities = np.array(
-            [[a.linearVelocity.x, a.linearVelocity.y] for a in self.agents],
-            dtype=np.float32,
-        ) / self.velocity_norm  # (n_agents, 2)
+        all_velocities = (
+            np.array(
+                [[a.linearVelocity.x, a.linearVelocity.y] for a in self.agents],
+                dtype=np.float32,
+            )
+            / self.velocity_norm
+        )  # (n_agents, 2)
 
         # Vectorized density sensors for all agents in one pass (replaces n_agents calls)
         all_density_sensors = self._calculate_density_sensors_all(
@@ -868,7 +879,8 @@ class MultiBoxPushEnv(gym.Env):
             self.delivered_objects = set()
 
         current_object_distances = {}
-        distance_reward = 0.0
+        shaping_reward = 0.0
+        completion_reward = 0.0
 
         # 2. Iterate over all movable objects
         for obj_idx, obj in enumerate(self.objects):
@@ -892,11 +904,11 @@ class MultiBoxPushEnv(gym.Env):
                 # If improvement is positive (getting closer), give reward
                 # If negative (getting farther), give penalty
                 # Scaling factor 10.0 makes the signal stronger
-                distance_reward += improvement * 10.0
+                shaping_reward += improvement * 10.0
 
             # 4. Check for completion (object inside target) — bonus only once
             if target.contains_object(obj):
-                distance_reward += 100.0
+                completion_reward += 100.0
                 self.delivered_objects.add(obj_idx)
 
         # Update previous distances for next step (only for non-delivered objects)
@@ -906,8 +918,11 @@ class MultiBoxPushEnv(gym.Env):
         if len(self.delivered_objects) == len(self.objects):
             done = True
 
-        # Assign the distance reward as the task reward (shared by all)
-        task_reward = distance_reward
+        # Dense mode keeps the shaping term; sparse mode only pays on delivery.
+        if self.reward_mode == "dense":
+            task_reward = shaping_reward + completion_reward
+        else:
+            task_reward = completion_reward
 
         return task_reward, done
 

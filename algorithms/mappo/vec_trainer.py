@@ -43,6 +43,7 @@ class VecMAPPOTrainer:
         self.n_parallel_envs = env_params.n_envs
         self.env_variant = env_params.env_variant
         self.n_objects = env_params.n_objects
+        self.reward_mode = env_params.reward_mode
         self.critic_type = model_params.critic_type
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_conditioning = model_params.entropy_conditioning
@@ -55,6 +56,7 @@ class VecMAPPOTrainer:
             use_async=True,
             env_variant=self.env_variant,
             n_objects=self.n_objects,
+            reward_mode=self.reward_mode,
         )
         self.vec_env = make_vec_env(
             self.env_name,
@@ -63,6 +65,7 @@ class VecMAPPOTrainer:
             use_async=True,
             env_variant=self.env_variant,
             n_objects=self.n_objects,
+            reward_mode=self.reward_mode,
         )
 
         obs_space = self.vec_env.single_observation_space
@@ -138,6 +141,7 @@ class VecMAPPOTrainer:
             env_variant=self.env_variant,
             n_agents=self.n_agents,
             n_objects=self.n_objects,
+            reward_mode=self.reward_mode,
             discrete=self.discrete,
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_runtime=self.hypergraph_runtime,
