@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from algorithms.mappo.types import MAPPO_Params, Model_Params
+from algorithms.mappo.networks.encoders import LocalStateEncoder
 from algorithms.mappo.networks.models import MAPPONetwork
 from algorithms.mappo.hg_cache import HypergraphCache
 from algorithms.mappo.entropy_helpers import EntropyPredictorHelper
@@ -42,6 +43,16 @@ class MAPPOAgent:
         # Auxiliary LSTM entropy predictor config
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_pred_coef = model_params.entropy_pred_coef
+        # Standalone intrinsic reward config
+        self.use_intrinsic_reward = model_params.use_intrinsic_reward
+        self.intrinsic_reward_encoder_dim = model_params.intrinsic_reward_encoder_dim
+        self.intrinsic_reward_k = model_params.intrinsic_reward_k
+        self.intrinsic_reward_memory_capacity = (
+            model_params.intrinsic_reward_memory_capacity
+        )
+        self.intrinsic_reward_obs_dim = (
+            self.n_agents * self.intrinsic_reward_encoder_dim
+        )
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -88,6 +99,13 @@ class MAPPOAgent:
         ).to(self.device)
 
         self.network_old.load_state_dict(self.network.state_dict())
+
+        self.local_state_encoder = None
+        if self.use_intrinsic_reward:
+            self.local_state_encoder = LocalStateEncoder(
+                observation_dim, self.intrinsic_reward_encoder_dim
+            ).to(self.device)
+            self.local_state_encoder.eval()
 
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
@@ -138,6 +156,31 @@ class MAPPOAgent:
     def reset_obs_history(self, env_mask=None):
         """Zero out obs history. If env_mask given, only reset those envs."""
         self.entropy_helper.reset_obs_history(env_mask)
+
+    def encode_team_observations(self, obs_batch: np.ndarray) -> np.ndarray:
+        """Encode and concatenate per-agent observations for each environment."""
+        if self.local_state_encoder is None:
+            raise RuntimeError(
+                "Intrinsic reward encoder is not initialized for this agent."
+            )
+
+        with torch.no_grad():
+            obs_tensor = torch.from_numpy(
+                np.ascontiguousarray(obs_batch, dtype=np.float32)
+            ).to(self.device)
+            n_envs = obs_tensor.shape[0]
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
+            encoded = torch.stack(
+                [
+                    self.local_state_encoder.embedding(obs_flat[idx])
+                    for idx in range(obs_flat.shape[0])
+                ],
+                dim=0,
+            )
+            encoded = encoded.reshape(
+                n_envs, self.n_agents, self.intrinsic_reward_encoder_dim
+            )
+            return encoded.reshape(n_envs, self.intrinsic_reward_obs_dim).cpu().numpy()
 
     def get_actions(
         self, observations, global_state, deterministic=False, hypergraphs=None

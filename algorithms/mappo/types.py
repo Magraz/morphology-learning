@@ -28,6 +28,11 @@ class Model_Params:
     critic_type: str
     # For HGNN
     n_hyperedge_types: int = 1
+    # Standalone episodic intrinsic reward
+    use_intrinsic_reward: bool = False
+    intrinsic_reward_encoder_dim: int = 64
+    intrinsic_reward_k: int = 4
+    intrinsic_reward_memory_capacity: int = 600
     # Entropy conditioning of HGNN critics
     entropy_conditioning: bool = False
     # Auxiliary LSTM entropy predictor

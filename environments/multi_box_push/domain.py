@@ -107,7 +107,7 @@ class MultiBoxPushEnv(gym.Env):
 
         # Create boxes coupling reqs
         self.objects_push_coupling_list = np.random.default_rng(42).integers(
-            2, self.n_agents, (self.n_objects)
+            2, (self.n_agents // 2) + 1, (self.n_objects)
         )
 
         # Add force tracking

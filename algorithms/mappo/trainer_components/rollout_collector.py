@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from algorithms.mappo.intrinsic_reward import IntrinsicReward
 from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
 import numpy as np
 import torch
@@ -32,6 +33,16 @@ class RolloutCollector:
         self.discrete = discrete
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
+        self.intrinsic_rewarders = None
+        if self.agent.use_intrinsic_reward:
+            self.intrinsic_rewarders = [
+                IntrinsicReward(
+                    obs_dim=self.agent.intrinsic_reward_obs_dim,
+                    k=self.agent.intrinsic_reward_k,
+                    memory_capacity=self.agent.intrinsic_reward_memory_capacity,
+                )
+                for _ in range(self.n_parallel_envs)
+            ]
 
     def collect(self, max_steps: int) -> RolloutResult:
         """Collect trajectory using Gymnasium vectorized environments."""
@@ -42,6 +53,9 @@ class RolloutCollector:
         batch_size = obs.shape[0]
 
         self.hypergraph_runtime.on_rollout_reset()
+        if self.intrinsic_rewarders is not None:
+            for rewarder in self.intrinsic_rewarders:
+                rewarder.reset()
 
         current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
         total_step_count = 0
@@ -89,6 +103,13 @@ class RolloutCollector:
             )
             dones = np.logical_or(terminateds, truncateds)
 
+            if self.intrinsic_rewarders is not None:
+                rewards = self._apply_intrinsic_rewards(
+                    next_obs=next_obs,
+                    dones=dones,
+                    rewards=rewards,
+                )
+
             if dones.any():
                 self.agent.reset_obs_history(env_mask=dones)
                 self.hypergraph_runtime.on_env_done_mask(dones)
@@ -123,6 +144,21 @@ class RolloutCollector:
             episode_count=episode_count,
             final_values=final_values,
         )
+
+    def _apply_intrinsic_rewards(self, next_obs, dones, rewards) -> np.ndarray:
+        intrinsic_obs = np.ascontiguousarray(next_obs, dtype=np.float32)
+        encoded_obs = self.agent.encode_team_observations(intrinsic_obs)
+
+        intrinsic_rewards = np.zeros(self.n_parallel_envs, dtype=np.float32)
+        for env_idx, rewarder in enumerate(self.intrinsic_rewarders):
+            intrinsic_rewards[env_idx] = rewarder.compute_reward(encoded_obs[env_idx])
+            rewarder.on_rollout_step(encoded_obs[env_idx])
+            if dones[env_idx]:
+                rewarder.reset()
+
+        updated_rewards = np.ascontiguousarray(rewards, dtype=np.float32).copy()
+        updated_rewards += intrinsic_rewards
+        return updated_rewards
 
     def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
         final_global_states = obs.reshape(batch_size, -1)
