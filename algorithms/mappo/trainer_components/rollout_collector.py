@@ -144,16 +144,15 @@ class RolloutCollector:
             )
             dones = np.logical_or(terminateds, truncateds)
 
+            per_agent_intrinsic = None
             if self.intrinsic_rewarders is not None:
                 encoder_hgs = None
                 if (
                     self.intrinsic_reward_use_encoder
                     and self.intrinsic_reward_encoder_type == "hypergraph"
                 ):
-                    encoder_hgs = (
-                        self.hypergraph_runtime.build_per_env_hypergraphs(
-                            next_obs, infos, batch_size
-                        )
+                    encoder_hgs = self.hypergraph_runtime.build_per_env_hypergraphs(
+                        next_obs, infos, batch_size
                     )
                 per_agent_intrinsic = self._get_team_intrinsic_rewards(
                     next_obs=next_obs,
@@ -240,9 +239,7 @@ class RolloutCollector:
                 np.ascontiguousarray(next_obs, dtype=np.float32)
             )  # (n_envs, n_agents, encoder_dim)
         else:
-            agent_features = next_obs.astype(
-                np.float32
-            )  # (n_envs, n_agents, obs_dim)
+            agent_features = next_obs.astype(np.float32)  # (n_envs, n_agents, obs_dim)
 
         intrinsic_rewards = np.zeros(
             (self.n_parallel_envs, self.n_agents), dtype=np.float32
