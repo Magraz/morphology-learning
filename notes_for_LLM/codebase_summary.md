@@ -129,7 +129,7 @@ A 2D multi-agent environment where circular agents move in a bounded arena, can 
 
 ### Multi-Box Push (`environments/multi_box_push/`)
 
-A variant of the Salp environment focused on **cooperative object pushing**. Agents must push dynamic objects into a rectangular drop zone.
+A env_variant of the Salp environment focused on **cooperative object pushing**. Agents must push dynamic objects into a rectangular drop zone.
 
 **`domain.py` — `MultiBoxPushEnv(gym.Env)`**
 - **World**: 30×30 Box2D, zero gravity, boundary walls.

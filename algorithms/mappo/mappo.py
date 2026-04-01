@@ -47,6 +47,7 @@ class MAPPOAgent:
         self.use_intrinsic_reward = model_params.use_intrinsic_reward
         self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
         self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
+        self.intrinsic_reward_use_encoder = model_params.intrinsic_reward_use_encoder
         self.intrinsic_reward_encoder_dim = model_params.intrinsic_reward_encoder_dim
         self.intrinsic_reward_k = model_params.intrinsic_reward_k
         self.intrinsic_reward_memory_capacity = (
@@ -103,7 +104,7 @@ class MAPPOAgent:
         self.network_old.load_state_dict(self.network.state_dict())
 
         self.local_state_encoder = None
-        if self.use_intrinsic_reward:
+        if self.use_intrinsic_reward and self.intrinsic_reward_use_encoder:
             self.local_state_encoder = LocalStateEncoder(
                 observation_dim, self.intrinsic_reward_encoder_dim
             ).to(self.device)
@@ -194,7 +195,9 @@ class MAPPOAgent:
             obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
             encoded = self.local_state_encoder.embedding(obs_flat)
             return (
-                encoded.reshape(n_envs, self.n_agents, self.intrinsic_reward_encoder_dim)
+                encoded.reshape(
+                    n_envs, self.n_agents, self.intrinsic_reward_encoder_dim
+                )
                 .cpu()
                 .numpy()
             )
@@ -438,7 +441,6 @@ class MAPPOAgent:
         values,  # np (n_envs, 1)
         rewards,  # np (n_envs,)
         dones,  # np (n_envs,)
-        infos,  # dict
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
         hg_signature_ids=None,  # list[int] of length n_envs or None
         entropies=None,  # torch tensor (n_envs, n_types) or None
@@ -452,14 +454,9 @@ class MAPPOAgent:
         n_envs = obs.shape[0]
 
         # Per-agent rewards: (n_envs, n_agents)
-        if "local_rewards" in infos:
-            per_agent_rewards = infos["local_rewards"].astype(np.float32) + rewards[
-                :, None
-            ].astype(np.float32)
-        else:
-            per_agent_rewards = np.tile(
-                rewards.astype(np.float32)[:, None], (1, self.n_agents)
-            )
+        per_agent_rewards = np.tile(
+            rewards.astype(np.float32)[:, None], (1, self.n_agents)
+        )
 
         if per_agent_intrinsic_rewards is not None:
             per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
@@ -500,7 +497,9 @@ class MAPPOAgent:
                     env_idx=env_idx,
                     sig_id=hg_signature_ids[env_idx],
                     entropy_conditioning=self.entropy_conditioning,
-                    entropy_tensor=entropies[env_idx] if entropies is not None else None,
+                    entropy_tensor=(
+                        entropies[env_idx] if entropies is not None else None
+                    ),
                 )
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])

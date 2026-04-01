@@ -131,7 +131,6 @@ class PettingZooToGymWrapper(gym.Env):
         local_rewards = np.array([reward_dict[agent] for agent in self.agents])
 
         info = {
-            "local_rewards": local_rewards,
             "agents": self.agents,
         }
 

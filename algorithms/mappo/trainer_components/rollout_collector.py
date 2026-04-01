@@ -36,14 +36,29 @@ class RolloutCollector:
         self.intrinsic_rewarders = None
         self.agent_intrinsic_rewarders = None
         self.intrinsic_reward_mode = (
-            self.agent.intrinsic_reward_mode if self.agent.use_intrinsic_reward else None
+            self.agent.intrinsic_reward_mode
+            if self.agent.use_intrinsic_reward
+            else None
+        )
+        self.intrinsic_reward_use_encoder = (
+            self.agent.intrinsic_reward_use_encoder
+            if self.agent.use_intrinsic_reward
+            else False
         )
         if self.agent.use_intrinsic_reward:
+            obs_dim_per_agent = self.agent.observation_dim
+            if self.intrinsic_reward_use_encoder:
+                team_obs_dim = self.agent.intrinsic_reward_obs_dim
+                agent_obs_dim = self.agent.intrinsic_reward_encoder_dim
+            else:
+                team_obs_dim = self.n_agents * obs_dim_per_agent
+                agent_obs_dim = obs_dim_per_agent
+
             if self.intrinsic_reward_mode == "agent":
                 self.agent_intrinsic_rewarders = [
                     [
                         IntrinsicReward(
-                            obs_dim=self.agent.intrinsic_reward_encoder_dim,
+                            obs_dim=agent_obs_dim,
                             k=self.agent.intrinsic_reward_k,
                             memory_capacity=self.agent.intrinsic_reward_memory_capacity,
                         )
@@ -54,7 +69,7 @@ class RolloutCollector:
             else:
                 self.intrinsic_rewarders = [
                     IntrinsicReward(
-                        obs_dim=self.agent.intrinsic_reward_obs_dim,
+                        obs_dim=team_obs_dim,
                         k=self.agent.intrinsic_reward_k,
                         memory_capacity=self.agent.intrinsic_reward_memory_capacity,
                     )
@@ -124,15 +139,13 @@ class RolloutCollector:
             )
             dones = np.logical_or(terminateds, truncateds)
 
-            per_agent_intrinsic = None
             if self.intrinsic_rewarders is not None:
-                rewards = self._apply_team_intrinsic_rewards(
+                per_agent_intrinsic = self._get_team_intrinsic_rewards(
                     next_obs=next_obs,
                     dones=dones,
-                    rewards=rewards,
                 )
             elif self.agent_intrinsic_rewarders is not None:
-                per_agent_intrinsic = self._apply_agent_intrinsic_rewards(
+                per_agent_intrinsic = self._get_agent_intrinsic_rewards(
                     next_obs=next_obs,
                     dones=dones,
                 )
@@ -149,7 +162,6 @@ class RolloutCollector:
                 values_array,
                 rewards,
                 dones,
-                infos,
                 action_masks=current_masks,
                 hg_signature_ids=per_env_sig_ids,
                 entropies=per_env_entropies,
@@ -159,6 +171,7 @@ class RolloutCollector:
             current_masks = (
                 infos.get("avail_actions") if isinstance(infos, dict) else None
             )
+
             obs = next_obs
             total_step_count += batch_size
             current_episode_steps += 1
@@ -167,16 +180,22 @@ class RolloutCollector:
             current_episode_steps[dones] = 0
 
         final_values = self._compute_final_values(obs, infos, batch_size)
+
         return RolloutResult(
             step_count=total_step_count,
             episode_count=episode_count,
             final_values=final_values,
         )
 
-    def _apply_team_intrinsic_rewards(self, next_obs, dones, rewards) -> np.ndarray:
-        encoded_obs = self.agent.encode_team_observations(
-            np.ascontiguousarray(next_obs, dtype=np.float32)
-        )
+    def _get_team_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+        if self.intrinsic_reward_use_encoder:
+            team_features = self.agent.encode_team_observations(
+                np.ascontiguousarray(next_obs, dtype=np.float32)
+            )
+        else:
+            team_features = next_obs.reshape(self.n_parallel_envs, -1).astype(
+                np.float32
+            )
 
         intrinsic_rewards = np.zeros(self.n_parallel_envs, dtype=np.float32)
         for env_idx, rewarder in enumerate(self.intrinsic_rewarders):
@@ -184,23 +203,27 @@ class RolloutCollector:
                 rewarder.reset()
             else:
                 intrinsic_rewards[env_idx] = rewarder.compute_reward(
-                    encoded_obs[env_idx]
+                    team_features[env_idx]
                 )
-                rewarder.on_rollout_step(encoded_obs[env_idx])
+                rewarder.on_rollout_step(team_features[env_idx])
 
-        updated_rewards = np.array(rewards, dtype=np.float32)
-        updated_rewards += self.agent.intrinsic_reward_coef * intrinsic_rewards
-        return updated_rewards
+        rewards = self.agent.intrinsic_reward_coef * intrinsic_rewards
+        return np.tile(rewards[:, None], (1, self.n_agents))
 
-    def _apply_agent_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+    def _get_agent_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
         """Compute per-agent intrinsic rewards.
 
         Returns:
             np.ndarray of shape (n_envs, n_agents) — scaled intrinsic rewards.
         """
-        encoded_obs = self.agent.encode_agent_observations(
-            np.ascontiguousarray(next_obs, dtype=np.float32)
-        )  # (n_envs, n_agents, encoder_dim)
+        if self.intrinsic_reward_use_encoder:
+            agent_features = self.agent.encode_agent_observations(
+                np.ascontiguousarray(next_obs, dtype=np.float32)
+            )  # (n_envs, n_agents, encoder_dim)
+        else:
+            agent_features = next_obs.astype(
+                np.float32
+            )  # (n_envs, n_agents, obs_dim)
 
         intrinsic_rewards = np.zeros(
             (self.n_parallel_envs, self.n_agents), dtype=np.float32
@@ -212,9 +235,9 @@ class RolloutCollector:
             else:
                 for agent_idx, rewarder in enumerate(env_rewarders):
                     intrinsic_rewards[env_idx, agent_idx] = rewarder.compute_reward(
-                        encoded_obs[env_idx, agent_idx]
+                        agent_features[env_idx, agent_idx]
                     )
-                    rewarder.on_rollout_step(encoded_obs[env_idx, agent_idx])
+                    rewarder.on_rollout_step(agent_features[env_idx, agent_idx])
 
         return self.agent.intrinsic_reward_coef * intrinsic_rewards
 

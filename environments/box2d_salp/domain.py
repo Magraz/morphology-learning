@@ -1221,7 +1221,6 @@ class SalpChainEnv(gym.Env):
             "agent_positions": [
                 {"x": agent.position.x, "y": agent.position.y} for agent in self.agents
             ],
-            "local_rewards": individual_rewards,
             "task_reward": task_reward,
         }
 
