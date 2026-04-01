@@ -1,8 +1,10 @@
+import dhg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from algorithms.mappo.networks.utils import layer_init
+from hypergraphs.hgnn_conv_layer import HGNNConv
 
 
 class LocalStateEncoder(nn.Module):
@@ -56,11 +58,87 @@ class LocalStateEncoder(nn.Module):
             x = x.squeeze(0)
         return x
 
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        e1 = self.embedding(x1)
-        e2 = self.embedding(x2)
-        z = torch.cat([e1, e2], dim=-1)
-        return self.last(z)  # logits (use CrossEntropyLoss outside if training)
+
+class HypergraphStateEncoder(nn.Module):
+    """Frozen random encoder that produces a fixed-size embedding from
+    a set of hypergraphs and node features.
+
+    Mirrors the LocalStateEncoder API but operates on hypergraph-structured
+    inputs.  Each hyperedge type gets its own randomly-initialized HGNNConv
+    stack.  Per-type agent representations are mean-pooled and concatenated,
+    then projected to a unit-norm embedding via an MLP.
+    """
+
+    def __init__(
+        self,
+        n_hyperedge_types: int,
+        observation_dim: int,
+        num_outputs: int,
+        hidden_dim: int = 64,
+        n_hgnn_layers: int = 2,
+    ):
+        super().__init__()
+        self.n_hyperedge_types = n_hyperedge_types
+        self.num_outputs = num_outputs
+
+        # Per-type HGNN convolution stacks (drop_rate=0 for deterministic encoding)
+        self.conv_stacks = nn.ModuleList()
+        for _ in range(n_hyperedge_types):
+            stack = nn.ModuleList()
+            stack.append(HGNNConv(observation_dim, hidden_dim, drop_rate=0.0))
+            for _ in range(n_hgnn_layers - 1):
+                stack.append(HGNNConv(hidden_dim, hidden_dim, drop_rate=0.0))
+            self.conv_stacks.append(stack)
+
+        # MLP over concatenated per-type pooled vectors
+        pooled_dim = n_hyperedge_types * hidden_dim
+        self.fc1 = nn.Linear(pooled_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_outputs)
+
+        # Head over concatenated embeddings [e(s1)||e(s2)]
+        self.last = nn.Linear(num_outputs * 2, 2)
+
+        self._init_weights()
+
+        # Freeze all weights for random feature extraction
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.eval()
+
+    def _init_weights(self):
+        for stack in self.conv_stacks:
+            for conv in stack:
+                nn.init.orthogonal_(conv.theta.weight)
+                nn.init.zeros_(conv.theta.bias)
+        for m in [self.fc1, self.fc2, self.last]:
+            nn.init.orthogonal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def embedding(
+        self, X: torch.Tensor, hypergraphs: list[dhg.Hypergraph]
+    ) -> torch.Tensor:
+        """Produce a unit-norm embedding from node features and hypergraphs.
+
+        Args:
+            X: Node features of shape (n_agents, observation_dim).
+            hypergraphs: List of dhg.Hypergraph, one per hyperedge type.
+
+        Returns:
+            Unit-norm embedding of shape (num_outputs,).
+        """
+        pooled = []
+        for conv_stack, hg in zip(self.conv_stacks, hypergraphs):
+            h = X
+            for conv in conv_stack:
+                h = conv(h, hg)
+            pooled.append(h.mean(dim=0))  # mean-pool over agents → (hidden_dim,)
+
+        z = torch.cat(pooled, dim=-1)  # (n_types * hidden_dim,)
+        z = F.silu(self.ln1(self.fc1(z)))
+        z = self.fc2(z)
+        return F.normalize(z, dim=-1)  # unit-norm embedding
 
 
 class HypergraphEntropyPredictor(nn.Module):

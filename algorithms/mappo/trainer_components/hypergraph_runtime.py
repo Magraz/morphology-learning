@@ -3,6 +3,8 @@ from functools import partial
 import numpy as np
 import torch
 
+import dhg
+
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
     canonicalize_edge_lists,
@@ -84,26 +86,35 @@ class HypergraphRuntime:
         if self._dynamic_grouping is not None:
             self._dynamic_grouping.reset_history(env_mask=dones)
 
+    def _compute_all_type_edge_lists(self, obs, infos, n_envs: int):
+        """Compute per-type, per-env edge lists from observations and infos.
+
+        Returns:
+            all_type_edge_lists: [type_idx][env_idx] -> edge_list
+        """
+        if self.hypergraph_mode == "hygma":
+            spectral_edges = self._dynamic_grouping.get_edge_lists(n_envs)
+            return [spectral_edges]
+
+        all_type_edge_lists = []
+        for fn, source in self.hyperedge_fns:
+            if source == "obs":
+                data = obs
+            else:
+                data = infos.get(source) if isinstance(infos, dict) else None
+                if data is None:
+                    continue
+            all_type_edge_lists.append(
+                [fn(data[e], self.n_agents) for e in range(n_envs)]
+            )
+        return all_type_edge_lists
+
     def build_inference_hypergraphs(self, obs, infos, n_envs: int):
         """Build batched block-diagonal hypergraphs for critic inference."""
         if self.critic_type != "multi_hgnn":
             return None, None
 
-        if self.hypergraph_mode == "hygma":
-            spectral_edges = self._dynamic_grouping.get_edge_lists(n_envs)
-            all_type_edge_lists = [spectral_edges]  # [type_idx][env_idx] -> edge_list
-        else:
-            all_type_edge_lists = []  # [type_idx][env_idx] -> edge_list
-            for fn, source in self.hyperedge_fns:
-                if source == "obs":
-                    data = obs
-                else:
-                    data = infos.get(source) if isinstance(infos, dict) else None
-                    if data is None:
-                        continue
-                all_type_edge_lists.append(
-                    [fn(data[e], self.n_agents) for e in range(n_envs)]
-                )
+        all_type_edge_lists = self._compute_all_type_edge_lists(obs, infos, n_envs)
 
         n_types = len(all_type_edge_lists)
         per_env_edge_lists = [
@@ -136,6 +147,26 @@ class HypergraphRuntime:
                 batched_hgs.append(hg)
 
         return batched_hgs, per_env_sig_ids
+
+    def build_per_env_hypergraphs(self, obs, infos, n_envs: int):
+        """Build individual per-env hypergraphs (not batched).
+
+        Returns:
+            list[list[dhg.Hypergraph]]: [env_idx][type_idx]
+        """
+        all_type_edge_lists = self._compute_all_type_edge_lists(obs, infos, n_envs)
+        n_types = len(all_type_edge_lists)
+
+        result = []
+        for e in range(n_envs):
+            env_hgs = [
+                dhg.Hypergraph(
+                    self.n_agents, all_type_edge_lists[t][e], device=self.device
+                )
+                for t in range(n_types)
+            ]
+            result.append(env_hgs)
+        return result
 
     def compute_entropies_for_critic(self, per_env_sig_ids):
         """Compute structural entropy values for critic conditioning."""

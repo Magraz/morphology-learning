@@ -26,6 +26,10 @@ class CheckpointIO:
             checkpoint["local_state_encoder"] = (
                 self.agent.local_state_encoder.state_dict()
             )
+        if self.agent.hypergraph_state_encoder is not None:
+            checkpoint["hypergraph_state_encoder"] = (
+                self.agent.hypergraph_state_encoder.state_dict()
+            )
 
         torch.save(checkpoint, path)
 
@@ -41,13 +45,26 @@ class CheckpointIO:
         if has_encoder_checkpoint != has_encoder_agent:
             raise ValueError(
                 "Checkpoint intrinsic encoder state does not match the current "
-                "agent configuration."
+                "agent configuration (local_state_encoder)."
             )
         if has_encoder_agent:
             self.agent.local_state_encoder.load_state_dict(
                 checkpoint["local_state_encoder"]
             )
             self.agent.local_state_encoder.eval()
+
+        has_hg_encoder_checkpoint = "hypergraph_state_encoder" in checkpoint
+        has_hg_encoder_agent = self.agent.hypergraph_state_encoder is not None
+        if has_hg_encoder_checkpoint != has_hg_encoder_agent:
+            raise ValueError(
+                "Checkpoint intrinsic encoder state does not match the current "
+                "agent configuration (hypergraph_state_encoder)."
+            )
+        if has_hg_encoder_agent:
+            self.agent.hypergraph_state_encoder.load_state_dict(
+                checkpoint["hypergraph_state_encoder"]
+            )
+            self.agent.hypergraph_state_encoder.eval()
 
         if restore_rng and "rng_python" in checkpoint:
             random.setstate(checkpoint["rng_python"])

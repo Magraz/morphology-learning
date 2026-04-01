@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from algorithms.mappo.types import MAPPO_Params, Model_Params
-from algorithms.mappo.networks.encoders import LocalStateEncoder
+from algorithms.mappo.networks.encoders import LocalStateEncoder, HypergraphStateEncoder
 from algorithms.mappo.networks.models import MAPPONetwork
 from algorithms.mappo.hg_cache import HypergraphCache
 from algorithms.mappo.entropy_helpers import EntropyPredictorHelper
@@ -48,6 +48,7 @@ class MAPPOAgent:
         self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
         self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
         self.intrinsic_reward_use_encoder = model_params.intrinsic_reward_use_encoder
+        self.intrinsic_reward_encoder_type = model_params.intrinsic_reward_encoder_type
         self.intrinsic_reward_encoder_dim = model_params.intrinsic_reward_encoder_dim
         self.intrinsic_reward_k = model_params.intrinsic_reward_k
         self.intrinsic_reward_memory_capacity = (
@@ -104,11 +105,20 @@ class MAPPOAgent:
         self.network_old.load_state_dict(self.network.state_dict())
 
         self.local_state_encoder = None
+        self.hypergraph_state_encoder = None
         if self.use_intrinsic_reward and self.intrinsic_reward_use_encoder:
-            self.local_state_encoder = LocalStateEncoder(
-                observation_dim, self.intrinsic_reward_encoder_dim
-            ).to(self.device)
-            self.local_state_encoder.eval()
+            if self.intrinsic_reward_encoder_type == "hypergraph":
+                self.hypergraph_state_encoder = HypergraphStateEncoder(
+                    n_hyperedge_types=self.n_hyperedge_types,
+                    observation_dim=observation_dim,
+                    num_outputs=self.intrinsic_reward_encoder_dim,
+                ).to(self.device)
+                self.intrinsic_reward_obs_dim = self.intrinsic_reward_encoder_dim
+            else:
+                self.local_state_encoder = LocalStateEncoder(
+                    observation_dim, self.intrinsic_reward_encoder_dim
+                ).to(self.device)
+                self.local_state_encoder.eval()
 
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
@@ -160,21 +170,52 @@ class MAPPOAgent:
         """Zero out obs history. If env_mask given, only reset those envs."""
         self.entropy_helper.reset_obs_history(env_mask)
 
-    def encode_team_observations(self, obs_batch: np.ndarray) -> np.ndarray:
-        """Encode and concatenate per-agent observations for each environment."""
-        if self.local_state_encoder is None:
-            raise RuntimeError(
-                "Intrinsic reward encoder is not initialized for this agent."
-            )
+    def encode_team_observations(
+        self, obs_batch: np.ndarray, hypergraphs: list = None
+    ) -> np.ndarray:
+        """Encode and concatenate per-agent observations for each environment.
 
+        Args:
+            obs_batch: Observations of shape (n_envs, n_agents, obs_dim).
+            hypergraphs: Per-env list of per-type dhg.Hypergraph lists.
+                         Required when intrinsic_reward_encoder_type="hypergraph".
+
+        Returns:
+            Encoded features of shape (n_envs, intrinsic_reward_obs_dim).
+        """
         with torch.no_grad():
             obs_tensor = torch.from_numpy(
                 np.ascontiguousarray(obs_batch, dtype=np.float32)
             ).to(self.device)
             n_envs = obs_tensor.shape[0]
-            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
-            encoded = self.local_state_encoder.embedding(obs_flat)
-            return encoded.reshape(n_envs, self.intrinsic_reward_obs_dim).cpu().numpy()
+
+            if self.intrinsic_reward_encoder_type == "hypergraph":
+                if self.hypergraph_state_encoder is None:
+                    raise RuntimeError(
+                        "Hypergraph state encoder is not initialized."
+                    )
+                embeddings = []
+                for env_idx in range(n_envs):
+                    X = obs_tensor[env_idx]  # (n_agents, obs_dim)
+                    emb = self.hypergraph_state_encoder.embedding(
+                        X, hypergraphs[env_idx]
+                    )
+                    embeddings.append(emb)
+                return torch.stack(embeddings).cpu().numpy()
+            else:
+                if self.local_state_encoder is None:
+                    raise RuntimeError(
+                        "Local state encoder is not initialized."
+                    )
+                obs_flat = obs_tensor.reshape(
+                    n_envs * self.n_agents, self.observation_dim
+                )
+                encoded = self.local_state_encoder.embedding(obs_flat)
+                return (
+                    encoded.reshape(n_envs, self.intrinsic_reward_obs_dim)
+                    .cpu()
+                    .numpy()
+                )
 
     def encode_agent_observations(self, obs_batch: np.ndarray) -> np.ndarray:
         """Encode per-agent observations individually.

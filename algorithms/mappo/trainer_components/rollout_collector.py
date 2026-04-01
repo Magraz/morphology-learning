@@ -45,6 +45,11 @@ class RolloutCollector:
             if self.agent.use_intrinsic_reward
             else False
         )
+        self.intrinsic_reward_encoder_type = (
+            self.agent.intrinsic_reward_encoder_type
+            if self.agent.use_intrinsic_reward
+            else "local"
+        )
         if self.agent.use_intrinsic_reward:
             obs_dim_per_agent = self.agent.observation_dim
             if self.intrinsic_reward_use_encoder:
@@ -140,9 +145,20 @@ class RolloutCollector:
             dones = np.logical_or(terminateds, truncateds)
 
             if self.intrinsic_rewarders is not None:
+                encoder_hgs = None
+                if (
+                    self.intrinsic_reward_use_encoder
+                    and self.intrinsic_reward_encoder_type == "hypergraph"
+                ):
+                    encoder_hgs = (
+                        self.hypergraph_runtime.build_per_env_hypergraphs(
+                            next_obs, infos, batch_size
+                        )
+                    )
                 per_agent_intrinsic = self._get_team_intrinsic_rewards(
                     next_obs=next_obs,
                     dones=dones,
+                    hypergraphs=encoder_hgs,
                 )
             elif self.agent_intrinsic_rewarders is not None:
                 per_agent_intrinsic = self._get_agent_intrinsic_rewards(
@@ -187,10 +203,13 @@ class RolloutCollector:
             final_values=final_values,
         )
 
-    def _get_team_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+    def _get_team_intrinsic_rewards(
+        self, next_obs, dones, hypergraphs=None
+    ) -> np.ndarray:
         if self.intrinsic_reward_use_encoder:
             team_features = self.agent.encode_team_observations(
-                np.ascontiguousarray(next_obs, dtype=np.float32)
+                np.ascontiguousarray(next_obs, dtype=np.float32),
+                hypergraphs=hypergraphs,
             )
         else:
             team_features = next_obs.reshape(self.n_parallel_envs, -1).astype(
