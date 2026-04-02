@@ -52,7 +52,7 @@ class IntrinsicReward:
 
     def _compute_intrinsic_reward(self, current_state: torch.Tensor) -> float:
         if len(self._memory) == 0:
-            return 1.0
+            return 0.0
 
         memory_tensor = torch.stack(list(self._memory), dim=0)
 

@@ -3,9 +3,8 @@ from algorithms.algorithms import run_algorithm
 import argparse
 from pathlib import Path
 
-if __name__ == "__main__":
 
-    # Arg parser variables
+def parse_trial_args(cli_args=None):
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -42,7 +41,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint",
         action="store_true",
-        help="Load model checkpointfor training",
+        help="Load model checkpoint for training",
     )
 
     parser.add_argument(
@@ -53,12 +52,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--trial_id", default="debug", help="Sets trial ID", type=str)
 
-    args = vars(parser.parse_args())
+    return vars(parser.parse_args(cli_args))
 
-    # Set base_config path
-    dir_path = Path(__file__).parent
+
+if __name__ == "__main__":
+    args = parse_trial_args()
 
     # Set configuration folder
+    dir_path = Path(__file__).parent
     batch_dir = dir_path / "experiments" / "yamls" / args["batch"]
 
     # Run learning algorithm

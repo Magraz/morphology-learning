@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from algorithms.mappo.intrinsic_reward import IntrinsicReward
 from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
+from algorithms.mappo.mappo import MAPPOAgent
 import numpy as np
 import torch
 
@@ -17,7 +18,7 @@ class RolloutCollector:
         self,
         *,
         vec_env,
-        agent,
+        agent: MAPPOAgent,
         device: str,
         n_agents: int,
         n_parallel_envs: int,
@@ -205,6 +206,12 @@ class RolloutCollector:
     def _get_team_intrinsic_rewards(
         self, next_obs, dones, hypergraphs=None
     ) -> np.ndarray:
+        """
+        Computes a single intrinsic reward per environment by concatenating/encoding all agents'
+        observations into one team-level feature vector. It then tiles that scalar reward across
+        all agents (np.tile(rewards[:, None], (1, self.n_agents))), so every agent in the same
+        environment gets the same intrinsic reward.
+        """
         if self.intrinsic_reward_use_encoder:
             team_features = self.agent.encode_team_observations(
                 np.ascontiguousarray(next_obs, dtype=np.float32),
@@ -235,11 +242,9 @@ class RolloutCollector:
             np.ndarray of shape (n_envs, n_agents) — scaled intrinsic rewards.
         """
         if self.intrinsic_reward_use_encoder:
-            agent_features = self.agent.encode_agent_observations(
-                np.ascontiguousarray(next_obs, dtype=np.float32)
-            )  # (n_envs, n_agents, encoder_dim)
+            agent_features = self.agent.encode_agent_observations(next_obs)
         else:
-            agent_features = next_obs.astype(np.float32)  # (n_envs, n_agents, obs_dim)
+            agent_features = next_obs.astype(np.float32)
 
         intrinsic_rewards = np.zeros(
             (self.n_parallel_envs, self.n_agents), dtype=np.float32
