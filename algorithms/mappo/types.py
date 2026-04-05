@@ -43,12 +43,13 @@ class Model_Params:
     entropy_pred_seq_len: int = 32
     entropy_pred_coef: float = 0.01
     # HYGMA dynamic spectral clustering mode
-    hypergraph_mode: str = "predefined"  # "predefined" | "hygma"
+    hypergraph_mode: str = "predefined"  # "predefined" | "hygma" | "learned_affinity"
     hygma_history_len: int = 50
     hygma_clustering_interval: int = 100  # rollout steps
     hygma_min_clusters: int = 2
     hygma_max_clusters: int = 0  # 0 = auto (n_agents - 1)
     hygma_stability_threshold: float = 0.6
+    affinity_loss_coef: float = 0.01
 
 
 @dataclass

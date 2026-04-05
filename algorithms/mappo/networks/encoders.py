@@ -141,6 +141,86 @@ class HypergraphStateEncoder(nn.Module):
         return F.normalize(z, dim=-1)  # unit-norm embedding
 
 
+class AffinityTransformer(nn.Module):
+    """Transformer that encodes per-agent observation histories into a
+    pairwise affinity matrix suitable for precomputed spectral clustering.
+
+    Input:  (n_agents, history_length, observation_dim)
+    Output: (n_agents, n_agents)  symmetric, values in [0, 1], diagonal = 1
+    """
+
+    def __init__(
+        self,
+        n_agents: int,
+        observation_dim: int,
+        history_length: int,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.n_agents = n_agents
+        self.d_model = d_model
+
+        self.input_proj = nn.Linear(observation_dim, d_model)
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, history_length, d_model) * 0.02
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+        self.embed_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        # Learnable temperature for scaling dot-product similarities
+        self.log_temperature = nn.Parameter(torch.zeros(1))
+
+    def encode_agents(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode each agent's observation history into a unit-norm embedding.
+
+        Args:
+            x: (n_agents, history_length, observation_dim)
+
+        Returns:
+            (n_agents, d_model)
+        """
+        h = self.input_proj(x) + self.pos_encoding
+        h = self.temporal_encoder(h)
+        h = h.mean(dim=1)  # mean-pool over time
+        h = self.embed_proj(h)
+        return F.normalize(h, dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute affinity matrix from agent observation histories.
+
+        Args:
+            x: (n_agents, history_length, observation_dim)
+
+        Returns:
+            Symmetric affinity matrix (n_agents, n_agents), values in [0, 1].
+        """
+        embeddings = self.encode_agents(x)
+        temperature = self.log_temperature.exp()
+        similarity = (embeddings @ embeddings.T) / temperature
+        affinity = torch.sigmoid(similarity)
+        diag_mask = torch.eye(x.shape[0], dtype=torch.bool, device=x.device)
+        affinity = torch.where(diag_mask, torch.ones_like(affinity), affinity)
+        return affinity
+
+
 class HypergraphEntropyPredictor(nn.Module):
     """Shared LSTM predictor of hypergraph structural entropy.
 

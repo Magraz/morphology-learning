@@ -30,6 +30,10 @@ class CheckpointIO:
             checkpoint["hypergraph_state_encoder"] = (
                 self.agent.hypergraph_state_encoder.state_dict()
             )
+        if self.agent.network.affinity_transformer is not None:
+            checkpoint["affinity_transformer"] = (
+                self.agent.network.affinity_transformer.state_dict()
+            )
 
         torch.save(checkpoint, path)
 
@@ -65,6 +69,21 @@ class CheckpointIO:
                 checkpoint["hypergraph_state_encoder"]
             )
             self.agent.hypergraph_state_encoder.eval()
+
+        has_affinity_checkpoint = "affinity_transformer" in checkpoint
+        has_affinity_agent = self.agent.network.affinity_transformer is not None
+        if has_affinity_checkpoint != has_affinity_agent:
+            raise ValueError(
+                "Checkpoint affinity transformer state does not match the current "
+                "agent configuration (affinity_transformer)."
+            )
+        if has_affinity_agent:
+            self.agent.network.affinity_transformer.load_state_dict(
+                checkpoint["affinity_transformer"]
+            )
+            self.agent.network_old.affinity_transformer.load_state_dict(
+                checkpoint["affinity_transformer"]
+            )
 
         if restore_rng and "rng_python" in checkpoint:
             random.setstate(checkpoint["rng_python"])

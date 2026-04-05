@@ -1360,7 +1360,7 @@ if __name__ == "__main__":
         # 3. Log info nicely
         # Format observation array to be compact
         obs_str = np.array2string(
-            obs[current_agent_idx],
+            obs[0, current_agent_idx],
             precision=2,
             suppress_small=True,
             separator=",",
@@ -1376,7 +1376,7 @@ if __name__ == "__main__":
         #     f"{obs_str}"
         # )
 
-        print(cum_rew)
+        print(f"Cumulative Rew {cum_rew} Rew {reward}")
 
         # 4. Render
         env.render()

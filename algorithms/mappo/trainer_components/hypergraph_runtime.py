@@ -38,15 +38,23 @@ class HypergraphRuntime:
             (object_contact_hyperedges, "agents_2_objects"),
         ]
 
-        if self.hypergraph_mode == "hygma":
+        if self.hypergraph_mode in ("hygma", "learned_affinity"):
             from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
 
             assert (
                 self.critic_type == "multi_hgnn"
-            ), "HYGMA mode requires critic_type='multi_hgnn'"
+            ), f"{self.hypergraph_mode} mode requires critic_type='multi_hgnn'"
             assert (
                 model_params.n_hyperedge_types == 1
-            ), "HYGMA mode requires n_hyperedge_types=1"
+            ), f"{self.hypergraph_mode} mode requires n_hyperedge_types=1"
+
+            affinity_fn = None
+            if self.hypergraph_mode == "learned_affinity":
+                transformer = agent.network.affinity_transformer
+                assert transformer is not None, (
+                    "learned_affinity mode requires AffinityTransformer on MAPPONetwork"
+                )
+                affinity_fn = self._make_affinity_fn(transformer, agent.device)
 
             max_k = model_params.hygma_max_clusters or (self.n_agents - 1)
             self._dynamic_grouping = DynamicSpectralGrouping(
@@ -58,6 +66,7 @@ class HypergraphRuntime:
                 min_clusters=model_params.hygma_min_clusters,
                 max_clusters=max_k,
                 stability_threshold=model_params.hygma_stability_threshold,
+                affinity_fn=affinity_fn,
             )
             self._entropy_type_names = ["proximity"]
         elif self.hypergraph_mode == "predefined":
@@ -66,8 +75,17 @@ class HypergraphRuntime:
         else:
             raise ValueError(
                 f"Unknown hypergraph_mode: {self.hypergraph_mode!r}. "
-                "Expected 'predefined' or 'hygma'."
+                "Expected 'predefined', 'hygma', or 'learned_affinity'."
             )
+
+    @staticmethod
+    def _make_affinity_fn(transformer, device):
+        """Create a closure that maps observation history to a numpy affinity matrix."""
+        @torch.no_grad()
+        def affinity_fn(agg_tensor: torch.Tensor) -> np.ndarray:
+            x = agg_tensor.to(device)
+            return transformer(x).cpu().numpy()
+        return affinity_fn
 
     @property
     def entropy_type_names(self) -> list[str]:
@@ -80,7 +98,9 @@ class HypergraphRuntime:
     def on_rollout_step(self, obs: np.ndarray) -> None:
         if self._dynamic_grouping is not None:
             self._dynamic_grouping.update_history(obs)
-            self._dynamic_grouping.maybe_update_groups()
+            updated, agg_history = self._dynamic_grouping.maybe_update_groups()
+            if updated and agg_history is not None and self.hypergraph_mode == "learned_affinity":
+                self.agent.store_affinity_snapshot(agg_history)
 
     def on_env_done_mask(self, dones: np.ndarray) -> None:
         if self._dynamic_grouping is not None:
@@ -92,7 +112,7 @@ class HypergraphRuntime:
         Returns:
             all_type_edge_lists: [type_idx][env_idx] -> edge_list
         """
-        if self.hypergraph_mode == "hygma":
+        if self.hypergraph_mode in ("hygma", "learned_affinity"):
             spectral_edges = self._dynamic_grouping.get_edge_lists(n_envs)
             return [spectral_edges]
 

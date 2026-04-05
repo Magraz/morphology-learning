@@ -7,16 +7,27 @@ from sklearn.metrics import silhouette_score
 class DynamicSpectralClustering:
     """HYGMA spectral grouping helper with small-sample hardening."""
 
-    def __init__(self, min_clusters: int, max_clusters: int, n_agents: int):
+    def __init__(
+        self,
+        min_clusters: int,
+        max_clusters: int,
+        n_agents: int,
+    ):
         self.min_clusters = int(min_clusters)
         self.max_clusters = int(max_clusters)
         self.n_agents = int(n_agents)
         self.current_groups = None
 
-    def cluster(self, state_history: torch.Tensor) -> list[list[int]]:
+    def cluster(
+        self,
+        state_history: torch.Tensor,
+        affinity_matrix: np.ndarray | None = None,
+    ) -> list[list[int]]:
         batch_size, _, _ = state_history.shape
         reshaped_states = state_history.view(batch_size, -1).cpu().numpy()
-        best_n_clusters, best_labels = self._find_best_clustering(reshaped_states)
+        best_n_clusters, best_labels = self._find_best_clustering(
+            reshaped_states, affinity_matrix
+        )
 
         new_groups = [[] for _ in range(best_n_clusters)]
         for i in range(self.n_agents):
@@ -25,23 +36,31 @@ class DynamicSpectralClustering:
 
         return [group for group in new_groups if group]
 
-    def _find_best_clustering(self, data: np.ndarray) -> tuple[int, np.ndarray]:
+    def _find_best_clustering(
+        self,
+        data: np.ndarray,
+        affinity_matrix: np.ndarray | None = None,
+    ) -> tuple[int, np.ndarray]:
         best_score = -1.0
         best_n_clusters = self.min_clusters
         best_labels = None
 
+        use_precomputed = affinity_matrix is not None
         n_samples = int(data.shape[0])
         n_neighbors = max(1, min(10, self.n_agents - 1, n_samples - 1))
 
         for n_clusters in range(self.min_clusters, self.max_clusters + 1):
             try:
-                spectral_clustering = SpectralClustering(
+                sc_kwargs = dict(
                     n_clusters=n_clusters,
-                    affinity="nearest_neighbors",
-                    n_neighbors=n_neighbors,
+                    affinity="precomputed" if use_precomputed else "nearest_neighbors",
                     random_state=0,
                 )
-                labels = spectral_clustering.fit_predict(data)
+                if not use_precomputed:
+                    sc_kwargs["n_neighbors"] = n_neighbors
+                spectral_clustering = SpectralClustering(**sc_kwargs)
+                fit_data = affinity_matrix if use_precomputed else data
+                labels = spectral_clustering.fit_predict(fit_data)
                 if np.unique(labels).shape[0] < 2:
                     continue
                 score = silhouette_score(data, labels)
@@ -61,9 +80,12 @@ class DynamicSpectralClustering:
         return best_n_clusters, best_labels
 
     def update_groups(
-        self, state_history: torch.Tensor, stability_threshold: float
+        self,
+        state_history: torch.Tensor,
+        stability_threshold: float,
+        affinity_matrix: np.ndarray | None = None,
     ) -> tuple[bool, list[list[int]], int]:
-        new_groups = self.cluster(state_history)
+        new_groups = self.cluster(state_history, affinity_matrix)
 
         if self.current_groups is None:
             self.current_groups = new_groups
@@ -110,7 +132,14 @@ class DynamicSpectralGrouping:
         min_clusters: int,
         max_clusters: int,
         stability_threshold: float,
+        affinity_fn=None,
     ):
+        """
+        Args:
+            affinity_fn: Optional callable (torch.Tensor) -> np.ndarray.
+                         Receives aggregated history (n_agents, history_len, obs_dim)
+                         and returns an (n_agents, n_agents) affinity matrix.
+        """
         assert history_len > 0, f"hygma_history_len must be > 0, got {history_len}"
         assert (
             clustering_interval > 0
@@ -122,6 +151,7 @@ class DynamicSpectralGrouping:
         self.history_len = int(history_len)
         self.clustering_interval = int(clustering_interval)
         self.stability_threshold = float(stability_threshold)
+        self.affinity_fn = affinity_fn
 
         self._clustering_possible = self.n_agents > 2
         if self._clustering_possible:
@@ -143,7 +173,7 @@ class DynamicSpectralGrouping:
 
         self._clusterer = (
             DynamicSpectralClustering(
-                self._min_clusters, self._max_clusters, self.n_agents
+                self._min_clusters, self._max_clusters, self.n_agents,
             )
             if self._clustering_possible
             else None
@@ -182,30 +212,41 @@ class DynamicSpectralGrouping:
         self._history[env_mask] = 0.0
         self._env_steps[env_mask] = 0
 
-    def maybe_update_groups(self) -> bool:
+    def maybe_update_groups(self) -> tuple[bool, np.ndarray | None]:
+        """Attempt re-clustering if the interval has elapsed.
+
+        Returns:
+            (updated, agg_history) where agg_history is the (n_agents,
+            history_len, obs_dim) array used for clustering when it fired,
+            or None when clustering was skipped.
+        """
         if not self._clustering_possible:
-            return False
+            return False, None
         if self._env_steps.max() < self.history_len:
-            return False
+            return False, None
 
         if (
             self._rollout_steps // self.clustering_interval
             == self._last_cluster_rollout_step // self.clustering_interval
         ):
-            return False
+            return False, None
 
         valid = self._env_steps >= self.history_len
         agg = self._history[valid].mean(axis=0)
         agg_tensor = torch.from_numpy(agg)
 
+        affinity_matrix = None
+        if self.affinity_fn is not None:
+            affinity_matrix = self.affinity_fn(agg_tensor)
+
         updated, new_groups, _ = self._clusterer.update_groups(
-            agg_tensor, self.stability_threshold
+            agg_tensor, self.stability_threshold, affinity_matrix
         )
         if updated:
             self._current_groups = new_groups
 
         self._last_cluster_rollout_step = self._rollout_steps
-        return updated
+        return updated, agg
 
     def get_edge_lists(self, n_envs: int) -> list[list[tuple]]:
         if self._current_groups is None:

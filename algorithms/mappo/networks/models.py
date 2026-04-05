@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from algorithms.mappo.networks.actors import MAPPOActor, MAPPO_Hybrid_Actor
 from algorithms.mappo.networks.critics import MAPPOCritic, MultiHGNNCritic
-from algorithms.mappo.networks.encoders import HypergraphEntropyPredictor
+from algorithms.mappo.networks.encoders import AffinityTransformer, HypergraphEntropyPredictor
 
 
 class MAPPONetwork(nn.Module):
@@ -21,6 +21,8 @@ class MAPPONetwork(nn.Module):
         critic_type: str = "mlp",  # "mlp" or "multi_hgnn"
         n_hyperedge_types: int = 0,  # Required when critic_type="multi_hgnn"
         entropy_conditioning: bool = False,
+        hypergraph_mode: str = "predefined",
+        history_len: int = 0,
     ):
         super(MAPPONetwork, self).__init__()
 
@@ -97,6 +99,18 @@ class MAPPONetwork(nn.Module):
                 n_agents, observation_dim, n_hyperedge_types, hidden_dim=64
             )
             if entropy_conditioning and n_hyperedge_types > 0
+            else None
+        )
+
+        # Learned affinity transformer for dynamic grouping
+        self.affinity_transformer = (
+            AffinityTransformer(
+                n_agents=n_agents,
+                observation_dim=observation_dim,
+                history_length=history_len,
+                d_model=hidden_dim,
+            )
+            if hypergraph_mode == "learned_affinity" and history_len > 0
             else None
         )
 

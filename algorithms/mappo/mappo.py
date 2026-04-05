@@ -43,6 +43,10 @@ class MAPPOAgent:
         # Auxiliary LSTM entropy predictor config
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_pred_coef = model_params.entropy_pred_coef
+        # Learned affinity config
+        self.hypergraph_mode = model_params.hypergraph_mode
+        self.hygma_history_len = model_params.hygma_history_len
+        self.affinity_loss_coef = model_params.affinity_loss_coef
         # Standalone intrinsic reward config
         self.use_intrinsic_reward = model_params.use_intrinsic_reward
         self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
@@ -67,7 +71,7 @@ class MAPPOAgent:
         self.grad_clip = params.grad_clip
 
         # Create network
-        self.network = MAPPONetwork(
+        network_kwargs = dict(
             observation_dim=observation_dim,
             global_state_dim=global_state_dim,
             action_dim=action_dim,
@@ -82,25 +86,13 @@ class MAPPOAgent:
             critic_type=self.critic_type,
             n_hyperedge_types=self.n_hyperedge_types,
             entropy_conditioning=self.entropy_conditioning,
-        ).to(self.device)
+            hypergraph_mode=self.hypergraph_mode,
+            history_len=self.hygma_history_len,
+        )
+        self.network = MAPPONetwork(**network_kwargs).to(self.device)
 
         # Create old network for PPO
-        self.network_old = MAPPONetwork(
-            observation_dim=observation_dim,
-            global_state_dim=global_state_dim,
-            action_dim=action_dim,
-            n_agents=n_agents,
-            hidden_dim=(
-                round(model_params.hidden_dim * 1.09)
-                if self.critic_type == "mlp"
-                else model_params.hidden_dim
-            ),
-            discrete=discrete,
-            share_actor=self.share_actor,
-            critic_type=self.critic_type,
-            n_hyperedge_types=self.n_hyperedge_types,
-            entropy_conditioning=self.entropy_conditioning,
-        ).to(self.device)
+        self.network_old = MAPPONetwork(**network_kwargs).to(self.device)
 
         self.network_old.load_state_dict(self.network.state_dict())
 
@@ -137,8 +129,44 @@ class MAPPOAgent:
             seq_len=self.entropy_pred_seq_len,
         )
 
+        # Affinity training: stores aggregated history snapshots from rollout
+        self._affinity_history_snapshots = []
+
         # Buffers for each agent
         self.reset_buffers()
+
+    def store_affinity_snapshot(self, agg_history: np.ndarray) -> None:
+        """Store an aggregated observation history snapshot for affinity training.
+
+        Called by HypergraphRuntime each time clustering runs.
+
+        Args:
+            agg_history: (n_agents, history_len, obs_dim) numpy array.
+        """
+        self._affinity_history_snapshots.append(agg_history.copy())
+
+    def compute_affinity_loss(self) -> torch.Tensor:
+        """Compute auxiliary loss for the affinity transformer.
+
+        Uses stored history snapshots from the last rollout. Encourages the
+        affinity matrix to be decisive (low binary entropy) rather than
+        uniformly uncertain.
+        """
+        transformer = self.network.affinity_transformer
+        if transformer is None or not self._affinity_history_snapshots:
+            return torch.tensor(0.0, device=self.device)
+
+        total_loss = torch.tensor(0.0, device=self.device)
+        for snapshot in self._affinity_history_snapshots:
+            x = torch.from_numpy(snapshot).to(self.device)
+            affinity = transformer(x)
+            # Binary-entropy regulariser: push off-diagonal values toward 0 or 1
+            mask = ~torch.eye(self.n_agents, dtype=torch.bool, device=self.device)
+            a = affinity[mask]
+            entropy = -(a * torch.log(a + 1e-8) + (1 - a) * torch.log(1 - a + 1e-8))
+            total_loss = total_loss + entropy.mean()
+
+        return total_loss / len(self._affinity_history_snapshots)
 
     def reset_buffers(self):
         """Reset experience buffers - separate for each parallel environment"""
@@ -165,6 +193,7 @@ class MAPPOAgent:
         ]
         # Clear hypergraph caches and per-trajectory buffers
         self.hg_cache.reset()
+        self._affinity_history_snapshots = []
 
     def reset_obs_history(self, env_mask=None):
         """Zero out obs history. If env_mask given, only reset those envs."""
@@ -637,6 +666,7 @@ class MAPPOAgent:
             "value_loss": 0,
             "entropy_loss": 0,
             "entropy_pred_loss": 0,
+            "affinity_loss": 0,
         }
         num_updates = 0
 
@@ -658,6 +688,10 @@ class MAPPOAgent:
         use_entropy_pred = (
             self.network.entropy_predictor is not None
             and len(self.hg_cache.entropies[0]) > 0
+        )
+        use_affinity = (
+            self.network.affinity_transformer is not None
+            and len(self._affinity_history_snapshots) > 0
         )
 
         if use_hgnn:
@@ -868,6 +902,11 @@ class MAPPOAgent:
                     )
                     loss = loss + self.entropy_pred_coef * entropy_pred_loss
 
+                # Auxiliary affinity transformer loss
+                if use_affinity:
+                    affinity_loss = self.compute_affinity_loss()
+                    loss = loss + self.affinity_loss_coef * affinity_loss
+
                 # Optimize
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -883,6 +922,8 @@ class MAPPOAgent:
                 stats["entropy_loss"] += entropy_loss.item()
                 if use_entropy_pred:
                     stats["entropy_pred_loss"] += entropy_pred_loss.item()
+                if use_affinity:
+                    stats["affinity_loss"] += affinity_loss.item()
                 num_updates += 1
 
         return stats, num_updates
@@ -903,6 +944,7 @@ class MAPPOAgent:
             "value_loss": 0,
             "entropy_loss": 0,
             "entropy_pred_loss": 0,
+            "affinity_loss": 0,
         }
         num_updates = 0
 
@@ -911,6 +953,10 @@ class MAPPOAgent:
         use_entropy_pred = (
             self.network.entropy_predictor is not None
             and len(self.hg_cache.entropies[0]) > 0
+        )
+        use_affinity = (
+            self.network.affinity_transformer is not None
+            and len(self._affinity_history_snapshots) > 0
         )
 
         if use_hgnn:
@@ -1128,6 +1174,11 @@ class MAPPOAgent:
                         )
                         loss = loss + self.entropy_pred_coef * entropy_pred_loss
 
+                    # Auxiliary affinity transformer loss
+                    if use_affinity:
+                        affinity_loss = self.compute_affinity_loss()
+                        loss = loss + self.affinity_loss_coef * affinity_loss
+
                     # Optimize
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -1143,6 +1194,8 @@ class MAPPOAgent:
                     stats["entropy_loss"] += entropy_loss.item()
                     if use_entropy_pred:
                         stats["entropy_pred_loss"] += entropy_pred_loss.item()
+                    if use_affinity:
+                        stats["affinity_loss"] += affinity_loss.item()
                     num_updates += 1
 
         return stats, num_updates
