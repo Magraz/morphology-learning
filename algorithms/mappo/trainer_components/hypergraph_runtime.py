@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from functools import partial
 
 import numpy as np
@@ -90,6 +91,35 @@ class HypergraphRuntime:
     @property
     def entropy_type_names(self) -> list[str]:
         return self._entropy_type_names
+
+    @contextmanager
+    def render_grouping_context(self):
+        """Temporarily swap in a single-env DynamicSpectralGrouping for render.
+
+        The training grouping (n_envs=n_parallel_envs) is restored on exit.
+        """
+        if self._dynamic_grouping is None:
+            yield
+            return
+
+        from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
+
+        training_grouping = self._dynamic_grouping
+        self._dynamic_grouping = DynamicSpectralGrouping(
+            n_agents=self.n_agents,
+            n_envs=1,
+            obs_dim=training_grouping.obs_dim,
+            history_len=training_grouping.history_len,
+            clustering_interval=training_grouping.clustering_interval,
+            min_clusters=training_grouping._min_clusters,
+            max_clusters=training_grouping._max_clusters,
+            stability_threshold=training_grouping.stability_threshold,
+            affinity_fn=training_grouping.affinity_fn,
+        )
+        try:
+            yield
+        finally:
+            self._dynamic_grouping = training_grouping
 
     def on_rollout_reset(self) -> None:
         if self._dynamic_grouping is not None:

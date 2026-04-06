@@ -89,7 +89,9 @@ class MAPPO_Runner(Runner):
         # Test trained agents with rendering
         print("\nTesting trained agents...")
         for episode in range(10):
-            rewards, entropy_logs, frames = self.trainer.render(capture_video=True)
+            rewards, entropy_logs, frames, hypergraphs = self.trainer.render(
+                capture_video=True
+            )
 
             print(f"REWARD: {rewards[-1]:.4f}")
 
@@ -204,6 +206,16 @@ class MAPPO_Runner(Runner):
                     plt.savefig(fig2_path, dpi=150, bbox_inches="tight")
                     plt.close(fig2)
                     print(f"Prediction plot saved to {fig2_path}")
+
+                # Frame + hypergraph snapshot grid
+                snap_fig = self.trainer.build_snapshot_figure(frames, hypergraphs)
+                if snap_fig is not None:
+                    snap_path = (
+                        self.dirs["logs"] / f"snapshots_episode_{episode}.png"
+                    )
+                    snap_fig.savefig(snap_path, dpi=150, bbox_inches="tight")
+                    plt.close(snap_fig)
+                    print(f"Snapshot plot saved to {snap_path}")
 
     def evaluate(self):
         pass

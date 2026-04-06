@@ -46,11 +46,13 @@ class CheckpointIO:
 
         has_encoder_checkpoint = "local_state_encoder" in checkpoint
         has_encoder_agent = self.agent.local_state_encoder is not None
+
         if has_encoder_checkpoint != has_encoder_agent:
             raise ValueError(
                 "Checkpoint intrinsic encoder state does not match the current "
                 "agent configuration (local_state_encoder)."
             )
+
         if has_encoder_agent:
             self.agent.local_state_encoder.load_state_dict(
                 checkpoint["local_state_encoder"]
@@ -59,11 +61,13 @@ class CheckpointIO:
 
         has_hg_encoder_checkpoint = "hypergraph_state_encoder" in checkpoint
         has_hg_encoder_agent = self.agent.hypergraph_state_encoder is not None
+
         if has_hg_encoder_checkpoint != has_hg_encoder_agent:
             raise ValueError(
                 "Checkpoint intrinsic encoder state does not match the current "
                 "agent configuration (hypergraph_state_encoder)."
             )
+
         if has_hg_encoder_agent:
             self.agent.hypergraph_state_encoder.load_state_dict(
                 checkpoint["hypergraph_state_encoder"]
@@ -72,11 +76,13 @@ class CheckpointIO:
 
         has_affinity_checkpoint = "affinity_transformer" in checkpoint
         has_affinity_agent = self.agent.network.affinity_transformer is not None
+
         if has_affinity_checkpoint != has_affinity_agent:
             raise ValueError(
                 "Checkpoint affinity transformer state does not match the current "
                 "agent configuration (affinity_transformer)."
             )
+
         if has_affinity_agent:
             self.agent.network.affinity_transformer.load_state_dict(
                 checkpoint["affinity_transformer"]
@@ -90,7 +96,9 @@ class CheckpointIO:
             np.random.set_state(checkpoint["rng_numpy"])
             torch.random.set_rng_state(checkpoint["rng_torch_cpu"].cpu())
             if torch.cuda.is_available() and checkpoint["rng_torch_cuda"] is not None:
-                torch.cuda.set_rng_state_all([s.cpu() for s in checkpoint["rng_torch_cuda"]])
+                torch.cuda.set_rng_state_all(
+                    [s.cpu() for s in checkpoint["rng_torch_cuda"]]
+                )
 
     def load_training_stats(self, path) -> dict:
         with path.open("rb") as f:
