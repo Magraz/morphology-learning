@@ -107,12 +107,6 @@ class ObjectTargetArea:
         return in_x and in_y
 
 
-class Agent:
-    def __init__(self, body, previous_position=(0, 0)):
-        self.body = body
-        self.prev_position = previous_position
-
-
 class BoundaryContactListener(b2ContactListener):
     def __init__(self):
         super().__init__()

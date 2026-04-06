@@ -161,7 +161,7 @@ def get_state_and_action_dims(
             action_dim = env.action_space.shape[1]
 
         case EnvironmentEnum.MULTI_BOX:
-            from environments.multi_box_push.domain import MultiBoxPushEnv
+            from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
             # Environment configuration
             env = MultiBoxPushEnv(
@@ -253,7 +253,7 @@ def make_vec_env(
                 return SalpChainEnv(n_agents=n_agents, render_mode=None)
 
             case EnvironmentEnum.MULTI_BOX:
-                from environments.multi_box_push.domain import MultiBoxPushEnv
+                from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
                 return MultiBoxPushEnv(
                     n_agents=n_agents,

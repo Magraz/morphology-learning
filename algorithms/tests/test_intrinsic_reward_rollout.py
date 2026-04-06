@@ -17,7 +17,7 @@ from algorithms.mappo.networks.encoders import (
     LocalStateEncoder,
 )
 from algorithms.mappo.networks.models import MAPPONetwork
-from environments.multi_box_push.domain import MultiBoxPushEnv
+from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
 
 def load_from_checkpoint(checkpoint_path, n_agents, device="cpu"):
