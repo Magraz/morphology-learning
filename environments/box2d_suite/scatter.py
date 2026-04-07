@@ -38,14 +38,12 @@ class ScatterEnv(gym.Env):
         self,
         render_mode=None,
         n_agents=3,
-        n_objects=3,
         max_steps=512,
         reward_mode="dense",
     ):
         super().__init__()
 
         self.n_agents = n_agents
-        self.n_objects = n_objects
         self.render_mode = render_mode
         self.reward_mode = reward_mode
 
@@ -80,7 +78,7 @@ class ScatterEnv(gym.Env):
 
         # Auto-scale world size based on entity count
         # Reference: 8 entities (5 agents + 3 objects) -> 30x30
-        _total_entities = self.n_agents + self.n_objects
+        _total_entities = self.n_agents
         self.world_width = int(30 * max(1.0, _total_entities / 8) ** 0.5)
         self.world_height = self.world_width
         self.world_center_x = self.world_width // 2
@@ -96,11 +94,6 @@ class ScatterEnv(gym.Env):
         )
 
         self._init_agents()
-
-        # Create boxes coupling reqs
-        self.objects_push_coupling_list = np.random.default_rng(42).integers(
-            2, (self.n_agents // 2) + 1, (self.n_objects)
-        )
 
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
@@ -334,7 +327,7 @@ class ScatterEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = ScatterEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=1024)
+    env = ScatterEnv(render_mode="human", n_agents=12, max_steps=1024)
     obs, info = env.reset()
 
     running = True

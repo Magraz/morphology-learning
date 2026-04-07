@@ -143,84 +143,6 @@ class PettingZooToGymWrapper(gym.Env):
         self.env.close()
 
 
-def get_state_and_action_dims(
-    env_name: EnvironmentEnum,
-    n_agents: int,
-    render_mode: str = None,
-    env_variant: str = None,
-    n_objects: int = 3,
-    reward_mode: str = "dense",
-):
-    match (env_name):
-        case EnvironmentEnum.BOX2D_SALP:
-            from environments.box2d_salp.domain import SalpChainEnv
-
-            # Environment configuration
-            env = SalpChainEnv(n_agents=n_agents, render_mode=render_mode)
-            state_dim = env.observation_space.shape[1]
-            action_dim = env.action_space.shape[1]
-
-        case EnvironmentEnum.MULTI_BOX:
-            from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
-
-            # Environment configuration
-            env = MultiBoxPushEnv(
-                n_agents=n_agents,
-                n_objects=n_objects,
-                render_mode=render_mode,
-                reward_mode=reward_mode,
-            )
-            state_dim = env.observation_space.shape[1]
-            action_dim = env.action_space.shape[1]
-
-        case EnvironmentEnum.MPE_SPREAD:
-            from mpe2 import simple_spread_v3
-
-            pz_env = simple_spread_v3.parallel_env(
-                N=n_agents,
-                local_ratio=0.5,
-                max_cycles=25,
-                continuous_actions=False,
-                dynamic_rescaling=True,
-                render_mode=render_mode,
-            )
-            # Wrap PettingZoo env for Gymnasium compatibility
-            env = PettingZooToGymWrapper(pz_env)
-            state_dim = env.observation_space.shape[1]
-            action_dim = env.action_space.nvec[0]
-
-        case EnvironmentEnum.MPE_SIMPLE:
-            from mpe2 import simple_v3
-
-            pz_env = simple_v3.parallel_env(
-                max_cycles=25,
-                continuous_actions=False,
-                render_mode=render_mode,
-            )
-            # Wrap PettingZoo env for Gymnasium compatibility
-            env = PettingZooToGymWrapper(pz_env)
-            state_dim = env.observation_space.shape[1]
-            action_dim = env.action_space.nvec[0]
-
-        case EnvironmentEnum.SMACV2:
-            from environments.smacv2.wrapper import SMACv2ToGymWrapper
-
-            env = SMACv2ToGymWrapper(map_name=env_variant)
-            state_dim = env.observation_space.shape[1]  # obs_dim per agent
-            action_dim = env.action_space.nvec[0]  # n_actions per agent
-            env.close()
-
-        case EnvironmentEnum.SMACLITE:
-            from environments.smaclite.wrapper import SmacliteToGymWrapper
-
-            env = SmacliteToGymWrapper(map_name=env_variant)
-            state_dim = env.observation_space.shape[1]
-            action_dim = env.action_space.nvec[0]
-            env.close()
-
-    return state_dim, action_dim
-
-
 def make_vec_env(
     env_name: EnvironmentEnum,
     n_agents: int,
@@ -258,6 +180,24 @@ def make_vec_env(
                 return MultiBoxPushEnv(
                     n_agents=n_agents,
                     n_objects=n_objects,
+                    render_mode=None,
+                    reward_mode=reward_mode,
+                )
+
+            case EnvironmentEnum.SCATTER:
+                from environments.box2d_suite.scatter import ScatterEnv
+
+                return ScatterEnv(
+                    n_agents=n_agents,
+                    render_mode=None,
+                    reward_mode=reward_mode,
+                )
+
+            case EnvironmentEnum.RENDEZVOUZ:
+                from environments.box2d_suite.rendezvouz import RendezvouzEnv
+
+                return RendezvouzEnv(
+                    n_agents=n_agents,
                     render_mode=None,
                     reward_mode=reward_mode,
                 )

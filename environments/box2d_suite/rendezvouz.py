@@ -37,14 +37,12 @@ class RendezvouzEnv(gym.Env):
         self,
         render_mode=None,
         n_agents=3,
-        n_objects=3,
         max_steps=512,
         reward_mode="dense",
     ):
         super().__init__()
 
         self.n_agents = n_agents
-        self.n_objects = n_objects
         self.render_mode = render_mode
         self.reward_mode = reward_mode
 
@@ -68,7 +66,9 @@ class RendezvouzEnv(gym.Env):
 
         self.agents = []
 
-        self.prev_agent_closest_distances = [float("inf") for _ in range(self.n_agents)]
+        self.prev_agent_closest_distances = np.full(
+            self.n_agents, np.inf, dtype=np.float32
+        )
         self.prev_target_closest_distances = [
             float("inf") for _ in range(self.n_agents)
         ]
@@ -79,7 +79,7 @@ class RendezvouzEnv(gym.Env):
 
         # Auto-scale world size based on entity count
         # Reference: 8 entities (5 agents + 3 objects) -> 30x30
-        _total_entities = self.n_agents + self.n_objects
+        _total_entities = self.n_agents
         self.world_width = int(30 * max(1.0, _total_entities / 8) ** 0.5)
         self.world_height = self.world_width
         self.world_center_x = self.world_width // 2
@@ -95,10 +95,11 @@ class RendezvouzEnv(gym.Env):
         )
 
         self._init_agents()
-
-        # Create boxes coupling reqs
-        self.objects_push_coupling_list = np.random.default_rng(42).integers(
-            2, (self.n_agents // 2) + 1, (self.n_objects)
+        positions = np.array(
+            [[ag.position.x, ag.position.y] for ag in self.agents], dtype=np.float32
+        )
+        self.prev_agent_closest_distances = self._get_nearest_neighbor_distances(
+            positions
         )
 
         # Add force tracking
@@ -219,6 +220,16 @@ class RendezvouzEnv(gym.Env):
     def _get_observation(self):
         return self.observation_manager.get_observation()
 
+    def _get_nearest_neighbor_distances(self, positions):
+        """Return each agent's distance to its closest other agent."""
+        if self.n_agents <= 1:
+            return np.zeros(self.n_agents, dtype=np.float32)
+
+        diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=-1)
+        np.fill_diagonal(dists, np.inf)
+        return dists.min(axis=1)
+
     def _get_rewards(self):
         """Calculate combined rewards from chain size and target areas"""
         # Calculate target area rewards
@@ -235,6 +246,7 @@ class RendezvouzEnv(gym.Env):
         # Pairwise distances
         diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
         dists = np.linalg.norm(diff, axis=-1)
+        nearest_neighbor_distances = self._get_nearest_neighbor_distances(positions)
 
         # Adjacency: agents within threshold are in the same cluster
         adjacency = dists < self.cluster_threshold
@@ -271,6 +283,14 @@ class RendezvouzEnv(gym.Env):
             if abs(reward) < 1e-5:
                 reward = 0.0
         self._prev_cluster_potential = potential
+
+        # Reward agents for getting closer to their nearest neighbor and
+        # penalize them for drifting farther away.
+        nearest_neighbor_delta = (
+            self.prev_agent_closest_distances - nearest_neighbor_distances
+        )
+        reward += nearest_neighbor_delta.sum() / self.world_diagonal
+        self.prev_agent_closest_distances = nearest_neighbor_distances
 
         done = largest_group == self.n_agents
 
@@ -321,6 +341,12 @@ class RendezvouzEnv(gym.Env):
             self.world_width, self.world_height, self.boundary_thickness
         )
         self._init_agents()
+        positions = np.array(
+            [[ag.position.x, ag.position.y] for ag in self.agents], dtype=np.float32
+        )
+        self.prev_agent_closest_distances = self._get_nearest_neighbor_distances(
+            positions
+        )
 
         obs = self._get_observation()
 
@@ -388,7 +414,7 @@ class RendezvouzEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = RendezvouzEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=512)
+    env = RendezvouzEnv(render_mode="human", n_agents=12, max_steps=512)
     obs, info = env.reset()
 
     running = True
