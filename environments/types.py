@@ -17,6 +17,8 @@ class EnvironmentEnum(StrEnum):
     MPE_SIMPLE = "mpe_simple"
     BOX2D_SALP = "box2d_salp"
     MULTI_BOX = "multi_box_push"
+    SCATTER = "scatter"
+    RENDEZVOUZ = "rendezvouz"
     SMACV2 = "smacv2"
     SMACLITE = "smaclite"
     # JAXMARL
