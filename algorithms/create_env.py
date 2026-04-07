@@ -190,7 +190,6 @@ def make_vec_env(
                 return ScatterEnv(
                     n_agents=n_agents,
                     render_mode=None,
-                    reward_mode=reward_mode,
                 )
 
             case EnvironmentEnum.RENDEZVOUZ:
@@ -199,7 +198,14 @@ def make_vec_env(
                 return RendezvouzEnv(
                     n_agents=n_agents,
                     render_mode=None,
-                    reward_mode=reward_mode,
+                )
+
+            case EnvironmentEnum.CONTACT:
+                from environments.box2d_suite.contact import ContactEnv
+
+                return ContactEnv(
+                    n_agents=n_agents,
+                    render_mode=None,
                 )
 
             case EnvironmentEnum.MPE_SPREAD:

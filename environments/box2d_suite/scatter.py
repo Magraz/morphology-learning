@@ -39,13 +39,11 @@ class ScatterEnv(gym.Env):
         render_mode=None,
         n_agents=3,
         max_steps=512,
-        reward_mode="dense",
     ):
         super().__init__()
 
         self.n_agents = n_agents
         self.render_mode = render_mode
-        self.reward_mode = reward_mode
 
         # Add target areas parameters
         self.target_areas = []

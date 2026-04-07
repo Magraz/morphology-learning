@@ -15,6 +15,7 @@ from algorithms.mappo.hypergraph import (
 from Box2D import (
     b2World,
     b2PolygonShape,
+    b2CircleShape,
     b2FixtureDef,
 )
 
@@ -30,7 +31,14 @@ from environments.box2d_suite.utils import (
 )
 
 
-class BaseEnv(gym.Env):
+class ContactEnv(gym.Env):
+    """Multi-agent environment where agents must find and touch a random static object.
+
+    Each episode spawns a single immovable object (box, circle, or triangle) at a
+    random position. Agents are rewarded for making contact and penalised for
+    losing contact.
+    """
+
     metadata = {"render_fps": 30}
 
     def __init__(
@@ -44,14 +52,12 @@ class BaseEnv(gym.Env):
         self.n_agents = n_agents
         self.render_mode = render_mode
 
-        # Add target areas parameters
         self.target_areas = []
 
-        # Update action space to include detach action
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(self.n_agents, 2),  # (n_agents, action_dim)
+            shape=(self.n_agents, 2),
             dtype=np.float32,
         )
 
@@ -64,13 +70,12 @@ class BaseEnv(gym.Env):
 
         self.agents = []
 
-        # Add contact listener
+        # Contact listener
         self.contact_listener = BoundaryContactListener()
         self.world.contactListener = self.contact_listener
 
         # Auto-scale world size based on entity count
-        # Reference: 8 entities (5 agents + 3 objects) -> 30x30
-        _total_entities = self.n_agents
+        _total_entities = self.n_agents + 1
         self.world_width = int(30 * max(1.0, _total_entities / 8) ** 0.5)
         self.world_height = self.world_width
         self.world_center_x = self.world_width // 2
@@ -78,31 +83,32 @@ class BaseEnv(gym.Env):
         self.world_diagonal = np.sqrt(self.world_height**2 + self.world_width**2)
         self.boundary_thickness = 0.5
 
-        self.boundary_bodies = []  # Track boundary walls
+        self.boundary_bodies = []
 
-        # Create boundary and agents
         self._create_boundary(
             self.world_width, self.world_height, self.boundary_thickness
         )
 
         self._init_agents()
 
-        # Add force tracking
+        # Force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
-        self.force_scale = 2.0  # Scale factor for visualizing forces
+        self.force_scale = 2.0
 
-        # Velocity normalization constant (agents have linear damping=10.0,
-        # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
         self.velocity_norm = self.world_width / 10.0
-
-        # Scale sector sensor radius proportionally to world size
         self.sector_sensor_radius = self.world_width / 3.0
 
-        # Step tracking for truncation
         self.max_steps = max_steps
         self.current_step = 0
 
-        self.objects = []  # Track dynamic objects
+        self.objects = []
+
+        # Reward state
+        self.prev_n_touching = 0
+
+        # Renderer compatibility (no attachment mechanic — show agents as green)
+        self.attach_values = np.ones(self.n_agents, dtype=np.int8)
+        self.detach_values = np.zeros(self.n_agents, dtype=np.int8)
 
         self.observation_manager = ObservationManager(self)
         self.renderer = Renderer(self)
@@ -148,87 +154,123 @@ class BaseEnv(gym.Env):
             self.agents.append(agent)
 
     def _create_boundary(self, width, height, thickness):
-        """Create boundary walls that agents can collide with"""
+        """Create boundary walls that agents can collide with."""
+        walls = [
+            ((width / 2, thickness / 2), (width / 2, thickness / 2)),
+            ((width / 2, height - thickness / 2), (width / 2, thickness / 2)),
+            ((thickness / 2, height / 2), (thickness / 2, height / 2)),
+            ((width - thickness / 2, height / 2), (thickness / 2, height / 2)),
+        ]
+        for pos, half in walls:
+            wall = self.world.CreateStaticBody(
+                position=pos,
+                shapes=b2PolygonShape(box=half),
+            )
+            wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
+            wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
+            self.boundary_bodies.append(wall)
 
-        # Bottom wall
-        bottom_wall = self.world.CreateStaticBody(
-            position=(width / 2, thickness / 2),
-            shapes=b2PolygonShape(box=(width / 2, thickness / 2)),
-        )
-        bottom_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
-        bottom_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
-        self.boundary_bodies.append(bottom_wall)
+    def _create_object(self):
+        """Spawn a single random-shaped static (immovable) object at a random position."""
+        self.objects.clear()
 
-        # Top wall
-        top_wall = self.world.CreateStaticBody(
-            position=(width / 2, height - thickness / 2),
-            shapes=b2PolygonShape(box=(width / 2, thickness / 2)),
-        )
-        top_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
-        top_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
-        self.boundary_bodies.append(top_wall)
+        margin = 3.0
+        pos_x = self.np_random.uniform(margin, self.world_width - margin)
+        pos_y = self.np_random.uniform(margin, self.world_height - margin)
 
-        # Left wall
-        left_wall = self.world.CreateStaticBody(
-            position=(thickness / 2, height / 2),
-            shapes=b2PolygonShape(box=(thickness / 2, height / 2)),
-        )
-        left_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
-        left_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
-        self.boundary_bodies.append(left_wall)
+        shape_type = self.np_random.choice(["box", "circle", "triangle"])
+        # Scale object so more agents can physically surround it
+        # Base size 1.5 for 3 agents, grows with sqrt(n_agents)
+        size = 1.4 * (self.n_agents / 3) ** 0.5
 
-        # Right wall
-        right_wall = self.world.CreateStaticBody(
-            position=(width - thickness / 2, height / 2),
-            shapes=b2PolygonShape(box=(thickness / 2, height / 2)),
+        if shape_type == "box":
+            shape = b2PolygonShape(box=(size, size))
+        elif shape_type == "circle":
+            shape = b2CircleShape(radius=size)
+        else:  # triangle
+            shape = b2PolygonShape(vertices=[(-size, -size), (size, -size), (0, size)])
+
+        fixture_def = b2FixtureDef(shape=shape)
+        fixture_def.filter.categoryBits = OBJECT_CATEGORY
+        fixture_def.filter.maskBits = AGENT_CATEGORY | BOUNDARY_CATEGORY
+
+        body = self.world.CreateStaticBody(
+            position=(pos_x, pos_y),
+            fixtures=fixture_def,
         )
-        right_wall.fixtures[0].filterData.categoryBits = BOUNDARY_CATEGORY
-        right_wall.fixtures[0].filterData.maskBits = AGENT_CATEGORY | OBJECT_CATEGORY
-        self.boundary_bodies.append(right_wall)
+
+        body.userData = {
+            "type": "object",
+            "color": COLORS_LIST[self.n_agents % len(COLORS_LIST)],
+            "index": 0,
+            "shape_type": shape_type,
+            "coupling": self.n_agents,  # displayed on object by renderer
+        }
+
+        self.objects.append(body)
+
+    def _count_agents_touching_object(self):
+        """Count how many agents are within contact distance of the object."""
+        if not self.objects:
+            return 0
+
+        obj = self.objects[0]
+        obj_pos = np.array([obj.position.x, obj.position.y])
+        count = 0
+
+        for agent in self.agents:
+            agent_pos = np.array([agent.position.x, agent.position.y])
+            dist = self.observation_manager._agent_object_distance(
+                agent_pos, obj, obj_pos
+            )
+            if dist <= agent.radius + 0.2:
+                count += 1
+
+        return count
 
     def _get_observation(self):
         return self.observation_manager.get_observation()
 
-    def _get_rewards(self):
-        reward, done = self._calculate_reward()
+    def _calculate_reward(self):
+        n_touching = self._count_agents_touching_object()
+
+        # Delta reward: +1 per new agent making contact, -1 per agent losing contact
+        reward = float(n_touching - self.prev_n_touching)
+        self.prev_n_touching = n_touching
+
+        # Episode succeeds when every agent is touching the object
+        done = n_touching == self.n_agents
 
         return reward, done
 
-    def _calculate_reward(self):
-
-        return 0.0, False
-
     def _get_info(self):
-        """Build the info dictionary returned by reset() and step()."""
         return {
             "agent_positions": [
                 {"x": ag.position.x, "y": ag.position.y} for ag in self.agents
             ],
+            "n_touching": self.prev_n_touching,
         }
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Reset step counter
         self.current_step = 0
+        self.prev_n_touching = 0
 
-        # Create a completely fresh Box2D world to avoid stale references
+        # Fresh Box2D world
         self.world = b2World(gravity=(0, 0))
-
-        # Re-attach contact listener to new world
         self.contact_listener = BoundaryContactListener()
         self.world.contactListener = self.contact_listener
 
-        # Clear all body references
         self.agents.clear()
         self.objects.clear()
         self.boundary_bodies.clear()
 
-        # Recreate everything in the fresh world
         self._create_boundary(
             self.world_width, self.world_height, self.boundary_thickness
         )
         self._init_agents()
+        self._create_object()
 
         obs = self._get_observation()
 
@@ -238,15 +280,8 @@ class BaseEnv(gym.Env):
         return obs, self._get_info()
 
     def step(self, actions):
-
-        # PREPROCESS ENVIRONMENT ACTION
-
-        # Transform actions into dictionary
         movement_action = actions[:, :2]
 
-        # PROCESS ENVIRONMENT ACTION
-
-        # Apply movement forces
         force_multiplier = 100.0
         for agent in self.agents:
             force_x = np.clip(movement_action[agent.index][0], -1, 1) * force_multiplier
@@ -255,34 +290,25 @@ class BaseEnv(gym.Env):
             self.applied_forces[agent.index] = [force_x, force_y]
             agent.apply_force(force_x, force_y)
 
-        # Rest of the step method remains the same
         self.world.Step(self.time_step, 6, 2)
 
-        # CALCULATE REWARDS
-
-        # Check for boundary collisions
         reward = 0.0
         terminated = False
 
         if self.contact_listener.boundary_collision:
             terminated = True
         else:
-            # The normal reward calculation
-            reward, terminated = self._get_rewards()
+            reward, terminated = self._calculate_reward()
 
-        # Get observation BEFORE resetting contacts
         obs = self._get_observation()
 
-        # Reset collision flag for next step (AFTER observation and rewards)
         self.contact_listener.reset()
 
         info = self._get_info()
 
         self.current_step += 1
-
         truncated = self.current_step >= self.max_steps
 
-        # The observation
         return obs, reward, terminated, truncated, info
 
     def render(self):
@@ -293,17 +319,16 @@ class BaseEnv(gym.Env):
 
 
 if __name__ == "__main__":
-    # Create the environment with rendering
-    env = BaseEnv(render_mode="human", n_agents=12, max_steps=512)
+    env = ContactEnv(render_mode="human", n_agents=12, max_steps=512)
     obs, info = env.reset()
 
     running = True
     current_agent_idx = 0
     cum_rew = 0
-    group_control = False  # Toggle for group replication
+    group_control = False
 
     print("\n" + "=" * 50)
-    print(" SALP CHAIN ENVIRONMENT DEBUGGER")
+    print(" CONTACT ENVIRONMENT DEBUGGER")
     print("=" * 50)
     print(f" Controlling Agent: {current_agent_idx}")
     print(" Controls:")
@@ -313,10 +338,9 @@ if __name__ == "__main__":
     print("  [ESC]    : Quit")
     print("=" * 50 + "\n")
 
-    entropy_log = []  # list of [S_e, S_normalized] per step
+    entropy_log = []
 
     while running:
-        # 1. Handle user input
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -331,17 +355,10 @@ if __name__ == "__main__":
                     status = "ON" if group_control else "OFF"
                     print(f">>> Group Control {status} (Radius 5)")
 
-        # Get continuous key presses
         keys = pygame.key.get_pressed()
 
-        # Initialize actions (n_agents, 4)
-        # [force_x, force_y, attach_signal, detach_signal]
-        # Default: No movement, Attach=1 (allow), Detach=0 (don't)
-        actions = np.zeros((env.n_agents, 4), dtype=np.float32)
-        actions[:, 2] = 1.0
-        actions[:, 3] = 0.0
+        actions = np.zeros((env.n_agents, 2), dtype=np.float32)
 
-        # Set force for controlled agent
         force_x = 0.0
         force_y = 0.0
 
@@ -354,11 +371,9 @@ if __name__ == "__main__":
         if keys[pygame.K_DOWN]:
             force_y = -1.0
 
-        # Apply control to active agent
         actions[current_agent_idx, 0] = force_x
         actions[current_agent_idx, 1] = force_y
 
-        # If group control is active, replicate actions to neighbors
         if group_control and (force_x != 0 or force_y != 0):
             current_pos = env.agents[current_agent_idx].position
             radius = 5.0
@@ -377,7 +392,6 @@ if __name__ == "__main__":
                     actions[i, 0] = force_x
                     actions[i, 1] = force_y
 
-        # 2. Step environment
         obs, reward, terminated, truncated, info = env.step(actions)
 
         # Hypergraph testing
@@ -387,44 +401,25 @@ if __name__ == "__main__":
         )
 
         entropies = compute_hyperedge_structural_entropy_batch(hypergraphs)
-        entropy_log.append(entropies[0])  # [S_e, S_normalized] for this step
+        entropy_log.append(entropies[0])
 
         cum_rew += reward
 
-        # 3. Log info nicely
-        # Format observation array to be compact
-        obs_str = np.array2string(
-            obs[0, current_agent_idx],
-            precision=2,
-            suppress_small=True,
-            separator=",",
-            floatmode="fixed",
-            max_line_width=np.inf,
+        print(
+            f"Cumulative Rew {cum_rew:.2f}  Rew {reward:.2f}  "
+            f"Touching {info['n_touching']}/{env.n_agents}"
         )
 
-        # print(
-        #     f"{env.current_step:<5d} | "
-        #     f"{current_agent_idx:<3d} | "
-        #     f"({force_x:>4.1f}, {force_y:>4.1f})  | "
-        #     f"{reward:<8.4f} | "
-        #     f"{obs_str}"
-        # )
-
-        print(f"Cumulative Rew {cum_rew} Rew {reward}")
-
-        # 4. Render
         env.render()
 
-        # 5. Handle reset
         if terminated or truncated:
             print(">>> Environment Reset")
             cum_rew = 0
             break
-            obs, info = env.reset()
 
     env.close()
 
-    entropy_array = np.array(entropy_log)  # (n_steps, 2)
+    entropy_array = np.array(entropy_log)
     steps = np.arange(len(entropy_array))
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)

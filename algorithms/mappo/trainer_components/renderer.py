@@ -136,10 +136,8 @@ class PolicyRenderer:
                         entropy_type_logs[t].append(entropies[t])
                         soft_entropy_type_logs[t].append(soft_entropies[t])
 
-                    per_env_hgs = (
-                        self.hypergraph_runtime.build_per_env_hypergraphs(
-                            obs, infos, 1
-                        )
+                    per_env_hgs = self.hypergraph_runtime.build_per_env_hypergraphs(
+                        obs, infos, 1
                     )
                     hypergraphs.append(per_env_hgs[0])
                 else:
@@ -175,9 +173,7 @@ class PolicyRenderer:
 
         return np.array(episode_reward), entropy_logs, frames, hypergraphs
 
-    def build_snapshot_figure(
-        self, frames, hypergraphs, n_snapshots=4, hg_type_idx=0
-    ):
+    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4, hg_type_idx=0):
         """Build a figure pairing env frames with hypergraph drawings.
 
         Args:
@@ -241,9 +237,38 @@ class PolicyRenderer:
                     self.n_agents,
                     1,
                     use_async=True,
-                    env_variant=self.env_variant,
                     n_objects=self.n_objects,
                     reward_mode=self.reward_mode,
+                )
+                render_env.envs[0].render_mode = "human"
+                return render_env
+
+            case EnvironmentEnum.SCATTER:
+                render_env = make_vec_env(
+                    self.env_name,
+                    self.n_agents,
+                    1,
+                    use_async=True,
+                )
+                render_env.envs[0].render_mode = "human"
+                return render_env
+
+            case EnvironmentEnum.RENDEZVOUZ:
+                render_env = make_vec_env(
+                    self.env_name,
+                    self.n_agents,
+                    1,
+                    use_async=True,
+                )
+                render_env.envs[0].render_mode = "human"
+                return render_env
+
+            case EnvironmentEnum.CONTACT:
+                render_env = make_vec_env(
+                    self.env_name,
+                    self.n_agents,
+                    1,
+                    use_async=True,
                 )
                 render_env.envs[0].render_mode = "human"
                 return render_env

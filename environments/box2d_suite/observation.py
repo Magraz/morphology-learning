@@ -3,7 +3,7 @@ from Box2D import b2PolygonShape, b2CircleShape
 
 
 class ObservationManager:
-    """Encapsulates all observation computation for MultiBoxPushEnv."""
+    """Encapsulates all observation computation for Box2D_Suite envs."""
 
     def __init__(self, env):
         self.env = env
@@ -50,7 +50,8 @@ class ObservationManager:
         )  # (n_agents, 2)
         self._object_pos_cache = (
             np.array(
-                [[o.position.x, o.position.y] for o in self.env.objects], dtype=np.float32
+                [[o.position.x, o.position.y] for o in self.env.objects],
+                dtype=np.float32,
             )
             if self.env.objects
             else np.empty((0, 2), dtype=np.float32)

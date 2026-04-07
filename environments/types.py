@@ -19,6 +19,7 @@ class EnvironmentEnum(StrEnum):
     MULTI_BOX = "multi_box_push"
     SCATTER = "scatter"
     RENDEZVOUZ = "rendezvouz"
+    CONTACT = "contact"
     SMACV2 = "smacv2"
     SMACLITE = "smaclite"
     # JAXMARL
