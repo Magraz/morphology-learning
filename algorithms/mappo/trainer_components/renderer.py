@@ -173,14 +173,13 @@ class PolicyRenderer:
 
         return np.array(episode_reward), entropy_logs, frames, hypergraphs
 
-    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4, hg_type_idx=0):
+    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4):
         """Build a figure pairing env frames with hypergraph drawings.
 
         Args:
             frames: list of RGB numpy arrays from render().
             hypergraphs: list of per-env hypergraph lists from render().
             n_snapshots: Number of evenly-spaced timesteps to display.
-            hg_type_idx: Which hypergraph type index to draw.
 
         Returns:
             fig: matplotlib Figure, or None if no frames.
@@ -189,10 +188,16 @@ class PolicyRenderer:
         if total_steps == 0:
             return None
 
+        entropy_type_names = self.hypergraph_runtime.entropy_type_names
+        n_types = len(entropy_type_names)
+        n_rows = 1 + n_types
+
         indices = np.linspace(0, total_steps - 1, n_snapshots, dtype=int)
         v_labels = [str(i) for i in range(self.n_agents)]
 
-        fig, axes = plt.subplots(2, n_snapshots, figsize=(5 * n_snapshots, 10))
+        fig, axes = plt.subplots(
+            n_rows, n_snapshots, figsize=(5 * n_snapshots, 5 * n_rows)
+        )
         if n_snapshots == 1:
             axes = axes[:, np.newaxis]
 
@@ -202,20 +207,33 @@ class PolicyRenderer:
             axes[0, col].axis("off")
 
             hgs = hypergraphs[idx]
-            if hgs is not None and hg_type_idx < len(hgs):
-                hg = hgs[hg_type_idx]
-                if hg.num_e > 0:
-                    hg_img = self._hypergraph_to_image(hg, v_labels)
-                    axes[1, col].imshow(hg_img)
-            axes[1, col].axis("off")
+            for t in range(n_types):
+                row = 1 + t
+                if hgs is not None and t < len(hgs):
+                    hg = hgs[t]
+                    if hg.num_e > 0:
+                        color = self._HG_TYPE_COLORS[t % len(self._HG_TYPE_COLORS)]
+                        hg_img = self._hypergraph_to_image(hg, v_labels, v_color=color)
+                        if hg_img is not None:
+                            axes[row, col].imshow(hg_img)
+                axes[row, col].axis("off")
+                if col == 0:
+                    axes[row, col].set_ylabel(
+                        entropy_type_names[t], fontsize=12, rotation=90
+                    )
 
         fig.tight_layout()
         return fig
 
+    _HG_TYPE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
     @staticmethod
-    def _hypergraph_to_image(hg, v_label=None):
+    def _hypergraph_to_image(hg, v_label=None, v_color="gray"):
         """Render a dhg.Hypergraph to a numpy RGB image array via its draw() method."""
-        hg.draw(v_label=v_label)
+        try:
+            hg.draw(v_label=v_label, v_color=v_color)
+        except ValueError:
+            return None
         fig_hg = plt.gcf()
         canvas = FigureCanvasAgg(fig_hg)
         canvas.draw()

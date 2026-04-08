@@ -264,9 +264,9 @@ class VecMAPPOTrainer:
     def render(self, capture_video=False):
         return self.renderer.render(capture_video=capture_video)
 
-    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4, hg_type_idx=0):
+    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4):
         return self.renderer.build_snapshot_figure(
-            frames, hypergraphs, n_snapshots=n_snapshots, hg_type_idx=hg_type_idx
+            frames, hypergraphs, n_snapshots=n_snapshots
         )
 
     def close_environments(self):
