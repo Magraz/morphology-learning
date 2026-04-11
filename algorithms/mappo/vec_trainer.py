@@ -115,6 +115,7 @@ class VecMAPPOTrainer:
             n_parallel_envs=self.n_parallel_envs,
             critic_type=self.critic_type,
             model_params=model_params,
+            batch_dir=self.dirs.get("batch"),
         )
         self.rollout_collector = RolloutCollector(
             vec_env=self.vec_env,
