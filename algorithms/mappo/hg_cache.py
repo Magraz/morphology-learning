@@ -161,7 +161,9 @@ class HypergraphCache:
         if not self.unique_edge_lists:
             raise RuntimeError("No hypergraph signatures are cached yet.")
 
-        flat_sig_ids = tuple(int(sig_id) for sig_id in signature_sequences.reshape(-1).tolist())
+        flat_sig_ids = tuple(
+            int(sig_id) for sig_id in signature_sequences.reshape(-1).tolist()
+        )
         n_types = len(self.unique_edge_lists[0])
 
         batched_hgs = []
@@ -193,7 +195,9 @@ class HypergraphCache:
             self.get_or_compute_entropy(int(sig_id))
             for sig_id in signature_sequences.reshape(-1).tolist()
         ]
-        entropies = torch.tensor(np.stack(flat_entropies), dtype=torch.float32).to(device)
+        entropies = torch.tensor(np.stack(flat_entropies), dtype=torch.float32).to(
+            device
+        )
         return entropies.view(*signature_sequences.shape, -1)
 
     @staticmethod
@@ -209,7 +213,10 @@ class HypergraphCache:
         device = timestep_indices.device
         lengths = torch.tensor(trajectory_lengths, dtype=torch.long, device=device)
         starts = torch.cat(
-            [torch.zeros(1, dtype=torch.long, device=device), lengths.cumsum(dim=0)[:-1]]
+            [
+                torch.zeros(1, dtype=torch.long, device=device),
+                lengths.cumsum(dim=0)[:-1],
+            ]
         )
         boundaries = lengths.cumsum(dim=0)
         env_indices = torch.bucketize(timestep_indices, boundaries, right=True)

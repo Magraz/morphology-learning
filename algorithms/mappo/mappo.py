@@ -692,7 +692,8 @@ class MAPPOAgent:
         }
         num_updates = 0
 
-        # Combine all agent data for shared actor update
+        # Build timestep-centric tensors so the centralized critic runs once per
+        # (env, timestep) batch element rather than once per duplicated agent sample.
         all_obs = []
         all_global_states = []
         all_actions = []
@@ -700,10 +701,9 @@ class MAPPOAgent:
         all_returns_combined = []
         all_advantages_combined = []
         all_masks = []
-        all_ts_indices = []  # maps each sample to its (env, timestep) index
-        all_raw_obs_for_seq = []  # (T, obs_dim) per (env, agent) — batched later
-        all_entropy_targets = []  # (T, n_types) per (env, agent)
-        all_agent_indices = []  # (T,) int per (env, agent)
+        all_ts_indices = []
+        all_obs_sequences = []
+        all_entropy_targets = []
 
         has_masks = len(self.action_masks[0][0]) > 0
         use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
@@ -721,14 +721,6 @@ class MAPPOAgent:
             ts_to_entropies = self.hg_cache.get_flat_entropies(
                 train_device, self.entropy_conditioning
             )
-            ts_to_global_states = torch.cat(
-                [
-                    torch.stack(self.global_states[env_idx])
-                    for env_idx in range(self.n_parallel_envs)
-                    if len(self.values[env_idx]) > 0
-                ],
-                dim=0,
-            ).detach().to(train_device)
             trajectory_lengths = [
                 len(self.values[env_idx])
                 for env_idx in range(self.n_parallel_envs)
@@ -736,64 +728,79 @@ class MAPPOAgent:
             ]
             hgnn_batch_cache = {}
 
-        # Iterate through each environment
-        ts_offset = 0  # running offset for timestep indices
+        ts_offset = 0
         for env_idx in range(self.n_parallel_envs):
             if len(self.values[env_idx]) == 0:
-                continue  # Skip empty environments
+                continue
 
-            T = len(self.values[env_idx])  # timesteps for this env
+            T = len(self.values[env_idx])
+            env_global_states = torch.stack(self.global_states[env_idx])
+            env_obs = []
+            env_actions = []
+            env_old_log_probs = []
+            env_returns = []
+            env_advantages = []
+            env_obs_sequences = []
 
-            # For this environment, iterate through each agent
             for agent_idx in range(self.n_agents):
                 if len(self.observations[env_idx][agent_idx]) == 0:
-                    continue  # Skip if no data for this agent
+                    continue
 
                 data_idx = env_idx * self.n_agents + agent_idx
-
                 if data_idx >= len(all_advantages):
                     continue
 
-                # Normalize advantages for this agent in this environment
                 advantages = all_advantages[data_idx]
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
 
-                # Stack data for this agent in this environment
                 obs = torch.stack(self.observations[env_idx][agent_idx])
                 actions = torch.stack(self.actions[env_idx][agent_idx])
                 old_log_probs = torch.stack(self.log_probs[env_idx][agent_idx])
                 returns = all_returns[data_idx]
 
-                global_states = torch.stack(self.global_states[env_idx])
-
-                all_obs.append(obs)
-                all_global_states.append(global_states)
-                all_actions.append(actions)
-                all_old_log_probs.append(old_log_probs)
-                all_returns_combined.append(returns)
-                all_advantages_combined.append(advantages)
-
-                if has_masks:
-                    all_masks.append(torch.stack(self.action_masks[env_idx][agent_idx]))
-
-                if use_hgnn:
-                    all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
-
+                env_obs.append(obs)
+                env_actions.append(actions)
+                env_old_log_probs.append(old_log_probs)
+                env_returns.append(returns)
+                env_advantages.append(advantages)
                 if use_entropy_pred:
-                    all_raw_obs_for_seq.append(obs)  # (T, obs_dim)
-                    entropy_t = torch.tensor(
-                        np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
-                    )  # (T, n_types)
-                    all_entropy_targets.append(entropy_t)
-                    all_agent_indices.append(
-                        torch.full((obs.shape[0],), agent_idx, dtype=torch.long)
+                    env_obs_sequences.append(
+                        self.entropy_helper.build_obs_sequences(obs)
                     )
+
+            if not env_obs:
+                ts_offset += T
+                continue
+
+            all_obs.append(torch.stack(env_obs, dim=1))
+            all_global_states.append(env_global_states)
+            all_actions.append(torch.stack(env_actions, dim=1))
+            all_old_log_probs.append(torch.stack(env_old_log_probs, dim=1))
+            all_returns_combined.append(torch.stack(env_returns, dim=1))
+            all_advantages_combined.append(torch.stack(env_advantages, dim=1))
+            if has_masks:
+                env_masks = [
+                    torch.stack(self.action_masks[env_idx][agent_idx])
+                    for agent_idx in range(self.n_agents)
+                ]
+                all_masks.append(torch.stack(env_masks, dim=1))
+            if use_hgnn:
+                all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
+            if use_entropy_pred:
+                all_obs_sequences.append(torch.stack(env_obs_sequences, dim=1))
+                entropy_t = torch.tensor(
+                    np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
+                )
+                all_entropy_targets.append(
+                    entropy_t.unsqueeze(1).expand(-1, self.n_agents, -1)
+                )
 
             ts_offset += T
 
-        # Concatenate all data and move to training device (may be CUDA)
+        # Concatenate to timestep-major tensors:
+        # obs/actions/... shape (n_total_ts, n_agents, ...)
         combined_obs = torch.cat(all_obs, dim=0).detach().to(train_device)
         combined_global_states = (
             torch.cat(all_global_states, dim=0).detach().to(train_device)
@@ -811,11 +818,7 @@ class MAPPOAgent:
             torch.cat(all_ts_indices).to(train_device) if use_hgnn else None
         )
         combined_obs_sequences = (
-            self.entropy_helper.build_obs_sequences_batched(
-                torch.stack(all_raw_obs_for_seq)
-            )
-            .detach()
-            .to(train_device)
+            torch.cat(all_obs_sequences, dim=0).detach().to(train_device)
             if use_entropy_pred
             else None
         )
@@ -824,9 +827,7 @@ class MAPPOAgent:
             if use_entropy_pred
             else None
         )
-        combined_agent_indices = (
-            torch.cat(all_agent_indices).to(train_device) if use_entropy_pred else None
-        )
+        ts_to_global_states = combined_global_states if use_hgnn else None
 
         # Create dataset
         dataset_tensors = [
@@ -844,11 +845,13 @@ class MAPPOAgent:
         if combined_obs_sequences is not None:
             dataset_tensors.append(combined_obs_sequences)
             dataset_tensors.append(combined_entropy_targets)
-            dataset_tensors.append(combined_agent_indices)
 
         dataset = TensorDataset(*dataset_tensors)
 
-        dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
+        timestep_minibatch_size = max(1, minibatch_size // self.n_agents)
+        dataloader = DataLoader(
+            dataset, batch_size=timestep_minibatch_size, shuffle=True
+        )
 
         # Train for multiple epochs
         for epoch in range(epochs):
@@ -868,27 +871,52 @@ class MAPPOAgent:
                 if use_entropy_pred:
                     batch_obs_seq = extra.pop(0)
                     batch_entropy_targets = extra.pop(0)
-                    batch_agent_idx = extra.pop(0).long()
+
+                batch_n_ts = batch_obs.shape[0]
+                batch_obs_flat = batch_obs.reshape(batch_n_ts * self.n_agents, -1)
+                batch_actions_flat = batch_actions.reshape(
+                    batch_n_ts * self.n_agents, *batch_actions.shape[2:]
+                )
+                batch_old_log_probs_flat = batch_old_log_probs.reshape(-1)
+                batch_advantages_flat = batch_advantages.reshape(-1)
+                batch_masks_flat = (
+                    batch_masks.reshape(batch_n_ts * self.n_agents, -1)
+                    if batch_masks is not None
+                    else None
+                )
 
                 # Predict entropy and condition actor observations
                 pred_mean = pred_log_var = None
                 if use_entropy_pred:
+                    batch_obs_seq_flat = batch_obs_seq.reshape(
+                        batch_n_ts * self.n_agents,
+                        batch_obs_seq.shape[2],
+                        batch_obs_seq.shape[3],
+                    )
+                    batch_entropy_targets_flat = batch_entropy_targets.reshape(
+                        batch_n_ts * self.n_agents, batch_entropy_targets.shape[-1]
+                    )
+                    batch_agent_idx = torch.arange(
+                        self.n_agents, device=train_device
+                    ).repeat(batch_n_ts)
                     pred_mean, pred_log_var = (
                         self.network.entropy_predictor.forward_batch(
-                            batch_obs_seq, batch_agent_idx
+                            batch_obs_seq_flat, batch_agent_idx
                         )
                     )
                     pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
                     batch_obs_conditioned = self.entropy_helper.condition_obs(
-                        batch_obs, pred_entropy.detach()
+                        batch_obs_flat, pred_entropy.detach()
                     )
                 else:
-                    batch_obs_conditioned = batch_obs
+                    batch_obs_conditioned = batch_obs_flat
 
                 # Actor evaluation (batched over individual agent observations)
                 actor = self.network.get_actor(0)
                 log_probs, entropy = actor.evaluate(
-                    batch_obs_conditioned, batch_actions, action_mask=batch_masks
+                    batch_obs_conditioned,
+                    batch_actions_flat,
+                    action_mask=batch_masks_flat,
                 )
 
                 # Critic evaluation
@@ -909,16 +937,18 @@ class MAPPOAgent:
                     values = self.network.critic(batch_global_states).squeeze(-1)
 
                 # PPO objective
-                ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs)
-                surr1 = ratio * batch_advantages
+                ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs_flat)
+                surr1 = ratio * batch_advantages_flat
                 surr2 = (
                     torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-                    * batch_advantages
+                    * batch_advantages_flat
                 )
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss
-                value_loss = F.mse_loss(values, batch_returns)
+                # Shared critic value is compared against each agent's return.
+                value_loss = F.mse_loss(
+                    values.unsqueeze(1).expand_as(batch_returns), batch_returns
+                )
 
                 # Entropy loss
                 entropy_loss = -entropy.mean()
@@ -935,7 +965,7 @@ class MAPPOAgent:
                     entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
                         pred_mean=pred_mean,
                         pred_log_var=pred_log_var,
-                        targets=batch_entropy_targets,
+                        targets=batch_entropy_targets_flat,
                     )
                     loss = loss + self.entropy_pred_coef * entropy_pred_loss
 
