@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from algorithms.mappo.intrinsic_reward import IntrinsicReward
+from algorithms.mappo.entropy_helpers import update_left_padded_history
 from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
 from algorithms.mappo.mappo import MAPPOAgent
 import numpy as np
@@ -105,6 +106,21 @@ class RolloutCollector:
         current_episode_steps = np.zeros(self.n_parallel_envs, dtype=np.int32)
 
         self.agent.reset_obs_history()
+        critic_obs_history = None
+        critic_sig_history = None
+        critic_history_counts = None
+        if self.agent.critic_type == "hg_cross_attention":
+            critic_obs_history = torch.zeros(
+                batch_size,
+                self.agent.critic_seq_len,
+                self.n_agents,
+                self.agent.observation_dim,
+                dtype=torch.float32,
+            )
+            critic_sig_history = torch.zeros(
+                batch_size, self.agent.critic_seq_len, dtype=torch.long
+            )
+            critic_history_counts = torch.zeros(batch_size, dtype=torch.long)
 
         while total_step_count <= max_steps:
             global_states = obs.reshape(batch_size, -1)
@@ -122,6 +138,23 @@ class RolloutCollector:
                 else None
             )
 
+            critic_obs_sequences = None
+            critic_signature_sequences = None
+            if self.agent.critic_type == "hg_cross_attention":
+                obs_step = torch.from_numpy(
+                    np.ascontiguousarray(obs, dtype=np.float32)
+                )
+                sig_step = torch.tensor(per_env_sig_ids, dtype=torch.long)
+                prev_counts = critic_history_counts.clone()
+                critic_obs_history, critic_history_counts = update_left_padded_history(
+                    critic_obs_history, obs_step, critic_history_counts
+                )
+                critic_sig_history, _ = update_left_padded_history(
+                    critic_sig_history, sig_step, prev_counts
+                )
+                critic_obs_sequences = critic_obs_history.clone()
+                critic_signature_sequences = critic_sig_history.clone()
+
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(
                 obs,
                 global_states,
@@ -129,6 +162,8 @@ class RolloutCollector:
                 action_masks=current_masks,
                 hypergraphs=per_env_hgs,
                 entropies=per_env_entropies,
+                critic_obs_sequences=critic_obs_sequences,
+                critic_signature_sequences=critic_signature_sequences,
             )
 
             actions_array = actions_t.cpu().numpy()
@@ -169,6 +204,10 @@ class RolloutCollector:
             if dones.any():
                 self.agent.reset_obs_history(env_mask=dones)
                 self.hypergraph_runtime.on_env_done_mask(dones)
+                if critic_obs_history is not None:
+                    critic_obs_history[dones] = 0.0
+                    critic_sig_history[dones] = 0
+                    critic_history_counts[dones] = 0
 
             self.agent.store_transitions_batch(
                 obs,

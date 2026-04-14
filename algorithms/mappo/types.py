@@ -28,6 +28,7 @@ class Model_Params:
     critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention"
     # For HGNN
     n_hyperedge_types: int = 1
+    critic_seq_len: int = 32
     # Standalone episodic intrinsic reward
     use_intrinsic_reward: bool = False
     intrinsic_reward_mode: str = "agent"  # "team" | "agent"
@@ -43,7 +44,9 @@ class Model_Params:
     entropy_pred_seq_len: int = 32
     entropy_pred_coef: float = 0.01
     # HYGMA dynamic spectral clustering mode
-    hypergraph_mode: str = "predefined"  # "predefined" | "hygma" | "learned_affinity" | "combined_affinities"
+    hypergraph_mode: str = (
+        "predefined"  # "predefined" | "hygma" | "learned_affinity" | "combined_affinities"
+    )
     hygma_history_len: int = 50
     hygma_clustering_interval: int = 100  # rollout steps
     hygma_min_clusters: int = 2
@@ -51,7 +54,9 @@ class Model_Params:
     hygma_stability_threshold: float = 0.6
     affinity_loss_coef: float = 0.01
     # Combined affinities: load pre-trained AffinityTransformers from other experiments
-    combined_affinity_sources: list[str] | None = None  # batch names, e.g. ["contact_12a", "scatter_12a"]
+    combined_affinity_sources: list[str] | None = (
+        None  # batch names, e.g. ["contact_12a", "scatter_12a"]
+    )
     combined_affinity_trial_id: str = "0"
 
 

@@ -4,6 +4,7 @@ import torch
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from algorithms.create_env import make_vec_env
+from algorithms.mappo.entropy_helpers import update_left_padded_history
 from algorithms.mappo.hypergraph import (
     compute_hyperedge_structural_entropy_batch,
     compute_soft_hyperedge_structural_entropy_batch,
@@ -73,6 +74,19 @@ class PolicyRenderer:
         current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
         if current_masks is not None:
             current_masks = current_masks[np.newaxis]
+        critic_obs_history = None
+        critic_sig_history = None
+        critic_history_counts = None
+        if self.agent.critic_type == "hg_cross_attention":
+            critic_obs_history = torch.zeros(
+                1,
+                self.agent.critic_seq_len,
+                self.agent.n_agents,
+                self.agent.observation_dim,
+                dtype=torch.float32,
+            )
+            critic_sig_history = torch.zeros(1, self.agent.critic_seq_len, dtype=torch.long)
+            critic_history_counts = torch.zeros(1, dtype=torch.long)
 
         with torch.no_grad(), self.hypergraph_runtime.render_grouping_context():
             self.hypergraph_runtime.on_rollout_reset()
@@ -92,6 +106,25 @@ class PolicyRenderer:
                     else None
                 )
 
+                critic_obs_sequences = None
+                critic_signature_sequences = None
+                if self.agent.critic_type == "hg_cross_attention":
+                    obs_step = torch.from_numpy(
+                        np.ascontiguousarray(obs, dtype=np.float32)
+                    )
+                    if obs_step.dim() == 2:
+                        obs_step = obs_step.unsqueeze(0)
+                    sig_step = torch.tensor(render_sig_ids, dtype=torch.long)
+                    prev_counts = critic_history_counts.clone()
+                    critic_obs_history, critic_history_counts = update_left_padded_history(
+                        critic_obs_history, obs_step, critic_history_counts
+                    )
+                    critic_sig_history, _ = update_left_padded_history(
+                        critic_sig_history, sig_step, prev_counts
+                    )
+                    critic_obs_sequences = critic_obs_history.clone()
+                    critic_signature_sequences = critic_sig_history.clone()
+
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
                     global_states,
@@ -99,6 +132,8 @@ class PolicyRenderer:
                     action_masks=current_masks,
                     hypergraphs=render_hgs,
                     entropies=render_entropies,
+                    critic_obs_sequences=critic_obs_sequences,
+                    critic_signature_sequences=critic_signature_sequences,
                 )
                 actions = actions_t.cpu().numpy()
 

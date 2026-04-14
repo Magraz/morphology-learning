@@ -122,6 +122,80 @@ class HypergraphCache:
             all_ent.extend(self.entropies[env_idx])
         return torch.tensor(np.stack(all_ent), dtype=torch.float32).to(device)
 
+    def build_sequence_batched_hypergraphs(
+        self,
+        signature_sequences: torch.Tensor,
+        device: str,
+    ) -> list:
+        """Build block-diagonal hypergraphs for a batch of temporal windows.
+
+        Args:
+            signature_sequences: (batch, seq_len) tensor of signature IDs.
+            device: Torch device string.
+
+        Returns:
+            list[dhg.Hypergraph]: One block-diagonal hypergraph per hyperedge type,
+            batching ``batch * seq_len`` graphs together.
+        """
+        if not self.unique_edge_lists:
+            raise RuntimeError("No hypergraph signatures are cached yet.")
+
+        flat_sig_ids = tuple(int(sig_id) for sig_id in signature_sequences.reshape(-1).tolist())
+        n_types = len(self.unique_edge_lists[0])
+
+        batched_hgs = []
+        for type_idx in range(n_types):
+            cache_key = ("temporal", type_idx, flat_sig_ids)
+            cached = self.object_cache.get(cache_key)
+            if cached is not None:
+                batched_hgs.append(cached)
+                continue
+
+            edge_lists = [
+                self.unique_edge_lists[sig_id][type_idx] for sig_id in flat_sig_ids
+            ]
+            hg = batch_hypergraphs(edge_lists, self.n_agents, device=device)
+            self.object_cache[cache_key] = hg
+            batched_hgs.append(hg)
+
+        return batched_hgs
+
+    def get_entropies_for_signature_sequences(
+        self,
+        signature_sequences: torch.Tensor,
+        device: str,
+    ) -> torch.Tensor:
+        """Return structural entropies aligned with a signature window tensor."""
+        flat_entropies = [
+            self.get_or_compute_entropy(int(sig_id))
+            for sig_id in signature_sequences.reshape(-1).tolist()
+        ]
+        entropies = torch.tensor(np.stack(flat_entropies), dtype=torch.float32).to(device)
+        return entropies.view(*signature_sequences.shape, -1)
+
+    @staticmethod
+    def build_temporal_window_indices(
+        timestep_indices: torch.Tensor,
+        trajectory_lengths: list[int],
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Build left-padded temporal windows over flattened per-env trajectories."""
+        if not trajectory_lengths:
+            raise RuntimeError("Cannot build temporal windows without trajectories.")
+
+        device = timestep_indices.device
+        lengths = torch.tensor(trajectory_lengths, dtype=torch.long, device=device)
+        starts = torch.cat(
+            [torch.zeros(1, dtype=torch.long, device=device), lengths.cumsum(dim=0)[:-1]]
+        )
+        boundaries = lengths.cumsum(dim=0)
+        env_indices = torch.bucketize(timestep_indices, boundaries, right=True)
+        local_t = timestep_indices - starts[env_indices]
+
+        offsets = torch.arange(seq_len, device=device) - (seq_len - 1)
+        local_window = (local_t.unsqueeze(1) + offsets).clamp(min=0)
+        return starts[env_indices].unsqueeze(1) + local_window
+
     # ------------------------------------------------------------------
     # HGNN critic batched evaluation
     # ------------------------------------------------------------------
@@ -136,6 +210,8 @@ class HypergraphCache:
         observation_dim: int,
         device: str,
         ts_to_entropies=None,
+        ts_to_global_states=None,
+        trajectory_lengths: list[int] | None = None,
     ):
         """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
 
@@ -151,6 +227,12 @@ class HypergraphCache:
             device: Torch device string.
             ts_to_entropies: Optional (N_total_ts, n_types) tensor of structural
                              entropy values aligned with ts_to_signature_ids.
+            ts_to_global_states: Optional (N_total_ts, n_agents * obs_dim) tensor
+                                 of flattened team observations. Required for
+                                 temporal critics.
+            trajectory_lengths: Optional list of per-env trajectory lengths in
+                                flat timestep order. Required for temporal
+                                critics.
 
         Returns:
             values: (B,) tensor of critic values.
@@ -158,6 +240,36 @@ class HypergraphCache:
         B = batch_global_states.shape[0]
         unique_ts, inverse = batch_ts_indices.unique(return_inverse=True)
         n_unique = unique_ts.shape[0]
+
+        if getattr(network_critic, "uses_temporal_sequences", False):
+            if ts_to_global_states is None or trajectory_lengths is None:
+                raise RuntimeError(
+                    "Temporal HGNN critics require flat global states and trajectory lengths."
+                )
+
+            window_indices = self.build_temporal_window_indices(
+                unique_ts, trajectory_lengths, network_critic.seq_len
+            )
+            obs_sequences = ts_to_global_states[window_indices].reshape(
+                n_unique, network_critic.seq_len, self.n_agents, observation_dim
+            )
+
+            sig_tensor = torch.tensor(
+                ts_to_signature_ids, dtype=torch.long, device=batch_ts_indices.device
+            )
+            signature_sequences = sig_tensor[window_indices]
+            batched_hgs = self.build_sequence_batched_hypergraphs(
+                signature_sequences, device=device
+            )
+
+            entropy_sequences = None
+            if ts_to_entropies is not None:
+                entropy_sequences = ts_to_entropies[window_indices]
+
+            unique_values = network_critic.forward_batched(
+                obs_sequences, batched_hgs, n_unique, entropies=entropy_sequences
+            )
+            return unique_values.squeeze(-1)[inverse]
 
         # Vectorized first-occurrence gathering
         first_occ = torch.full(

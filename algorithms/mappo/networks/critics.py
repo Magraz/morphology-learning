@@ -260,6 +260,7 @@ class HGNNCrossAttentionCritic(nn.Module):
         n_agents: int,
         observation_dim: int,
         hidden_dim: int = 128,
+        seq_len: int = 1,
         n_heads: int = 4,
         n_cross_attn_layers: int = 2,
         n_hgnn_layers: int = 2,
@@ -269,7 +270,10 @@ class HGNNCrossAttentionCritic(nn.Module):
     ):
         super().__init__()
         self.n_hyperedge_types = n_hyperedge_types
+        self.n_agents = n_agents
+        self.seq_len = seq_len
         self.entropy_conditioning = entropy_conditioning
+        self.uses_temporal_sequences = True
 
         input_dim = observation_dim + 1 if entropy_conditioning else observation_dim
 
@@ -314,7 +318,8 @@ class HGNNCrossAttentionCritic(nn.Module):
         Returns:
             Scalar value estimate of shape (1,).
         """
-        sequences = self._encode(X, hypergraphs, entropies)
+        X_seq = X.unsqueeze(0).unsqueeze(0)  # (1, 1, n_agents, obs_dim)
+        sequences = self._encode_sequence(X_seq, hypergraphs)
         return self._fuse_and_pool(sequences).squeeze(0)  # (1,)
 
     def forward_batched(
@@ -322,48 +327,50 @@ class HGNNCrossAttentionCritic(nn.Module):
         X: torch.Tensor,
         batched_hgs: list,
         n_graphs: int,
+        entropies: torch.Tensor = None,
     ) -> torch.Tensor:
         """Batched forward pass over multiple environments/timesteps.
 
         Args:
-            X: (n_graphs * n_agents, obs_dim).
-            batched_hgs: List of block-diagonal dhg.Hypergraph (one per type).
-            n_graphs: Number of graphs batched together.
+            X:
+                Either (n_graphs * n_agents, obs_dim) for single-step batched
+                evaluation, or (n_graphs, seq_len, n_agents, obs_dim) for
+                temporal evaluation.
+            batched_hgs:
+                List of block-diagonal dhg.Hypergraph (one per type). For the
+                temporal case each hypergraph batches ``n_graphs * seq_len``
+                graphs together.
+            n_graphs: Number of batch elements.
+            entropies:
+                Optional (n_graphs, n_types) for single-step conditioning, or
+                (n_graphs, seq_len, n_types) for temporal conditioning.
 
         Returns:
             (n_graphs, 1).
         """
-        n_agents = X.shape[0] // n_graphs
+        if X.dim() == 2:
+            n_agents = X.shape[0] // n_graphs
+            X = X.view(n_graphs, 1, n_agents, -1)
+
+        sequences = self._encode_sequence(X, batched_hgs)
+
+        return self._fuse_and_pool(sequences)  # (n_graphs, 1)
+
+    def _encode_sequence(self, X_seq, batched_hgs):
+        """Run HGNN encoding for each type, return per-type token sequences."""
+        batch_size, seq_len, n_agents, obs_dim = X_seq.shape
+        x_flat = X_seq.reshape(batch_size * seq_len * n_agents, obs_dim)
 
         sequences = []
         for type_idx, conv_layers in enumerate(self.convs):
-            x = X
+            x = x_flat
 
             for conv in conv_layers:
                 x = conv(x, batched_hgs[type_idx])
 
-            # (n_graphs * n_agents, hidden) → (n_graphs, n_agents, hidden)
-            sequences.append(x.view(n_graphs, n_agents, -1))
-
-        return self._fuse_and_pool(sequences)  # (n_graphs, 1)
-
-    def _encode(self, X, hypergraphs, entropies):
-        """Run HGNN encoding for each type, return list of sequences."""
-        sequences = []
-        for type_idx, conv_layers in enumerate(self.convs):
-            x = X
-            if self.entropy_conditioning:
-                n_agents = X.shape[0]
-                if entropies is not None:
-                    ent_col = entropies[type_idx].reshape(1, 1).expand(n_agents, 1)
-                else:
-                    ent_col = torch.zeros(n_agents, 1, device=X.device)
-                x = torch.cat([x, ent_col], dim=-1)
-
-            for conv in conv_layers:
-                x = conv(x, hypergraphs[type_idx])
-
-            sequences.append(x.unsqueeze(0))  # (1, n_agents, hidden)
+            # Mean-pool agents at each timestep into a temporal token stream.
+            tokens = x.view(batch_size, seq_len, n_agents, -1).mean(dim=2)
+            sequences.append(tokens)  # (batch, seq_len, hidden)
         return sequences
 
     def _fuse_and_pool(self, sequences):

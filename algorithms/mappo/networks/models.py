@@ -27,6 +27,7 @@ class MAPPONetwork(nn.Module):
         share_actor: bool = True,  # Whether to share actor parameters
         critic_type: str = "mlp",  # "mlp" | "multi_hgnn" | "hg_cross_attention"
         n_hyperedge_types: int = 0,  # Required when critic_type uses hypergraphs
+        critic_seq_len: int = 1,
         entropy_conditioning: bool = False,
         hypergraph_mode: str = "predefined",
         history_len: int = 0,
@@ -106,6 +107,7 @@ class MAPPONetwork(nn.Module):
                 n_agents,
                 observation_dim,
                 hidden_dim=hidden_dim,
+                seq_len=critic_seq_len,
                 entropy_conditioning=entropy_conditioning,
             )
         else:

@@ -9,6 +9,35 @@ import torch
 import torch.nn.functional as F
 
 
+def update_left_padded_history(
+    history: torch.Tensor,
+    new_values: torch.Tensor,
+    counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Append one step to a rolling history with repeat-left padding.
+
+    Args:
+        history: (batch, seq_len, ...) tensor storing previous values.
+        new_values: (batch, ...) tensor for the current timestep.
+        counts: (batch,) tensor with the number of valid steps seen so far.
+
+    Returns:
+        Updated ``history`` and ``counts``. If a sequence has fewer than
+        ``seq_len`` valid elements, the earliest available timestep is repeated
+        on the left to keep the full window dense.
+    """
+    history = torch.roll(history, shifts=-1, dims=1)
+    history[:, -1] = new_values
+    counts = torch.clamp(counts + 1, max=history.shape[1])
+
+    for batch_idx in range(history.shape[0]):
+        pad_len = history.shape[1] - int(counts[batch_idx].item())
+        if pad_len > 0:
+            history[batch_idx, :pad_len] = history[batch_idx, pad_len]
+
+    return history, counts
+
+
 class EntropyPredictorHelper:
     """Agent-side helper for entropy predictor inference and training."""
 

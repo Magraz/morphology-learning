@@ -35,6 +35,7 @@ class MAPPOAgent:
         self.n_parallel_envs = n_parallel_envs
         self.critic_type = model_params.critic_type
         self.n_hyperedge_types = model_params.n_hyperedge_types
+        self.critic_seq_len = model_params.critic_seq_len
         # Hyperedge builder specs: list of (fn, source) where source is "obs"
         # or an info-dict key name (e.g. "agents_2_objects")
         self.hyperedge_fns = hyperedge_fns or []
@@ -85,6 +86,7 @@ class MAPPOAgent:
             share_actor=self.share_actor,
             critic_type=self.critic_type,
             n_hyperedge_types=self.n_hyperedge_types,
+            critic_seq_len=self.critic_seq_len,
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_mode=self.hypergraph_mode,
             history_len=self.hygma_history_len,
@@ -321,6 +323,8 @@ class MAPPOAgent:
         action_masks=None,
         hypergraphs=None,
         entropies=None,
+        critic_obs_sequences=None,
+        critic_signature_sequences=None,
     ):
         """
         Get actions for all agents in all environments in a single batched forward pass.
@@ -335,6 +339,11 @@ class MAPPOAgent:
                          Required when critic_type="multi_hgnn".
             entropies: Optional (n_envs, n_types) tensor of structural entropy
                        values for critic conditioning.
+            critic_obs_sequences: Optional (n_envs, seq_len, n_agents, obs_dim)
+                                  tensor for temporal hg_cross_attention critic.
+            critic_signature_sequences: Optional (n_envs, seq_len) tensor of
+                                        hypergraph signature IDs aligned with
+                                        ``critic_obs_sequences``.
 
         Returns:
             actions:   tensor (n_envs, n_agents, action_dim) on self.device
@@ -440,7 +449,26 @@ class MAPPOAgent:
                 )  # (n_envs, n_agents)
 
             # Centralized critic
-            if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
+            if self.critic_type == "hg_cross_attention" and critic_obs_sequences is not None:
+                critic_obs_sequences = critic_obs_sequences.to(self.device)
+                critic_signature_sequences = critic_signature_sequences.to(self.device)
+                critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
+                    critic_signature_sequences, device=self.device
+                )
+                critic_entropies = (
+                    self.hg_cache.get_entropies_for_signature_sequences(
+                        critic_signature_sequences, device=self.device
+                    )
+                    if self.entropy_conditioning
+                    else None
+                )
+                values = self.network_old.get_value_batched(
+                    critic_obs_sequences,
+                    critic_hgs,
+                    n_envs,
+                    entropies=critic_entropies,
+                )
+            elif self.critic_type in ("multi_hgnn", "hg_cross_attention"):
                 obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
                 values = self.network_old.get_value_batched(
                     obs_flat, hypergraphs, n_envs, entropies=entropies
@@ -693,6 +721,19 @@ class MAPPOAgent:
             ts_to_entropies = self.hg_cache.get_flat_entropies(
                 train_device, self.entropy_conditioning
             )
+            ts_to_global_states = torch.cat(
+                [
+                    torch.stack(self.global_states[env_idx])
+                    for env_idx in range(self.n_parallel_envs)
+                    if len(self.values[env_idx]) > 0
+                ],
+                dim=0,
+            ).detach().to(train_device)
+            trajectory_lengths = [
+                len(self.values[env_idx])
+                for env_idx in range(self.n_parallel_envs)
+                if len(self.values[env_idx]) > 0
+            ]
             hgnn_batch_cache = {}
 
         # Iterate through each environment
@@ -861,6 +902,8 @@ class MAPPOAgent:
                         observation_dim=self.observation_dim,
                         device=self.device,
                         ts_to_entropies=ts_to_entropies,
+                        ts_to_global_states=ts_to_global_states,
+                        trajectory_lengths=trajectory_lengths,
                     )
                 else:
                     values = self.network.critic(batch_global_states).squeeze(-1)
@@ -958,6 +1001,19 @@ class MAPPOAgent:
             ts_to_entropies = self.hg_cache.get_flat_entropies(
                 train_device, self.entropy_conditioning
             )
+            ts_to_global_states = torch.cat(
+                [
+                    torch.stack(self.global_states[env_idx])
+                    for env_idx in range(self.n_parallel_envs)
+                    if len(self.values[env_idx]) > 0
+                ],
+                dim=0,
+            ).detach().to(train_device)
+            trajectory_lengths = [
+                len(self.values[env_idx])
+                for env_idx in range(self.n_parallel_envs)
+                if len(self.values[env_idx]) > 0
+            ]
             hgnn_batch_cache = {}
 
         # Update each agent separately (independent actors)
@@ -1133,6 +1189,8 @@ class MAPPOAgent:
                             observation_dim=self.observation_dim,
                             device=self.device,
                             ts_to_entropies=ts_to_entropies,
+                            ts_to_global_states=ts_to_global_states,
+                            trajectory_lengths=trajectory_lengths,
                         )
                     else:
                         values = self.network.critic(batch_global_states).squeeze(-1)

@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from algorithms.mappo.entropy_helpers import update_left_padded_history
+
 
 class PolicyEvaluator:
     def __init__(
@@ -33,6 +35,21 @@ class PolicyEvaluator:
             current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
             episode_rewards = np.zeros(n_eps)
             finished = np.zeros(n_eps, dtype=bool)
+            critic_obs_history = None
+            critic_sig_history = None
+            critic_history_counts = None
+            if self.agent.critic_type == "hg_cross_attention":
+                critic_obs_history = torch.zeros(
+                    n_eps,
+                    self.agent.critic_seq_len,
+                    self.agent.n_agents,
+                    self.agent.observation_dim,
+                    dtype=torch.float32,
+                )
+                critic_sig_history = torch.zeros(
+                    n_eps, self.agent.critic_seq_len, dtype=torch.long
+                )
+                critic_history_counts = torch.zeros(n_eps, dtype=torch.long)
 
             while not finished.all():
                 global_states = obs.reshape(n_eps, -1)
@@ -46,6 +63,23 @@ class PolicyEvaluator:
                     else None
                 )
 
+                critic_obs_sequences = None
+                critic_signature_sequences = None
+                if self.agent.critic_type == "hg_cross_attention":
+                    obs_step = torch.from_numpy(
+                        np.ascontiguousarray(obs, dtype=np.float32)
+                    )
+                    sig_step = torch.tensor(eval_sig_ids, dtype=torch.long)
+                    prev_counts = critic_history_counts.clone()
+                    critic_obs_history, critic_history_counts = update_left_padded_history(
+                        critic_obs_history, obs_step, critic_history_counts
+                    )
+                    critic_sig_history, _ = update_left_padded_history(
+                        critic_sig_history, sig_step, prev_counts
+                    )
+                    critic_obs_sequences = critic_obs_history.clone()
+                    critic_signature_sequences = critic_sig_history.clone()
+
                 actions_t, _, _ = self.agent.get_actions_batched(
                     obs,
                     global_states,
@@ -53,6 +87,8 @@ class PolicyEvaluator:
                     action_masks=current_masks,
                     hypergraphs=eval_hgs,
                     entropies=eval_entropies,
+                    critic_obs_sequences=critic_obs_sequences,
+                    critic_signature_sequences=critic_signature_sequences,
                 )
                 actions = actions_t.cpu().numpy()
 
@@ -65,6 +101,10 @@ class PolicyEvaluator:
                 current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
 
                 dones = np.logical_or(terminated, truncated)
+                if critic_obs_history is not None and dones.any():
+                    critic_obs_history[dones] = 0.0
+                    critic_sig_history[dones] = 0
+                    critic_history_counts[dones] = 0
                 episode_rewards[~finished] += rewards[~finished]
                 finished |= dones
 
