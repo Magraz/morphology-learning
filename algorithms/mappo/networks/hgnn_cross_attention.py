@@ -241,7 +241,9 @@ class HGNNCrossAttentionTransformer(nn.Module):
         # One HGNN encoder per hypergraph type
         self.encoders = nn.ModuleList(
             [
-                HGNNEncoder(node_feat_dims[i], d_model, n_hgnn_layers, drop_rate=dropout)
+                HGNNEncoder(
+                    node_feat_dims[i], d_model, n_hgnn_layers, drop_rate=dropout
+                )
                 for i in range(n_sequences)
             ]
         )

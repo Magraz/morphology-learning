@@ -1255,6 +1255,9 @@ class MAPPOAgent:
     def update(self, next_value=0, minibatch_size=128, epochs=10):
         """Update all agents using shared critic"""
 
+        if self.critic_type == "hg_cross_attention":
+            self.hg_cache.clear_temporal_object_cache()
+
         # Compute returns and advantages
         all_returns, all_advantages = self.compute_returns_and_advantages(next_value)
 

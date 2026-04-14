@@ -41,6 +41,22 @@ class HypergraphCache:
         self.signature_ids = [[] for _ in range(self.n_parallel_envs)]
         self.entropies = [[] for _ in range(self.n_parallel_envs)]
 
+    def clear_temporal_object_cache(self):
+        """Drop cached temporal batched hypergraphs.
+
+        Temporal windows can generate a very large number of unique cache keys,
+        and storing those ``dhg.Hypergraph`` objects on GPU causes VRAM to grow
+        across rollout steps and PPO minibatches. We keep only the structural
+        signature caches and non-temporal inference cache entries.
+        """
+        temporal_keys = [
+            key
+            for key in self.object_cache
+            if isinstance(key, tuple) and len(key) > 0 and key[0] == "temporal"
+        ]
+        for key in temporal_keys:
+            del self.object_cache[key]
+
     # ------------------------------------------------------------------
     # Entropy computation
     # ------------------------------------------------------------------
@@ -126,12 +142,17 @@ class HypergraphCache:
         self,
         signature_sequences: torch.Tensor,
         device: str,
+        cache_result: bool = False,
     ) -> list:
         """Build block-diagonal hypergraphs for a batch of temporal windows.
 
         Args:
             signature_sequences: (batch, seq_len) tensor of signature IDs.
             device: Torch device string.
+            cache_result: Whether to retain the resulting batched hypergraphs in
+                          ``object_cache``. Defaults to ``False`` to avoid
+                          unbounded GPU memory growth from unique temporal
+                          windows during rollout/update.
 
         Returns:
             list[dhg.Hypergraph]: One block-diagonal hypergraph per hyperedge type,
@@ -146,16 +167,18 @@ class HypergraphCache:
         batched_hgs = []
         for type_idx in range(n_types):
             cache_key = ("temporal", type_idx, flat_sig_ids)
-            cached = self.object_cache.get(cache_key)
-            if cached is not None:
-                batched_hgs.append(cached)
-                continue
+            if cache_result:
+                cached = self.object_cache.get(cache_key)
+                if cached is not None:
+                    batched_hgs.append(cached)
+                    continue
 
             edge_lists = [
                 self.unique_edge_lists[sig_id][type_idx] for sig_id in flat_sig_ids
             ]
             hg = batch_hypergraphs(edge_lists, self.n_agents, device=device)
-            self.object_cache[cache_key] = hg
+            if cache_result:
+                self.object_cache[cache_key] = hg
             batched_hgs.append(hg)
 
         return batched_hgs
