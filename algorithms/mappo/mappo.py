@@ -449,7 +449,10 @@ class MAPPOAgent:
                 )  # (n_envs, n_agents)
 
             # Centralized critic
-            if self.critic_type == "hg_cross_attention" and critic_obs_sequences is not None:
+            if (
+                self.critic_type == "hg_cross_attention"
+                and critic_obs_sequences is not None
+            ):
                 critic_obs_sequences = critic_obs_sequences.to(self.device)
                 critic_signature_sequences = critic_signature_sequences.to(self.device)
                 critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
@@ -1031,14 +1034,18 @@ class MAPPOAgent:
             ts_to_entropies = self.hg_cache.get_flat_entropies(
                 train_device, self.entropy_conditioning
             )
-            ts_to_global_states = torch.cat(
-                [
-                    torch.stack(self.global_states[env_idx])
-                    for env_idx in range(self.n_parallel_envs)
-                    if len(self.values[env_idx]) > 0
-                ],
-                dim=0,
-            ).detach().to(train_device)
+            ts_to_global_states = (
+                torch.cat(
+                    [
+                        torch.stack(self.global_states[env_idx])
+                        for env_idx in range(self.n_parallel_envs)
+                        if len(self.values[env_idx]) > 0
+                    ],
+                    dim=0,
+                )
+                .detach()
+                .to(train_device)
+            )
             trajectory_lengths = [
                 len(self.values[env_idx])
                 for env_idx in range(self.n_parallel_envs)

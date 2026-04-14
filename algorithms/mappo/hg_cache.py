@@ -79,7 +79,7 @@ class HypergraphCache:
 
         edge_lists = self.unique_edge_lists[sig_id]
         n_types = len(edge_lists)
-        result = np.empty(n_types, dtype=np.float64)
+        result = np.empty(n_types, dtype=np.float32)
 
         for type_idx, edges in enumerate(edge_lists):
             _, S_soft_norm = soft_entropy_from_edges(edges, self.n_agents)

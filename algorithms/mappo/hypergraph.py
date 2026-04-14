@@ -184,7 +184,7 @@ def compute_hyperedge_structural_entropy_batch(
     for hg in hypergraphs:
         S_e, S_norm, _ = compute_hyperedge_structural_entropy(hg)
         results.append([S_e, S_norm])
-    return np.array(results, dtype=np.float64)  # (n_hypergraphs, 2)
+    return np.array(results, dtype=np.float32)  # (n_hypergraphs, 2)
 
 
 def compute_soft_hyperedge_structural_entropy_batch(
@@ -213,7 +213,7 @@ def compute_soft_hyperedge_structural_entropy_batch(
             hg, n_bins=n_bins, sigma=sigma, use_log_binning=use_log_binning
         )
         results.append([S_soft, S_soft_norm])
-    return np.array(results, dtype=np.float64)  # (n_hypergraphs, 2)
+    return np.array(results, dtype=np.float32)  # (n_hypergraphs, 2)
 
 
 def compute_hyperedge_structural_entropy(hg: dhg.Hypergraph):
@@ -230,7 +230,7 @@ def compute_hyperedge_structural_entropy(hg: dhg.Hypergraph):
     """
     # A: (E_total, |V|) incidence matrix
     A = (
-        hg.H_T.to_dense().cpu().numpy().astype(np.float64)
+        hg.H_T.to_dense().cpu().numpy().astype(np.float32)
     )  # H_T shape is (num_e, num_v)
     E_total = hg.num_e
 
@@ -245,7 +245,7 @@ def compute_hyperedge_structural_entropy(hg: dhg.Hypergraph):
     # Step 3: Probability distribution P(w) = n_w / E_total
     weight_counts = Counter(weights.tolist())
     unique_weights = np.array(list(weight_counts.keys()))
-    counts = np.array(list(weight_counts.values()), dtype=np.float64)
+    counts = np.array(list(weight_counts.values()), dtype=np.float32)
     P = counts / E_total
 
     # Step 4: Shannon entropy S_e = -sum P(w) ln P(w)
@@ -290,7 +290,7 @@ def calculate_soft_hyperedge_structural_entropy(
         weights:         np.ndarray of per-hyperedge weights w(e).
     """
     # --- Step 1: Compute hyperedge weights (unchanged from paper) ---
-    A = hg.H_T.to_dense().cpu().numpy().astype(np.float64)  # (E, |V|)
+    A = hg.H_T.to_dense().cpu().numpy().astype(np.float32)  # (E, |V|)
     E_total = hg.num_e
 
     D = A.sum(axis=0)  # node hyperdegrees, shape (|V|,)
@@ -373,13 +373,13 @@ def soft_entropy_from_edges(
         return 0.0, 0.0
 
     # Node hyperdegrees
-    D = np.zeros(n_vertices, dtype=np.float64)
+    D = np.zeros(n_vertices, dtype=np.float32)
     for edge in edge_list:
         for v in edge:
             D[v] += 1.0
 
     # Per-edge weights: w(e) = |e| * sum_{v in e} D(v)
-    weights = np.empty(E_total, dtype=np.float64)
+    weights = np.empty(E_total, dtype=np.float32)
     for i, edge in enumerate(edge_list):
         weights[i] = len(edge) * sum(D[v] for v in edge)
 
