@@ -25,7 +25,7 @@ class MAPPO_Params:
 @dataclass
 class Model_Params:
     hidden_dim: int
-    critic_type: str
+    critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention"
     # For HGNN
     n_hyperedge_types: int = 1
     # Standalone episodic intrinsic reward

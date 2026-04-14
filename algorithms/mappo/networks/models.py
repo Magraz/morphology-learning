@@ -2,8 +2,15 @@ import torch
 import torch.nn as nn
 
 from algorithms.mappo.networks.actors import MAPPOActor, MAPPO_Hybrid_Actor
-from algorithms.mappo.networks.critics import MAPPOCritic, MultiHGNNCritic
-from algorithms.mappo.networks.encoders import AffinityTransformer, HypergraphEntropyPredictor
+from algorithms.mappo.networks.critics import (
+    MAPPOCritic,
+    MultiHGNNCritic,
+    HGNNCrossAttentionCritic,
+)
+from algorithms.mappo.networks.encoders import (
+    AffinityTransformer,
+    HypergraphEntropyPredictor,
+)
 
 
 class MAPPONetwork(nn.Module):
@@ -18,8 +25,8 @@ class MAPPONetwork(nn.Module):
         hidden_dim: int = 128,
         discrete: bool = False,
         share_actor: bool = True,  # Whether to share actor parameters
-        critic_type: str = "mlp",  # "mlp" or "multi_hgnn"
-        n_hyperedge_types: int = 0,  # Required when critic_type="multi_hgnn"
+        critic_type: str = "mlp",  # "mlp" | "multi_hgnn" | "hg_cross_attention"
+        n_hyperedge_types: int = 0,  # Required when critic_type uses hypergraphs
         entropy_conditioning: bool = False,
         hypergraph_mode: str = "predefined",
         history_len: int = 0,
@@ -90,6 +97,17 @@ class MAPPONetwork(nn.Module):
                 hidden_dim=hidden_dim * 2,
                 entropy_conditioning=entropy_conditioning,
             )
+        elif critic_type == "hg_cross_attention":
+            assert (
+                n_hyperedge_types > 0
+            ), "n_hyperedge_types must be > 0 for hg_cross_attention critic"
+            self.critic = HGNNCrossAttentionCritic(
+                n_hyperedge_types,
+                n_agents,
+                observation_dim,
+                hidden_dim=hidden_dim,
+                entropy_conditioning=entropy_conditioning,
+            )
         else:
             self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
 
@@ -151,7 +169,7 @@ class MAPPONetwork(nn.Module):
         log_probs, entropy = actor.evaluate(obs, actions, action_mask=action_mask)
 
         # Get values from centralized critic
-        if self.critic_type == "multi_hgnn":
+        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
             values = self.critic(obs, hypergraphs, entropies=entropies).squeeze(-1)
         else:
             values = self.critic(global_states).squeeze(-1)
@@ -166,7 +184,7 @@ class MAPPONetwork(nn.Module):
             hypergraphs: List of dhg.Hypergraph (required for multi_hgnn critic).
             entropies: Optional (n_types,) tensor for entropy conditioning.
         """
-        if self.critic_type == "multi_hgnn":
+        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
             return self.critic(global_state, hypergraphs, entropies=entropies)
         return self.critic(global_state)
 
@@ -218,7 +236,6 @@ if __name__ == "__main__":
         action_dim,
         n_agents,
         hidden_dim=round(hidden_dim * 1.09),
-        discrete=True,
         critic_type="mlp",
     )
     print_breakdown(net1, "Condition 1: MLP Critic (no hypergraph)")
@@ -230,7 +247,6 @@ if __name__ == "__main__":
         action_dim,
         n_agents,
         hidden_dim=hidden_dim,
-        discrete=True,
         critic_type="multi_hgnn",
         n_hyperedge_types=n_hyperedge_types,
         entropy_conditioning=False,
@@ -244,7 +260,6 @@ if __name__ == "__main__":
         action_dim,
         n_agents,
         hidden_dim=hidden_dim,
-        discrete=True,
         critic_type="multi_hgnn",
         n_hyperedge_types=n_hyperedge_types,
         entropy_conditioning=True,
@@ -252,5 +267,17 @@ if __name__ == "__main__":
     print_breakdown(
         net3, "Condition 3: Multi-HGNN Critic + Entropy Conditioning + Predictor"
     )
+
+    # 4) HG Cross-Attention critic
+    net4 = MAPPONetwork(
+        obs_dim,
+        obs_dim * n_agents,
+        action_dim,
+        n_agents,
+        hidden_dim=round(80),
+        critic_type="hg_cross_attention",
+        n_hyperedge_types=n_hyperedge_types,
+    )
+    print_breakdown(net4, "Condition 4: HG Cross-Attention Critic")
 
     print()

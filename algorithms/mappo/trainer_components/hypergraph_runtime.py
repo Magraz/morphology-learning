@@ -101,9 +101,9 @@ class HypergraphRuntime:
         if self.hypergraph_mode in ("hygma", "learned_affinity"):
             from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
 
-            assert (
-                self.critic_type == "multi_hgnn"
-            ), f"{self.hypergraph_mode} mode requires critic_type='multi_hgnn'"
+            assert self.critic_type in (
+                "multi_hgnn", "hg_cross_attention"
+            ), f"{self.hypergraph_mode} mode requires critic_type='multi_hgnn' or 'hg_cross_attention'"
             assert (
                 model_params.n_hyperedge_types == 1
             ), f"{self.hypergraph_mode} mode requires n_hyperedge_types=1"
@@ -134,9 +134,9 @@ class HypergraphRuntime:
             from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
 
             sources = model_params.combined_affinity_sources
-            assert (
-                self.critic_type == "multi_hgnn"
-            ), "combined_affinities mode requires critic_type='multi_hgnn'"
+            assert self.critic_type in (
+                "multi_hgnn", "hg_cross_attention"
+            ), "combined_affinities mode requires critic_type='multi_hgnn' or 'hg_cross_attention'"
             assert sources and len(sources) > 0, (
                 "combined_affinities mode requires non-empty combined_affinity_sources"
             )
@@ -296,7 +296,7 @@ class HypergraphRuntime:
 
     def build_inference_hypergraphs(self, obs, infos, n_envs: int):
         """Build batched block-diagonal hypergraphs for critic inference."""
-        if self.critic_type != "multi_hgnn":
+        if self.critic_type not in ("multi_hgnn", "hg_cross_attention"):
             return None, None
 
         all_type_edge_lists = self._compute_all_type_edge_lists(obs, infos, n_envs)

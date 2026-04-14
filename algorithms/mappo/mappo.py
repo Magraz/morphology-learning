@@ -220,9 +220,7 @@ class MAPPOAgent:
 
             if self.intrinsic_reward_encoder_type == "hypergraph":
                 if self.hypergraph_state_encoder is None:
-                    raise RuntimeError(
-                        "Hypergraph state encoder is not initialized."
-                    )
+                    raise RuntimeError("Hypergraph state encoder is not initialized.")
                 embeddings = []
                 for env_idx in range(n_envs):
                     X = obs_tensor[env_idx]  # (n_agents, obs_dim)
@@ -233,17 +231,13 @@ class MAPPOAgent:
                 return torch.stack(embeddings).cpu().numpy()
             else:
                 if self.local_state_encoder is None:
-                    raise RuntimeError(
-                        "Local state encoder is not initialized."
-                    )
+                    raise RuntimeError("Local state encoder is not initialized.")
                 obs_flat = obs_tensor.reshape(
                     n_envs * self.n_agents, self.observation_dim
                 )
                 encoded = self.local_state_encoder.embedding(obs_flat)
                 return (
-                    encoded.reshape(n_envs, self.intrinsic_reward_obs_dim)
-                    .cpu()
-                    .numpy()
+                    encoded.reshape(n_envs, self.intrinsic_reward_obs_dim).cpu().numpy()
                 )
 
     def encode_agent_observations(self, obs_batch: np.ndarray) -> np.ndarray:
@@ -311,7 +305,7 @@ class MAPPOAgent:
                 log_probs.append(log_prob)
 
             # Get value from centralized critic
-            if self.critic_type == "multi_hgnn":
+            if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
                 obs_full = torch.stack(obs_tensors)  # (n_agents, obs_dim)
                 value = self.network_old.get_value(obs_full, hypergraphs=hypergraphs)
             else:
@@ -446,7 +440,7 @@ class MAPPOAgent:
                 )  # (n_envs, n_agents)
 
             # Centralized critic
-            if self.critic_type == "multi_hgnn":
+            if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
                 obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
                 values = self.network_old.get_value_batched(
                     obs_flat, hypergraphs, n_envs, entropies=entropies
@@ -684,7 +678,7 @@ class MAPPOAgent:
         all_agent_indices = []  # (T,) int per (env, agent)
 
         has_masks = len(self.action_masks[0][0]) > 0
-        use_hgnn = self.critic_type == "multi_hgnn"
+        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
         use_entropy_pred = (
             self.network.entropy_predictor is not None
             and len(self.hg_cache.entropies[0]) > 0
@@ -949,7 +943,7 @@ class MAPPOAgent:
         num_updates = 0
 
         has_masks = len(self.action_masks[0][0]) > 0
-        use_hgnn = self.critic_type == "multi_hgnn"
+        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
         use_entropy_pred = (
             self.network.entropy_predictor is not None
             and len(self.hg_cache.entropies[0]) > 0

@@ -100,7 +100,7 @@ class VecMAPPOTrainer:
             self.discrete,
             self.n_parallel_envs,
             model_params=model_params,
-            hyperedge_fns=(hyperedge_fns if self.critic_type == "multi_hgnn" else None),
+            hyperedge_fns=(hyperedge_fns if self.critic_type in ("multi_hgnn", "hg_cross_attention") else None),
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__

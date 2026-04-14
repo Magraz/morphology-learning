@@ -3,6 +3,10 @@ import torch
 import torch.nn as nn
 
 from algorithms.mappo.networks.utils import layer_init
+from algorithms.mappo.networks.hgnn_cross_attention import (
+    CosinePositionalEncoding,
+    CrossAttentionLayer,
+)
 from hypergraphs.hgnn_conv_layer import HGNNConv
 
 
@@ -235,3 +239,143 @@ class MultiHGNNCritic(nn.Module):
         # (n_graphs, n_types * n_agents)
         combined = torch.cat(per_type_values, dim=1)
         return self.mixer(combined)  # (n_graphs, 1)
+
+
+class HGNNCrossAttentionCritic(nn.Module):
+    """Critic that fuses multiple hypergraph types via HGNN encoding
+    followed by cross-attention.
+
+    For each hyperedge type, HGNN convolution produces per-agent embeddings
+    (n_agents, hidden_dim).  These N sequences are treated as separate
+    token streams and fused with a stack of cross-attention layers where
+    each type attends to the concatenation of all other types.
+
+    The fused representations are mean-pooled and projected to a scalar
+    value estimate.
+    """
+
+    def __init__(
+        self,
+        n_hyperedge_types: int,
+        n_agents: int,
+        observation_dim: int,
+        hidden_dim: int = 128,
+        n_heads: int = 4,
+        n_cross_attn_layers: int = 2,
+        n_hgnn_layers: int = 2,
+        d_ff: int = 128,
+        dropout: float = 0.1,
+        entropy_conditioning: bool = False,
+    ):
+        super().__init__()
+        self.n_hyperedge_types = n_hyperedge_types
+        self.entropy_conditioning = entropy_conditioning
+
+        input_dim = observation_dim + 1 if entropy_conditioning else observation_dim
+
+        # One set of HGNN conv layers per hyperedge type
+        self.convs = nn.ModuleList()
+        for _ in range(n_hyperedge_types):
+            layers = nn.ModuleList()
+            layers.append(HGNNConv(input_dim, hidden_dim, drop_rate=dropout))
+            for _ in range(n_hgnn_layers - 1):
+                layers.append(HGNNConv(hidden_dim, hidden_dim, drop_rate=dropout))
+            self.convs.append(layers)
+
+        # Cosine positional encoding + cross-attention stack
+        self.pos_encoding = CosinePositionalEncoding(hidden_dim)
+        self.cross_attn_layers = nn.ModuleList(
+            [
+                CrossAttentionLayer(
+                    n_hyperedge_types, hidden_dim, n_heads, d_ff, dropout
+                )
+                for _ in range(n_cross_attn_layers)
+            ]
+        )
+
+        # Value projection
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        hypergraphs: list,
+        entropies: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            X: (n_agents, observation_dim).
+            hypergraphs: List of dhg.Hypergraph, one per hyperedge type.
+            entropies: Optional (n_types,) tensor for entropy conditioning.
+
+        Returns:
+            Scalar value estimate of shape (1,).
+        """
+        sequences = self._encode(X, hypergraphs, entropies)
+        return self._fuse_and_pool(sequences).squeeze(0)  # (1,)
+
+    def forward_batched(
+        self,
+        X: torch.Tensor,
+        batched_hgs: list,
+        n_graphs: int,
+    ) -> torch.Tensor:
+        """Batched forward pass over multiple environments/timesteps.
+
+        Args:
+            X: (n_graphs * n_agents, obs_dim).
+            batched_hgs: List of block-diagonal dhg.Hypergraph (one per type).
+            n_graphs: Number of graphs batched together.
+
+        Returns:
+            (n_graphs, 1).
+        """
+        n_agents = X.shape[0] // n_graphs
+
+        sequences = []
+        for type_idx, conv_layers in enumerate(self.convs):
+            x = X
+
+            for conv in conv_layers:
+                x = conv(x, batched_hgs[type_idx])
+
+            # (n_graphs * n_agents, hidden) → (n_graphs, n_agents, hidden)
+            sequences.append(x.view(n_graphs, n_agents, -1))
+
+        return self._fuse_and_pool(sequences)  # (n_graphs, 1)
+
+    def _encode(self, X, hypergraphs, entropies):
+        """Run HGNN encoding for each type, return list of sequences."""
+        sequences = []
+        for type_idx, conv_layers in enumerate(self.convs):
+            x = X
+            if self.entropy_conditioning:
+                n_agents = X.shape[0]
+                if entropies is not None:
+                    ent_col = entropies[type_idx].reshape(1, 1).expand(n_agents, 1)
+                else:
+                    ent_col = torch.zeros(n_agents, 1, device=X.device)
+                x = torch.cat([x, ent_col], dim=-1)
+
+            for conv in conv_layers:
+                x = conv(x, hypergraphs[type_idx])
+
+            sequences.append(x.unsqueeze(0))  # (1, n_agents, hidden)
+        return sequences
+
+    def _fuse_and_pool(self, sequences):
+        """Apply positional encoding, cross-attention, and pool to value."""
+        sequences = [self.pos_encoding(seq) for seq in sequences]
+
+        for layer in self.cross_attn_layers:
+            sequences = layer(sequences)
+
+        # Mean over types and agents
+        combined = torch.stack(sequences, dim=0).mean(
+            dim=0
+        )  # (batch, n_agents, hidden)
+        pooled = combined.mean(dim=1)  # (batch, hidden)
+        return self.value_head(pooled)  # (batch, 1)

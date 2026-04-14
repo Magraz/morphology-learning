@@ -269,7 +269,7 @@ class RolloutCollector:
                 np.ascontiguousarray(final_global_states, dtype=np.float32)
             ).to(self.device)
 
-            if self.agent.critic_type == "multi_hgnn":
+            if self.agent.critic_type in ("multi_hgnn", "hg_cross_attention"):
                 final_batched_hgs, final_sig_ids = (
                     self.hypergraph_runtime.build_inference_hypergraphs(
                         obs, infos, batch_size
