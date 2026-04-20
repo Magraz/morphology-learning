@@ -183,7 +183,7 @@ class MultiBoxPushEnv(gym.Env):
         spawn_width = self.world_width * 0.8
         spawn_height = self.world_height * 0.3
 
-        base_density = 2.0
+        base_density = 20.0
 
         placed_positions = []
         min_separation = 4.0
@@ -270,7 +270,7 @@ class MultiBoxPushEnv(gym.Env):
                     n_touching += 1
 
             if obj.userData["coupling"] <= n_touching:
-                new_density = 0.1 * obj.userData["coupling"]
+                new_density = 0.05 * obj.userData["coupling"]
             else:
                 new_density = base_density
 
@@ -390,7 +390,7 @@ class MultiBoxPushEnv(gym.Env):
                 # If improvement is positive (getting closer), give reward
                 # If negative (getting farther), give penalty
                 # Scaling factor 10.0 makes the signal stronger
-                shaping_reward += improvement * 10.0
+                shaping_reward += improvement * 1.0
 
             # 4. Check for completion (object inside target) — bonus only once
             if target.contains_object(obj):
