@@ -1293,6 +1293,23 @@ class MAPPOAgent:
         # Compute returns and advantages
         all_returns, all_advantages = self.compute_returns_and_advantages(next_value)
 
+        # Pre-update explained variance: how well the centralized critic's
+        # stored predictions explain the GAE returns on this rollout.
+        # Ordering of all_returns is env_idx * n_agents + agent_idx, so values
+        # for each env are repeated n_agents times contiguously to align.
+        with torch.no_grad():
+            flat_returns = torch.cat(all_returns)
+            flat_values = torch.cat(
+                [
+                    torch.cat(self.values[e]).repeat(self.n_agents)
+                    for e in range(self.n_parallel_envs)
+                ]
+            )
+            var_returns = flat_returns.var()
+            explained_variance = 1.0 - (flat_returns - flat_values).var() / (
+                var_returns + 1e-8
+            )
+
         # Update each agent (or all at once if sharing actor)
         if self.share_actor:
             stats, num_updates = self.update_shared(
@@ -1313,5 +1330,7 @@ class MAPPOAgent:
         # Average statistics
         for key in stats:
             stats[key] /= max(1, num_updates)
+
+        stats["explained_variance"] = float(explained_variance.item())
 
         return stats
