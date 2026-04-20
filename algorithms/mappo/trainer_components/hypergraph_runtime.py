@@ -8,8 +8,6 @@ import torch
 import dhg
 
 from algorithms.mappo.hypergraph import (
-    batch_hypergraphs,
-    canonicalize_edge_lists,
     distance_based_hyperedges,
     object_contact_hyperedges,
 )
@@ -82,6 +80,7 @@ class HypergraphRuntime:
         critic_type: str,
         model_params,
         batch_dir: Path = None,
+        hyperedge_fns: list[tuple] = None,
     ):
         self.agent = agent
         self.device = device
@@ -90,10 +89,13 @@ class HypergraphRuntime:
         self.critic_type = critic_type
         self.hypergraph_mode = model_params.hypergraph_mode
 
-        self.hyperedge_fns = [
-            (partial(distance_based_hyperedges, threshold=1.0), "obs"),
-            (object_contact_hyperedges, "agents_2_objects"),
-        ]
+        if hyperedge_fns is not None:
+            self.hyperedge_fns = hyperedge_fns
+        else:
+            self.hyperedge_fns = [
+                (partial(distance_based_hyperedges, threshold=1.0), "obs"),
+                (object_contact_hyperedges, "agents_2_objects"),
+            ]
 
         # Plural list used only by combined_affinities mode
         self._dynamic_groupings: list | None = None
@@ -306,30 +308,16 @@ class HypergraphRuntime:
             [all_type_edge_lists[t][e] for t in range(n_types)] for e in range(n_envs)
         ]
 
-        per_env_sig_ids = []
         hg_cache = self.agent.hg_cache
-        for edge_lists in per_env_edge_lists:
-            sig = canonicalize_edge_lists(edge_lists)
-            sig_id = hg_cache.signature_to_id.get(sig)
-            if sig_id is None:
-                sig_id = len(hg_cache.unique_edge_lists)
-                hg_cache.signature_to_id[sig] = sig_id
-                hg_cache.unique_edge_lists.append(edge_lists)
-            per_env_sig_ids.append(sig_id)
+        per_env_sig_ids = [hg_cache.intern(e) for e in per_env_edge_lists]
 
-        batched_hgs = []
-        for type_idx in range(n_types):
-            type_edge_lists = [
-                hg_cache.unique_edge_lists[sid][type_idx] for sid in per_env_sig_ids
-            ]
-            cache_key = tuple(per_env_sig_ids)
-            cached = hg_cache.object_cache.get((type_idx, cache_key))
-            if cached is not None:
-                batched_hgs.append(cached)
-            else:
-                hg = batch_hypergraphs(type_edge_lists, self.n_agents, device=self.device)
-                hg_cache.object_cache[(type_idx, cache_key)] = hg
-                batched_hgs.append(hg)
+        sig_key = tuple(per_env_sig_ids)
+        batched_hgs = [
+            hg_cache.get_or_build_batched_by_type(
+                sig_key, type_idx, self.device, cache_scope="inference"
+            )
+            for type_idx in range(n_types)
+        ]
 
         return batched_hgs, per_env_sig_ids
 

@@ -1,17 +1,16 @@
 import time
 
-import gymnasium as gym
 import numpy as np
 
-import smaclite  # noqa
+from environments.smaclite.wrapper import SmacliteToGymWrapper
 
-RENDER = False
+RENDER = True
 USE_CPP_RVO2 = False
 
 
 def main():
     env = "MMM2"
-    env = gym.make(f"smaclite/{env}-v0", use_cpp_rvo2=USE_CPP_RVO2)
+    env = SmacliteToGymWrapper(env, use_cpp_rvo2=USE_CPP_RVO2)
     episode_num = 20
     total_time = 0
     total_timesteps = 0
@@ -25,14 +24,13 @@ def main():
         episode_time = 0
         timestep_no = 0
         while not done and timestep_no < 200:
+            avail_actions = env._get_avail_actions()
             actions = []
-            avail_actions = env.unwrapped.get_avail_actions()
-            for i in range(env.unwrapped.n_agents):
-                avail_indices = [a for a, valid in enumerate(avail_actions[i]) if valid]
+            for agent_idx in range(env.n_agents):
+                avail_indices = np.flatnonzero(avail_actions[agent_idx]).tolist()
                 actions.append(int(np.random.choice(avail_indices)))
-                # time.sleep(1/2)
             timer = time.time()
-            obs, reward, done, truncated, info = env.step(actions)
+            obs, reward, done, truncated, info = env.step(np.asarray(actions))
             episode_time += time.time() - timer
             episode_reward += reward
             timestep_no += 1

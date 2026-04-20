@@ -729,7 +729,6 @@ class MAPPOAgent:
                 for env_idx in range(self.n_parallel_envs)
                 if len(self.values[env_idx]) > 0
             ]
-            hgnn_batch_cache = {}
 
         ts_offset = 0
         for env_idx in range(self.n_parallel_envs):
@@ -929,7 +928,6 @@ class MAPPOAgent:
                         batch_global_states=batch_global_states,
                         batch_ts_indices=batch_ts_idx,
                         ts_to_signature_ids=ts_to_signature_ids,
-                        hgnn_batch_cache=hgnn_batch_cache,
                         observation_dim=self.observation_dim,
                         device=self.device,
                         ts_to_entropies=ts_to_entropies,
@@ -1051,7 +1049,6 @@ class MAPPOAgent:
                 for env_idx in range(self.n_parallel_envs)
                 if len(self.values[env_idx]) > 0
             ]
-            hgnn_batch_cache = {}
 
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
@@ -1222,7 +1219,6 @@ class MAPPOAgent:
                             batch_global_states=batch_global_states,
                             batch_ts_indices=batch_ts_idx,
                             ts_to_signature_ids=ts_to_signature_ids,
-                            hgnn_batch_cache=hgnn_batch_cache,
                             observation_dim=self.observation_dim,
                             device=self.device,
                             ts_to_entropies=ts_to_entropies,
@@ -1292,8 +1288,7 @@ class MAPPOAgent:
     def update(self, next_value=0, minibatch_size=128, epochs=10):
         """Update all agents using shared critic"""
 
-        if self.critic_type == "hg_cross_attention":
-            self.hg_cache.clear_temporal_object_cache()
+        self.hg_cache.clear_minibatch_cache()
 
         # Compute returns and advantages
         all_returns, all_advantages = self.compute_returns_and_advantages(next_value)

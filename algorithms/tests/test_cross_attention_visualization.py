@@ -197,16 +197,12 @@ def main():
     with torch.no_grad():
         while True:
             # Build hypergraphs
-            batched_hgs, edge_lists, sig = build_hypergraphs(
+            batched_hgs, edge_lists, _ = build_hypergraphs(
                 obs, info, N_AGENTS, DEVICE
             )
 
             # Cache signature
-            sig_id = hg_cache.signature_to_id.get(sig)
-            if sig_id is None:
-                sig_id = len(hg_cache.unique_edge_lists)
-                hg_cache.signature_to_id[sig] = sig_id
-                hg_cache.unique_edge_lists.append(edge_lists)
+            sig_id = hg_cache.intern(edge_lists)
 
             # Update temporal history
             obs_step = torch.from_numpy(

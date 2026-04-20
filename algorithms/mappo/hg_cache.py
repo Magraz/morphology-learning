@@ -8,7 +8,11 @@ the batched HGNN critic evaluation used during PPO updates.
 import numpy as np
 import torch
 
-from algorithms.mappo.hypergraph import batch_hypergraphs, soft_entropy_from_edges
+from algorithms.mappo.hypergraph import (
+    batch_hypergraphs,
+    canonicalize_edge_lists,
+    soft_entropy_from_edges,
+)
 
 
 class HypergraphCache:
@@ -21,7 +25,10 @@ class HypergraphCache:
         # Structure caches (persist within a trajectory, cleared each reset)
         self.signature_to_id: dict[tuple, int] = {}
         self.unique_edge_lists: list[list[list[tuple]]] = []
-        self.object_cache: dict[tuple, object] = {}
+        # Built dhg.Hypergraph objects. Inference entries persist across rollout
+        # steps; minibatch entries are cleared at the start of each PPO update.
+        self.inference_object_cache: dict[tuple, object] = {}
+        self.minibatch_object_cache: dict[tuple, object] = {}
         self.entropy_cache: dict[int, np.ndarray] = {}
 
         # Per-(env, timestep) buffers populated during collection
@@ -36,26 +43,59 @@ class HypergraphCache:
         """Clear all caches and per-trajectory buffers."""
         self.signature_to_id.clear()
         self.unique_edge_lists.clear()
-        self.object_cache.clear()
+        self.inference_object_cache.clear()
+        self.minibatch_object_cache.clear()
         self.entropy_cache.clear()
         self.signature_ids = [[] for _ in range(self.n_parallel_envs)]
         self.entropies = [[] for _ in range(self.n_parallel_envs)]
 
-    def clear_temporal_object_cache(self):
-        """Drop cached temporal batched hypergraphs.
+    def clear_minibatch_cache(self):
+        """Drop cached batched hypergraphs built during a PPO update pass."""
+        self.minibatch_object_cache.clear()
 
-        Temporal windows can generate a very large number of unique cache keys,
-        and storing those ``dhg.Hypergraph`` objects on GPU causes VRAM to grow
-        across rollout steps and PPO minibatches. We keep only the structural
-        signature caches and non-temporal inference cache entries.
+    # ------------------------------------------------------------------
+    # Structure interning / batched-object building
+    # ------------------------------------------------------------------
+
+    def intern(self, edge_lists: list[list[tuple]]) -> int:
+        """Return (inserting if new) the signature id for these per-type edge lists."""
+        sig = canonicalize_edge_lists(edge_lists)
+        sig_id = self.signature_to_id.get(sig)
+        if sig_id is None:
+            sig_id = len(self.unique_edge_lists)
+            self.signature_to_id[sig] = sig_id
+            self.unique_edge_lists.append(edge_lists)
+        return sig_id
+
+    def get_or_build_batched_by_type(
+        self,
+        sig_ids: tuple[int, ...],
+        type_idx: int,
+        device: str,
+        cache_scope: str | None = None,
+    ) -> object:
+        """Return a block-diagonal batched hypergraph for one hyperedge type.
+
+        cache_scope: "inference" or "minibatch" to read/write the matching cache;
+        None skips caching entirely.
         """
-        temporal_keys = [
-            key
-            for key in self.object_cache
-            if isinstance(key, tuple) and len(key) > 0 and key[0] == "temporal"
-        ]
-        for key in temporal_keys:
-            del self.object_cache[key]
+        cache = None
+        if cache_scope == "inference":
+            cache = self.inference_object_cache
+        elif cache_scope == "minibatch":
+            cache = self.minibatch_object_cache
+
+        key = (type_idx, sig_ids)
+        if cache is not None:
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+
+        edge_lists = [self.unique_edge_lists[sid][type_idx] for sid in sig_ids]
+        hg = batch_hypergraphs(edge_lists, self.n_agents, device=device)
+        if cache is not None:
+            cache[key] = hg
+        return hg
 
     # ------------------------------------------------------------------
     # Entropy computation
@@ -142,17 +182,16 @@ class HypergraphCache:
         self,
         signature_sequences: torch.Tensor,
         device: str,
-        cache_result: bool = False,
     ) -> list:
         """Build block-diagonal hypergraphs for a batch of temporal windows.
+
+        Temporal windows generate a very large number of unique signature tuples,
+        so the built objects are deliberately not cached — keeping them alive
+        would grow GPU memory unboundedly across rollout steps and minibatches.
 
         Args:
             signature_sequences: (batch, seq_len) tensor of signature IDs.
             device: Torch device string.
-            cache_result: Whether to retain the resulting batched hypergraphs in
-                          ``object_cache``. Defaults to ``False`` to avoid
-                          unbounded GPU memory growth from unique temporal
-                          windows during rollout/update.
 
         Returns:
             list[dhg.Hypergraph]: One block-diagonal hypergraph per hyperedge type,
@@ -166,24 +205,10 @@ class HypergraphCache:
         )
         n_types = len(self.unique_edge_lists[0])
 
-        batched_hgs = []
-        for type_idx in range(n_types):
-            cache_key = ("temporal", type_idx, flat_sig_ids)
-            if cache_result:
-                cached = self.object_cache.get(cache_key)
-                if cached is not None:
-                    batched_hgs.append(cached)
-                    continue
-
-            edge_lists = [
-                self.unique_edge_lists[sig_id][type_idx] for sig_id in flat_sig_ids
-            ]
-            hg = batch_hypergraphs(edge_lists, self.n_agents, device=device)
-            if cache_result:
-                self.object_cache[cache_key] = hg
-            batched_hgs.append(hg)
-
-        return batched_hgs
+        return [
+            self.get_or_build_batched_by_type(flat_sig_ids, type_idx, device)
+            for type_idx in range(n_types)
+        ]
 
     def get_entropies_for_signature_sequences(
         self,
@@ -236,7 +261,6 @@ class HypergraphCache:
         batch_global_states,
         batch_ts_indices,
         ts_to_signature_ids,
-        hgnn_batch_cache,
         observation_dim: int,
         device: str,
         ts_to_entropies=None,
@@ -245,14 +269,15 @@ class HypergraphCache:
     ):
         """Evaluate MultiHGNNCritic for a minibatch using batched forward pass.
 
+        Built batched hypergraphs are memoized in ``minibatch_object_cache`` —
+        callers should invoke :meth:`clear_minibatch_cache` once per PPO update.
+
         Args:
             network_critic: The critic network (e.g. network.critic).
             batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
             batch_ts_indices: (B,) int tensor mapping each sample to an index
                               in ts_to_signature_ids.
             ts_to_signature_ids: list mapping timestep index -> signature id.
-            hgnn_batch_cache: dict mapping tuple(signature ids in minibatch) to
-                              pre-built list[dhg.Hypergraph] batched by type.
             observation_dim: Single-agent observation dimensionality.
             device: Torch device string.
             ts_to_entropies: Optional (N_total_ts, n_types) tensor of structural
@@ -313,21 +338,15 @@ class HypergraphCache:
         unique_ts_list = [idx.item() for idx in unique_ts]
         unique_sig_ids = [ts_to_signature_ids[ts] for ts in unique_ts_list]
 
-        # Cache by structural signature ids
+        # Cache by structural signature ids (per-type, scoped to this PPO update)
         cache_key = tuple(unique_sig_ids)
-        batched_hgs = hgnn_batch_cache.get(cache_key)
-        if batched_hgs is None:
-            n_types = len(self.unique_edge_lists[0])
-            batched_hgs = []
-            for type_idx in range(n_types):
-                edge_lists = [
-                    self.unique_edge_lists[sig_id][type_idx]
-                    for sig_id in unique_sig_ids
-                ]
-                batched_hgs.append(
-                    batch_hypergraphs(edge_lists, self.n_agents, device=device)
-                )
-            hgnn_batch_cache[cache_key] = batched_hgs
+        n_types = len(self.unique_edge_lists[0])
+        batched_hgs = [
+            self.get_or_build_batched_by_type(
+                cache_key, type_idx, device, cache_scope="minibatch"
+            )
+            for type_idx in range(n_types)
+        ]
 
         # Gather per-unique-timestep entropy values for conditioning
         unique_entropies = None

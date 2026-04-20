@@ -12,7 +12,12 @@ import numpy as np
 import psutil
 
 from algorithms.create_env import make_vec_env
-from algorithms.mappo.hypergraph import distance_based_hyperedges, object_contact_hyperedges
+from algorithms.mappo.hypergraph import (
+    distance_based_hyperedges,
+    object_contact_hyperedges,
+    smaclite_ally_visibility_hyperedges,
+    smaclite_shared_targets_hyperedges,
+)
 from algorithms.mappo.mappo import MAPPOAgent
 from algorithms.mappo.trainer_components import (
     CheckpointIO,
@@ -85,10 +90,16 @@ class VecMAPPOTrainer:
             EnvironmentEnum.SMACLITE,
         ]
 
-        hyperedge_fns = [
-            (partial(distance_based_hyperedges, threshold=1.0), "obs"),
-            (object_contact_hyperedges, "agents_2_objects"),
-        ]
+        if self.env_name == EnvironmentEnum.SMACLITE:
+            hyperedge_fns = [
+                (smaclite_ally_visibility_hyperedges, "obs"),
+                (smaclite_shared_targets_hyperedges, "obs"),
+            ]
+        else:
+            hyperedge_fns = [
+                (partial(distance_based_hyperedges, threshold=1.0), "obs"),
+                (object_contact_hyperedges, "agents_2_objects"),
+            ]
 
         self.agent = MAPPOAgent(
             observation_dim,
@@ -116,6 +127,7 @@ class VecMAPPOTrainer:
             critic_type=self.critic_type,
             model_params=model_params,
             batch_dir=self.dirs.get("batch"),
+            hyperedge_fns=hyperedge_fns,
         )
         self.rollout_collector = RolloutCollector(
             vec_env=self.vec_env,

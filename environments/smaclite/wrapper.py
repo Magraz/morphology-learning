@@ -1,7 +1,8 @@
 import numpy as np
 import gymnasium as gym
 
-import smaclite  # noqa: F401 — registers smaclite envs with gymnasium
+from smaclite.smaclite.env import SMACliteEnv
+from smaclite.smaclite.env.maps.map import MapPreset
 
 
 class SmacliteToGymWrapper(gym.Env):
@@ -14,8 +15,18 @@ class SmacliteToGymWrapper(gym.Env):
     Reward:            scalar team reward
     """
 
-    def __init__(self, map_name: str, use_cpp_rvo2: bool = False):
-        self.env = gym.make(f"smaclite/{map_name}-v0", use_cpp_rvo2=use_cpp_rvo2)
+    def __init__(
+        self,
+        map_name: str,
+        use_cpp_rvo2: bool = False,
+        render_mode=None,
+    ):
+        map_info = self._resolve_map_info(map_name)
+        self.env = SMACliteEnv(
+            map_info=map_info,
+            use_cpp_rvo2=use_cpp_rvo2,
+            render_mode=render_mode,
+        )
         self.max_steps = 512
         self.step_count = 0
 
@@ -31,6 +42,26 @@ class SmacliteToGymWrapper(gym.Env):
             dtype=np.float32,
         )
         self.action_space = gym.spaces.MultiDiscrete([n_actions] * self.n_agents)
+
+    @staticmethod
+    def _resolve_map_info(map_name: str):
+        """Resolve flexible map names like ``MMM2`` or ``MAP_MMM2``."""
+        normalized = map_name.upper()
+        candidate_names = {
+            normalized,
+            normalized.removeprefix("MAP_"),
+        }
+
+        for preset in MapPreset:
+            preset_name = preset.name.upper()
+            value_name = preset.value.name.upper()
+            if preset_name in candidate_names or value_name in candidate_names:
+                return preset.value
+
+        known_maps = ", ".join(preset.value.name for preset in MapPreset)
+        raise ValueError(
+            f"Unknown SMACLite map '{map_name}'. Known maps: {known_maps}"
+        )
 
     def _get_avail_actions(self):
         return np.array(

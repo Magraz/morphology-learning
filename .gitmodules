@@ -4,3 +4,6 @@
 [submodule "HYGMA"]
 	path = HYGMA
 	url = https://github.com/mysteryelder/HYGMA.git
+[submodule "hemac"]
+	path = hemac
+	url = https://github.com/ThalesGroup/hemac.git
