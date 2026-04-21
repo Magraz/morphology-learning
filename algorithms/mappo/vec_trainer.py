@@ -91,11 +91,36 @@ class VecMAPPOTrainer:
         ]
 
         if self.env_name == EnvironmentEnum.SMACLITE:
+            from environments.smaclite.wrapper import SmacliteToGymWrapper
+
+            probe = SmacliteToGymWrapper(map_name=self.env_variant)
+            try:
+                n_enemies = probe.n_enemies
+                enemy_feat_size = probe.enemy_feat_size
+                ally_feat_size = probe.ally_feat_size
+            finally:
+                probe.close()
+
             hyperedge_fns = [
-                (smaclite_ally_visibility_hyperedges, "obs"),
-                (smaclite_shared_targets_hyperedges, "obs"),
+                (
+                    partial(
+                        smaclite_ally_visibility_hyperedges,
+                        n_enemies=n_enemies,
+                        enemy_feat_size=enemy_feat_size,
+                        ally_feat_size=ally_feat_size,
+                    ),
+                    "obs",
+                ),
+                (
+                    partial(
+                        smaclite_shared_targets_hyperedges,
+                        n_enemies=n_enemies,
+                        enemy_feat_size=enemy_feat_size,
+                    ),
+                    "obs",
+                ),
             ]
-        else:
+        elif self.env_name == EnvironmentEnum.MULTI_BOX:
             hyperedge_fns = [
                 (partial(distance_based_hyperedges, threshold=1.0), "obs"),
                 (object_contact_hyperedges, "agents_2_objects"),
@@ -111,7 +136,11 @@ class VecMAPPOTrainer:
             self.discrete,
             self.n_parallel_envs,
             model_params=model_params,
-            hyperedge_fns=(hyperedge_fns if self.critic_type in ("multi_hgnn", "hg_cross_attention") else None),
+            hyperedge_fns=(
+                hyperedge_fns
+                if self.critic_type in ("multi_hgnn", "hg_cross_attention")
+                else None
+            ),
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__
@@ -190,7 +219,9 @@ class VecMAPPOTrainer:
         log_every: int = 10e3,
     ):
         """Train MAPPO agent."""
-        resume_steps, resume_episodes = self.stats_tracker.initialize_for_train(checkpoint)
+        resume_steps, resume_episodes = self.stats_tracker.initialize_for_train(
+            checkpoint
+        )
 
         steps_completed = resume_steps
         episodes_completed = resume_episodes
@@ -198,7 +229,9 @@ class VecMAPPOTrainer:
         if resume_steps > 0:
             print(f"Resuming MAPPO training from step {resume_steps}/{total_steps}...")
         else:
-            print(f"Starting MAPPO training for {total_steps} total environment steps...")
+            print(
+                f"Starting MAPPO training for {total_steps} total environment steps..."
+            )
 
         while steps_completed < total_steps:
             steps_to_collect = min(batch_size, total_steps - steps_completed)
@@ -249,7 +282,9 @@ class VecMAPPOTrainer:
                     f"Eval: {eval_time:.2f}s"
                 )
 
-                self.save_training_stats(self.dirs["logs"] / "training_stats_checkpoint.pkl")
+                self.save_training_stats(
+                    self.dirs["logs"] / "training_stats_checkpoint.pkl"
+                )
                 self.save_agent(self.dirs["models"] / "models_checkpoint.pth")
 
         self.close_environments()

@@ -30,8 +30,12 @@ class SmacliteToGymWrapper(gym.Env):
         self.max_steps = 512
         self.step_count = 0
 
-        self.n_agents = self.env.unwrapped.n_agents
-        n_actions = self.env.unwrapped.n_actions
+        base = self.env.unwrapped
+        self.n_agents = base.n_agents
+        self.n_enemies = base.n_enemies
+        self.enemy_feat_size = base.enemy_feat_size
+        self.ally_feat_size = base.ally_feat_size
+        n_actions = base.n_actions
 
         self._obs_dim = int(self.env.observation_space.spaces[0].shape[0])
 

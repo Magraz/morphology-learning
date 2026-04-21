@@ -66,61 +66,121 @@ def distance_based_hyperedges(
 def smaclite_ally_visibility_hyperedges(
     obs: np.ndarray,
     n_agents: int,
+    n_enemies: int,
+    enemy_feat_size: int,
+    ally_feat_size: int,
 ) -> list[tuple]:
     """Build hyperedges from ally visibility in SMACLITE observations.
 
-    In SMACLITE the per-agent observation layout is:
+    SMACLITE per-agent observation layout:
         [0:4]                                   — movement feasibility (4 dirs)
         [4 : 4 + n_enemies * enemy_feat_size]   — enemy features
             per enemy: attackable, distance, dx, dy, hp, [shield], [unit_type]
         [... : ... + (n_agents-1) * ally_feat_size] — ally features
             per ally:  visible, distance, dx, dy, hp, [shield], [unit_type]
-        [... : obs_dim]                         — own features (hp, [shield], [unit_type])
+        [... : obs_dim]                         — own features
 
-    Intended logic (TODO): extract the ally-visible flags from each agent's
-    observation and group agents that are mutually visible into hyperedges.
+    The ally block for agent i skips i's own slot, so slot ``s`` in agent i's
+    block refers to ally id ``s if s < i else s + 1``.
 
-    Current dummy behaviour: returns one hyperedge containing all agents.
+    For each agent i, build a hyperedge of i plus every ally it currently sees
+    (``visible`` flag == 1). Ally visibility is symmetric by construction
+    (same sight radius on both sides) and dead agents produce all-zero obs, so
+    no explicit mutual-visibility filter is needed. Duplicate hyperedges are
+    removed; agents not in any multi-member edge get isolated self-loops.
 
     Args:
-        obs:      Agent observations, shape (n_agents, obs_dim).
-        n_agents: Total number of agents.
+        obs:              Agent observations, shape (n_agents, obs_dim).
+        n_agents:         Total number of agents.
+        n_enemies:        Number of enemies in the map.
+        enemy_feat_size:  Size of each enemy's feature sub-block.
+        ally_feat_size:   Size of each ally's feature sub-block.
 
     Returns:
         List of hyperedge tuples (sequences of agent indices).
     """
-    # TODO: parse ally-visibility features from obs and build real hyperedges
-    return [tuple(range(n_agents))]
+    if n_agents < 2:
+        return [(i,) for i in range(n_agents)]
+
+    ally_block_start = 4 + n_enemies * enemy_feat_size
+    ally_block_len = (n_agents - 1) * ally_feat_size
+    ally_block = obs[:, ally_block_start : ally_block_start + ally_block_len]
+    ally_block = ally_block.reshape(n_agents, n_agents - 1, ally_feat_size)
+    visible = ally_block[:, :, 0]  # (n_agents, n_agents - 1)
+
+    hyperedge_list = []
+    grouped_agents = set()
+
+    for i in range(n_agents):
+        visible_slots = np.flatnonzero(visible[i] > 0.5)
+        if visible_slots.size == 0:
+            continue
+        real_ids = np.where(visible_slots < i, visible_slots, visible_slots + 1)
+        members = tuple(sorted([i, *real_ids.tolist()]))
+        hyperedge_list.append(members)
+        grouped_agents.update(members)
+
+    hyperedge_list = list(set(hyperedge_list))
+
+    for i in range(n_agents):
+        if i not in grouped_agents:
+            hyperedge_list.append((i,))
+
+    return hyperedge_list
 
 
 def smaclite_shared_targets_hyperedges(
     obs: np.ndarray,
     n_agents: int,
+    n_enemies: int,
+    enemy_feat_size: int,
 ) -> list[tuple]:
     """Build hyperedges from shared enemy targets in SMACLITE observations.
 
-    In SMACLITE the per-agent observation layout is:
-        [0:4]                                   — movement feasibility (4 dirs)
-        [4 : 4 + n_enemies * enemy_feat_size]   — enemy features
-            per enemy: attackable, distance, dx, dy, hp, [shield], [unit_type]
-        [... : ... + (n_agents-1) * ally_feat_size] — ally features
-        [... : obs_dim]                         — own features
+    SMACLITE per-agent observation layout (see
+    ``smaclite_ally_visibility_hyperedges`` for the full spec). The first
+    feature of each enemy sub-block is the ``attackable`` flag — set when the
+    enemy is visible, alive, and within the agent's attack range. Healers
+    contribute 0 to every enemy slot since their avail-action mask covers
+    allies, not enemies, so they are naturally excluded from shared-target
+    edges without an explicit role filter.
 
-    Intended logic (TODO): for each enemy, collect the set of agents that can
-    attack it (attackable flag == 1). Each such set with 2+ members becomes a
-    hyperedge. Agents that share no targets get isolated self-loops.
-
-    Current dummy behaviour: returns one hyperedge containing all agents.
+    For each enemy, collect the set of agents with ``attackable == 1``. Sets
+    with 2+ members become hyperedges (focus-fire groups). Duplicate
+    hyperedges are removed; agents in no group get isolated self-loops.
 
     Args:
-        obs:      Agent observations, shape (n_agents, obs_dim).
-        n_agents: Total number of agents.
+        obs:             Agent observations, shape (n_agents, obs_dim).
+        n_agents:        Total number of agents.
+        n_enemies:       Number of enemies in the map.
+        enemy_feat_size: Size of each enemy's feature sub-block.
 
     Returns:
         List of hyperedge tuples (sequences of agent indices).
     """
-    # TODO: parse enemy-attackable flags from obs and build real hyperedges
-    return [tuple(range(n_agents))]
+    if n_enemies == 0:
+        return [(i,) for i in range(n_agents)]
+
+    enemy_block = obs[:, 4 : 4 + n_enemies * enemy_feat_size]
+    attackable = enemy_block.reshape(n_agents, n_enemies, enemy_feat_size)[:, :, 0]
+
+    hyperedge_list = []
+    grouped_agents = set()
+
+    for e in range(n_enemies):
+        attackers = np.flatnonzero(attackable[:, e] > 0.5)
+        if attackers.size > 1:
+            edge = tuple(attackers.tolist())
+            hyperedge_list.append(edge)
+            grouped_agents.update(edge)
+
+    hyperedge_list = list(set(hyperedge_list))
+
+    for i in range(n_agents):
+        if i not in grouped_agents:
+            hyperedge_list.append((i,))
+
+    return hyperedge_list
 
 
 def object_contact_hyperedges(
