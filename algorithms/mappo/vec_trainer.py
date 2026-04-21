@@ -4,7 +4,6 @@ This is the sole supported MAPPO trainer path; the legacy non-vector trainer
 has been removed.
 """
 
-from functools import partial
 import time
 
 import gymnasium as gym
@@ -12,12 +11,7 @@ import numpy as np
 import psutil
 
 from algorithms.create_env import make_vec_env
-from algorithms.mappo.hypergraph import (
-    distance_based_hyperedges,
-    object_contact_hyperedges,
-    smaclite_ally_visibility_hyperedges,
-    smaclite_shared_targets_hyperedges,
-)
+from algorithms.mappo.hypergraph import build_hyperedge_fns_from_names
 from algorithms.mappo.mappo import MAPPOAgent
 from algorithms.mappo.trainer_components import (
     CheckpointIO,
@@ -90,41 +84,40 @@ class VecMAPPOTrainer:
             EnvironmentEnum.SMACLITE,
         ]
 
-        if self.env_name == EnvironmentEnum.SMACLITE:
-            from environments.smaclite.wrapper import SmacliteToGymWrapper
+        hyperedge_fns = None
+        uses_hypergraph_critic = self.critic_type in (
+            "multi_hgnn",
+            "hg_cross_attention",
+        )
+        if (
+            uses_hypergraph_critic
+            and model_params.hypergraph_mode == "predefined"
+        ):
+            if not model_params.hyperedge_fn_names:
+                raise ValueError(
+                    "hypergraph_mode='predefined' with a hypergraph critic requires "
+                    "model_params.hyperedge_fn_names to be a non-empty list."
+                )
 
-            probe = SmacliteToGymWrapper(map_name=self.env_variant)
-            try:
-                n_enemies = probe.n_enemies
-                enemy_feat_size = probe.enemy_feat_size
-                ally_feat_size = probe.ally_feat_size
-            finally:
-                probe.close()
+            env_ctx: dict = {}
+            if self.env_name == EnvironmentEnum.SMACLITE:
+                from environments.smaclite.wrapper import SmacliteToGymWrapper
 
-            hyperedge_fns = [
-                (
-                    partial(
-                        smaclite_ally_visibility_hyperedges,
-                        n_enemies=n_enemies,
-                        enemy_feat_size=enemy_feat_size,
-                        ally_feat_size=ally_feat_size,
-                    ),
-                    "obs",
-                ),
-                (
-                    partial(
-                        smaclite_shared_targets_hyperedges,
-                        n_enemies=n_enemies,
-                        enemy_feat_size=enemy_feat_size,
-                    ),
-                    "obs",
-                ),
-            ]
-        elif self.env_name == EnvironmentEnum.MULTI_BOX:
-            hyperedge_fns = [
-                (partial(distance_based_hyperedges, threshold=1.0), "obs"),
-                (object_contact_hyperedges, "agents_2_objects"),
-            ]
+                probe = SmacliteToGymWrapper(map_name=self.env_variant)
+                try:
+                    env_ctx = {
+                        "n_enemies": probe.n_enemies,
+                        "enemy_feat_size": probe.enemy_feat_size,
+                        "ally_feat_size": probe.ally_feat_size,
+                    }
+                finally:
+                    probe.close()
+
+            hyperedge_fns = build_hyperedge_fns_from_names(
+                env_name=self.env_name,
+                fn_names=model_params.hyperedge_fn_names,
+                env_ctx=env_ctx,
+            )
 
         self.agent = MAPPOAgent(
             observation_dim,
@@ -136,11 +129,7 @@ class VecMAPPOTrainer:
             self.discrete,
             self.n_parallel_envs,
             model_params=model_params,
-            hyperedge_fns=(
-                hyperedge_fns
-                if self.critic_type in ("multi_hgnn", "hg_cross_attention")
-                else None
-            ),
+            hyperedge_fns=hyperedge_fns,
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__

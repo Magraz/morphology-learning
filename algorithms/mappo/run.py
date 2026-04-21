@@ -152,7 +152,9 @@ class MAPPO_Runner(Runner):
                 # predicted_per_agent shape: (n_steps, n_agents, n_types)
                 pred_per_agent = entropy_logs.get("predicted_per_agent")
                 if pred_per_agent is not None:
-                    type_names = ["proximity", "object"]
+                    type_names = list(
+                        self.trainer.hypergraph_runtime.entropy_type_names
+                    )
                     n_agents = pred_per_agent.shape[1]
                     n_types = pred_per_agent.shape[2]
                     pred_mean = pred_per_agent.mean(axis=1)  # (n_steps, n_types)

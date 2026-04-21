@@ -1,7 +1,10 @@
 import numpy as np
 import dhg
 from collections import Counter
+from functools import partial
 from typing import Callable
+
+from environments.types import EnvironmentEnum
 
 
 def canonicalize_edge_lists(edge_lists: list[list[tuple]]) -> tuple:
@@ -535,3 +538,81 @@ def soft_entropy_from_edges(
     S_soft_norm = S_soft / S_max if S_max > 0 else 0.0
 
     return S_soft, S_soft_norm
+
+
+# ── Hyperedge function registry ───────────────────────────────────────────────
+#
+# Maps (environment, hyperedge_fn_name) -> factory(env_ctx) -> (fn, source).
+# `source` is either "obs" (per-agent observations) or a key in the env `info`
+# dict (e.g. "agents_2_objects"). `env_ctx` provides environment-specific
+# parameters like `n_enemies` / `enemy_feat_size` for SMACLITE builders.
+
+_PROXIMITY_FACTORY = lambda ctx: (
+    partial(distance_based_hyperedges, threshold=1.0),
+    "obs",
+)
+
+HYPEREDGE_FN_REGISTRY: dict[str, dict[str, Callable]] = {
+    EnvironmentEnum.MULTI_BOX: {
+        "proximity": _PROXIMITY_FACTORY,
+        "contact": lambda ctx: (object_contact_hyperedges, "agents_2_objects"),
+    },
+    EnvironmentEnum.SMACLITE: {
+        "ally_visibility": lambda ctx: (
+            partial(
+                smaclite_ally_visibility_hyperedges,
+                n_enemies=ctx["n_enemies"],
+                enemy_feat_size=ctx["enemy_feat_size"],
+                ally_feat_size=ctx["ally_feat_size"],
+            ),
+            "obs",
+        ),
+        "shared_targets": lambda ctx: (
+            partial(
+                smaclite_shared_targets_hyperedges,
+                n_enemies=ctx["n_enemies"],
+                enemy_feat_size=ctx["enemy_feat_size"],
+            ),
+            "obs",
+        ),
+    },
+    EnvironmentEnum.SCATTER: {"proximity": _PROXIMITY_FACTORY},
+    EnvironmentEnum.RENDEZVOUZ: {"proximity": _PROXIMITY_FACTORY},
+    EnvironmentEnum.CONTACT: {"proximity": _PROXIMITY_FACTORY},
+}
+
+
+def build_hyperedge_fns_from_names(
+    env_name: str,
+    fn_names: list[str],
+    env_ctx: dict | None = None,
+) -> list[tuple]:
+    """Resolve `fn_names` to a list of (hyperedge_fn, source) tuples.
+
+    Args:
+        env_name: EnvironmentEnum value identifying the environment.
+        fn_names: Hyperedge function names declared in the experiment config.
+        env_ctx:  Environment-specific context required by some factories
+                  (e.g. SMACLITE needs n_enemies / feat sizes).
+
+    Raises:
+        ValueError: If the environment has no registered hyperedge functions,
+                    or any name in `fn_names` is not registered for that env.
+    """
+    if env_name not in HYPEREDGE_FN_REGISTRY:
+        raise ValueError(
+            f"No hyperedge functions are registered for environment "
+            f"'{env_name}'. Registered environments: "
+            f"{sorted(HYPEREDGE_FN_REGISTRY.keys())}."
+        )
+
+    registry = HYPEREDGE_FN_REGISTRY[env_name]
+    missing = [n for n in fn_names if n not in registry]
+    if missing:
+        raise ValueError(
+            f"hyperedge_fn_names {missing} are not registered for environment "
+            f"'{env_name}'. Available names: {sorted(registry.keys())}."
+        )
+
+    ctx = env_ctx or {}
+    return [registry[name](ctx) for name in fn_names]

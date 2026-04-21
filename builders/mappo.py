@@ -18,7 +18,7 @@ for i, experiment_name in enumerate(EXPERIMENTS_LIST):
         model_params=Model_Params(
             model_name="mlp",
             critic_type="multi_hgnn",
-            n_hyperedge_types=2,
+            hyperedge_fn_names=["proximity", "contact"],
             entropy_conditioning=True,
             entropy_pred_seq_len=32,
             entropy_pred_coef=0.01,

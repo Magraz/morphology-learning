@@ -26,8 +26,11 @@ class MAPPO_Params:
 class Model_Params:
     hidden_dim: int
     critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention"
-    # For HGNN
-    n_hyperedge_types: int = 1
+    # Predefined hyperedge builders (names resolved via HYPEREDGE_FN_REGISTRY).
+    # Determines the number of hyperedge types processed by HGNN critics when
+    # hypergraph_mode="predefined". Ignored for hygma / learned_affinity
+    # (always 1 type) and combined_affinities (one per source).
+    hyperedge_fn_names: list[str] | None = None
     critic_seq_len: int = 32
     # Standalone episodic intrinsic reward
     use_intrinsic_reward: bool = False
@@ -58,6 +61,21 @@ class Model_Params:
         None  # batch names, e.g. ["contact_12a", "scatter_12a"]
     )
     combined_affinity_trial_id: str = "0"
+
+    @property
+    def n_hyperedge_types(self) -> int:
+        """Number of hyperedge types the critic will process.
+
+        Derived from `hypergraph_mode`:
+          - "hygma" / "learned_affinity": always 1 (single spectral grouping).
+          - "combined_affinities": one per entry in `combined_affinity_sources`.
+          - "predefined": one per entry in `hyperedge_fn_names`.
+        """
+        if self.hypergraph_mode in ("hygma", "learned_affinity"):
+            return 1
+        if self.hypergraph_mode == "combined_affinities":
+            return len(self.combined_affinity_sources or [])
+        return len(self.hyperedge_fn_names or [])
 
 
 @dataclass

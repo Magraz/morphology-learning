@@ -1,16 +1,10 @@
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 
 import dhg
-
-from algorithms.mappo.hypergraph import (
-    distance_based_hyperedges,
-    object_contact_hyperedges,
-)
 
 
 def load_pretrained_affinity_transformers(
@@ -89,13 +83,7 @@ class HypergraphRuntime:
         self.critic_type = critic_type
         self.hypergraph_mode = model_params.hypergraph_mode
 
-        if hyperedge_fns is not None:
-            self.hyperedge_fns = hyperedge_fns
-        else:
-            self.hyperedge_fns = [
-                (partial(distance_based_hyperedges, threshold=1.0), "obs"),
-                (object_contact_hyperedges, "agents_2_objects"),
-            ]
+        self.hyperedge_fns = hyperedge_fns or []
 
         # Plural list used only by combined_affinities mode
         self._dynamic_groupings: list | None = None
@@ -106,9 +94,6 @@ class HypergraphRuntime:
             assert self.critic_type in (
                 "multi_hgnn", "hg_cross_attention"
             ), f"{self.hypergraph_mode} mode requires critic_type='multi_hgnn' or 'hg_cross_attention'"
-            assert (
-                model_params.n_hyperedge_types == 1
-            ), f"{self.hypergraph_mode} mode requires n_hyperedge_types=1"
 
             affinity_fn = None
             if self.hypergraph_mode == "learned_affinity":
@@ -141,10 +126,6 @@ class HypergraphRuntime:
             ), "combined_affinities mode requires critic_type='multi_hgnn' or 'hg_cross_attention'"
             assert sources and len(sources) > 0, (
                 "combined_affinities mode requires non-empty combined_affinity_sources"
-            )
-            assert model_params.n_hyperedge_types == len(sources), (
-                f"n_hyperedge_types ({model_params.n_hyperedge_types}) must equal "
-                f"len(combined_affinity_sources) ({len(sources)})"
             )
             assert batch_dir is not None, (
                 "combined_affinities mode requires batch_dir for checkpoint resolution"
@@ -185,7 +166,7 @@ class HypergraphRuntime:
 
         elif self.hypergraph_mode == "predefined":
             self._dynamic_grouping = None
-            self._entropy_type_names = ["proximity", "object"]
+            self._entropy_type_names = list(model_params.hyperedge_fn_names or [])
         else:
             raise ValueError(
                 f"Unknown hypergraph_mode: {self.hypergraph_mode!r}. "
