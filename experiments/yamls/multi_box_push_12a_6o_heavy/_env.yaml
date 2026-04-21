@@ -1,0 +1,4 @@
+n_envs: 10
+n_agents: 12
+n_objects: 6
+reward_mode: "dense"
