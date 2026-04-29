@@ -88,6 +88,12 @@ class HypergraphRuntime:
         # Plural list used only by combined_affinities mode
         self._dynamic_groupings: list | None = None
 
+        # Learned-grouping rolling obs history and last-emitted token sequences.
+        # Populated only when hypergraph_mode == "learned_grouping".
+        self._grouping_history_len: int = 0
+        self._grouping_obs_history: torch.Tensor | None = None
+        self._last_grouping_tokens: list[list[int]] | None = None
+
         if self.hypergraph_mode in ("hygma", "learned_affinity"):
             from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
 
@@ -167,10 +173,30 @@ class HypergraphRuntime:
         elif self.hypergraph_mode == "predefined":
             self._dynamic_grouping = None
             self._entropy_type_names = list(model_params.hyperedge_fn_names or [])
+        elif self.hypergraph_mode == "learned_grouping":
+            assert self.critic_type in (
+                "multi_hgnn", "hg_cross_attention"
+            ), "learned_grouping mode requires critic_type='multi_hgnn' or 'hg_cross_attention'"
+            assert agent.network_old.grouping_transformer is not None, (
+                "learned_grouping mode requires GroupingTransformer on MAPPONetwork"
+            )
+            self._grouping_history_len = model_params.grouping_history_len
+            self._grouping_obs_history = torch.zeros(
+                self.n_parallel_envs,
+                self.n_agents,
+                self._grouping_history_len,
+                agent.observation_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._last_grouping_tokens = [None] * self.n_parallel_envs
+            self._dynamic_grouping = None
+            self._entropy_type_names = ["learned_grouping"]
         else:
             raise ValueError(
                 f"Unknown hypergraph_mode: {self.hypergraph_mode!r}. "
-                "Expected 'predefined', 'hygma', 'learned_affinity', or 'combined_affinities'."
+                "Expected 'predefined', 'hygma', 'learned_affinity', "
+                "'combined_affinities', or 'learned_grouping'."
             )
 
     @staticmethod
@@ -232,6 +258,8 @@ class HypergraphRuntime:
                 g.reset_history()
         elif self._dynamic_grouping is not None:
             self._dynamic_grouping.reset_history()
+        if self._grouping_obs_history is not None:
+            self._grouping_obs_history.zero_()
 
     def on_rollout_step(self, obs: np.ndarray) -> None:
         if self._dynamic_groupings:
@@ -243,6 +271,14 @@ class HypergraphRuntime:
             updated, agg_history = self._dynamic_grouping.maybe_update_groups()
             if updated and agg_history is not None and self.hypergraph_mode == "learned_affinity":
                 self.agent.store_affinity_snapshot(agg_history)
+        if self._grouping_obs_history is not None:
+            obs_t = torch.from_numpy(
+                np.ascontiguousarray(obs, dtype=np.float32)
+            ).to(self._grouping_obs_history.device)
+            self._grouping_obs_history = torch.roll(
+                self._grouping_obs_history, shifts=-1, dims=2
+            )
+            self._grouping_obs_history[:, :, -1, :] = obs_t
 
     def on_env_done_mask(self, dones: np.ndarray) -> None:
         if self._dynamic_groupings:
@@ -250,6 +286,8 @@ class HypergraphRuntime:
                 g.reset_history(env_mask=dones)
         elif self._dynamic_grouping is not None:
             self._dynamic_grouping.reset_history(env_mask=dones)
+        if self._grouping_obs_history is not None:
+            self._grouping_obs_history[dones] = 0.0
 
     def _compute_all_type_edge_lists(self, obs, infos, n_envs: int):
         """Compute per-type, per-env edge lists from observations and infos.
@@ -264,6 +302,11 @@ class HypergraphRuntime:
         if self.hypergraph_mode == "combined_affinities":
             return [g.get_edge_lists(n_envs) for g in self._dynamic_groupings]
 
+        if self.hypergraph_mode == "learned_grouping":
+            edges, tokens = self._sample_learned_groupings(n_envs)
+            self._last_grouping_tokens = tokens
+            return [edges]
+
         all_type_edge_lists = []
         for fn, source in self.hyperedge_fns:
             if source == "obs":
@@ -276,6 +319,25 @@ class HypergraphRuntime:
                 [fn(data[e], self.n_agents) for e in range(n_envs)]
             )
         return all_type_edge_lists
+
+    @torch.no_grad()
+    def _sample_learned_groupings(self, n_envs: int):
+        """Run the GroupingTransformer once on the current obs history window.
+
+        Returns:
+            edge_lists: list[list[tuple]] of length n_envs.
+            token_seqs: list[list[int]] of length n_envs (the sampled token
+                        sequence per env, including its terminal EOS).
+        """
+        gt = self.agent.network_old.grouping_transformer
+        history = self._grouping_obs_history[:n_envs]
+        edges, tokens = gt.generate_with_tokens(history, sample=True)
+        return edges, tokens
+
+    def get_last_grouping_tokens(self) -> list[list[int]] | None:
+        """Return the per-env token sequences emitted by the most recent
+        learned-grouping inference call, or None if not in that mode."""
+        return self._last_grouping_tokens
 
     def build_inference_hypergraphs(self, obs, infos, n_envs: int):
         """Build batched block-diagonal hypergraphs for critic inference."""

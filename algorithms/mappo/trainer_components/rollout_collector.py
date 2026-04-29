@@ -209,6 +209,12 @@ class RolloutCollector:
                     critic_sig_history[dones] = 0
                     critic_history_counts[dones] = 0
 
+            grouping_tokens = (
+                self.hypergraph_runtime.get_last_grouping_tokens()
+                if self.agent.hypergraph_mode == "learned_grouping"
+                else None
+            )
+
             self.agent.store_transitions_batch(
                 obs,
                 global_states,
@@ -221,6 +227,7 @@ class RolloutCollector:
                 hg_signature_ids=per_env_sig_ids,
                 entropies=per_env_entropies,
                 per_agent_intrinsic_rewards=per_agent_intrinsic,
+                grouping_tokens=grouping_tokens,
             )
 
             current_masks = (

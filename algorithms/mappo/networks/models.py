@@ -11,6 +11,7 @@ from algorithms.mappo.networks.encoders import (
     AffinityTransformer,
     HypergraphEntropyPredictor,
 )
+from algorithms.mappo.networks.grouping_transformer import GroupingTransformer
 
 
 class MAPPONetwork(nn.Module):
@@ -31,6 +32,7 @@ class MAPPONetwork(nn.Module):
         entropy_conditioning: bool = False,
         hypergraph_mode: str = "predefined",
         history_len: int = 0,
+        grouping_history_len: int = 0,
     ):
         super(MAPPONetwork, self).__init__()
 
@@ -131,6 +133,20 @@ class MAPPONetwork(nn.Module):
                 d_model=hidden_dim,
             )
             if hypergraph_mode == "learned_affinity" and history_len > 0
+            else None
+        )
+
+        # Autoregressive hyperedge generator for learned coordination groupings.
+        # Single hyperedge type, no overlap (each agent belongs to one group).
+        self.grouping_transformer = (
+            GroupingTransformer(
+                n_agents=n_agents,
+                observation_dim=observation_dim,
+                history_length=grouping_history_len,
+                d_model=hidden_dim,
+                allow_overlap=False,
+            )
+            if hypergraph_mode == "learned_grouping" and grouping_history_len > 0
             else None
         )
 

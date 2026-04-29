@@ -48,6 +48,9 @@ class MAPPOAgent:
         self.hypergraph_mode = model_params.hypergraph_mode
         self.hygma_history_len = model_params.hygma_history_len
         self.affinity_loss_coef = model_params.affinity_loss_coef
+        # Learned grouping (autoregressive hyperedge generator) config
+        self.grouping_history_len = model_params.grouping_history_len
+        self.grouping_loss_coef = model_params.grouping_loss_coef
         # Standalone intrinsic reward config
         self.use_intrinsic_reward = model_params.use_intrinsic_reward
         self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
@@ -90,6 +93,7 @@ class MAPPOAgent:
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_mode=self.hypergraph_mode,
             history_len=self.hygma_history_len,
+            grouping_history_len=self.grouping_history_len,
         )
         self.network = MAPPONetwork(**network_kwargs).to(self.device)
 
@@ -134,6 +138,11 @@ class MAPPOAgent:
         # Affinity training: stores aggregated history snapshots from rollout
         self._affinity_history_snapshots = []
 
+        # Learned grouping: per-(env, t) token sequences sampled at rollout
+        self._grouping_tokens: list[list[list[int]]] = [
+            [] for _ in range(n_parallel_envs)
+        ]
+
         # Buffers for each agent
         self.reset_buffers()
 
@@ -170,6 +179,94 @@ class MAPPOAgent:
 
         return total_loss / len(self._affinity_history_snapshots)
 
+    def compute_grouping_loss(
+        self,
+        env_indices: list[int],
+        ts_indices: list[int],
+        advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """REINFORCE-style loss for the GroupingTransformer.
+
+        Treats the autoregressive hyperedge generator as a policy whose action
+        is the sampled token sequence. The reward signal is the standardized
+        per-(env, t) advantage already computed for PPO; raising the
+        log-probability of token sequences whose downstream rollouts had
+        positive advantage pushes the structure toward edges the critic finds
+        useful.
+
+        Args:
+            env_indices: List of env_idx for each minibatch sample.
+            ts_indices: List of timestep-within-env for each minibatch sample.
+            advantages: (B,) tensor of standardized advantages on training device.
+
+        Returns:
+            Scalar loss tensor (zero when no usable samples).
+        """
+        gt = self.network.grouping_transformer
+        device = advantages.device
+        if gt is None:
+            return torch.tensor(0.0, device=device)
+
+        # Gather per-sample token sequences and observation histories.
+        token_lists: list[list[int]] = []
+        obs_histories: list[torch.Tensor] = []
+        valid_advantages: list[torch.Tensor] = []
+        seq_len = self.grouping_history_len
+
+        for k, (env_idx, t) in enumerate(zip(env_indices, ts_indices)):
+            env_tokens = self._grouping_tokens[env_idx]
+            if t >= len(env_tokens) or not env_tokens[t]:
+                continue
+            token_lists.append(env_tokens[t])
+
+            # Build the obs-history window ending at timestep t for this env:
+            #   shape (n_agents, seq_len, obs_dim), zero-left-padded.
+            agent_obs = []
+            for agent_idx in range(self.n_agents):
+                traj = self.observations[env_idx][agent_idx]
+                window = traj[max(0, t - seq_len + 1) : t + 1]
+                if not window:
+                    continue
+                stacked = torch.stack(window, dim=0)
+                pad_len = seq_len - stacked.shape[0]
+                if pad_len > 0:
+                    pad = torch.zeros(
+                        pad_len, self.observation_dim, dtype=stacked.dtype
+                    )
+                    stacked = torch.cat([pad, stacked], dim=0)
+                agent_obs.append(stacked)
+            if len(agent_obs) != self.n_agents:
+                token_lists.pop()
+                continue
+            obs_histories.append(torch.stack(agent_obs, dim=0))
+            valid_advantages.append(advantages[k])
+
+        if not token_lists:
+            return torch.tensor(0.0, device=device)
+
+        max_len = max(len(s) for s in token_lists)
+        eos_id = gt.eos_id
+        padded = torch.full(
+            (len(token_lists), max_len), eos_id, dtype=torch.long, device=device
+        )
+        lengths = torch.zeros(len(token_lists), dtype=torch.long, device=device)
+        for i, s in enumerate(token_lists):
+            padded[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+            lengths[i] = len(s)
+
+        obs_hist_tensor = torch.stack(obs_histories, dim=0).to(device)
+
+        logits = gt(obs_hist_tensor, padded)  # (B, L, vocab)
+        # log_softmax handles the -inf masked entries cleanly.
+        log_probs = F.log_softmax(logits, dim=-1)
+        gathered = log_probs.gather(-1, padded.unsqueeze(-1)).squeeze(-1)  # (B, L)
+        pos = torch.arange(max_len, device=device).unsqueeze(0)
+        valid = pos < lengths.unsqueeze(-1)
+        seq_log_prob = (gathered * valid.float()).sum(dim=-1)  # (B,)
+
+        adv = torch.stack(valid_advantages).detach()
+        return -(adv * seq_log_prob).mean()
+
     def reset_buffers(self):
         """Reset experience buffers - separate for each parallel environment"""
         # Buffers indexed by [env_idx][agent_idx]
@@ -196,6 +293,7 @@ class MAPPOAgent:
         # Clear hypergraph caches and per-trajectory buffers
         self.hg_cache.reset()
         self._affinity_history_snapshots = []
+        self._grouping_tokens = [[] for _ in range(self.n_parallel_envs)]
 
     def reset_obs_history(self, env_mask=None):
         """Zero out obs history. If env_mask given, only reset those envs."""
@@ -540,6 +638,7 @@ class MAPPOAgent:
         hg_signature_ids=None,  # list[int] of length n_envs or None
         entropies=None,  # torch tensor (n_envs, n_types) or None
         per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
+        grouping_tokens=None,  # list[list[int]] of length n_envs or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -596,6 +695,8 @@ class MAPPOAgent:
                         entropies[env_idx] if entropies is not None else None
                     ),
                 )
+            if grouping_tokens is not None:
+                self._grouping_tokens[env_idx].append(grouping_tokens[env_idx])
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
                 self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
@@ -692,6 +793,7 @@ class MAPPOAgent:
             "entropy_loss": 0,
             "entropy_pred_loss": 0,
             "affinity_loss": 0,
+            "grouping_loss": 0,
         }
         num_updates = 0
 
@@ -718,6 +820,10 @@ class MAPPOAgent:
             self.network.affinity_transformer is not None
             and len(self._affinity_history_snapshots) > 0
         )
+        use_grouping = (
+            self.network.grouping_transformer is not None
+            and len(self._grouping_tokens[0]) > 0
+        )
 
         if use_hgnn:
             ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
@@ -729,6 +835,14 @@ class MAPPOAgent:
                 for env_idx in range(self.n_parallel_envs)
                 if len(self.values[env_idx]) > 0
             ]
+
+        # Flat-ts -> (env_idx, t_within_env) lookup for grouping loss.
+        flat_to_env_t: list[tuple[int, int]] = []
+        if use_grouping:
+            for env_idx in range(self.n_parallel_envs):
+                T_env = len(self.values[env_idx])
+                for local_t in range(T_env):
+                    flat_to_env_t.append((env_idx, local_t))
 
         ts_offset = 0
         for env_idx in range(self.n_parallel_envs):
@@ -975,6 +1089,20 @@ class MAPPOAgent:
                     affinity_loss = self.compute_affinity_loss()
                     loss = loss + self.affinity_loss_coef * affinity_loss
 
+                # Auxiliary REINFORCE loss for the GroupingTransformer
+                grouping_loss = None
+                if use_grouping and batch_ts_idx is not None:
+                    ts_per_sample = batch_ts_idx.detach().cpu().tolist()
+                    env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
+                    local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
+                    # Per-(env,t) advantage = mean over agents, then normalized.
+                    mb_adv = batch_advantages.mean(dim=-1)
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                    grouping_loss = self.compute_grouping_loss(
+                        env_indices, local_t_indices, mb_adv
+                    )
+                    loss = loss + self.grouping_loss_coef * grouping_loss
+
                 # Optimize
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -992,6 +1120,8 @@ class MAPPOAgent:
                     stats["entropy_pred_loss"] += entropy_pred_loss.item()
                 if use_affinity:
                     stats["affinity_loss"] += affinity_loss.item()
+                if grouping_loss is not None:
+                    stats["grouping_loss"] += grouping_loss.item()
                 num_updates += 1
 
         return stats, num_updates
@@ -1013,6 +1143,7 @@ class MAPPOAgent:
             "entropy_loss": 0,
             "entropy_pred_loss": 0,
             "affinity_loss": 0,
+            "grouping_loss": 0,
         }
         num_updates = 0
 
@@ -1026,6 +1157,17 @@ class MAPPOAgent:
             self.network.affinity_transformer is not None
             and len(self._affinity_history_snapshots) > 0
         )
+        use_grouping = (
+            self.network.grouping_transformer is not None
+            and len(self._grouping_tokens[0]) > 0
+        )
+
+        flat_to_env_t: list[tuple[int, int]] = []
+        if use_grouping:
+            for env_idx in range(self.n_parallel_envs):
+                T_env = len(self.values[env_idx])
+                for local_t in range(T_env):
+                    flat_to_env_t.append((env_idx, local_t))
 
         if use_hgnn:
             ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
@@ -1264,6 +1406,30 @@ class MAPPOAgent:
                         affinity_loss = self.compute_affinity_loss()
                         loss = loss + self.affinity_loss_coef * affinity_loss
 
+                    # Auxiliary REINFORCE loss for the GroupingTransformer.
+                    # Only run on agent_idx == 0 — the same hyperedge sample is
+                    # shared across all agents, and we don't want to update it
+                    # n_agents times per minibatch.
+                    grouping_loss = None
+                    if (
+                        use_grouping
+                        and agent_idx == 0
+                        and batch_ts_idx is not None
+                    ):
+                        ts_per_sample = batch_ts_idx.detach().cpu().tolist()
+                        env_indices = [
+                            flat_to_env_t[ts][0] for ts in ts_per_sample
+                        ]
+                        local_t_indices = [
+                            flat_to_env_t[ts][1] for ts in ts_per_sample
+                        ]
+                        mb_adv = batch_advantages
+                        mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                        grouping_loss = self.compute_grouping_loss(
+                            env_indices, local_t_indices, mb_adv
+                        )
+                        loss = loss + self.grouping_loss_coef * grouping_loss
+
                     # Optimize
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -1281,6 +1447,8 @@ class MAPPOAgent:
                         stats["entropy_pred_loss"] += entropy_pred_loss.item()
                     if use_affinity:
                         stats["affinity_loss"] += affinity_loss.item()
+                    if grouping_loss is not None:
+                        stats["grouping_loss"] += grouping_loss.item()
                     num_updates += 1
 
         return stats, num_updates

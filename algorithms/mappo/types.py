@@ -48,7 +48,9 @@ class Model_Params:
     entropy_pred_coef: float = 0.01
     # HYGMA dynamic spectral clustering mode
     hypergraph_mode: str = (
-        "predefined"  # "predefined" | "hygma" | "learned_affinity" | "combined_affinities"
+        "predefined"
+        # "predefined" | "hygma" | "learned_affinity"
+        # | "combined_affinities" | "learned_grouping"
     )
     hygma_history_len: int = 50
     hygma_clustering_interval: int = 100  # rollout steps
@@ -61,17 +63,20 @@ class Model_Params:
         None  # batch names, e.g. ["contact_12a", "scatter_12a"]
     )
     combined_affinity_trial_id: str = "0"
+    # Learned grouping (autoregressive GroupingTransformer) config
+    grouping_history_len: int = 32
+    grouping_loss_coef: float = 0.01
 
     @property
     def n_hyperedge_types(self) -> int:
         """Number of hyperedge types the critic will process.
 
         Derived from `hypergraph_mode`:
-          - "hygma" / "learned_affinity": always 1 (single spectral grouping).
+          - "hygma" / "learned_affinity" / "learned_grouping": always 1.
           - "combined_affinities": one per entry in `combined_affinity_sources`.
           - "predefined": one per entry in `hyperedge_fn_names`.
         """
-        if self.hypergraph_mode in ("hygma", "learned_affinity"):
+        if self.hypergraph_mode in ("hygma", "learned_affinity", "learned_grouping"):
             return 1
         if self.hypergraph_mode == "combined_affinities":
             return len(self.combined_affinity_sources or [])
