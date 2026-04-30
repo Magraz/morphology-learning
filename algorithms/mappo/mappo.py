@@ -250,9 +250,9 @@ class MAPPOAgent:
             (len(token_lists), max_len), eos_id, dtype=torch.long, device=device
         )
         lengths = torch.zeros(len(token_lists), dtype=torch.long, device=device)
-        for i, s in enumerate(token_lists):
-            padded[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-            lengths[i] = len(s)
+        for i, seq in enumerate(token_lists):
+            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+            lengths[i] = len(seq)
 
         obs_hist_tensor = torch.stack(obs_histories, dim=0).to(device)
 
@@ -836,7 +836,7 @@ class MAPPOAgent:
                 if len(self.values[env_idx]) > 0
             ]
 
-        # Flat-ts -> (env_idx, t_within_env) lookup for grouping loss.
+        # Flat-ts -> (env_idx, timestep_within_env) lookup for grouping loss.
         flat_to_env_t: list[tuple[int, int]] = []
         if use_grouping:
             for env_idx in range(self.n_parallel_envs):
@@ -1411,18 +1411,10 @@ class MAPPOAgent:
                     # shared across all agents, and we don't want to update it
                     # n_agents times per minibatch.
                     grouping_loss = None
-                    if (
-                        use_grouping
-                        and agent_idx == 0
-                        and batch_ts_idx is not None
-                    ):
+                    if use_grouping and agent_idx == 0 and batch_ts_idx is not None:
                         ts_per_sample = batch_ts_idx.detach().cpu().tolist()
-                        env_indices = [
-                            flat_to_env_t[ts][0] for ts in ts_per_sample
-                        ]
-                        local_t_indices = [
-                            flat_to_env_t[ts][1] for ts in ts_per_sample
-                        ]
+                        env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
+                        local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
                         mb_adv = batch_advantages
                         mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
                         grouping_loss = self.compute_grouping_loss(

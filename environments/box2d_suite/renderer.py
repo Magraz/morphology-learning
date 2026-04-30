@@ -46,6 +46,9 @@ class Renderer:
         self._draw_dynamic_objects()
         self._draw_object_coupling()
 
+        # Draw active grab joints (no-op for envs without agent_joints)
+        self._draw_grab_joints()
+
         # Draw agents
         self._render_agents_as_circles()
 
@@ -71,7 +74,7 @@ class Renderer:
                 self.env.attach_values[agent.index] == 1
                 and self.env.detach_values[agent.index] == 0
             )
-            agent.render_circle(self.screen, self.screen_size, self.scale, is_open)
+            agent.render_circle(self.screen, self.screen_size, self.scale, False)
 
     def _render_agents_as_boxes(self):
         for agent in self.env.agents:
@@ -295,11 +298,33 @@ class Renderer:
                 self.screen, self.screen_size, self.scale, self._index_font
             )
 
+    def _draw_grab_joints(self):
+        """Draw a line between each agent and the object it is grabbing."""
+        agent_joints = getattr(self.env, "agent_joints", None)
+        if not agent_joints:
+            return
+
+        LINE_COLOR = (255, 140, 0)
+        ANCHOR_COLOR = (0, 0, 0)
+        sh = self.screen_size[1]
+
+        for entry in agent_joints:
+            if entry is None:
+                continue
+            joint, _ = entry
+            ax, ay = joint.anchorA
+            bx, by = joint.anchorB
+            start = (int(ax * self.scale), int(sh - ay * self.scale))
+            end = (int(bx * self.scale), int(sh - by * self.scale))
+            pygame.draw.line(self.screen, LINE_COLOR, start, end, 2)
+            pygame.draw.circle(self.screen, ANCHOR_COLOR, start, 3)
+            pygame.draw.circle(self.screen, ANCHOR_COLOR, end, 3)
+
     def _draw_object_coupling(self):
         """Render the coupling requirement on top of each object."""
         if self._coupling_font is None:
             pygame.font.init()
-            self._coupling_font = pygame.font.SysFont("Arial", 14, bold=True)
+            self._coupling_font = pygame.font.SysFont("Arial", 20, bold=True)
 
         for body in self.env.objects:
             center_x = body.position.x * self.scale

@@ -19,7 +19,7 @@
 - Owns `get_or_compute_entropy()` (currently `MAPPOAgent.get_or_compute_entropy`).
 - Owns HGNN minibatch critic value path (`compute_hgnn_critic_values()`), including batch-hypergraph cache semantics and keying. **Receives the network as a method argument** — does not hold a reference.
 - Owns `reset()` method that clears all caches and buffers (called from `MAPPOAgent.reset_buffers()`).
-- Keep dtype/device behavior unchanged (`np.float64` cached entropy, `float32` tensors on target device).
+- Keep dtype/device behavior unchanged (`np.float32` cached entropy, `float32` tensors on target device).
 
 **Relationship to existing `HypergraphRuntime`**: `HypergraphRuntime` (trainer_components) handles *collection-time* hypergraph construction and entropy computation. It currently mutates agent caches directly (`agent.hg_signature_to_id`, etc.). After refactor, `HypergraphRuntime` will access these through `agent.hg_cache.<attr>` instead. `HypergraphRuntime` remains a trainer-side orchestrator; `hg_cache` is the agent-side data owner.
 
