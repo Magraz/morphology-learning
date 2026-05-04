@@ -43,6 +43,10 @@ class Model_Params:
     intrinsic_reward_memory_capacity: int = 1025
     # Entropy conditioning of HGNN critics
     entropy_conditioning: bool = False
+    # COMA-style per-agent counterfactual baseline over hyperedges.
+    # Replaces the shared V(s) baseline in the policy loss with
+    # V_cf(i, s) = critic(s, hg \ E_i). Only supported for critic_type="multi_hgnn".
+    counterfactual_credit: bool = False
     # Auxiliary LSTM entropy predictor
     entropy_pred_seq_len: int = 32
     entropy_pred_coef: float = 0.01

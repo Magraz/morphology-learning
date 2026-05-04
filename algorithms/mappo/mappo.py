@@ -41,6 +41,14 @@ class MAPPOAgent:
         self.hyperedge_fns = hyperedge_fns or []
         # Entropy conditioning of HGNN critics
         self.entropy_conditioning = model_params.entropy_conditioning
+        # COMA-style per-agent counterfactual baseline (multi_hgnn only).
+        self.counterfactual_credit = model_params.counterfactual_credit
+        if self.counterfactual_credit and self.critic_type != "multi_hgnn":
+            raise ValueError(
+                "counterfactual_credit is only supported for "
+                "critic_type='multi_hgnn'; got "
+                f"critic_type={self.critic_type!r}."
+            )
         # Auxiliary LSTM entropy predictor config
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_pred_coef = model_params.entropy_pred_coef
@@ -1051,12 +1059,33 @@ class MAPPOAgent:
                 else:
                     values = self.network.critic(batch_global_states).squeeze(-1)
 
+                # COMA-style per-agent counterfactual baseline (multi_hgnn only).
+                # V_cf(i, s) = critic(s, hg \ E_i); replaces the shared baseline
+                # in the policy loss with A_i = R_i - V_cf(i, s).
+                if use_hgnn and self.counterfactual_credit:
+                    cf_values = self.hg_cache.compute_per_agent_counterfactual_values(
+                        network_critic=self.network.critic,
+                        batch_global_states=batch_global_states,
+                        batch_ts_indices=batch_ts_idx,
+                        ts_to_signature_ids=ts_to_signature_ids,
+                        observation_dim=self.observation_dim,
+                        device=self.device,
+                    )  # (n_minibatch_ts, n_agents)
+                    cf_advantages = batch_returns - cf_values.detach()
+                    cf_advantages_flat = cf_advantages.reshape(-1)
+                    cf_advantages_flat = (
+                        cf_advantages_flat - cf_advantages_flat.mean()
+                    ) / (cf_advantages_flat.std() + 1e-8)
+                    actor_advantages = cf_advantages_flat
+                else:
+                    actor_advantages = batch_advantages_flat
+
                 # PPO objective
                 ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs_flat)
-                surr1 = ratio * batch_advantages_flat
+                surr1 = ratio * actor_advantages
                 surr2 = (
                     torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-                    * batch_advantages_flat
+                    * actor_advantages
                 )
                 policy_loss = -torch.min(surr1, surr2).mean()
 

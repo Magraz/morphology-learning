@@ -20,6 +20,27 @@ def canonicalize_edge_lists(edge_lists: list[list[tuple]]) -> tuple:
     )
 
 
+def remove_agent_from_edge_lists(
+    edge_lists: list[list[tuple]], agent_idx: int, n_agents: int
+) -> list[list[tuple]]:
+    """Drop every multi-vertex hyperedge containing ``agent_idx`` from each type.
+
+    Used to build COMA-style counterfactual hypergraphs where agent ``i``'s
+    coalition memberships are erased. The result is identical to the input
+    when ``agent_idx`` is not in any multi-vertex edge, which preserves the
+    invariant V_cf(i, s) == V(s) in that case. A single-vertex placeholder
+    is added only as a fallback when an entire type's edge list would
+    otherwise be empty (dhg.Hypergraph requires ``num_e > 0``).
+    """
+    result: list[list[tuple]] = []
+    for type_edges in edge_lists:
+        kept = [e for e in type_edges if not (len(e) > 1 and agent_idx in e)]
+        if not kept:
+            kept = [(agent_idx,)]
+        result.append(kept)
+    return result
+
+
 def distance_based_hyperedges(
     obs: np.ndarray, n_agents: int, threshold: float
 ) -> list[tuple]:

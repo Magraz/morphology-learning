@@ -11,6 +11,7 @@ import torch
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
     canonicalize_edge_lists,
+    remove_agent_from_edge_lists,
     soft_entropy_from_edges,
 )
 
@@ -35,6 +36,11 @@ class HypergraphCache:
         self.signature_ids: list[list[int]] = [[] for _ in range(n_parallel_envs)]
         self.entropies: list[list[np.ndarray]] = [[] for _ in range(n_parallel_envs)]
 
+        # COMA-style counterfactual edge-list cache, keyed by (sig_id, agent_idx).
+        # Entries are deterministic functions of the original edge lists, so we
+        # never invalidate them during training.
+        self._cf_edge_lists: dict[tuple[int, int], list[list[tuple]]] = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -46,6 +52,7 @@ class HypergraphCache:
         self.inference_object_cache.clear()
         self.minibatch_object_cache.clear()
         self.entropy_cache.clear()
+        self._cf_edge_lists.clear()
         self.signature_ids = [[] for _ in range(self.n_parallel_envs)]
         self.entropies = [[] for _ in range(self.n_parallel_envs)]
 
@@ -359,3 +366,112 @@ class HypergraphCache:
         )
 
         return unique_values.squeeze(-1)[inverse]
+
+    # ------------------------------------------------------------------
+    # COMA-style per-agent counterfactual baseline
+    # ------------------------------------------------------------------
+
+    def get_cf_edge_lists(
+        self, sig_id: int, agent_idx: int
+    ) -> list[list[tuple]]:
+        """Return the per-type edge lists for sig_id with agent_idx removed.
+
+        Cached on the instance — counterfactual edges are a deterministic
+        function of (original sig_id, agent_idx).
+        """
+        key = (sig_id, agent_idx)
+        cached = self._cf_edge_lists.get(key)
+        if cached is None:
+            cached = remove_agent_from_edge_lists(
+                self.unique_edge_lists[sig_id], agent_idx, self.n_agents
+            )
+            self._cf_edge_lists[key] = cached
+        return cached
+
+    def _get_or_build_cf_batched_by_type(
+        self,
+        cache_key: tuple,
+        unique_sig_ids: tuple[int, ...],
+        agent_idx: int,
+        type_idx: int,
+        device: str,
+    ):
+        """Block-diagonal batched hypergraph for one type, with `agent_idx`
+        removed from each contributing timestep's edge list. Cached in the
+        minibatch object cache (cleared per PPO update)."""
+        cached = self.minibatch_object_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        type_edge_lists = [
+            self.get_cf_edge_lists(sid, agent_idx)[type_idx]
+            for sid in unique_sig_ids
+        ]
+        hg = batch_hypergraphs(type_edge_lists, self.n_agents, device=device)
+        self.minibatch_object_cache[cache_key] = hg
+        return hg
+
+    def compute_per_agent_counterfactual_values(
+        self,
+        network_critic,
+        batch_global_states: torch.Tensor,
+        batch_ts_indices: torch.Tensor,
+        ts_to_signature_ids,
+        observation_dim: int,
+        device: str,
+    ) -> torch.Tensor:
+        """COMA-style counterfactual values V_cf(i, s) for every (sample, agent).
+
+        For each agent i, evaluates the critic on the same observations but
+        with all multi-vertex hyperedges containing i removed from the
+        per-type hypergraphs.
+
+        Args:
+            network_critic: MultiHGNNCritic instance.
+            batch_global_states: (B, n_agents * obs_dim) flattened all-agent obs.
+            batch_ts_indices: (B,) int tensor mapping each sample to an index
+                              in ts_to_signature_ids.
+            ts_to_signature_ids: list mapping global timestep index -> signature id.
+            observation_dim: Single-agent observation dimensionality.
+            device: Torch device string.
+
+        Returns:
+            (B, n_agents) tensor of counterfactual values.
+        """
+        B = batch_global_states.shape[0]
+        unique_ts, inverse = batch_ts_indices.unique(return_inverse=True)
+        n_unique = unique_ts.shape[0]
+
+        # Vectorized first-occurrence gathering (mirrors compute_hgnn_critic_values).
+        first_occ = torch.full(
+            (n_unique,), B, dtype=torch.long, device=batch_ts_indices.device
+        )
+        arange = torch.arange(B, device=batch_ts_indices.device)
+        first_occ.scatter_reduce_(0, inverse, arange, reduce="amin")
+        obs_unique = batch_global_states[first_occ]
+        obs_flat = obs_unique.reshape(n_unique * self.n_agents, observation_dim)
+
+        unique_ts_list = [idx.item() for idx in unique_ts]
+        unique_sig_ids = tuple(ts_to_signature_ids[ts] for ts in unique_ts_list)
+        n_types = len(self.unique_edge_lists[0])
+
+        cf_unique = torch.zeros(
+            n_unique, self.n_agents, device=obs_flat.device, dtype=obs_flat.dtype
+        )
+        for agent_idx in range(self.n_agents):
+            batched_hgs = [
+                self._get_or_build_cf_batched_by_type(
+                    cache_key=("cf", type_idx, agent_idx, unique_sig_ids),
+                    unique_sig_ids=unique_sig_ids,
+                    agent_idx=agent_idx,
+                    type_idx=type_idx,
+                    device=device,
+                )
+                for type_idx in range(n_types)
+            ]
+            unique_v = network_critic.forward_batched(
+                obs_flat, batched_hgs, n_unique
+            ).squeeze(-1)
+            cf_unique[:, agent_idx] = unique_v
+
+        return cf_unique[inverse]
