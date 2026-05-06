@@ -70,6 +70,9 @@ class Model_Params:
     # Learned grouping (autoregressive GroupingTransformer) config
     grouping_history_len: int = 32
     grouping_loss_coef: float = 0.01
+    grouping_entropy_coef: float = 0.01
+    # Resample the hypergraph every N rollout steps (per env). 1 = every step.
+    grouping_resample_interval: int = 1
 
     @property
     def n_hyperedge_types(self) -> int:

@@ -310,6 +310,8 @@ class MultiBoxGrabEnv(gym.Env):
         agent = self.agents[agent_idx]
         agent_pos = np.array([agent.position.x, agent.position.y])
 
+        grab_range = agent.radius + 0.2
+
         closest_idx = None
         closest_dist = float("inf")
 
@@ -322,7 +324,7 @@ class MultiBoxGrabEnv(gym.Env):
                 closest_dist = dist
                 closest_idx = obj_idx
 
-        if closest_idx is None:
+        if closest_idx is None or closest_dist > grab_range:
             return
 
         target_obj = self.objects[closest_idx]

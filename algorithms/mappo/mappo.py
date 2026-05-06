@@ -59,6 +59,7 @@ class MAPPOAgent:
         # Learned grouping (autoregressive hyperedge generator) config
         self.grouping_history_len = model_params.grouping_history_len
         self.grouping_loss_coef = model_params.grouping_loss_coef
+        self.grouping_entropy_coef = model_params.grouping_entropy_coef
         # Standalone intrinsic reward config
         self.use_intrinsic_reward = model_params.use_intrinsic_reward
         self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
@@ -273,7 +274,19 @@ class MAPPOAgent:
         seq_log_prob = (gathered * valid.float()).sum(dim=-1)  # (B,)
 
         adv = torch.stack(valid_advantages).detach()
-        return -(adv * seq_log_prob).mean()
+        pg_loss = -(adv * seq_log_prob).mean()
+
+        # Entropy bonus over the per-step categorical distributions, summed over
+        # valid (non-padded) positions. -inf-masked logits give probs=0 there;
+        # treat 0 * log(0) as 0 so the masked vocabulary entries don't contribute.
+        probs = log_probs.exp()
+        step_entropy = -(probs * torch.where(
+            torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs)
+        )).sum(dim=-1)  # (B, L)
+        seq_entropy = (step_entropy * valid.float()).sum(dim=-1)  # (B,)
+        entropy_bonus = seq_entropy.mean()
+
+        return pg_loss - self.grouping_entropy_coef * entropy_bonus
 
     def reset_buffers(self):
         """Reset experience buffers - separate for each parallel environment"""

@@ -93,6 +93,10 @@ class HypergraphRuntime:
         self._grouping_history_len: int = 0
         self._grouping_obs_history: torch.Tensor | None = None
         self._last_grouping_tokens: list[list[int]] | None = None
+        # Per-env step counter and cached edge lists for interval-based resampling.
+        self._grouping_resample_interval: int = 1
+        self._grouping_step_count: np.ndarray | None = None
+        self._cached_grouping_edges: list | None = None
 
         if self.hypergraph_mode in ("hygma", "learned_affinity"):
             from algorithms.mappo.dynamic_grouping import DynamicSpectralGrouping
@@ -192,6 +196,13 @@ class HypergraphRuntime:
             self._last_grouping_tokens = [None] * self.n_parallel_envs
             self._dynamic_grouping = None
             self._entropy_type_names = ["learned_grouping"]
+            self._grouping_resample_interval = max(
+                1, int(getattr(model_params, "grouping_resample_interval", 1))
+            )
+            self._grouping_step_count = np.zeros(
+                self.n_parallel_envs, dtype=np.int64
+            )
+            self._cached_grouping_edges = [None] * self.n_parallel_envs
         else:
             raise ValueError(
                 f"Unknown hypergraph_mode: {self.hypergraph_mode!r}. "
@@ -260,6 +271,9 @@ class HypergraphRuntime:
             self._dynamic_grouping.reset_history()
         if self._grouping_obs_history is not None:
             self._grouping_obs_history.zero_()
+        if self._grouping_step_count is not None:
+            self._grouping_step_count[:] = 0
+            self._cached_grouping_edges = [None] * self.n_parallel_envs
 
     def on_rollout_step(self, obs: np.ndarray) -> None:
         if self._dynamic_groupings:
@@ -288,6 +302,10 @@ class HypergraphRuntime:
             self._dynamic_grouping.reset_history(env_mask=dones)
         if self._grouping_obs_history is not None:
             self._grouping_obs_history[dones] = 0.0
+        if self._grouping_step_count is not None:
+            self._grouping_step_count[dones] = 0
+            for e in np.where(dones)[0]:
+                self._cached_grouping_edges[int(e)] = None
 
     def _compute_all_type_edge_lists(self, obs, infos, n_envs: int):
         """Compute per-type, per-env edge lists from observations and infos.
@@ -324,15 +342,52 @@ class HypergraphRuntime:
     def _sample_learned_groupings(self, n_envs: int):
         """Run the GroupingTransformer once on the current obs history window.
 
+        Honors ``grouping_resample_interval``: each env only resamples when its
+        per-env step counter is at a multiple of N. Off-boundary steps reuse
+        the cached edge list and return an empty token list (signaling the
+        REINFORCE loss to skip — gradient should only flow on the step where
+        the structural decision was actually made).
+
         Returns:
             edge_lists: list[list[tuple]] of length n_envs.
-            token_seqs: list[list[int]] of length n_envs (the sampled token
-                        sequence per env, including its terminal EOS).
+            token_seqs: list[list[int]] of length n_envs.
         """
         gt = self.agent.network_old.grouping_transformer
         history = self._grouping_obs_history[:n_envs]
+        interval = self._grouping_resample_interval
+        counts = self._grouping_step_count
+
+        if interval <= 1 or counts is None:
+            edges, tokens = gt.generate_with_tokens(history, sample=True)
+            if counts is not None:
+                counts[:n_envs] += 1
+            return edges, tokens
+
+        boundary = (counts[:n_envs] % interval) == 0
+        for e in range(n_envs):
+            if not boundary[e] and self._cached_grouping_edges[e] is None:
+                # First step of a fresh env (counter just reset) — force resample.
+                boundary[e] = True
+
+        if not boundary.any():
+            out_edges = [self._cached_grouping_edges[e] for e in range(n_envs)]
+            out_tokens = [[] for _ in range(n_envs)]
+            counts[:n_envs] += 1
+            return out_edges, out_tokens
+
         edges, tokens = gt.generate_with_tokens(history, sample=True)
-        return edges, tokens
+        out_edges: list = []
+        out_tokens: list = []
+        for e in range(n_envs):
+            if boundary[e]:
+                self._cached_grouping_edges[e] = edges[e]
+                out_edges.append(edges[e])
+                out_tokens.append(tokens[e])
+            else:
+                out_edges.append(self._cached_grouping_edges[e])
+                out_tokens.append([])
+        counts[:n_envs] += 1
+        return out_edges, out_tokens
 
     def get_last_grouping_tokens(self) -> list[list[int]] | None:
         """Return the per-env token sequences emitted by the most recent
