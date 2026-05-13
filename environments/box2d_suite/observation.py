@@ -80,17 +80,37 @@ class ObservationManager:
             self.env.sector_sensor_radius
         )
 
+        # Fraction of agents within neighbor_detection_range of each agent (incl. self)
+        all_neighbor_fractions = self._calculate_neighbor_fractions(
+            self.env.neighbor_detection_range
+        )
+
         observations = []
         for i in range(self.env.n_agents):
             own_state = all_states[i]
             own_velocity = all_velocities[i]
             is_touching_object = np.array([self._is_agent_touching_object(i)])
+            neighbor_fraction = np.array([all_neighbor_fractions[i]])
             agent_obs = np.concatenate(
-                [own_state, own_velocity, all_density_sensors[i], is_touching_object]
+                [
+                    own_state,
+                    own_velocity,
+                    all_density_sensors[i],
+                    is_touching_object,
+                    neighbor_fraction,
+                ]
             )
             observations.append(agent_obs)
 
         return np.array(observations, dtype=np.float32)
+
+    def _calculate_neighbor_fractions(self, radius):
+        """Fraction of all agents within `radius` of each agent (self included)."""
+        agent_pos = self._agent_pos_cache  # (A, 2)
+        diff = agent_pos[:, np.newaxis, :] - agent_pos[np.newaxis, :, :]
+        dist = np.linalg.norm(diff, axis=-1)  # (A, A), zero on the diagonal
+        within = (dist <= radius).sum(axis=1).astype(np.float32)  # (A,)
+        return within / float(self.env.n_agents)
 
     def _calculate_density_sensors_all(self, sensor_radius):
         """

@@ -550,7 +550,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     n_agents = 6
-    observation_dim = 21
+    observation_dim = 22
     history_length = 32
     batch_size = 2
 

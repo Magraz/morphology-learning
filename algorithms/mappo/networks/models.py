@@ -226,7 +226,7 @@ class MAPPONetwork(nn.Module):
 if __name__ == "__main__":
     import numpy as np
 
-    obs_dim = 21
+    obs_dim = 22
     n_agents = 5
     action_dim = 5
     hidden_dim = 168

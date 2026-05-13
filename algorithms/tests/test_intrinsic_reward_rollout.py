@@ -16,69 +16,8 @@ from algorithms.mappo.networks.encoders import (
     HypergraphStateEncoder,
     LocalStateEncoder,
 )
-from algorithms.mappo.networks.models import MAPPONetwork
+from algorithms.tests._rollout_utils import load_mappo_network_inferred
 from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
-
-
-def load_from_checkpoint(checkpoint_path, n_agents, device="cpu"):
-    """Load a MAPPONetwork and optional LocalStateEncoder from a checkpoint.
-
-    Infers network dimensions from the saved state dict.
-
-    Returns:
-        (network, encoder, encoder_dim)
-        - network: MAPPONetwork with loaded weights (eval mode)
-        - encoder: LocalStateEncoder or None
-        - encoder_dim: int or None
-    """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    sd = checkpoint["network"]
-
-    # Infer dimensions from actor weights
-    share_actor = "actor.actor.0.weight" in sd
-    if share_actor:
-        obs_dim = sd["actor.actor.0.weight"].shape[1]
-        action_dim = sd["actor.actor.4.weight"].shape[0]
-        hidden_dim = sd["actor.actor.0.weight"].shape[0]
-    else:
-        obs_dim = sd["actors.0.actor.0.weight"].shape[1]
-        action_dim = sd["actors.0.actor.4.weight"].shape[0]
-        hidden_dim = sd["actors.0.actor.0.weight"].shape[0]
-
-    # Detect critic type: MLP critic has "critic.critic.0.weight",
-    # multi_hgnn critic has "critic.critics.0..." keys instead.
-    critic_type = "mlp" if "critic.critic.0.weight" in sd else "multi_hgnn"
-    if critic_type == "mlp":
-        global_state_dim = sd["critic.critic.0.weight"].shape[1]
-    else:
-        global_state_dim = obs_dim * n_agents
-
-    network = MAPPONetwork(
-        observation_dim=obs_dim,
-        global_state_dim=global_state_dim,
-        action_dim=action_dim,
-        n_agents=n_agents,
-        hidden_dim=hidden_dim,
-        discrete=False,
-        share_actor=share_actor,
-        critic_type=critic_type,
-        n_hyperedge_types=2,
-    )
-    network.load_state_dict(sd)
-    network.to(device)
-    network.eval()
-
-    # Load encoder if present
-    encoder, encoder_dim = None, None
-    if "local_state_encoder" in checkpoint:
-        enc_sd = checkpoint["local_state_encoder"]
-        enc_obs_size = enc_sd["init.weight"].shape[1]
-        encoder_dim = enc_sd["fc3.weight"].shape[0]
-        encoder = LocalStateEncoder(enc_obs_size, encoder_dim)
-        encoder.load_state_dict(enc_sd)
-        encoder.eval()
-
-    return network, encoder, encoder_dim
 
 
 def run_episode(
@@ -244,14 +183,16 @@ def run_episode_hg_encoder(
 
 def test_intrinsic_reward_rollout(checkpoint_path=None, force_encoder=False):
     n_agents = 12
-    obs_per_agent = 21
+    obs_per_agent = 22
     k_values = [2, 4, 8, 16]
 
     env = MultiBoxPushEnv(n_agents=n_agents, n_objects=6, max_steps=1024)
 
     network = None
     if checkpoint_path is not None:
-        network, encoder, encoder_dim = load_from_checkpoint(checkpoint_path, n_agents)
+        network, encoder, encoder_dim = load_mappo_network_inferred(
+            checkpoint_path, n_agents
+        )
         use_encoder = encoder is not None
         if not use_encoder and force_encoder:
             encoder_dim = 32

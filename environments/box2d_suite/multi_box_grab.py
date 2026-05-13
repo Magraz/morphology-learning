@@ -65,7 +65,7 @@ class MultiBoxGrabEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 21), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))

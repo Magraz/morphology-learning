@@ -1,0 +1,5 @@
+n_envs: 10
+n_agents: 9
+n_objects: 3
+coupling_def: "even"
+reward_mode: "dense"

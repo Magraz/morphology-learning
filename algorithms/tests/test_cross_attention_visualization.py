@@ -23,7 +23,6 @@ import torch.nn.functional as F
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from algorithms.mappo.networks.models import MAPPONetwork
 from algorithms.mappo.hypergraph import (
     batch_hypergraphs,
     canonicalize_edge_lists,
@@ -32,13 +31,14 @@ from algorithms.mappo.hypergraph import (
 )
 from algorithms.mappo.hg_cache import HypergraphCache
 from algorithms.mappo.entropy_helpers import update_left_padded_history
+from algorithms.tests._rollout_utils import capture_frame, load_mappo_network
 from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
 # ── Experiment configuration (matches hg_cross_attention.yaml + _env.yaml) ──
 
 N_AGENTS = 12
 N_OBJECTS = 6
-OBSERVATION_DIM = 21
+OBSERVATION_DIM = 22
 ACTION_DIM = 2
 HIDDEN_DIM = 80
 N_HYPEREDGE_TYPES = 2
@@ -125,41 +125,21 @@ def build_hypergraphs(obs, info, n_agents, device):
     return batched_hgs, edge_lists_per_type, sig
 
 
-def capture_frame(env):
-    """Grab the current pygame surface as an RGB numpy array."""
-    import pygame
-
-    surface = pygame.display.get_surface()
-    if surface is None:
-        return None
-    frame = pygame.surfarray.array3d(surface)
-    return np.transpose(frame, (1, 0, 2)).copy()
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     # ── Build network and load checkpoint ──
-    global_state_dim = OBSERVATION_DIM * N_AGENTS
-    network = MAPPONetwork(
-        observation_dim=OBSERVATION_DIM,
-        global_state_dim=global_state_dim,
-        action_dim=ACTION_DIM,
+    network = load_mappo_network(
+        CHECKPOINT_PATH,
         n_agents=N_AGENTS,
+        observation_dim=OBSERVATION_DIM,
+        action_dim=ACTION_DIM,
         hidden_dim=HIDDEN_DIM,
-        discrete=False,
-        share_actor=True,
         critic_type="hg_cross_attention",
         n_hyperedge_types=N_HYPEREDGE_TYPES,
         critic_seq_len=CRITIC_SEQ_LEN,
-        entropy_conditioning=False,
-        hypergraph_mode="predefined",
-    ).to(DEVICE)
-
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    network.load_state_dict(checkpoint["network"])
-    network.eval()
-    print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
+        device=DEVICE,
+    )
 
     critic = network.critic
 

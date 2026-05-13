@@ -38,10 +38,11 @@ class MultiBoxPushEnv(gym.Env):
     def __init__(
         self,
         render_mode=None,
-        n_agents=3,
-        n_objects=3,
-        max_steps=1024,
-        reward_mode="dense",
+        n_agents: int = 3,
+        n_objects: int = 3,
+        coupling_def: str = "random",
+        max_steps: int = 1024,
+        reward_mode: str = "dense",
     ):
         super().__init__()
 
@@ -62,7 +63,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 21), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -102,9 +103,14 @@ class MultiBoxPushEnv(gym.Env):
         self._init_agents()
 
         # Create boxes coupling reqs
-        self.objects_push_coupling_list = np.random.default_rng(42).integers(
-            2, (self.n_agents // 2) + 1, (self.n_objects)
-        )
+        if coupling_def is "random":
+            self.objects_push_coupling_list = np.random.default_rng(42).integers(
+                2, (self.n_agents // 2) + 1, (self.n_objects)
+            )
+        elif coupling_def is "even":
+            self.objects_push_coupling_list = [
+                self.n_agents // self.n_objects for _ in range(self.n_objects)
+            ]
 
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)

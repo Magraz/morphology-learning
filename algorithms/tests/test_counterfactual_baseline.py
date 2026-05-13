@@ -28,12 +28,12 @@ from algorithms.mappo.hypergraph import (
     distance_based_hyperedges,
     object_contact_hyperedges,
 )
-from algorithms.mappo.networks.models import MAPPONetwork
+from algorithms.tests._rollout_utils import load_mappo_network
 from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
 N_AGENTS = 12
 N_OBJECTS = 6
-OBSERVATION_DIM = 21
+OBSERVATION_DIM = 22
 ACTION_DIM = 2
 HIDDEN_DIM = 168
 N_HYPEREDGE_TYPES = 2
@@ -54,24 +54,16 @@ def build_per_type_edge_lists(obs, info, n_agents):
 
 
 def main():
-    network = MAPPONetwork(
-        observation_dim=OBSERVATION_DIM,
-        global_state_dim=OBSERVATION_DIM * N_AGENTS,
-        action_dim=ACTION_DIM,
+    network = load_mappo_network(
+        CHECKPOINT_PATH,
         n_agents=N_AGENTS,
+        observation_dim=OBSERVATION_DIM,
+        action_dim=ACTION_DIM,
         hidden_dim=HIDDEN_DIM,
-        discrete=False,
-        share_actor=True,
         critic_type="multi_hgnn",
         n_hyperedge_types=N_HYPEREDGE_TYPES,
-        entropy_conditioning=False,
-        hypergraph_mode="predefined",
-    ).to(DEVICE)
-
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    network.load_state_dict(checkpoint["network"])
-    network.eval()
-    print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
+        device=DEVICE,
+    )
 
     cache = HypergraphCache(n_agents=N_AGENTS, n_parallel_envs=1)
 

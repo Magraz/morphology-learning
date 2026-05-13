@@ -33,14 +33,14 @@ from algorithms.mappo.hypergraph import (
     distance_based_hyperedges,
     object_contact_hyperedges,
 )
-from algorithms.mappo.networks.models import MAPPONetwork
+from algorithms.tests._rollout_utils import capture_frame, load_mappo_network
 from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
 
 # ── Experiment configuration (matches hgnn_shared.yaml + _env.yaml) ──────────
 
 N_AGENTS = 12
 N_OBJECTS = 6
-OBSERVATION_DIM = 21
+OBSERVATION_DIM = 22
 ACTION_DIM = 2
 HIDDEN_DIM = 168
 N_HYPEREDGE_TYPES = 2
@@ -76,17 +76,6 @@ def make_hypergraph(edges, n_agents, device):
     if len(edges) == 0:
         edges = [(i,) for i in range(n_agents)]
     return dhg.Hypergraph(n_agents, edges, device=device)
-
-
-def capture_frame(env):
-    """Grab the current pygame surface as an RGB numpy array."""
-    import pygame
-
-    surface = pygame.display.get_surface()
-    if surface is None:
-        return None
-    frame = pygame.surfarray.array3d(surface)
-    return np.transpose(frame, (1, 0, 2)).copy()
 
 
 def find_max_drop_edge(critic, X, edges, original_value, n_agents, device):
@@ -148,25 +137,16 @@ def draw_hypergraph_to_array(edges, n_agents, device):
 
 def main():
     # ── Build network and load checkpoint ──
-    global_state_dim = OBSERVATION_DIM * N_AGENTS
-    network = MAPPONetwork(
-        observation_dim=OBSERVATION_DIM,
-        global_state_dim=global_state_dim,
-        action_dim=ACTION_DIM,
+    network = load_mappo_network(
+        CHECKPOINT_PATH,
         n_agents=N_AGENTS,
+        observation_dim=OBSERVATION_DIM,
+        action_dim=ACTION_DIM,
         hidden_dim=HIDDEN_DIM,
-        discrete=False,
-        share_actor=True,
         critic_type="multi_hgnn",
         n_hyperedge_types=N_HYPEREDGE_TYPES,
-        entropy_conditioning=False,
-        hypergraph_mode="predefined",
-    ).to(DEVICE)
-
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    network.load_state_dict(checkpoint["network"])
-    network.eval()
-    print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
+        device=DEVICE,
+    )
 
     critic = network.critic
 
