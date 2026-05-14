@@ -212,9 +212,7 @@ class MAPPO_Runner(Runner):
                 # Frame + hypergraph snapshot grid
                 snap_fig = self.trainer.build_snapshot_figure(frames, hypergraphs)
                 if snap_fig is not None:
-                    snap_path = (
-                        self.dirs["logs"] / f"snapshots_episode_{episode}.png"
-                    )
+                    snap_path = self.dirs["logs"] / f"snapshots_episode_{episode}.png"
                     snap_fig.savefig(snap_path, dpi=150, bbox_inches="tight")
                     plt.close(snap_fig)
                     print(f"Snapshot plot saved to {snap_path}")

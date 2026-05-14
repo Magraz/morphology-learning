@@ -387,53 +387,6 @@ class MAPPOAgent:
                 .numpy()
             )
 
-    def get_actions(
-        self, observations, global_state, deterministic=False, hypergraphs=None
-    ):
-        """
-        Get actions for all agents
-
-        Args:
-            observations: List of observations, one per agent
-            global_state: Concatenated global state (all agent observations)
-            deterministic: Whether to use deterministic actions
-            hypergraphs: list of dhg.Hypergraph (one per type) or None.
-                         Required when critic_type="multi_hgnn".
-
-        Returns:
-            actions: List of actions for each agent
-            log_probs: List of log probabilities
-            value: Single value from centralized critic
-        """
-        with torch.no_grad():
-            # Convert observations to tensors
-            obs_tensors = [
-                torch.FloatTensor(obs).to(self.device) for obs in observations
-            ]
-
-            # Convert global state to tensor
-            global_state_tensor = torch.FloatTensor(global_state).to(self.device)
-
-            # Get actions from each actor
-            actions = []
-            log_probs = []
-
-            for agent_idx, obs_tensor in enumerate(obs_tensors):
-                action, log_prob = self.network_old.act(
-                    obs_tensor, agent_idx, deterministic
-                )
-                actions.append(action)
-                log_probs.append(log_prob)
-
-            # Get value from centralized critic
-            if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
-                obs_full = torch.stack(obs_tensors)  # (n_agents, obs_dim)
-                value = self.network_old.get_value(obs_full, hypergraphs=hypergraphs)
-            else:
-                value = self.network_old.get_value(global_state_tensor)
-
-        return torch.stack(actions), torch.cat(log_probs), value
-
     def get_actions_batched(
         self,
         observations_batch,
@@ -472,179 +425,156 @@ class MAPPOAgent:
         n_envs = observations_batch.shape[0]
 
         with torch.no_grad():
-            obs_tensor = torch.from_numpy(
-                np.ascontiguousarray(observations_batch, dtype=np.float32)
-            ).to(
-                self.device
-            )  # (n_envs, n_agents, obs_dim)
-            gs_tensor = torch.from_numpy(
-                np.ascontiguousarray(global_states_batch, dtype=np.float32)
-            ).to(
-                self.device
-            )  # (n_envs, global_state_dim)
-
-            masks_tensor = (
-                torch.from_numpy(
-                    np.ascontiguousarray(action_masks, dtype=np.float32)
-                ).to(self.device)
-                if action_masks is not None
-                else None
-            )  # (n_envs, n_agents, n_actions) or None
-
-            # Predict entropy conditioning for actor (if predictor exists)
-            pred_entropy_flat = None  # (n_envs * n_agents, 2*n_types) or None
-            if self.network_old.entropy_predictor is not None:
-                if n_envs == self.n_parallel_envs:
-                    # Training collection — use persistent rolling buffer
-                    obs_seqs = self.entropy_helper.update_obs_history(obs_tensor)
-                else:
-                    # Eval/render — use obs as single-step sequence (zero-padded)
-                    obs_seqs = self.entropy_helper.make_eval_sequences(obs_tensor)
-                obs_seqs_flat = obs_seqs.reshape(
-                    n_envs * self.n_agents, self.entropy_pred_seq_len, -1
-                ).to(self.device)
-                agent_ids = torch.arange(self.n_agents, device=self.device).repeat(
-                    n_envs
-                )
-                pred_mean, pred_log_var = (
-                    self.network_old.entropy_predictor.forward_batch(
-                        obs_seqs_flat, agent_ids
-                    )
-                )
-                pred_entropy_flat = torch.cat([pred_mean, pred_log_var], dim=-1)
-
-            if self.share_actor:
-                # Fuse envs and agents into one batch: single forward pass total
-                obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
-                if pred_entropy_flat is not None:
-                    obs_flat = self.entropy_helper.condition_obs(
-                        obs_flat, pred_entropy_flat
-                    )
-                masks_flat = (
-                    masks_tensor.reshape(n_envs * self.n_agents, -1)
-                    if masks_tensor is not None
-                    else None
-                )
-                actions_flat, log_probs_flat = self.network_old.act(
-                    obs_flat,
-                    agent_idx=0,
-                    deterministic=deterministic,
-                    action_mask=masks_flat,
-                )
-                actions = actions_flat.reshape(n_envs, self.n_agents, -1)
-                log_probs = log_probs_flat.reshape(n_envs, self.n_agents, -1).squeeze(
-                    -1
-                )
-            else:
-                # One batched pass per agent (n_agents passes, each over all envs)
-                pred_entropy_per_agent = (
-                    pred_entropy_flat.reshape(n_envs, self.n_agents, -1)
-                    if pred_entropy_flat is not None
-                    else None
-                )
-                actions_list = []
-                log_probs_list = []
-                for agent_idx in range(self.n_agents):
-                    agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
-                    if pred_entropy_per_agent is not None:
-                        agent_obs = self.entropy_helper.condition_obs(
-                            agent_obs, pred_entropy_per_agent[:, agent_idx, :]
-                        )
-                    agent_mask = (
-                        masks_tensor[:, agent_idx, :]
-                        if masks_tensor is not None
-                        else None
-                    )
-                    a, lp = self.network_old.act(
-                        agent_obs, agent_idx, deterministic, action_mask=agent_mask
-                    )
-                    actions_list.append(a)  # (n_envs, action_dim)
-                    log_probs_list.append(lp)  # (n_envs, 1)
-                actions = torch.stack(
-                    actions_list, dim=1
-                )  # (n_envs, n_agents, action_dim)
-                log_probs = torch.stack(log_probs_list, dim=1).squeeze(
-                    -1
-                )  # (n_envs, n_agents)
-
-            # Centralized critic
-            if (
-                self.critic_type == "hg_cross_attention"
-                and critic_obs_sequences is not None
-            ):
-                critic_obs_sequences = critic_obs_sequences.to(self.device)
-                critic_signature_sequences = critic_signature_sequences.to(self.device)
-                critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
-                    critic_signature_sequences, device=self.device
-                )
-                critic_entropies = (
-                    self.hg_cache.get_entropies_for_signature_sequences(
-                        critic_signature_sequences, device=self.device
-                    )
-                    if self.entropy_conditioning
-                    else None
-                )
-                values = self.network_old.get_value_batched(
-                    critic_obs_sequences,
-                    critic_hgs,
-                    n_envs,
-                    entropies=critic_entropies,
-                )
-            elif self.critic_type in ("multi_hgnn", "hg_cross_attention"):
-                obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
-                values = self.network_old.get_value_batched(
-                    obs_flat, hypergraphs, n_envs, entropies=entropies
-                )  # (n_envs, 1)
-            else:
-                values = self.network_old.get_value(gs_tensor)  # (n_envs, 1)
+            obs_tensor, gs_tensor, masks_tensor = self._to_device_tensors(
+                observations_batch, global_states_batch, action_masks
+            )
+            pred_entropy_flat = self._predict_entropy_conditioning(obs_tensor, n_envs)
+            actions, log_probs = self._run_actors(
+                obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
+            )
+            values = self._run_centralized_critic(
+                obs_tensor,
+                gs_tensor,
+                n_envs,
+                hypergraphs=hypergraphs,
+                entropies=entropies,
+                critic_obs_sequences=critic_obs_sequences,
+                critic_signature_sequences=critic_signature_sequences,
+            )
 
         return actions, log_probs, values
 
-    def store_transition(
-        self,
-        env_idx,
-        observations,
-        global_state,
-        actions,
-        rewards,
-        log_probs,
-        value,
-        dones,
-        action_masks=None,
+    def _to_device_tensors(self, observations_batch, global_states_batch, action_masks):
+        """Convert numpy rollout inputs to device tensors."""
+        obs_tensor = torch.from_numpy(
+            np.ascontiguousarray(observations_batch, dtype=np.float32)
+        ).to(self.device)  # (n_envs, n_agents, obs_dim)
+        gs_tensor = torch.from_numpy(
+            np.ascontiguousarray(global_states_batch, dtype=np.float32)
+        ).to(self.device)  # (n_envs, global_state_dim)
+        masks_tensor = (
+            torch.from_numpy(
+                np.ascontiguousarray(action_masks, dtype=np.float32)
+            ).to(self.device)
+            if action_masks is not None
+            else None
+        )  # (n_envs, n_agents, n_actions) or None
+        return obs_tensor, gs_tensor, masks_tensor
+
+    def _predict_entropy_conditioning(self, obs_tensor, n_envs):
+        """Run the entropy predictor over the rolling/eval obs history.
+
+        Returns (n_envs * n_agents, 2 * n_types) or None.
+        """
+        if self.network_old.entropy_predictor is None:
+            return None
+
+        if n_envs == self.n_parallel_envs:
+            # Training collection — use persistent rolling buffer
+            obs_seqs = self.entropy_helper.update_obs_history(obs_tensor)
+        else:
+            # Eval/render — use obs as single-step sequence (zero-padded)
+            obs_seqs = self.entropy_helper.make_eval_sequences(obs_tensor)
+        obs_seqs_flat = obs_seqs.reshape(
+            n_envs * self.n_agents, self.entropy_pred_seq_len, -1
+        ).to(self.device)
+        agent_ids = torch.arange(self.n_agents, device=self.device).repeat(n_envs)
+        pred_mean, pred_log_var = self.network_old.entropy_predictor.forward_batch(
+            obs_seqs_flat, agent_ids
+        )
+        return torch.cat([pred_mean, pred_log_var], dim=-1)
+
+    def _run_actors(
+        self, obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
     ):
-        """Store transition for a specific environment (CPU buffers to avoid small GPU transfers)"""
-        # Store global state (shared)
-        self.global_states[env_idx].append(torch.FloatTensor(global_state))
-
-        # Store value (shared)
-        self.values[env_idx].append(torch.tensor(value, dtype=torch.float32))
-
-        # Store per-agent data
-        for agent_idx in range(self.n_agents):
-            # Observation
-            self.observations[env_idx][agent_idx].append(
-                torch.FloatTensor(observations[agent_idx])
-            )
-
-            # Action
-            self.actions[env_idx][agent_idx].append(
-                torch.FloatTensor(actions[agent_idx])
-            )
-
-            # Reward, log_prob, done
-            self.rewards[env_idx][agent_idx].append(
-                torch.tensor(rewards[agent_idx], dtype=torch.float32)
-            )
-            self.log_probs[env_idx][agent_idx].append(
-                torch.tensor(log_probs[agent_idx], dtype=torch.float32)
-            )
-            self.dones[env_idx][agent_idx].append(
-                torch.tensor(dones[agent_idx], dtype=torch.float32)
-            )
-            if action_masks is not None:
-                self.action_masks[env_idx][agent_idx].append(
-                    torch.FloatTensor(action_masks[agent_idx])
+        """Run actors over all envs/agents; returns (actions, log_probs)."""
+        if self.share_actor:
+            # Fuse envs and agents into one batch: single forward pass total
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+            if pred_entropy_flat is not None:
+                obs_flat = self.entropy_helper.condition_obs(
+                    obs_flat, pred_entropy_flat
                 )
+            masks_flat = (
+                masks_tensor.reshape(n_envs * self.n_agents, -1)
+                if masks_tensor is not None
+                else None
+            )
+            actions_flat, log_probs_flat = self.network_old.act(
+                obs_flat,
+                agent_idx=0,
+                deterministic=deterministic,
+                action_mask=masks_flat,
+            )
+            actions = actions_flat.reshape(n_envs, self.n_agents, -1)
+            log_probs = log_probs_flat.reshape(n_envs, self.n_agents, -1).squeeze(-1)
+            return actions, log_probs
+
+        # One batched pass per agent (n_agents passes, each over all envs)
+        pred_entropy_per_agent = (
+            pred_entropy_flat.reshape(n_envs, self.n_agents, -1)
+            if pred_entropy_flat is not None
+            else None
+        )
+        actions_list = []
+        log_probs_list = []
+        for agent_idx in range(self.n_agents):
+            agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
+            if pred_entropy_per_agent is not None:
+                agent_obs = self.entropy_helper.condition_obs(
+                    agent_obs, pred_entropy_per_agent[:, agent_idx, :]
+                )
+            agent_mask = (
+                masks_tensor[:, agent_idx, :] if masks_tensor is not None else None
+            )
+            a, lp = self.network_old.act(
+                agent_obs, agent_idx, deterministic, action_mask=agent_mask
+            )
+            actions_list.append(a)  # (n_envs, action_dim)
+            log_probs_list.append(lp)  # (n_envs, 1)
+        actions = torch.stack(actions_list, dim=1)  # (n_envs, n_agents, action_dim)
+        log_probs = torch.stack(log_probs_list, dim=1).squeeze(-1)  # (n_envs, n_agents)
+        return actions, log_probs
+
+    def _run_centralized_critic(
+        self,
+        obs_tensor,
+        gs_tensor,
+        n_envs,
+        hypergraphs=None,
+        entropies=None,
+        critic_obs_sequences=None,
+        critic_signature_sequences=None,
+    ):
+        """Dispatch to the configured centralized critic; returns (n_envs, 1)."""
+        if (
+            self.critic_type == "hg_cross_attention"
+            and critic_obs_sequences is not None
+        ):
+            critic_obs_sequences = critic_obs_sequences.to(self.device)
+            critic_signature_sequences = critic_signature_sequences.to(self.device)
+            critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
+                critic_signature_sequences, device=self.device
+            )
+            critic_entropies = (
+                self.hg_cache.get_entropies_for_signature_sequences(
+                    critic_signature_sequences, device=self.device
+                )
+                if self.entropy_conditioning
+                else None
+            )
+            return self.network_old.get_value_batched(
+                critic_obs_sequences,
+                critic_hgs,
+                n_envs,
+                entropies=critic_entropies,
+            )
+        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+            return self.network_old.get_value_batched(
+                obs_flat, hypergraphs, n_envs, entropies=entropies
+            )
+        return self.network_old.get_value(gs_tensor)
 
     def store_transitions_batch(
         self,

@@ -40,7 +40,7 @@ class MultiBoxPushEnv(gym.Env):
         render_mode=None,
         n_agents: int = 3,
         n_objects: int = 3,
-        coupling_def: str = "random",
+        coupling_def: str = "even",
         max_steps: int = 1024,
         reward_mode: str = "dense",
     ):
@@ -103,11 +103,11 @@ class MultiBoxPushEnv(gym.Env):
         self._init_agents()
 
         # Create boxes coupling reqs
-        if coupling_def is "random":
+        if coupling_def == "random":
             self.objects_push_coupling_list = np.random.default_rng(42).integers(
                 2, (self.n_agents // 2) + 1, (self.n_objects)
             )
-        elif coupling_def is "even":
+        elif coupling_def == "even":
             self.objects_push_coupling_list = [
                 self.n_agents // self.n_objects for _ in range(self.n_objects)
             ]
