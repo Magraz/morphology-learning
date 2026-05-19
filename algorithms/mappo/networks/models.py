@@ -144,7 +144,7 @@ class MAPPONetwork(nn.Module):
                 observation_dim=observation_dim,
                 history_length=grouping_history_len,
                 d_model=hidden_dim,
-                allow_overlap=False,
+                allow_overlap=True,
             )
             if hypergraph_mode == "learned_grouping" and grouping_history_len > 0
             else None
