@@ -63,7 +63,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, 21), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -115,6 +115,10 @@ class MultiBoxPushEnv(gym.Env):
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
         self.force_scale = 2.0  # Scale factor for visualizing forces
+        self.force_multiplier = 100.0  # Max force an agent can apply per axis
+        # Per-agent normal contact force against any object, averaged over the
+        # last physics step. Populated from the contact listener's PostSolve.
+        self.agent_contact_forces = np.zeros(self.n_agents, dtype=np.float32)
 
         # Velocity normalization constant (agents have linear damping=10.0,
         # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
@@ -450,6 +454,9 @@ class MultiBoxPushEnv(gym.Env):
         # Reset delivered tracking
         self.delivered_objects = set()
 
+        # Reset per-step contact force readout
+        self.agent_contact_forces.fill(0.0)
+
         # Create a completely fresh Box2D world to avoid stale references
         self.world = b2World(gravity=(0, 0))
 
@@ -487,10 +494,13 @@ class MultiBoxPushEnv(gym.Env):
         # PROCESS ENVIRONMENT ACTION
 
         # Apply movement forces
-        force_multiplier = 100.0
         for agent in self.agents:
-            force_x = np.clip(movement_action[agent.index][0], -1, 1) * force_multiplier
-            force_y = np.clip(movement_action[agent.index][1], -1, 1) * force_multiplier
+            force_x = (
+                np.clip(movement_action[agent.index][0], -1, 1) * self.force_multiplier
+            )
+            force_y = (
+                np.clip(movement_action[agent.index][1], -1, 1) * self.force_multiplier
+            )
 
             self.applied_forces[agent.index] = [force_x, force_y]
             agent.apply_force(force_x, force_y)
@@ -500,6 +510,12 @@ class MultiBoxPushEnv(gym.Env):
 
         # Rest of the step method remains the same
         self.world.Step(self.time_step, 6, 2)
+
+        # Convert accumulated agent-object normal impulses into average forces
+        # over this step. Filled by BoundaryContactListener.PostSolve.
+        self.agent_contact_forces.fill(0.0)
+        for agent_idx, impulse in self.contact_listener.agent_object_normal_impulse.items():
+            self.agent_contact_forces[agent_idx] = impulse / self.time_step
 
         # CALCULATE REWARDS
 

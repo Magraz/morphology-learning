@@ -114,6 +114,28 @@ class BoundaryContactListener(b2ContactListener):
         # Track which agents are in contact with which objects
         # Key: object_index, Value: set of agent_indices
         self.object_agent_contacts = {}
+        # Accumulated normal impulse per agent against objects this step.
+        # Divide by dt to obtain average normal force.
+        # Key: agent_index, Value: float
+        self.agent_object_normal_impulse = {}
+
+    def PostSolve(self, contact, impulse):
+        body_a = contact.fixtureA.body
+        body_b = contact.fixtureB.body
+        ud_a = body_a.userData if body_a.userData else {}
+        ud_b = body_b.userData if body_b.userData else {}
+
+        if ud_a.get("type") == "agent" and ud_b.get("type") == "object":
+            agent_idx = ud_a["index"]
+        elif ud_a.get("type") == "object" and ud_b.get("type") == "agent":
+            agent_idx = ud_b["index"]
+        else:
+            return
+
+        total = float(sum(impulse.normalImpulses))
+        self.agent_object_normal_impulse[agent_idx] = (
+            self.agent_object_normal_impulse.get(agent_idx, 0.0) + total
+        )
 
     def BeginContact(self, contact):
         body_a = contact.fixtureA.body
@@ -177,6 +199,7 @@ class BoundaryContactListener(b2ContactListener):
     def reset(self):
         self.boundary_collision = False
         self.object_agent_contacts.clear()
+        self.agent_object_normal_impulse.clear()
 
 
 def get_linear_positions(world_width, world_height, n_agents, spacing=2):

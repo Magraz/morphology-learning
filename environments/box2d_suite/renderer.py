@@ -46,6 +46,9 @@ class Renderer:
         self._draw_dynamic_objects()
         self._draw_object_coupling()
 
+        # Draw obstacle-course walls / gaps (no-op for envs without walls)
+        self._draw_walls()
+
         # Draw active grab joints (no-op for envs without agent_joints)
         self._draw_grab_joints()
 
@@ -70,10 +73,6 @@ class Renderer:
 
     def _render_agents_as_circles(self):
         for agent in self.env.agents:
-            is_open = (
-                self.env.attach_values[agent.index] == 1
-                and self.env.detach_values[agent.index] == 0
-            )
             agent.render_circle(self.screen, self.screen_size, self.scale, False)
 
     def _render_agents_as_boxes(self):
@@ -319,6 +318,59 @@ class Renderer:
             pygame.draw.line(self.screen, LINE_COLOR, start, end, 2)
             pygame.draw.circle(self.screen, ANCHOR_COLOR, start, 3)
             pygame.draw.circle(self.screen, ANCHOR_COLOR, end, 3)
+
+    def _draw_walls(self):
+        """Render obstacle-course walls and gap-coupling labels."""
+        walls = getattr(self.env, "walls", None)
+        if not walls:
+            return
+
+        if self._coupling_font is None:
+            pygame.font.init()
+            self._coupling_font = pygame.font.SysFont("Arial", 20, bold=True)
+
+        sh = self.screen_size[1]
+        gap_pad = getattr(self.env, "gap_region_pad", 1.0)
+
+        for wall in walls:
+            wy = wall["y"]
+            thickness = wall["thickness"]
+            # Wall segments (static bodies).
+            for body in wall["segments"]:
+                for fixture in body.fixtures:
+                    shape = fixture.shape
+                    if not isinstance(shape, b2PolygonShape):
+                        continue
+                    verts = [(body.transform * v) * self.scale for v in shape.vertices]
+                    verts = [(v[0], sh - v[1]) for v in verts]
+                    pygame.draw.polygon(self.screen, (60, 60, 60), verts)
+                    pygame.draw.polygon(self.screen, (0, 0, 0), verts, 2)
+
+            # Gap influence zones + coupling labels.
+            half_t = thickness / 2 + gap_pad
+            for gap in wall["gaps"]:
+                left = int((gap["x_center"] - gap["width"] / 2) * self.scale)
+                right = int((gap["x_center"] + gap["width"] / 2) * self.scale)
+                top = int(sh - (wy + half_t) * self.scale)
+                bottom = int(sh - (wy - half_t) * self.scale)
+                w = right - left
+                h = bottom - top
+                surf = pygame.Surface((w, h), pygame.SRCALPHA)
+                surf.fill((255, 165, 0, 70))
+                self.screen.blit(surf, (left, top))
+                pygame.draw.rect(
+                    self.screen, (200, 100, 0), pygame.Rect(left, top, w, h), 1
+                )
+
+                text = str(gap["coupling"])
+                text_surface = self._coupling_font.render(text, True, (255, 255, 255))
+                cx = int(gap["x_center"] * self.scale)
+                cy = int(sh - wy * self.scale)
+                text_rect = text_surface.get_rect(center=(cx, cy))
+                for offset in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    outline = self._coupling_font.render(text, True, (0, 0, 0))
+                    self.screen.blit(outline, text_rect.move(offset))
+                self.screen.blit(text_surface, text_rect)
 
     def _draw_object_coupling(self):
         """Render the coupling requirement on top of each object."""

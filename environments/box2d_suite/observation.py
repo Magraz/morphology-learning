@@ -85,19 +85,26 @@ class ObservationManager:
             self.env.neighbor_detection_range
         )
 
+        # Normalize per-agent contact force by max applicable force so the
+        # observation lives in roughly [0, 1] (can exceed 1 when several
+        # bodies pile up against a stalled agent — still well-scaled).
+        contact_force_norm = self.env.agent_contact_forces / self.env.force_multiplier
+
         observations = []
         for i in range(self.env.n_agents):
             own_state = all_states[i]
             own_velocity = all_velocities[i]
             is_touching_object = np.array([self._is_agent_touching_object(i)])
             neighbor_fraction = np.array([all_neighbor_fractions[i]])
+            contact_force = np.array([contact_force_norm[i]], dtype=np.float32)
             agent_obs = np.concatenate(
                 [
-                    own_state,
+                    # own_state,
                     own_velocity,
                     all_density_sensors[i],
                     is_touching_object,
                     neighbor_fraction,
+                    contact_force,
                 ]
             )
             observations.append(agent_obs)
