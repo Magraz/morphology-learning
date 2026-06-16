@@ -25,7 +25,7 @@ class MAPPO_Params:
 @dataclass
 class Model_Params:
     hidden_dim: int
-    critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention"
+    critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention" | "gnn"
     # Predefined hyperedge builders (names resolved via HYPEREDGE_FN_REGISTRY).
     # Determines the number of hyperedge types processed by HGNN critics when
     # hypergraph_mode="predefined". Ignored for hygma / learned_affinity

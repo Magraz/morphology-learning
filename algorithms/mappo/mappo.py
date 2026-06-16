@@ -908,6 +908,11 @@ class MAPPOAgent:
                         ts_to_global_states=ts_to_global_states,
                         trajectory_lengths=trajectory_lengths,
                     )
+                elif self.critic_type == "gnn":
+                    obs_grid = batch_global_states.view(
+                        -1, self.n_agents, self.observation_dim
+                    )
+                    values = self.network.critic(obs_grid).squeeze(-1)
                 else:
                     values = self.network.critic(batch_global_states).squeeze(-1)
 
@@ -1248,6 +1253,11 @@ class MAPPOAgent:
                             ts_to_global_states=ts_to_global_states,
                             trajectory_lengths=trajectory_lengths,
                         )
+                    elif self.critic_type == "gnn":
+                        obs_grid = batch_global_states.view(
+                            -1, self.n_agents, self.observation_dim
+                        )
+                        values = self.network.critic(obs_grid).squeeze(-1)
                     else:
                         values = self.network.critic(batch_global_states).squeeze(-1)
 

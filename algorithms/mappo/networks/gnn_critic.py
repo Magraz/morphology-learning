@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from algorithms.mappo.networks.utils import layer_init
+from algorithms.mappo.networks.multi_head_attention import MultiHeadAttentionEncoder
 
 
 class DenseGCNConv(nn.Module):
@@ -139,11 +140,60 @@ class GNNCritic(nn.Module):
         return value
 
 
-if __name__ == "__main__":
-    from algorithms.mappo.networks.multi_head_attention import (
-        MultiHeadAttentionEncoder,
-    )
+class AttentionGNNCritic(nn.Module):
+    """Centralized critic that turns raw per-agent observations into a value.
 
+    Couples a ``MultiHeadAttentionEncoder`` (obs -> per-agent tokens + one
+    adjacency matrix per attention head) with a ``GNNCritic`` (per-head GCN +
+    pooling -> scalar value). This exposes the single-module ``forward(obs)``
+    contract every other centralized critic uses, so the rest of the MAPPO
+    pipeline can treat it like the MLP critic — the only difference is the input
+    is the all-agent observation grid ``(batch, n_agents, obs_dim)`` instead of a
+    flat global-state vector.
+    """
+
+    def __init__(
+        self,
+        observation_dim: int,
+        n_agents: int,
+        d_model: int = 128,
+        n_heads: int = 4,
+        hidden_dim: int = 128,
+        n_gcn_layers: int = 2,
+        d_ff: int = 256,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.n_agents = n_agents
+        self.encoder = MultiHeadAttentionEncoder(
+            observation_dim=observation_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            dropout=dropout,
+        )
+        self.gnn = GNNCritic(
+            node_feat_dim=d_model,
+            n_heads=n_heads,
+            hidden_dim=hidden_dim,
+            n_gcn_layers=n_gcn_layers,
+            dropout=dropout,
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            obs: (batch, n_agents, obs_dim) per-agent observations. A 2D input
+                 (n_agents, obs_dim) is also accepted (handled by the encoder
+                 and GNN squeeze logic).
+        Returns:
+            value: (batch, 1) value estimate, or (1,) if the input was unbatched.
+        """
+        tokens, adjacency = self.encoder(obs)
+        return self.gnn(tokens, adjacency)
+
+
+if __name__ == "__main__":
     torch.manual_seed(0)
 
     batch_size = 2

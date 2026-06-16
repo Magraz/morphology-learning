@@ -7,6 +7,7 @@ from algorithms.mappo.networks.critics import (
     MultiHGNNCritic,
     HGNNCrossAttentionCritic,
 )
+from algorithms.mappo.networks.gnn_critic import AttentionGNNCritic
 from algorithms.mappo.networks.encoders import (
     AffinityTransformer,
     HypergraphEntropyPredictor,
@@ -26,7 +27,7 @@ class MAPPONetwork(nn.Module):
         hidden_dim: int = 128,
         discrete: bool = False,
         share_actor: bool = True,  # Whether to share actor parameters
-        critic_type: str = "mlp",  # "mlp" | "multi_hgnn" | "hg_cross_attention"
+        critic_type: str = "mlp",  # "mlp" | "multi_hgnn" | "hg_cross_attention" | "gnn"
         n_hyperedge_types: int = 0,  # Required when critic_type uses hypergraphs
         critic_seq_len: int = 1,
         entropy_conditioning: bool = False,
@@ -37,6 +38,7 @@ class MAPPONetwork(nn.Module):
         super(MAPPONetwork, self).__init__()
 
         self.n_agents = n_agents
+        self.observation_dim = observation_dim
         self.discrete = discrete
         self.share_actor = share_actor
         self.critic_type = critic_type
@@ -111,6 +113,14 @@ class MAPPONetwork(nn.Module):
                 hidden_dim=hidden_dim,
                 seq_len=critic_seq_len,
                 entropy_conditioning=entropy_conditioning,
+            )
+        elif critic_type == "gnn":
+            # Attention encoder + per-head GCN over the all-agent observation
+            # grid. Consumes obs (reshaped from global_state), not hypergraphs.
+            self.critic = AttentionGNNCritic(
+                observation_dim,
+                n_agents,
+                hidden_dim=hidden_dim,
             )
         else:
             self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
@@ -189,6 +199,8 @@ class MAPPONetwork(nn.Module):
         # Get values from centralized critic
         if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
             values = self.critic(obs, hypergraphs, entropies=entropies).squeeze(-1)
+        elif self.critic_type == "gnn":
+            values = self.critic(self._to_obs_grid(global_states)).squeeze(-1)
         else:
             values = self.critic(global_states).squeeze(-1)
 
@@ -204,7 +216,17 @@ class MAPPONetwork(nn.Module):
         """
         if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
             return self.critic(global_state, hypergraphs, entropies=entropies)
+        if self.critic_type == "gnn":
+            return self.critic(self._to_obs_grid(global_state))
         return self.critic(global_state)
+
+    def _to_obs_grid(self, global_state):
+        """Reshape a flat all-agent global state (..., n_agents * obs_dim) into
+        the per-agent observation grid (..., n_agents, obs_dim) the GNN critic
+        consumes. global_state is built as obs.reshape(batch, -1) upstream."""
+        return global_state.view(
+            *global_state.shape[:-1], self.n_agents, self.observation_dim
+        )
 
     def get_value_batched(self, obs_flat, batched_hgs, n_graphs, entropies=None):
         """Batched value estimation for multi_hgnn critic.
@@ -297,5 +319,26 @@ if __name__ == "__main__":
         n_hyperedge_types=n_hyperedge_types,
     )
     print_breakdown(net4, "Condition 4: HG Cross-Attention Critic")
+
+    # 5) Attention-GNN critic
+    net5 = MAPPONetwork(
+        obs_dim,
+        obs_dim * n_agents,
+        action_dim,
+        n_agents,
+        hidden_dim=hidden_dim,
+        critic_type="gnn",
+        gnn_d_model=64,
+        gnn_n_heads=4,
+        gnn_n_gcn_layers=2,
+    )
+    print_breakdown(net5, "Condition 5: Attention-GNN Critic")
+
+    # Smoke-test the GNN critic value path: flat global state -> (batch, 1).
+    batch = 3
+    global_state = torch.randn(batch, obs_dim * n_agents)
+    value = net5.get_value(global_state)
+    assert value.shape == (batch, 1), value.shape
+    print(f"\n  GNN get_value output shape: {tuple(value.shape)}  (batch, 1)")
 
     print()
