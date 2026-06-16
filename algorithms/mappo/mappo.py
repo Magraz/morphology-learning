@@ -60,20 +60,6 @@ class MAPPOAgent:
         self.grouping_history_len = model_params.grouping_history_len
         self.grouping_loss_coef = model_params.grouping_loss_coef
         self.grouping_entropy_coef = model_params.grouping_entropy_coef
-        # Standalone intrinsic reward config
-        self.use_intrinsic_reward = model_params.use_intrinsic_reward
-        self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
-        self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
-        self.intrinsic_reward_use_encoder = model_params.intrinsic_reward_use_encoder
-        self.intrinsic_reward_encoder_type = model_params.intrinsic_reward_encoder_type
-        self.intrinsic_reward_encoder_dim = model_params.intrinsic_reward_encoder_dim
-        self.intrinsic_reward_k = model_params.intrinsic_reward_k
-        self.intrinsic_reward_memory_capacity = (
-            model_params.intrinsic_reward_memory_capacity
-        )
-        self.intrinsic_reward_obs_dim = (
-            self.n_agents * self.intrinsic_reward_encoder_dim
-        )
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -113,19 +99,6 @@ class MAPPOAgent:
 
         self.local_state_encoder = None
         self.hypergraph_state_encoder = None
-        if self.use_intrinsic_reward and self.intrinsic_reward_use_encoder:
-            if self.intrinsic_reward_encoder_type == "hypergraph":
-                self.hypergraph_state_encoder = HypergraphStateEncoder(
-                    n_hyperedge_types=self.n_hyperedge_types,
-                    observation_dim=observation_dim,
-                    num_outputs=self.intrinsic_reward_encoder_dim,
-                ).to(self.device)
-                self.intrinsic_reward_obs_dim = self.intrinsic_reward_encoder_dim
-            else:
-                self.local_state_encoder = LocalStateEncoder(
-                    observation_dim, self.intrinsic_reward_encoder_dim
-                ).to(self.device)
-                self.local_state_encoder.eval()
 
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
@@ -280,9 +253,14 @@ class MAPPOAgent:
         # valid (non-padded) positions. -inf-masked logits give probs=0 there;
         # treat 0 * log(0) as 0 so the masked vocabulary entries don't contribute.
         probs = log_probs.exp()
-        step_entropy = -(probs * torch.where(
-            torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs)
-        )).sum(dim=-1)  # (B, L)
+        step_entropy = -(
+            probs
+            * torch.where(
+                torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs)
+            )
+        ).sum(
+            dim=-1
+        )  # (B, L)
         seq_entropy = (step_entropy * valid.float()).sum(dim=-1)  # (B,)
         entropy_bonus = seq_entropy.mean()
 
@@ -319,73 +297,6 @@ class MAPPOAgent:
     def reset_obs_history(self, env_mask=None):
         """Zero out obs history. If env_mask given, only reset those envs."""
         self.entropy_helper.reset_obs_history(env_mask)
-
-    def encode_team_observations(
-        self, obs_batch: np.ndarray, hypergraphs: list = None
-    ) -> np.ndarray:
-        """Encode and concatenate per-agent observations for each environment.
-
-        Args:
-            obs_batch: Observations of shape (n_envs, n_agents, obs_dim).
-            hypergraphs: Per-env list of per-type dhg.Hypergraph lists.
-                         Required when intrinsic_reward_encoder_type="hypergraph".
-
-        Returns:
-            Encoded features of shape (n_envs, intrinsic_reward_obs_dim).
-        """
-        with torch.no_grad():
-            obs_tensor = torch.from_numpy(
-                np.ascontiguousarray(obs_batch, dtype=np.float32)
-            ).to(self.device)
-            n_envs = obs_tensor.shape[0]
-
-            if self.intrinsic_reward_encoder_type == "hypergraph":
-                if self.hypergraph_state_encoder is None:
-                    raise RuntimeError("Hypergraph state encoder is not initialized.")
-                embeddings = []
-                for env_idx in range(n_envs):
-                    X = obs_tensor[env_idx]  # (n_agents, obs_dim)
-                    emb = self.hypergraph_state_encoder.embedding(
-                        X, hypergraphs[env_idx]
-                    )
-                    embeddings.append(emb)
-                return torch.stack(embeddings).cpu().numpy()
-            else:
-                if self.local_state_encoder is None:
-                    raise RuntimeError("Local state encoder is not initialized.")
-                obs_flat = obs_tensor.reshape(
-                    n_envs * self.n_agents, self.observation_dim
-                )
-                encoded = self.local_state_encoder.embedding(obs_flat)
-                return (
-                    encoded.reshape(n_envs, self.intrinsic_reward_obs_dim).cpu().numpy()
-                )
-
-    def encode_agent_observations(self, obs_batch: np.ndarray) -> np.ndarray:
-        """Encode per-agent observations individually.
-
-        Returns:
-            np.ndarray of shape (n_envs, n_agents, encoder_dim)
-        """
-        if self.local_state_encoder is None:
-            raise RuntimeError(
-                "Intrinsic reward encoder is not initialized for this agent."
-            )
-
-        with torch.no_grad():
-            obs_tensor = torch.from_numpy(
-                np.ascontiguousarray(obs_batch, dtype=np.float32)
-            ).to(self.device)
-            n_envs = obs_tensor.shape[0]
-            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, self.observation_dim)
-            encoded = self.local_state_encoder.embedding(obs_flat)
-            return (
-                encoded.reshape(
-                    n_envs, self.n_agents, self.intrinsic_reward_encoder_dim
-                )
-                .cpu()
-                .numpy()
-            )
 
     def get_actions_batched(
         self,
@@ -448,14 +359,18 @@ class MAPPOAgent:
         """Convert numpy rollout inputs to device tensors."""
         obs_tensor = torch.from_numpy(
             np.ascontiguousarray(observations_batch, dtype=np.float32)
-        ).to(self.device)  # (n_envs, n_agents, obs_dim)
+        ).to(
+            self.device
+        )  # (n_envs, n_agents, obs_dim)
         gs_tensor = torch.from_numpy(
             np.ascontiguousarray(global_states_batch, dtype=np.float32)
-        ).to(self.device)  # (n_envs, global_state_dim)
+        ).to(
+            self.device
+        )  # (n_envs, global_state_dim)
         masks_tensor = (
-            torch.from_numpy(
-                np.ascontiguousarray(action_masks, dtype=np.float32)
-            ).to(self.device)
+            torch.from_numpy(np.ascontiguousarray(action_masks, dtype=np.float32)).to(
+                self.device
+            )
             if action_masks is not None
             else None
         )  # (n_envs, n_agents, n_actions) or None
@@ -588,7 +503,6 @@ class MAPPOAgent:
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
         hg_signature_ids=None,  # list[int] of length n_envs or None
         entropies=None,  # torch tensor (n_envs, n_types) or None
-        per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
         grouping_tokens=None,  # list[list[int]] of length n_envs or None
     ):
         """Store transitions for all environments in one vectorized call.
@@ -602,11 +516,6 @@ class MAPPOAgent:
         per_agent_rewards = np.tile(
             rewards.astype(np.float32)[:, None], (1, self.n_agents)
         )
-
-        if per_agent_intrinsic_rewards is not None:
-            per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
-                np.float32
-            )
 
         # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete
         if self.discrete and actions.ndim == 2:

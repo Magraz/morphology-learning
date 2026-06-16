@@ -32,15 +32,6 @@ class Model_Params:
     # (always 1 type) and combined_affinities (one per source).
     hyperedge_fn_names: list[str] | None = None
     critic_seq_len: int = 32
-    # Standalone episodic intrinsic reward
-    use_intrinsic_reward: bool = False
-    intrinsic_reward_mode: str = "agent"  # "team" | "agent"
-    intrinsic_reward_coef: float = 1.0
-    intrinsic_reward_use_encoder: bool = True
-    intrinsic_reward_encoder_type: str = "local"  # "local" | "hypergraph"
-    intrinsic_reward_encoder_dim: int = 64
-    intrinsic_reward_k: int = 6
-    intrinsic_reward_memory_capacity: int = 1025
     # Entropy conditioning of HGNN critics
     entropy_conditioning: bool = False
     # COMA-style per-agent counterfactual baseline over hyperedges.

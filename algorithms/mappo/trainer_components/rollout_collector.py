@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from algorithms.mappo.intrinsic_reward import IntrinsicReward
 from algorithms.mappo.entropy_helpers import update_left_padded_history
 from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
 from algorithms.mappo.mappo import MAPPOAgent
@@ -35,53 +34,6 @@ class RolloutCollector:
         self.discrete = discrete
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
-        self.intrinsic_rewarders = None
-        self.agent_intrinsic_rewarders = None
-        self.intrinsic_reward_mode = (
-            self.agent.intrinsic_reward_mode
-            if self.agent.use_intrinsic_reward
-            else None
-        )
-        self.intrinsic_reward_use_encoder = (
-            self.agent.intrinsic_reward_use_encoder
-            if self.agent.use_intrinsic_reward
-            else False
-        )
-        self.intrinsic_reward_encoder_type = (
-            self.agent.intrinsic_reward_encoder_type
-            if self.agent.use_intrinsic_reward
-            else "local"
-        )
-        if self.agent.use_intrinsic_reward:
-            obs_dim_per_agent = self.agent.observation_dim
-            if self.intrinsic_reward_use_encoder:
-                team_obs_dim = self.agent.intrinsic_reward_obs_dim
-                agent_obs_dim = self.agent.intrinsic_reward_encoder_dim
-            else:
-                team_obs_dim = self.n_agents * obs_dim_per_agent
-                agent_obs_dim = obs_dim_per_agent
-
-            if self.intrinsic_reward_mode == "agent":
-                self.agent_intrinsic_rewarders = [
-                    [
-                        IntrinsicReward(
-                            obs_dim=agent_obs_dim,
-                            k=self.agent.intrinsic_reward_k,
-                            memory_capacity=self.agent.intrinsic_reward_memory_capacity,
-                        )
-                        for _ in range(self.n_agents)
-                    ]
-                    for _ in range(self.n_parallel_envs)
-                ]
-            else:
-                self.intrinsic_rewarders = [
-                    IntrinsicReward(
-                        obs_dim=team_obs_dim,
-                        k=self.agent.intrinsic_reward_k,
-                        memory_capacity=self.agent.intrinsic_reward_memory_capacity,
-                    )
-                    for _ in range(self.n_parallel_envs)
-                ]
 
     def collect(self, max_steps: int) -> RolloutResult:
         """Collect trajectory using Gymnasium vectorized environments."""
@@ -92,13 +44,6 @@ class RolloutCollector:
         batch_size = obs.shape[0]
 
         self.hypergraph_runtime.on_rollout_reset()
-        if self.intrinsic_rewarders is not None:
-            for rewarder in self.intrinsic_rewarders:
-                rewarder.reset()
-        if self.agent_intrinsic_rewarders is not None:
-            for env_rewarders in self.agent_intrinsic_rewarders:
-                for rewarder in env_rewarders:
-                    rewarder.reset()
 
         current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
         total_step_count = 0
@@ -141,9 +86,7 @@ class RolloutCollector:
             critic_obs_sequences = None
             critic_signature_sequences = None
             if self.agent.critic_type == "hg_cross_attention":
-                obs_step = torch.from_numpy(
-                    np.ascontiguousarray(obs, dtype=np.float32)
-                )
+                obs_step = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32))
                 sig_step = torch.tensor(per_env_sig_ids, dtype=torch.long)
                 prev_counts = critic_history_counts.clone()
                 critic_obs_history, critic_history_counts = update_left_padded_history(
@@ -180,27 +123,6 @@ class RolloutCollector:
             )
             dones = np.logical_or(terminateds, truncateds)
 
-            per_agent_intrinsic = None
-            if self.intrinsic_rewarders is not None:
-                encoder_hgs = None
-                if (
-                    self.intrinsic_reward_use_encoder
-                    and self.intrinsic_reward_encoder_type == "hypergraph"
-                ):
-                    encoder_hgs = self.hypergraph_runtime.build_per_env_hypergraphs(
-                        next_obs, infos, batch_size
-                    )
-                per_agent_intrinsic = self._get_team_intrinsic_rewards(
-                    next_obs=next_obs,
-                    dones=dones,
-                    hypergraphs=encoder_hgs,
-                )
-            elif self.agent_intrinsic_rewarders is not None:
-                per_agent_intrinsic = self._get_agent_intrinsic_rewards(
-                    next_obs=next_obs,
-                    dones=dones,
-                )
-
             if dones.any():
                 self.agent.reset_obs_history(env_mask=dones)
                 self.hypergraph_runtime.on_env_done_mask(dones)
@@ -226,7 +148,6 @@ class RolloutCollector:
                 action_masks=current_masks,
                 hg_signature_ids=per_env_sig_ids,
                 entropies=per_env_entropies,
-                per_agent_intrinsic_rewards=per_agent_intrinsic,
                 grouping_tokens=grouping_tokens,
             )
 
@@ -248,65 +169,6 @@ class RolloutCollector:
             episode_count=episode_count,
             final_values=final_values,
         )
-
-    def _get_team_intrinsic_rewards(
-        self, next_obs, dones, hypergraphs=None
-    ) -> np.ndarray:
-        """
-        Computes a single intrinsic reward per environment by concatenating/encoding all agents'
-        observations into one team-level feature vector. It then tiles that scalar reward across
-        all agents (np.tile(rewards[:, None], (1, self.n_agents))), so every agent in the same
-        environment gets the same intrinsic reward.
-        """
-        if self.intrinsic_reward_use_encoder:
-            team_features = self.agent.encode_team_observations(
-                np.ascontiguousarray(next_obs, dtype=np.float32),
-                hypergraphs=hypergraphs,
-            )
-        else:
-            team_features = next_obs.reshape(self.n_parallel_envs, -1).astype(
-                np.float32
-            )
-
-        intrinsic_rewards = np.zeros(self.n_parallel_envs, dtype=np.float32)
-        for env_idx, rewarder in enumerate(self.intrinsic_rewarders):
-            if dones[env_idx]:
-                rewarder.reset()
-            else:
-                intrinsic_rewards[env_idx] = rewarder.compute_reward(
-                    team_features[env_idx]
-                )
-                rewarder.on_rollout_step(team_features[env_idx])
-
-        rewards = self.agent.intrinsic_reward_coef * intrinsic_rewards
-        return np.tile(rewards[:, None], (1, self.n_agents))
-
-    def _get_agent_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
-        """Compute per-agent intrinsic rewards.
-
-        Returns:
-            np.ndarray of shape (n_envs, n_agents) — scaled intrinsic rewards.
-        """
-        if self.intrinsic_reward_use_encoder:
-            agent_features = self.agent.encode_agent_observations(next_obs)
-        else:
-            agent_features = next_obs.astype(np.float32)
-
-        intrinsic_rewards = np.zeros(
-            (self.n_parallel_envs, self.n_agents), dtype=np.float32
-        )
-        for env_idx, env_rewarders in enumerate(self.agent_intrinsic_rewarders):
-            if dones[env_idx]:
-                for rewarder in env_rewarders:
-                    rewarder.reset()
-            else:
-                for agent_idx, rewarder in enumerate(env_rewarders):
-                    intrinsic_rewards[env_idx, agent_idx] = rewarder.compute_reward(
-                        agent_features[env_idx, agent_idx]
-                    )
-                    rewarder.on_rollout_step(agent_features[env_idx, agent_idx])
-
-        return self.agent.intrinsic_reward_coef * intrinsic_rewards
 
     def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
         final_global_states = obs.reshape(batch_size, -1)

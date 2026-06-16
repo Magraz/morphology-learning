@@ -44,36 +44,6 @@ class CheckpointIO:
         self.agent.network.load_state_dict(checkpoint["network"])
         self.agent.optimizer.load_state_dict(checkpoint["optimizer"])
 
-        has_encoder_checkpoint = "local_state_encoder" in checkpoint
-        has_encoder_agent = self.agent.local_state_encoder is not None
-
-        if has_encoder_checkpoint != has_encoder_agent:
-            raise ValueError(
-                "Checkpoint intrinsic encoder state does not match the current "
-                "agent configuration (local_state_encoder)."
-            )
-
-        if has_encoder_agent:
-            self.agent.local_state_encoder.load_state_dict(
-                checkpoint["local_state_encoder"]
-            )
-            self.agent.local_state_encoder.eval()
-
-        has_hg_encoder_checkpoint = "hypergraph_state_encoder" in checkpoint
-        has_hg_encoder_agent = self.agent.hypergraph_state_encoder is not None
-
-        if has_hg_encoder_checkpoint != has_hg_encoder_agent:
-            raise ValueError(
-                "Checkpoint intrinsic encoder state does not match the current "
-                "agent configuration (hypergraph_state_encoder)."
-            )
-
-        if has_hg_encoder_agent:
-            self.agent.hypergraph_state_encoder.load_state_dict(
-                checkpoint["hypergraph_state_encoder"]
-            )
-            self.agent.hypergraph_state_encoder.eval()
-
         has_affinity_checkpoint = "affinity_transformer" in checkpoint
         has_affinity_agent = self.agent.network.affinity_transformer is not None
 
