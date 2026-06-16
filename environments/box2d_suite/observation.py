@@ -1,5 +1,31 @@
 import numpy as np
-from Box2D import b2PolygonShape, b2CircleShape
+from Box2D import b2PolygonShape, b2CircleShape, b2Vec2, b2RayCastCallback
+
+# Number of lidar rays cast per agent (evenly spaced over 360 deg, world frame).
+N_LIDAR_RAYS = 16
+
+# Per-agent observation layout (see ObservationManager.get_observation):
+#   own_velocity (2) + density_sensors (16) + is_touching_object (1)
+#   + neighbor_fraction (1) + contact_force (1) = 21, then + lidar.
+BASE_OBS_DIM = 21
+OBS_DIM = BASE_OBS_DIM + N_LIDAR_RAYS
+
+
+class _ClosestHitCallback(b2RayCastCallback):
+    """Records the nearest fixture hit by a ray, ignoring the casting agent."""
+
+    def __init__(self, ignore_body):
+        super().__init__()
+        self.ignore = ignore_body
+        self.fraction = 1.0  # 1.0 == nothing hit within range
+        self.hit = False
+
+    def ReportFixture(self, fixture, point, normal, fraction):
+        if fixture.body is self.ignore:
+            return -1.0  # skip self, let the ray continue
+        self.fraction = fraction
+        self.hit = True
+        return fraction  # clip the ray here so we keep the closest hit
 
 
 class ObservationManager:
@@ -85,6 +111,12 @@ class ObservationManager:
             self.env.neighbor_detection_range
         )
 
+        # Lidar: nearest-obstacle distance along N evenly spaced rays per agent.
+        all_lidar = self._calculate_lidar_all(
+            getattr(self.env, "n_lidar_rays", N_LIDAR_RAYS),
+            getattr(self.env, "lidar_range", self.env.sector_sensor_radius),
+        )
+
         # Normalize per-agent contact force by max applicable force so the
         # observation lives in roughly [0, 1] (can exceed 1 when several
         # bodies pile up against a stalled agent — still well-scaled).
@@ -92,19 +124,20 @@ class ObservationManager:
 
         observations = []
         for i in range(self.env.n_agents):
-            own_state = all_states[i]
+            own_pos = all_states[i]
             own_velocity = all_velocities[i]
             is_touching_object = np.array([self._is_agent_touching_object(i)])
             neighbor_fraction = np.array([all_neighbor_fractions[i]])
             contact_force = np.array([contact_force_norm[i]], dtype=np.float32)
             agent_obs = np.concatenate(
                 [
-                    # own_state,
+                    # own_pos,
                     own_velocity,
                     all_density_sensors[i],
                     is_touching_object,
                     neighbor_fraction,
                     contact_force,
+                    all_lidar[i],
                 ]
             )
             observations.append(agent_obs)
@@ -118,6 +151,41 @@ class ObservationManager:
         dist = np.linalg.norm(diff, axis=-1)  # (A, A), zero on the diagonal
         within = (dist <= radius).sum(axis=1).astype(np.float32)  # (A,)
         return within / float(self.env.n_agents)
+
+    def _calculate_lidar_all(self, n_rays, max_range):
+        """
+        Lidar-style range scan for every agent via Box2D raycasts.
+
+        Casts `n_rays` evenly spaced rays (world frame, matching the density
+        sensor convention) out to `max_range` from each agent. Each ray returns
+        the normalized distance to the nearest obstacle hit — agents, objects,
+        and boundary walls are all picked up by the physics raycast. The casting
+        agent is ignored so a ray never hits its own body.
+
+        Returns:
+            np.ndarray of shape (n_agents, n_rays) in [0, 1]:
+                fraction of `max_range` to the closest hit, or 1.0 if the ray
+                reaches its full length without hitting anything.
+        """
+        angles = np.arange(n_rays) * (2 * np.pi / n_rays)
+        dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)  # (R, 2)
+
+        lidar = np.ones((self.env.n_agents, n_rays), dtype=np.float32)
+        for i, agent in enumerate(self.env.agents):
+            ox, oy = float(self._agent_pos_cache[i][0]), float(
+                self._agent_pos_cache[i][1]
+            )
+            origin = b2Vec2(ox, oy)
+            for r in range(n_rays):
+                end = b2Vec2(
+                    ox + float(dirs[r, 0]) * max_range,
+                    oy + float(dirs[r, 1]) * max_range,
+                )
+                cb = _ClosestHitCallback(agent)
+                self.env.world.RayCast(cb, origin, end)
+                if cb.hit:
+                    lidar[i, r] = cb.fraction  # already normalized to [0, 1]
+        return lidar
 
     def _calculate_density_sensors_all(self, sensor_radius):
         """

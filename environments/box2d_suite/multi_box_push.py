@@ -19,7 +19,7 @@ from Box2D import (
 )
 
 from environments.box2d_suite.agent import Agent
-from environments.box2d_suite.observation import ObservationManager
+from environments.box2d_suite.observation import ObservationManager, OBS_DIM
 from environments.box2d_suite.renderer import Renderer
 from environments.box2d_suite.utils import (
     COLORS_LIST,
@@ -63,7 +63,7 @@ class MultiBoxPushEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 21), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, OBS_DIM), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
@@ -129,16 +129,6 @@ class MultiBoxPushEnv(gym.Env):
 
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
-
-        # Add a field to track link openness for each agent
-        self.attach_values = np.zeros(
-            self.n_agents, dtype=np.int8
-        )  # Default to no attachment (0)
-
-        # Add a field to track detach values for each agent
-        self.detach_values = np.zeros(
-            self.n_agents, dtype=np.int8
-        )  # Default to 0 (no desire to detach)
 
         # Step tracking for truncation
         self.max_steps = max_steps
@@ -514,7 +504,10 @@ class MultiBoxPushEnv(gym.Env):
         # Convert accumulated agent-object normal impulses into average forces
         # over this step. Filled by BoundaryContactListener.PostSolve.
         self.agent_contact_forces.fill(0.0)
-        for agent_idx, impulse in self.contact_listener.agent_object_normal_impulse.items():
+        for (
+            agent_idx,
+            impulse,
+        ) in self.contact_listener.agent_object_normal_impulse.items():
             self.agent_contact_forces[agent_idx] = impulse / self.time_step
 
         # CALCULATE REWARDS

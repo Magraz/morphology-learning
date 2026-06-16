@@ -17,7 +17,7 @@ from Box2D import (
 )
 
 from environments.box2d_suite.agent import Agent
-from environments.box2d_suite.observation import ObservationManager
+from environments.box2d_suite.observation import ObservationManager, OBS_DIM
 from environments.box2d_suite.renderer import Renderer
 from environments.box2d_suite.utils import (
     AGENT_CATEGORY,
@@ -76,7 +76,7 @@ class MultiPassEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.n_agents, 21),
+            shape=(self.n_agents, OBS_DIM),
             dtype=np.float32,
         )
 

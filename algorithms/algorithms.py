@@ -3,8 +3,6 @@ from pathlib import Path
 
 from algorithms.types import AlgorithmEnum
 
-from environments.types import EnvironmentEnum, EnvironmentParams
-
 
 def run_algorithm(
     batch_dir: Path,
@@ -22,11 +20,9 @@ def run_algorithm(
     env_file = batch_dir / "_env.yaml"
 
     with open(env_file, "r") as file:
-        env_dict = yaml.safe_load(file)
+        env_config = yaml.safe_load(file)
 
-    env_config = EnvironmentParams(**env_dict)
-
-    env_config.environment = environment
+    env_config["environment"] = environment
 
     # Load experiment config
     exp_file = batch_dir / f"{experiment_name}.yaml"

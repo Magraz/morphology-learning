@@ -20,7 +20,7 @@ class MAPPO_Runner(Runner):
         trial_id: str,
         checkpoint: bool,
         exp_config: Experiment,
-        env_config: EnvironmentParams,
+        env_config: dict,
     ):
         super().__init__(device, batch_dir, trials_dir, trial_id, checkpoint)
 

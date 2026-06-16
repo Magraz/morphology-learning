@@ -31,68 +31,54 @@ class VecMAPPOTrainer:
         params=None,
         dirs=None,
         device: str = "cpu",
-        env_params: EnvironmentParams = None,
+        env_params: dict = None,
         model_params: Model_Params = None,
     ):
         self.device = device
         self.dirs = dirs
-        self.n_agents = env_params.n_agents
         self.params = params
-        self.env_name = env_params.environment
-        self.n_parallel_envs = env_params.n_envs
-        self.env_variant = env_params.env_variant
-        self.n_objects = env_params.n_objects
-        self.reward_mode = env_params.reward_mode
         self.critic_type = model_params.critic_type
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_conditioning = model_params.entropy_conditioning
 
         self.n_eval_episodes = 5
         self.eval_env = make_vec_env(
-            self.env_name,
-            self.n_agents,
+            env_params.get("environment"),
+            env_params.get("n_agents"),
             self.n_eval_episodes,
             use_async=True,
-            env_variant=self.env_variant,
-            n_objects=self.n_objects,
-            reward_mode=self.reward_mode,
+            env_params=env_params,
         )
         self.vec_env = make_vec_env(
-            self.env_name,
-            self.n_agents,
-            self.n_parallel_envs,
+            env_params.get("environment"),
+            env_params.get("n_agents"),
+            env_params.get("n_envs"),
             use_async=True,
-            env_variant=self.env_variant,
-            n_objects=self.n_objects,
-            reward_mode=self.reward_mode,
+            env_params=env_params,
         )
 
         obs_space = self.vec_env.single_observation_space
         act_space = self.vec_env.single_action_space
         observation_dim = obs_space.shape[1]
-        global_state_dim = observation_dim * self.n_agents
+        global_state_dim = observation_dim * env_params.get("n_agents")
 
         if isinstance(act_space, gym.spaces.MultiDiscrete):
             action_dim = int(act_space.nvec[0])
         else:
             action_dim = act_space.shape[1]
 
-        self.discrete = self.env_name in [
+        self.discrete = env_params.get("environment") in [
             EnvironmentEnum.MPE_SPREAD,
             EnvironmentEnum.MPE_SIMPLE,
             EnvironmentEnum.SMACV2,
             EnvironmentEnum.SMACLITE,
         ]
-
         hyperedge_fns = None
         uses_hypergraph_critic = self.critic_type in (
             "multi_hgnn",
             "hg_cross_attention",
         )
-        if (
-            uses_hypergraph_critic
-            and model_params.hypergraph_mode == "predefined"
-        ):
+        if uses_hypergraph_critic and model_params.hypergraph_mode == "predefined":
             if not model_params.hyperedge_fn_names:
                 raise ValueError(
                     "hypergraph_mode='predefined' with a hypergraph critic requires "
@@ -118,16 +104,15 @@ class VecMAPPOTrainer:
                 fn_names=model_params.hyperedge_fn_names,
                 env_ctx=env_ctx,
             )
-
         self.agent = MAPPOAgent(
             observation_dim,
             global_state_dim,
             action_dim,
-            self.n_agents,
+            env_params.get("n_agents"),
             self.params,
             self.device,
             self.discrete,
-            self.n_parallel_envs,
+            env_params.get("n_envs"),
             model_params=model_params,
             hyperedge_fns=hyperedge_fns,
         )
@@ -140,8 +125,8 @@ class VecMAPPOTrainer:
         self.hypergraph_runtime = HypergraphRuntime(
             agent=self.agent,
             device=self.device,
-            n_agents=self.n_agents,
-            n_parallel_envs=self.n_parallel_envs,
+            n_agents=env_params.get("n_envs"),
+            n_parallel_envs=env_params.get("n_envs"),
             critic_type=self.critic_type,
             model_params=model_params,
             batch_dir=self.dirs.get("batch"),
@@ -151,8 +136,8 @@ class VecMAPPOTrainer:
             vec_env=self.vec_env,
             agent=self.agent,
             device=self.device,
-            n_agents=self.n_agents,
-            n_parallel_envs=self.n_parallel_envs,
+            n_agents=env_params.get("n_agents"),
+            n_parallel_envs=env_params.get("n_envs"),
             discrete=self.discrete,
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_runtime=self.hypergraph_runtime,
@@ -168,11 +153,11 @@ class VecMAPPOTrainer:
         self.renderer = PolicyRenderer(
             agent=self.agent,
             device=self.device,
-            env_name=self.env_name,
-            env_variant=self.env_variant,
-            n_agents=self.n_agents,
-            n_objects=self.n_objects,
-            reward_mode=self.reward_mode,
+            env_name=env_params.get("environment"),
+            env_variant=env_params.get("env_variant"),
+            n_agents=env_params.get("n_agents"),
+            n_objects=env_params.get("n_objects"),
+            reward_mode=env_params.get("reward_mode"),
             discrete=self.discrete,
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_runtime=self.hypergraph_runtime,

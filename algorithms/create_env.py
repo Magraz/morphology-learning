@@ -148,9 +148,7 @@ def make_vec_env(
     n_agents: int,
     n_envs: int,
     use_async: bool = True,
-    env_variant: str = None,
-    n_objects: int = 3,
-    reward_mode: str = "dense",
+    env_params: dict = None,
 ):
     """
     Create a vectorized environment using Gymnasium's built-in vectorization.
@@ -179,9 +177,9 @@ def make_vec_env(
 
                 return MultiBoxPushEnv(
                     n_agents=n_agents,
-                    n_objects=n_objects,
+                    n_objects=env_params.get("n_objects"),
                     render_mode=None,
-                    reward_mode=reward_mode,
+                    reward_mode=env_params.get("reward_mode"),
                 )
 
             case EnvironmentEnum.SCATTER:
@@ -236,12 +234,12 @@ def make_vec_env(
             case EnvironmentEnum.SMACV2:
                 from environments.smacv2.wrapper import SMACv2ToGymWrapper
 
-                return SMACv2ToGymWrapper(map_name=env_variant)
+                return SMACv2ToGymWrapper(map_name=env_params.get("env_variant"))
 
             case EnvironmentEnum.SMACLITE:
                 from environments.smaclite.wrapper import SmacliteToGymWrapper
 
-                return SmacliteToGymWrapper(map_name=env_variant)
+                return SmacliteToGymWrapper(map_name=env_params.get("env_variant"))
 
     # Create list of factory functions (not environment instances!)
     env_fns = [make_env_fn for _ in range(n_envs)]

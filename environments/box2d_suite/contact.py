@@ -20,7 +20,7 @@ from Box2D import (
 )
 
 from environments.box2d_suite.agent import Agent
-from environments.box2d_suite.observation import ObservationManager
+from environments.box2d_suite.observation import ObservationManager, OBS_DIM
 from environments.box2d_suite.renderer import Renderer
 from environments.box2d_suite.utils import (
     COLORS_LIST,
@@ -62,7 +62,7 @@ class ContactEnv(gym.Env):
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.n_agents, 22), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.n_agents, OBS_DIM), dtype=np.float32
         )
 
         self.world = b2World(gravity=(0, 0))
