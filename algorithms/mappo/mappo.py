@@ -61,6 +61,21 @@ class MAPPOAgent:
         self.grouping_loss_coef = model_params.grouping_loss_coef
         self.grouping_entropy_coef = model_params.grouping_entropy_coef
 
+        # Coordination-graph novelty exploration (gnn critic only)
+        self.use_intrinsic_reward = model_params.use_intrinsic_reward
+        self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
+        self.intrinsic_descriptor_source = model_params.intrinsic_descriptor_source
+        self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
+        self.intrinsic_reward_k = model_params.intrinsic_reward_k
+        self.intrinsic_reward_memory_capacity = (
+            model_params.intrinsic_reward_memory_capacity
+        )
+        if self.use_intrinsic_reward and self.critic_type != "gnn":
+            raise ValueError(
+                "use_intrinsic_reward (coordination-graph novelty) is only "
+                f"supported for critic_type='gnn'; got {self.critic_type!r}."
+            )
+
         # PPO hyperparameters
         self.gamma = params.gamma
         self.gae_lambda = params.lmbda
@@ -491,6 +506,51 @@ class MAPPOAgent:
             )
         return self.network_old.get_value(gs_tensor)
 
+    @property
+    def intrinsic_feature_dim(self) -> int:
+        """Length of the per-rewarder coordination descriptor vector.
+
+        For "team" mode this is the whole-graph descriptor length; for "agent"
+        mode it is one agent's descriptor length. Computed once from a dummy
+        forward so it stays in sync with the critic's actual head/d_model config.
+        """
+        if getattr(self, "_intrinsic_feature_dim", None) is None:
+            with torch.no_grad():
+                dummy = torch.zeros(
+                    1, self.n_agents, self.observation_dim, device=self.device
+                ).reshape(1, -1)
+                desc = self.network_old.coordination_descriptor(
+                    dummy,
+                    mode=self.intrinsic_reward_mode,
+                    source=self.intrinsic_descriptor_source,
+                )
+            # team: (1, team_dim) -> team_dim; agent: (1, N, agent_dim) -> agent_dim
+            self._intrinsic_feature_dim = int(desc.shape[-1])
+        return self._intrinsic_feature_dim
+
+    def compute_coordination_features(self, obs) -> np.ndarray:
+        """Coordination-graph descriptor for the novelty bonus, read from the
+        dual-purpose attention encoder under no_grad via the behavior network.
+
+        Args:
+            obs: np (n_envs, n_agents, obs_dim).
+
+        Returns:
+            "team" mode:  (n_envs, team_dim)
+            "agent" mode: (n_envs, n_agents, agent_dim)
+        """
+        gs = obs.reshape(obs.shape[0], -1)
+        with torch.no_grad():
+            gs_t = torch.from_numpy(np.ascontiguousarray(gs, dtype=np.float32)).to(
+                self.device
+            )
+            desc = self.network_old.coordination_descriptor(
+                gs_t,
+                mode=self.intrinsic_reward_mode,
+                source=self.intrinsic_descriptor_source,
+            )
+        return desc.cpu().numpy()
+
     def store_transitions_batch(
         self,
         obs,  # np (n_envs, n_agents, obs_dim)
@@ -504,6 +564,7 @@ class MAPPOAgent:
         hg_signature_ids=None,  # list[int] of length n_envs or None
         entropies=None,  # torch tensor (n_envs, n_types) or None
         grouping_tokens=None,  # list[list[int]] of length n_envs or None
+        per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -516,6 +577,12 @@ class MAPPOAgent:
         per_agent_rewards = np.tile(
             rewards.astype(np.float32)[:, None], (1, self.n_agents)
         )
+
+        # Fold in the coordination-graph novelty bonus (already coef-scaled).
+        if per_agent_intrinsic_rewards is not None:
+            per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
+                np.float32
+            )
 
         # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete
         if self.discrete and actions.ndim == 2:

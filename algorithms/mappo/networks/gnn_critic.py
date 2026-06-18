@@ -192,6 +192,60 @@ class AttentionGNNCritic(nn.Module):
         tokens, adjacency = self.encoder(obs)
         return self.gnn(tokens, adjacency)
 
+    def coordination_descriptor(
+        self,
+        obs: torch.Tensor,
+        mode: str = "team",
+        source: str = "adjacency",
+    ) -> torch.Tensor:
+        """Extract a coordination-graph descriptor used for novelty-based
+        exploration. Reuses the same attention encoder as the value path, so the
+        descriptor reflects the *grounded* coordination structure the critic
+        learns.
+
+        Args:
+            obs:    (batch, n_agents, obs_dim) per-agent observations. A 2D input
+                    (n_agents, obs_dim) is also accepted.
+            mode:   "team"  -> one descriptor per graph.
+                    "agent" -> one descriptor per agent.
+            source: "adjacency"      -> derive from the per-head coordination
+                                        graph (who-coordinates-with-whom).
+                    "node_embedding" -> derive from the per-agent attended tokens.
+
+        Returns:
+            mode="team":  (batch, team_dim)            (or (team_dim,) if 2D in)
+            mode="agent": (batch, n_agents, agent_dim) (or (n_agents, agent_dim))
+        """
+        assert mode in ("team", "agent"), f"invalid mode {mode!r}"
+        assert source in ("adjacency", "node_embedding"), f"invalid source {source!r}"
+
+        squeeze = obs.dim() == 2
+        if squeeze:
+            obs = obs.unsqueeze(0)
+
+        # tokens: (B, N, d_model); adjacency: (B, n_heads, N, N)
+        tokens, adjacency = self.encoder(obs)
+
+        if source == "node_embedding":
+            if mode == "team":
+                desc = tokens.mean(dim=1)  # (B, d_model)
+            else:
+                desc = tokens  # (B, N, d_model)
+        else:  # adjacency
+            B, H, N, _ = adjacency.shape
+            if mode == "team":
+                # Upper triangle of each head's symmetric adjacency, per head.
+                iu, ju = torch.triu_indices(N, N, offset=1, device=adjacency.device)
+                # (B, H, n_pairs) -> (B, H * n_pairs)
+                desc = adjacency[:, :, iu, ju].reshape(B, -1)
+            else:
+                # Agent i's coordination row across heads: (B, N, H * N).
+                desc = adjacency.permute(0, 2, 1, 3).reshape(B, N, H * N)
+
+        if squeeze:
+            desc = desc.squeeze(0)
+        return desc
+
 
 if __name__ == "__main__":
     torch.manual_seed(0)

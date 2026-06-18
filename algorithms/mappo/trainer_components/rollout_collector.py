@@ -1,4 +1,6 @@
+import time
 from dataclasses import dataclass
+from algorithms.mappo.intrinsic_reward import BatchedIntrinsicReward
 from algorithms.mappo.entropy_helpers import update_left_padded_history
 from algorithms.mappo.trainer_components.hypergraph_runtime import HypergraphRuntime
 from algorithms.mappo.mappo import MAPPOAgent
@@ -11,6 +13,16 @@ class RolloutResult:
     step_count: int
     episode_count: int
     final_values: list[float]
+    # Wall-clock seconds spent inside vec_env reset/step (the actual environment
+    # physics + IPC), as opposed to the surrounding main-process work (policy
+    # inference, hypergraph build, intrinsic rewards, transition storage).
+    env_time: float = 0.0
+    # Per-step means over the rollout, for diagnosing intrinsic-vs-extrinsic
+    # balance per trial. ``mean_intrinsic_reward`` is the coef-scaled novelty
+    # bonus exactly as it enters the agents' reward (0 when intrinsic is off);
+    # ``mean_extrinsic_reward`` is the raw environment reward over the same steps.
+    mean_intrinsic_reward: float = 0.0
+    mean_extrinsic_reward: float = 0.0
 
 
 class RolloutCollector:
@@ -35,20 +47,51 @@ class RolloutCollector:
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
 
+        # Coordination-graph novelty exploration. A single batched episodic k-NN
+        # rewarder scores all streams at once: one stream per env ("team") or per
+        # (env, agent) ("agent"). Memory holds coordination descriptors extracted
+        # from the dual-purpose attention encoder.
+        self.intrinsic_rewarder = None
+        if self.agent.use_intrinsic_reward:
+            feat_dim = self.agent.intrinsic_feature_dim
+            if self.agent.intrinsic_reward_mode == "agent":
+                n_streams = self.n_parallel_envs * self.n_agents
+            else:
+                n_streams = self.n_parallel_envs
+            self.intrinsic_rewarder = BatchedIntrinsicReward(
+                n_streams=n_streams,
+                feat_dim=feat_dim,
+                k=self.agent.intrinsic_reward_k,
+                memory_capacity=self.agent.intrinsic_reward_memory_capacity,
+            )
+
     def collect(self, max_steps: int) -> RolloutResult:
         """Collect trajectory using Gymnasium vectorized environments."""
+        env_time = 0.0  # accumulated wall-clock inside vec_env reset/step
+
         train_seeds = [
             int(np.random.randint(0, 2**31)) for _ in range(self.n_parallel_envs)
         ]
+        _env_t0 = time.perf_counter()
         obs, infos = self.vec_env.reset(seed=train_seeds)
+        env_time += time.perf_counter() - _env_t0
         batch_size = obs.shape[0]
 
         self.hypergraph_runtime.on_rollout_reset()
+        if self.intrinsic_rewarder is not None:
+            self.intrinsic_rewarder.reset()
 
         current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
         total_step_count = 0
         episode_count = 0
         current_episode_steps = np.zeros(self.n_parallel_envs, dtype=np.int32)
+
+        # Accumulate per-step reward means to surface the intrinsic-vs-extrinsic
+        # balance (see RolloutResult). Both are summed per env-step then divided
+        # by the number of env-steps at the end.
+        intrinsic_reward_sum = 0.0
+        extrinsic_reward_sum = 0.0
+        reward_step_count = 0
 
         self.agent.reset_obs_history()
         critic_obs_history = None
@@ -118,10 +161,27 @@ class RolloutCollector:
                     actions_array = actions_array.squeeze(-1)
                 actions_array = actions_array.astype(np.int32)
 
+            _env_t0 = time.perf_counter()
             next_obs, rewards, terminateds, truncateds, infos = self.vec_env.step(
                 actions_array
             )
+            env_time += time.perf_counter() - _env_t0
             dones = np.logical_or(terminateds, truncateds)
+
+            per_agent_intrinsic = None
+            if self.intrinsic_rewarder is not None:
+                if self.agent.intrinsic_reward_mode == "agent":
+                    per_agent_intrinsic = self._get_agent_intrinsic_rewards(
+                        next_obs, dones
+                    )
+                else:
+                    per_agent_intrinsic = self._get_team_intrinsic_rewards(
+                        next_obs, dones
+                    )
+                intrinsic_reward_sum += float(per_agent_intrinsic.mean())
+
+            extrinsic_reward_sum += float(np.asarray(rewards).mean())
+            reward_step_count += 1
 
             if dones.any():
                 self.agent.reset_obs_history(env_mask=dones)
@@ -149,6 +209,7 @@ class RolloutCollector:
                 hg_signature_ids=per_env_sig_ids,
                 entropies=per_env_entropies,
                 grouping_tokens=grouping_tokens,
+                per_agent_intrinsic_rewards=per_agent_intrinsic,
             )
 
             current_masks = (
@@ -164,11 +225,46 @@ class RolloutCollector:
 
         final_values = self._compute_final_values(obs, infos, batch_size)
 
+        denom = max(reward_step_count, 1)
         return RolloutResult(
             step_count=total_step_count,
             episode_count=episode_count,
             final_values=final_values,
+            env_time=env_time,
+            mean_intrinsic_reward=intrinsic_reward_sum / denom,
+            mean_extrinsic_reward=extrinsic_reward_sum / denom,
         )
+
+    def _get_team_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+        """One coordination-graph novelty bonus per env (whole-graph descriptor),
+        tiled across all agents. Returns coef-scaled (n_envs, n_agents)."""
+        team_features = self.agent.compute_coordination_features(
+            np.ascontiguousarray(next_obs, dtype=np.float32)
+        )  # (n_envs, team_dim)
+
+        intrinsic = self.intrinsic_rewarder.compute_and_store(
+            team_features, dones
+        )  # (n_envs,)
+        rewards = self.agent.intrinsic_reward_coef * intrinsic
+        return np.tile(rewards[:, None], (1, self.n_agents))
+
+    def _get_agent_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:
+        """Per-agent coordination-graph novelty bonus from each agent's own
+        coordination row. Returns coef-scaled (n_envs, n_agents)."""
+        agent_features = self.agent.compute_coordination_features(
+            np.ascontiguousarray(next_obs, dtype=np.float32)
+        )  # (n_envs, n_agents, agent_dim)
+        n_envs, n_agents, feat_dim = agent_features.shape
+
+        # Flatten (env, agent) into independent streams; replicate each env's done
+        # flag across its agents so all of an env's streams reset together.
+        flat_features = agent_features.reshape(n_envs * n_agents, feat_dim)
+        flat_dones = np.repeat(np.asarray(dones), n_agents)
+
+        intrinsic = self.intrinsic_rewarder.compute_and_store(
+            flat_features, flat_dones
+        ).reshape(n_envs, n_agents)
+        return self.agent.intrinsic_reward_coef * intrinsic
 
     def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
         final_global_states = obs.reshape(batch_size, -1)

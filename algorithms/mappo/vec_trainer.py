@@ -153,11 +153,7 @@ class VecMAPPOTrainer:
         self.renderer = PolicyRenderer(
             agent=self.agent,
             device=self.device,
-            env_name=env_params.get("environment"),
-            env_variant=env_params.get("env_variant"),
-            n_agents=env_params.get("n_agents"),
-            n_objects=env_params.get("n_objects"),
-            reward_mode=env_params.get("reward_mode"),
+            env_params=env_params,
             discrete=self.discrete,
             entropy_conditioning=self.entropy_conditioning,
             hypergraph_runtime=self.hypergraph_runtime,
@@ -213,6 +209,8 @@ class VecMAPPOTrainer:
             collection_start = time.time()
             rollout = self.rollout_collector.collect(max_steps=int(steps_to_collect))
             collection_time = time.time() - collection_start
+            env_time = rollout.env_time
+            env_pct = 100.0 * env_time / collection_time if collection_time > 0 else 0.0
 
             update_start = time.time()
             stats = self.agent.update(
@@ -238,20 +236,29 @@ class VecMAPPOTrainer:
                 collection_time=collection_time,
                 update_time=update_time,
                 eval_time=eval_time,
+                intrinsic_reward=rollout.mean_intrinsic_reward,
+                extrinsic_reward=rollout.mean_extrinsic_reward,
             )
 
             steps_per_second = steps_completed / elapsed_time if elapsed_time > 0 else 0
 
             if steps_completed % log_every < rollout.step_count:
                 mem = self._get_total_memory_mb()
+                intrinsic_str = (
+                    f"Intrinsic: {rollout.mean_intrinsic_reward:.4f} "
+                    f"(extr {rollout.mean_extrinsic_reward:.4f}) | "
+                    if self.agent.use_intrinsic_reward
+                    else ""
+                )
                 print(
                     f"Steps: {steps_completed}/{total_steps} ({steps_completed/total_steps*100:.1f}%) | "
                     f"Episodes: {episodes_completed} | "
                     f"Reward: {self.training_stats['reward'][-1]:.2f} | "
+                    f"{intrinsic_str}"
                     f"Time: {elapsed_time:.1f}s | "
                     f"FPS: {steps_per_second:.1f} | "
                     f"Mem: {mem:.0f}MB | "
-                    f"Collection: {collection_time:.2f}s | "
+                    f"Collection: {collection_time:.2f}s (env {env_time:.2f}s, {env_pct:.0f}%) | "
                     f"Update: {update_time:.2f}s | "
                     f"Eval: {eval_time:.2f}s"
                 )

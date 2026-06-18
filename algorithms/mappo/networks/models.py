@@ -220,6 +220,26 @@ class MAPPONetwork(nn.Module):
             return self.critic(self._to_obs_grid(global_state))
         return self.critic(global_state)
 
+    def coordination_descriptor(
+        self, global_state, mode: str = "team", source: str = "adjacency"
+    ):
+        """Extract a coordination-graph descriptor from the attention critic for
+        novelty-based exploration. Only valid for the "gnn" critic.
+
+        Args:
+            global_state: flat all-agent state (..., n_agents * obs_dim) — the same
+                          layout the critic consumes.
+            mode/source:  forwarded to ``AttentionGNNCritic.coordination_descriptor``.
+        """
+        if self.critic_type != "gnn":
+            raise ValueError(
+                "coordination_descriptor requires critic_type='gnn'; got "
+                f"{self.critic_type!r}."
+            )
+        return self.critic.coordination_descriptor(
+            self._to_obs_grid(global_state), mode=mode, source=source
+        )
+
     def _to_obs_grid(self, global_state):
         """Reshape a flat all-agent global state (..., n_agents * obs_dim) into
         the per-agent observation grid (..., n_agents, obs_dim) the GNN critic

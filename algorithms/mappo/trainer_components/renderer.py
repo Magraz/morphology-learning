@@ -19,22 +19,19 @@ class PolicyRenderer:
         *,
         agent,
         device: str,
-        env_name,
-        env_variant,
-        n_agents: int,
-        n_objects: int,
-        reward_mode: str,
+        env_params: dict,
         discrete: bool,
         entropy_conditioning: bool,
         hypergraph_runtime: HypergraphRuntime,
     ):
         self.agent = agent
         self.device = device
-        self.env_name = env_name
-        self.env_variant = env_variant
-        self.n_agents = n_agents
-        self.n_objects = n_objects
-        self.reward_mode = reward_mode
+        self.env_params = env_params
+        self.env_name = env_params.get("environment")
+        self.env_variant = env_params.get("env_variant")
+        self.n_agents = env_params.get("n_agents")
+        self.n_objects = env_params.get("n_objects")
+        self.reward_mode = env_params.get("reward_mode")
         self.discrete = discrete
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
@@ -85,7 +82,9 @@ class PolicyRenderer:
                 self.agent.observation_dim,
                 dtype=torch.float32,
             )
-            critic_sig_history = torch.zeros(1, self.agent.critic_seq_len, dtype=torch.long)
+            critic_sig_history = torch.zeros(
+                1, self.agent.critic_seq_len, dtype=torch.long
+            )
             critic_history_counts = torch.zeros(1, dtype=torch.long)
 
         with torch.no_grad(), self.hypergraph_runtime.render_grouping_context():
@@ -116,8 +115,10 @@ class PolicyRenderer:
                         obs_step = obs_step.unsqueeze(0)
                     sig_step = torch.tensor(render_sig_ids, dtype=torch.long)
                     prev_counts = critic_history_counts.clone()
-                    critic_obs_history, critic_history_counts = update_left_padded_history(
-                        critic_obs_history, obs_step, critic_history_counts
+                    critic_obs_history, critic_history_counts = (
+                        update_left_padded_history(
+                            critic_obs_history, obs_step, critic_history_counts
+                        )
                     )
                     critic_sig_history, _ = update_left_padded_history(
                         critic_sig_history, sig_step, prev_counts
@@ -231,10 +232,8 @@ class PolicyRenderer:
         v_labels = [str(i) for i in range(self.n_agents)]
 
         fig, axes = plt.subplots(
-            n_rows, n_snapshots, figsize=(5 * n_snapshots, 5 * n_rows)
+            n_rows, n_snapshots, figsize=(5 * n_snapshots, 5 * n_rows), squeeze=False
         )
-        if n_snapshots == 1:
-            axes = axes[:, np.newaxis]
 
         for col, idx in enumerate(indices):
             axes[0, col].imshow(frames[idx])
@@ -290,8 +289,7 @@ class PolicyRenderer:
                     self.n_agents,
                     1,
                     use_async=True,
-                    n_objects=self.n_objects,
-                    reward_mode=self.reward_mode,
+                    env_params=self.env_params,
                 )
                 render_env.envs[0].render_mode = "human"
                 return render_env

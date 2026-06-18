@@ -64,6 +64,16 @@ class Model_Params:
     grouping_entropy_coef: float = 0.01
     # Resample the hypergraph every N rollout steps (per env). 1 = every step.
     grouping_resample_interval: int = 1
+    # --- Coordination-graph novelty exploration (critic_type="gnn" only) ---
+    # Reward novelty of the attention encoder's coordination graph. The encoder
+    # is dual-purpose (shared with the value path), so the graph is grounded by
+    # the value loss; the bonus reads it under no_grad via network_old.
+    use_intrinsic_reward: bool = False
+    intrinsic_reward_mode: str = "team"  # "team" | "agent"
+    intrinsic_descriptor_source: str = "adjacency"  # "adjacency" | "node_embedding"
+    intrinsic_reward_coef: float = 0.0
+    intrinsic_reward_k: int = 8
+    intrinsic_reward_memory_capacity: int = 10_000
 
     @property
     def n_hyperedge_types(self) -> int:

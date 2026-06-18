@@ -53,6 +53,15 @@ graph is novel** within the current episode.
 - Config knobs in `Model_Params`: `intrinsic_reward_coef`, `intrinsic_reward_k`,
   `intrinsic_reward_memory_capacity`. Asserts `critic_type=="gnn"`; fully inert
   when `use_intrinsic_reward=False`.
+- Logging: `RolloutCollector.collect` returns per-rollout means
+  `mean_intrinsic_reward` (coef-scaled bonus exactly as it enters the agents'
+  reward; 0 when intrinsic is off) and `mean_extrinsic_reward` (raw env reward
+  over the same steps) on `RolloutResult`. `vec_trainer` records these into
+  `training_stats["intrinsic_reward"]` / `["extrinsic_reward"]` and prints them
+  on the log line when `use_intrinsic_reward`. Use the two curves to diagnose
+  per-seed divergence: a failing trial with high sustained intrinsic but flat
+  extrinsic is farming graph novelty (reward hacking) rather than just unlucky
+  exploration.
 
 ### Visualizing the coordination graphs
 
