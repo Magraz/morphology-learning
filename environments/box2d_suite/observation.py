@@ -6,8 +6,9 @@ N_LIDAR_RAYS = 16
 
 # Per-agent observation layout (see ObservationManager.get_observation):
 #   own_velocity (2) + density_sensors (16) + is_touching_object (1)
-#   + neighbor_fraction (1) + contact_force (1) = 21, then + lidar.
-BASE_OBS_DIM = 21
+#   + neighbor_fraction (1) + contact_force (1) + nearest_box_vec (2)
+#   + goal_distance (1) = 24, then + lidar.
+BASE_OBS_DIM = 24
 OBS_DIM = BASE_OBS_DIM + N_LIDAR_RAYS
 
 
@@ -117,6 +118,15 @@ class ObservationManager:
             getattr(self.env, "lidar_range", self.env.sector_sensor_radius),
         )
 
+        # Goal-relative features (egocentric, so no absolute world anchor):
+        #   nearest_box_vec — relative (dx, dy) to the closest object, per axis
+        #     normalized by world_width; zero vector when there are no objects.
+        #   goal_distance — signed relative y distance from the agent to the
+        #     target region center, normalized by world_height; 0 when the env
+        #     has no target areas.
+        all_nearest_box_vec = self._calculate_nearest_box_vectors()
+        all_goal_distance = self._calculate_goal_distances()
+
         # Normalize per-agent contact force by max applicable force so the
         # observation lives in roughly [0, 1] (can exceed 1 when several
         # bodies pile up against a stalled agent — still well-scaled).
@@ -129,6 +139,8 @@ class ObservationManager:
             is_touching_object = np.array([self._is_agent_touching_object(i)])
             neighbor_fraction = np.array([all_neighbor_fractions[i]])
             contact_force = np.array([contact_force_norm[i]], dtype=np.float32)
+            nearest_box_vec = all_nearest_box_vec[i]
+            goal_distance = np.array([all_goal_distance[i]], dtype=np.float32)
             agent_obs = np.concatenate(
                 [
                     # own_pos,
@@ -137,6 +149,8 @@ class ObservationManager:
                     is_touching_object,
                     neighbor_fraction,
                     contact_force,
+                    nearest_box_vec,
+                    goal_distance,
                     all_lidar[i],
                 ]
             )
@@ -151,6 +165,43 @@ class ObservationManager:
         dist = np.linalg.norm(diff, axis=-1)  # (A, A), zero on the diagonal
         within = (dist <= radius).sum(axis=1).astype(np.float32)  # (A,)
         return within / float(self.env.n_agents)
+
+    def _calculate_nearest_box_vectors(self):
+        """Relative (dx, dy) from each agent to its nearest object.
+
+        Per-axis normalized by world_width so values land in ~[-1, 1]. Returns a
+        zero vector for every agent when the env has no objects.
+        """
+        n_agents = self.env.n_agents
+        if self._object_pos_cache.shape[0] == 0:
+            return np.zeros((n_agents, 2), dtype=np.float32)
+
+        # rel[i, o] = obj_pos[o] - agent_pos[i]
+        rel = (
+            self._object_pos_cache[np.newaxis, :, :]
+            - self._agent_pos_cache[:, np.newaxis, :]
+        )  # (A, O, 2)
+        dist = np.linalg.norm(rel, axis=-1)  # (A, O)
+        nearest = np.argmin(dist, axis=1)  # (A,)
+        nearest_vec = rel[np.arange(n_agents), nearest]  # (A, 2)
+        return (nearest_vec / float(self.env.world_width)).astype(np.float32)
+
+    def _calculate_goal_distances(self):
+        """Signed relative y distance from each agent to the target region center.
+
+        Normalized by world_height. Returns zeros when the env defines no target
+        areas (envs without a goal region).
+        """
+        n_agents = self.env.n_agents
+        target_areas = getattr(self.env, "target_areas", None)
+        if not target_areas:
+            return np.zeros(n_agents, dtype=np.float32)
+
+        target_y = target_areas[0].y
+        goal_dy = (target_y - self._agent_pos_cache[:, 1]) / float(
+            self.env.world_height
+        )
+        return goal_dy.astype(np.float32)
 
     def _calculate_lidar_all(self, n_rays, max_range):
         """
