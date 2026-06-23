@@ -1,4 +1,4 @@
-import dhg
+import hypergraphs.hg_compat as dhg  # torch>=2 drop-in for dhg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

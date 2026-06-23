@@ -1,5 +1,5 @@
 import numpy as np
-import dhg
+import hypergraphs.hg_compat as dhg  # torch>=2 drop-in for dhg
 from collections import Counter
 from functools import partial
 from typing import Callable

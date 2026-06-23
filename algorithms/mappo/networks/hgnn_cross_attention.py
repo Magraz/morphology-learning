@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import List
 
-import dhg
+import hypergraphs.hg_compat as dhg  # torch>=2 drop-in for dhg
 
 from hypergraphs.hgnn_conv_layer import HGNNConv
 

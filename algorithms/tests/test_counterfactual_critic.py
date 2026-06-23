@@ -19,7 +19,7 @@ import io
 import sys
 from pathlib import Path
 
-import dhg
+import hypergraphs.hg_compat as dhg  # torch>=2 drop-in for dhg
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec

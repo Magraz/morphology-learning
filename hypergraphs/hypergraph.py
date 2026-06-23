@@ -1,5 +1,5 @@
 import matplotlib.pyplot as plt
-import dhg
+import hypergraphs.hg_compat as dhg  # torch>=2 drop-in for dhg
 
 # draw a graph
 g = dhg.random.graph_Gnm(10, 12)
