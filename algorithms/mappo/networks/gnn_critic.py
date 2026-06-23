@@ -208,30 +208,43 @@ class AttentionGNNCritic(nn.Module):
                     (n_agents, obs_dim) is also accepted.
             mode:   "team"  -> one descriptor per graph.
                     "agent" -> one descriptor per agent.
-            source: "adjacency"      -> derive from the per-head coordination
-                                        graph (who-coordinates-with-whom).
-                    "node_embedding" -> derive from the per-agent attended tokens.
+            source: "adjacency"          -> derive from the per-head *symmetric*
+                                            coordination graph (who-coordinates-
+                                            with-whom, direction collapsed).
+                    "directed_adjacency" -> derive from the raw *directed*
+                                            attention scores, preserving the
+                                            asymmetry (who-attends-to-whom) that
+                                            symmetrization throws away.
+                    "node_embedding"     -> derive from the per-agent attended
+                                            tokens.
 
         Returns:
             mode="team":  (batch, team_dim)            (or (team_dim,) if 2D in)
             mode="agent": (batch, n_agents, agent_dim) (or (n_agents, agent_dim))
         """
         assert mode in ("team", "agent"), f"invalid mode {mode!r}"
-        assert source in ("adjacency", "node_embedding"), f"invalid source {source!r}"
+        assert source in ("adjacency", "directed_adjacency", "node_embedding"), (
+            f"invalid source {source!r}"
+        )
 
         squeeze = obs.dim() == 2
         if squeeze:
             obs = obs.unsqueeze(0)
 
-        # tokens: (B, N, d_model); adjacency: (B, n_heads, N, N)
-        tokens, adjacency = self.encoder(obs)
+        # tokens: (B, N, d_model); adjacency: (B, n_heads, N, N);
+        # attn (directed scores): (B, n_heads, N, N).
+        need_directed = source == "directed_adjacency"
+        if need_directed:
+            tokens, adjacency, attn = self.encoder(obs, return_scores=True)
+        else:
+            tokens, adjacency = self.encoder(obs)
 
         if source == "node_embedding":
             if mode == "team":
                 desc = tokens.mean(dim=1)  # (B, d_model)
             else:
                 desc = tokens  # (B, N, d_model)
-        else:  # adjacency
+        elif source == "adjacency":
             B, H, N, _ = adjacency.shape
             if mode == "team":
                 # Upper triangle of each head's symmetric adjacency, per head.
@@ -241,6 +254,19 @@ class AttentionGNNCritic(nn.Module):
             else:
                 # Agent i's coordination row across heads: (B, N, H * N).
                 desc = adjacency.permute(0, 2, 1, 3).reshape(B, N, H * N)
+        else:  # directed_adjacency — keep the ij vs ji asymmetry.
+            B, H, N, _ = attn.shape
+            if mode == "team":
+                # All off-diagonal directed entries (both triangles), per head.
+                off_diag = ~torch.eye(N, dtype=torch.bool, device=attn.device)
+                # (B, H, N*(N-1)) -> (B, H * N*(N-1))
+                desc = attn[:, :, off_diag].reshape(B, -1)
+            else:
+                # Agent i's outgoing (row) and incoming (col) attention across
+                # heads, concatenated: (B, N, 2 * H * N).
+                out_desc = attn.permute(0, 2, 1, 3).reshape(B, N, H * N)
+                in_desc = attn.permute(0, 3, 1, 2).reshape(B, N, H * N)
+                desc = torch.cat([out_desc, in_desc], dim=-1)
 
         if squeeze:
             desc = desc.squeeze(0)

@@ -141,19 +141,28 @@ class MultiHeadAttentionEncoder(nn.Module):
         )
 
     def forward(
-        self, observations: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        observations: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        return_scores: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             observations: (batch, n_agents, observation_dim) — one observation
                           per agent. A 2D input (n_agents, observation_dim) is
                           also accepted and a batch dim is added/removed.
             mask:         optional (batch, n_agents) bool — True = valid agent.
+            return_scores: if True, also return the raw *directed* attention
+                          scores (before symmetrization), so callers can inspect
+                          asymmetric (who-attends-to-whom) coordination.
         Returns:
             tokens:    (batch, n_agents, d_model) — attended per-agent features.
             adjacency: (batch, n_heads, n_agents, n_agents) — one symmetric
                        adjacency matrix per attention head, used to build one
                        graph per head.
+            attn:      (batch, n_heads, n_agents, n_agents) — only when
+                       ``return_scores=True``. The raw directed attention scores
+                       (rows sum to 1 over the key dimension).
         """
         squeeze = observations.dim() == 2
         if squeeze:
@@ -173,6 +182,9 @@ class MultiHeadAttentionEncoder(nn.Module):
         if squeeze:
             tokens = tokens.squeeze(0)
             adjacency = adjacency.squeeze(0)
+            attn = attn.squeeze(0)
+        if return_scores:
+            return tokens, adjacency, attn
         return tokens, adjacency
 
 

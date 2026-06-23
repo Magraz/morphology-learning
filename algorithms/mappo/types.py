@@ -70,7 +70,8 @@ class Model_Params:
     # the value loss; the bonus reads it under no_grad via network_old.
     use_intrinsic_reward: bool = False
     intrinsic_reward_mode: str = "team"  # "team" | "agent"
-    intrinsic_descriptor_source: str = "adjacency"  # "adjacency" | "node_embedding"
+    # "adjacency" (symmetric) | "directed_adjacency" (asymmetric) | "node_embedding"
+    intrinsic_descriptor_source: str = "adjacency"
     intrinsic_reward_coef: float = 0.0
     intrinsic_reward_k: int = 8
     intrinsic_reward_memory_capacity: int = 10_000
