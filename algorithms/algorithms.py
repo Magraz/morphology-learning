@@ -16,11 +16,15 @@ def run_algorithm(
     evaluate: bool = False,
 ):
 
-    # Load environment config
-    env_file = batch_dir / "_env.yaml"
+    # Load batch config. The env config is nested under an `env:` block and the
+    # batch-wide `random_seeds` live at the top level.
+    batch_file = batch_dir / "_batch.yaml"
 
-    with open(env_file, "r") as file:
-        env_config = yaml.safe_load(file)
+    with open(batch_file, "r") as file:
+        batch_config = yaml.safe_load(file)
+
+    env_config = batch_config.get("env", {})
+    random_seeds = batch_config.get("random_seeds")
 
     env_config["environment"] = environment
 
@@ -29,6 +33,12 @@ def run_algorithm(
 
     with open(exp_file, "r") as file:
         exp_dict = yaml.unsafe_load(file)
+
+    # Random seeds are shared across the whole batch, so they live in the batch
+    # config. Inject them into each experiment's params (overriding any
+    # per-experiment value) so the runners can keep reading params.random_seeds.
+    if random_seeds is not None:
+        exp_dict.setdefault("params", {})["random_seeds"] = random_seeds
 
     match (algorithm):
 

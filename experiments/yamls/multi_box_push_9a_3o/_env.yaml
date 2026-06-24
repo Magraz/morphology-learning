@@ -1,4 +1,0 @@
-n_envs: 16
-n_agents: 9
-n_objects: 3
-reward_mode: "dense"
