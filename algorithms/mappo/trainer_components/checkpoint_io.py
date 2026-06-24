@@ -38,7 +38,7 @@ class CheckpointIO:
         torch.save(checkpoint, path)
 
     def load_agent(self, filepath, restore_rng: bool = False) -> None:
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
         self.agent.network_old.load_state_dict(checkpoint["network"])
         self.agent.network.load_state_dict(checkpoint["network"])
