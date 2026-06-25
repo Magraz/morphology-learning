@@ -61,7 +61,7 @@ class ObservationManager:
         agent_pos = self._agent_pos_cache[agent_idx]
         agent_radius = self.env.agents[agent_idx].radius
 
-        for obj_idx, obj in enumerate(self.env.objects):
+        for obj_idx, obj in enumerate(self._objects):
             obj_pos = self._object_pos_cache[obj_idx]
             dist = self._agent_object_distance(agent_pos, obj, obj_pos)
             if dist <= agent_radius + 0.2:
@@ -75,14 +75,14 @@ class ObservationManager:
         self._agent_pos_cache = np.array(
             [[ag.position.x, ag.position.y] for ag in self.env.agents], dtype=np.float32
         )  # (n_agents, 2)
-        self._object_pos_cache = (
-            np.array(
-                [[o.position.x, o.position.y] for o in self.env.objects],
-                dtype=np.float32,
-            )
-            if self.env.objects
-            else np.empty((0, 2), dtype=np.float32)
-        )  # (n_objects, 2)
+        # Not every env defines `objects` — fall back to an empty list so every
+        # downstream consumer (touch check, density sensors, position cache)
+        # degrades gracefully instead of raising AttributeError.
+        self._objects = getattr(self.env, "objects", [])
+        self._object_pos_cache = np.array(
+            [[o.position.x, o.position.y] for o in self._objects],
+            dtype=np.float32,
+        ).reshape(-1, 2)  # (n_objects, 2)
 
         # Derive all_states from cache (no separate position reads)
         center = np.array(
@@ -187,21 +187,29 @@ class ObservationManager:
         return (nearest_vec / float(self.env.world_width)).astype(np.float32)
 
     def _calculate_goal_distances(self):
-        """Signed relative y distance from each agent to the target region center.
+        """Signed relative distance from each agent to the target region center.
 
-        Normalized by world_height. Returns zeros when the env defines no target
-        areas (envs without a goal region).
+        Measured along the env's goal axis: the y axis by default (normalized by
+        world_height), or the x axis (normalized by world_width) when the env
+        sets ``goal_axis == "x"`` — e.g. push_box, whose target band can sit
+        against the left/right wall. Returns zeros when the env defines no
+        target areas (envs without a goal region).
         """
         n_agents = self.env.n_agents
         target_areas = getattr(self.env, "target_areas", None)
         if not target_areas:
             return np.zeros(n_agents, dtype=np.float32)
 
-        target_y = target_areas[0].y
-        goal_dy = (target_y - self._agent_pos_cache[:, 1]) / float(
-            self.env.world_height
-        )
-        return goal_dy.astype(np.float32)
+        target = target_areas[0]
+        if getattr(self.env, "goal_axis", "y") == "x":
+            goal_d = (target.x - self._agent_pos_cache[:, 0]) / float(
+                self.env.world_width
+            )
+        else:
+            goal_d = (target.y - self._agent_pos_cache[:, 1]) / float(
+                self.env.world_height
+            )
+        return goal_d.astype(np.float32)
 
     def _calculate_lidar_all(self, n_rays, max_range):
         """
@@ -280,7 +288,7 @@ class ObservationManager:
             sensors[:, s] = np.where(has, 1.0 - centroid_dist / sensor_radius, 0.0)
 
         # === Agent-to-object ===
-        if self.env.objects:
+        if self._object_pos_cache.shape[0] > 0:
             obj_pos = self._object_pos_cache  # (O, 2)
 
             rel_ao = (
@@ -359,7 +367,7 @@ class ObservationManager:
             agent_sector_positions[sector].append(other_pos)
 
         # Check each dynamic object
-        for obj in self.env.objects:
+        for obj in getattr(self.env, "objects", []):
             obj_pos = np.array([obj.position.x, obj.position.y])
             relative_pos = obj_pos - agent_pos
             distance = np.linalg.norm(relative_pos)

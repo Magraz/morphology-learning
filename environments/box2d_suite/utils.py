@@ -107,6 +107,49 @@ class ObjectTargetArea:
         return in_x and in_y
 
 
+def update_object_mass_from_contacts(env, coupled_density_per_agent=0.05):
+    """Lighten each object once its coupling requirement is met.
+
+    Shared coupling mechanic for the box-pushing envs (multi_box_push,
+    push_box): an object becomes much easier to move only when at least
+    ``userData["coupling"]`` agents are touching it cooperatively. Until then it
+    keeps its heavy base density so a lone agent struggles.
+
+    Expects ``env`` to expose ``objects``, ``object_base_densities`` (parallel to
+    ``objects``), ``agents``, and ``observation_manager`` (for the distance helper).
+    Touch detection uses distance-based proximity for stability, matching
+    ``get_agents_touching_objects``.
+
+    When the requirement is met, density drops to
+    ``coupled_density_per_agent * coupling`` (slightly higher for boxes that
+    need more agents, but still tiny next to the base density); otherwise it is
+    restored to the base density. ``ResetMassData`` re-derives the mass.
+    """
+    for obj_idx, obj in enumerate(env.objects):
+        base_density = env.object_base_densities[obj_idx]
+
+        n_touching = 0
+        obj_pos = np.array([obj.position.x, obj.position.y])
+        for agent in env.agents:
+            agent_pos = np.array([agent.position.x, agent.position.y])
+            dist = env.observation_manager._agent_object_distance(
+                agent_pos, obj, obj_pos
+            )
+            if dist <= agent.radius + 0.2:
+                n_touching += 1
+
+        coupling = obj.userData["coupling"]
+        if coupling <= n_touching:
+            new_density = coupled_density_per_agent * coupling
+        else:
+            new_density = base_density
+
+        for fixture in obj.fixtures:
+            fixture.density = new_density
+
+        obj.ResetMassData()
+
+
 class BoundaryContactListener(b2ContactListener):
     def __init__(self):
         super().__init__()

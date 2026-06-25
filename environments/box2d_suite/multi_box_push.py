@@ -29,6 +29,7 @@ from environments.box2d_suite.utils import (
     ObjectTargetArea,
     BoundaryContactListener,
     get_scatter_positions,
+    update_object_mass_from_contacts,
 )
 
 
@@ -250,34 +251,8 @@ class MultiBoxPushEnv(gym.Env):
             self.object_base_densities.append(base_density)
 
     def _update_object_mass_from_contacts(self):
-        """
-        Reduce object mass for each additional agent pushing it.
-        Uses distance-based proximity for stable detection.
-        """
-        for obj_idx, obj in enumerate(self.objects):
-            base_density = self.object_base_densities[obj_idx]
-
-            n_touching = 0
-            obj_pos = np.array([obj.position.x, obj.position.y])
-
-            for agent in self.agents:
-                agent_pos = np.array([agent.position.x, agent.position.y])
-                dist = self.observation_manager._agent_object_distance(
-                    agent_pos, obj, obj_pos
-                )
-
-                if dist <= agent.radius + 0.2:
-                    n_touching += 1
-
-            if obj.userData["coupling"] <= n_touching:
-                new_density = 0.05 * obj.userData["coupling"]
-            else:
-                new_density = base_density
-
-            for fixture in obj.fixtures:
-                fixture.density = new_density
-
-            obj.ResetMassData()
+        """Lighten each box once its coupling requirement is met (shared helper)."""
+        update_object_mass_from_contacts(self)
 
     def _create_agents(self, positions):
         for i in range(self.n_agents):

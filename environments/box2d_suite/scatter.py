@@ -22,11 +22,9 @@ from environments.box2d_suite.agent import Agent
 from environments.box2d_suite.observation import ObservationManager, OBS_DIM
 from environments.box2d_suite.renderer import Renderer
 from environments.box2d_suite.utils import (
-    COLORS_LIST,
     AGENT_CATEGORY,
     BOUNDARY_CATEGORY,
     OBJECT_CATEGORY,
-    ObjectTargetArea,
     BoundaryContactListener,
 )
 
@@ -45,9 +43,6 @@ class ScatterEnv(gym.Env):
         self.n_agents = n_agents
         self.render_mode = render_mode
 
-        # Add target areas parameters
-        self.target_areas = []
-
         # Update action space to include detach action
         self.action_space = spaces.Box(
             low=-1.0,
@@ -64,11 +59,6 @@ class ScatterEnv(gym.Env):
         self.time_step = 1.0 / 60.0
 
         self.agents = []
-
-        self.prev_agent_closest_distances = [float("inf") for _ in range(self.n_agents)]
-        self.prev_target_closest_distances = [
-            float("inf") for _ in range(self.n_agents)
-        ]
 
         # Add contact listener
         self.contact_listener = BoundaryContactListener()
@@ -96,6 +86,11 @@ class ScatterEnv(gym.Env):
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
         self.force_scale = 2.0  # Scale factor for visualizing forces
+        self.force_multiplier = 100.0  # Max force an agent can apply per axis
+        # Per-agent normal contact force against any object, averaged over the
+        # last physics step. Scatter has no objects/force listener, so this
+        # stays zero, but the shared ObservationManager reads it.
+        self.agent_contact_forces = np.zeros(self.n_agents, dtype=np.float32)
 
         # Velocity normalization constant (agents have linear damping=10.0,
         # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
@@ -107,21 +102,9 @@ class ScatterEnv(gym.Env):
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
 
-        # Add a field to track link openness for each agent
-        self.attach_values = np.zeros(
-            self.n_agents, dtype=np.int8
-        )  # Default to no attachment (0)
-
-        # Add a field to track detach values for each agent
-        self.detach_values = np.zeros(
-            self.n_agents, dtype=np.int8
-        )  # Default to 0 (no desire to detach)
-
         # Step tracking for truncation
         self.max_steps = max_steps
         self.current_step = 0
-
-        self.objects = []  # Track dynamic objects
 
         self.observation_manager = ObservationManager(self)
         self.renderer = Renderer(self)
@@ -217,15 +200,6 @@ class ScatterEnv(gym.Env):
     def _get_info(self, task_reward=0.0):
         """Build the info dictionary returned by reset() and step()."""
         return {
-            "target_positions": [
-                {
-                    "x": target.x,
-                    "y": target.y,
-                    "radius": target.radius,
-                    "requirement": target.coupling_requirement,
-                }
-                for target in self.target_areas
-            ],
             "agent_positions": [
                 {"x": ag.position.x, "y": ag.position.y} for ag in self.agents
             ],
@@ -251,7 +225,6 @@ class ScatterEnv(gym.Env):
 
         # Clear all body references
         self.agents.clear()
-        self.objects.clear()
         self.boundary_bodies.clear()
 
         # Recreate everything in the fresh world
@@ -277,7 +250,7 @@ class ScatterEnv(gym.Env):
         # PROCESS ENVIRONMENT ACTION
 
         # Apply movement forces
-        force_multiplier = 100.0
+        force_multiplier = self.force_multiplier
         for agent in self.agents:
             force_x = np.clip(movement_action[agent.index][0], -1, 1) * force_multiplier
             force_y = np.clip(movement_action[agent.index][1], -1, 1) * force_multiplier

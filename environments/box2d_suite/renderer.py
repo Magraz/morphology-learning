@@ -109,7 +109,8 @@ class Renderer:
 
     def _draw_dynamic_objects(self):
         """Draw the extra objects (Square, Triangle, Circle)"""
-        for body in self.env.objects:
+        # Not every env has dynamic objects — nothing to draw when absent.
+        for body in getattr(self.env, "objects", []):
             color = body.userData.get("color", (128, 128, 128))
 
             for fixture in body.fixtures:
@@ -243,11 +244,16 @@ class Renderer:
 
     def _draw_target_areas(self):
         """Draw target areas with their coupling requirements"""
+        # Not every env defines target areas — nothing to draw when absent.
+        target_areas = getattr(self.env, "target_areas", None)
+        if not target_areas:
+            return
+
         if self._target_font is None:
             pygame.font.init()
             self._target_font = pygame.font.SysFont("Arial", 14)
 
-        for area in self.env.target_areas:
+        for area in target_areas:
 
             # Check if it's our new ObjectTargetArea (has width/height)
             if hasattr(area, "width"):
@@ -374,11 +380,16 @@ class Renderer:
 
     def _draw_object_coupling(self):
         """Render the coupling requirement on top of each object."""
+        # Not every env has dynamic objects — nothing to render when absent.
+        objects = getattr(self.env, "objects", [])
+        if not objects:
+            return
+
         if self._coupling_font is None:
             pygame.font.init()
             self._coupling_font = pygame.font.SysFont("Arial", 20, bold=True)
 
-        for body in self.env.objects:
+        for body in objects:
             center_x = body.position.x * self.scale
             center_y = self.screen_size[1] - body.position.y * self.scale
 

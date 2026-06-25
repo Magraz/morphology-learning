@@ -182,6 +182,15 @@ def make_vec_env(
                     reward_mode=env_params.get("reward_mode"),
                 )
 
+            case EnvironmentEnum.PUSH_BOX:
+                from environments.box2d_suite.push_box import PushBoxEnv
+
+                return PushBoxEnv(
+                    n_agents=n_agents,
+                    render_mode=None,
+                    reward_mode=env_params.get("reward_mode"),
+                )
+
             case EnvironmentEnum.SCATTER:
                 from environments.box2d_suite.scatter import ScatterEnv
 
