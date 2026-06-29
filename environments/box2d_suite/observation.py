@@ -35,6 +35,9 @@ class ObservationManager:
     def __init__(self, env):
         self.env = env
 
+        # Scale sector sensor radius proportionally to world size
+        self.sector_sensor_radius = self.env.world_width / 3.0
+
     def _agent_object_distance(self, agent_pos, obj, obj_pos):
         """Compute the surface distance between an agent position and an object."""
         shape = obj.fixtures[0].shape
@@ -82,7 +85,9 @@ class ObservationManager:
         self._object_pos_cache = np.array(
             [[o.position.x, o.position.y] for o in self._objects],
             dtype=np.float32,
-        ).reshape(-1, 2)  # (n_objects, 2)
+        ).reshape(
+            -1, 2
+        )  # (n_objects, 2)
 
         # Derive all_states from cache (no separate position reads)
         center = np.array(
@@ -104,7 +109,7 @@ class ObservationManager:
 
         # Vectorized density sensors for all agents in one pass (replaces n_agents calls)
         all_density_sensors = self._calculate_density_sensors_all(
-            self.env.sector_sensor_radius
+            self.sector_sensor_radius
         )
 
         # Fraction of agents within neighbor_detection_range of each agent (incl. self)
@@ -115,7 +120,7 @@ class ObservationManager:
         # Lidar: nearest-obstacle distance along N evenly spaced rays per agent.
         all_lidar = self._calculate_lidar_all(
             getattr(self.env, "n_lidar_rays", N_LIDAR_RAYS),
-            getattr(self.env, "lidar_range", self.env.sector_sensor_radius),
+            getattr(self.env, "lidar_range", self.sector_sensor_radius),
         )
 
         # Goal-relative features (egocentric, so no absolute world anchor):

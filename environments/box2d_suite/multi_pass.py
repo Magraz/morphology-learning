@@ -127,7 +127,6 @@ class MultiPassEnv(gym.Env):
         self.agent_contact_forces = np.zeros(self.n_agents, dtype=np.float32)
 
         self.velocity_norm = self.world_width / 10.0
-        self.sector_sensor_radius = self.world_width / 3.0
         self.neighbor_detection_range = 3.0
 
         self.max_steps = max_steps

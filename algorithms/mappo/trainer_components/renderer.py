@@ -294,6 +294,17 @@ class PolicyRenderer:
                 render_env.envs[0].render_mode = "human"
                 return render_env
 
+            case EnvironmentEnum.PUSH_BOX:
+                render_env = make_vec_env(
+                    self.env_name,
+                    self.n_agents,
+                    1,
+                    use_async=True,
+                    env_params=self.env_params,
+                )
+                render_env.envs[0].render_mode = "human"
+                return render_env
+
             case EnvironmentEnum.SCATTER:
                 render_env = make_vec_env(
                     self.env_name,

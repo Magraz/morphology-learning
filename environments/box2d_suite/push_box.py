@@ -145,9 +145,6 @@ class PushBoxEnv(gym.Env):
         # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
         self.velocity_norm = self.world_width / 10.0
 
-        # Scale sector sensor radius proportionally to world size
-        self.sector_sensor_radius = self.world_width / 3.0
-
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
 
@@ -335,16 +332,12 @@ class PushBoxEnv(gym.Env):
         if self.goal_axis == "y":
             spawn_y = float(np.clip(a_coord, bt + hy, self.world_height - bt - hy))
             spawn_x = float(
-                self.np_random.uniform(
-                    bt + hx + 1.0, self.world_width - bt - hx - 1.0
-                )
+                self.np_random.uniform(bt + hx + 1.0, self.world_width - bt - hx - 1.0)
             )
         else:
             spawn_x = float(np.clip(a_coord, bt + hx, self.world_width - bt - hx))
             spawn_y = float(
-                self.np_random.uniform(
-                    bt + hy + 1.0, self.world_height - bt - hy - 1.0
-                )
+                self.np_random.uniform(bt + hy + 1.0, self.world_height - bt - hy - 1.0)
             )
 
         # Remember the center so the agent scatter can avoid overlapping it.

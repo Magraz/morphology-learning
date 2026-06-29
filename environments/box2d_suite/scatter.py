@@ -96,9 +96,6 @@ class ScatterEnv(gym.Env):
         # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
         self.velocity_norm = self.world_width / 10.0
 
-        # Scale sector sensor radius proportionally to world size
-        self.sector_sensor_radius = self.world_width / 3.0
-
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
 

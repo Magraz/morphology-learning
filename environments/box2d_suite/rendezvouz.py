@@ -109,9 +109,6 @@ class RendezvouzEnv(gym.Env):
         # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
         self.velocity_norm = self.world_width / 10.0
 
-        # Scale sector sensor radius proportionally to world size
-        self.sector_sensor_radius = self.world_width / 3.0
-
         # Clustering threshold: agents within this distance are "connected"
         self.cluster_threshold = 3.0
 

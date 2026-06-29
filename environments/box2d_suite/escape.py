@@ -152,7 +152,6 @@ class EscapeEnv(gym.Env):
         self.force_scale = 2.0
 
         self.velocity_norm = self.world_width / 10.0
-        self.sector_sensor_radius = self.world_width / 3.0
 
         self.max_joints_per_agent = max_joints_per_agent
         self.min_group_size = min_group_size

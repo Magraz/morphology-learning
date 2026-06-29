@@ -91,12 +91,21 @@ class ContactEnv(gym.Env):
 
         self._init_agents()
 
-        # Force tracking
+        # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
-        self.force_scale = 2.0
+        self.force_scale = 2.0  # Scale factor for visualizing forces
+        self.force_multiplier = 100.0  # Max force an agent can apply per axis
+        # Per-agent normal contact force against any object, averaged over the
+        # last physics step. Scatter has no objects/force listener, so this
+        # stays zero, but the shared ObservationManager reads it.
+        self.agent_contact_forces = np.zeros(self.n_agents, dtype=np.float32)
 
+        # Velocity normalization constant (agents have linear damping=10.0,
+        # so terminal velocity is bounded; world_width/10 keeps values ~[-1,1])
         self.velocity_norm = self.world_width / 10.0
-        self.sector_sensor_radius = self.world_width / 3.0
+
+        # Add parameters for nearest neighbor detection
+        self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
 
         self.max_steps = max_steps
         self.current_step = 0
@@ -105,10 +114,6 @@ class ContactEnv(gym.Env):
 
         # Reward state
         self.prev_n_touching = 0
-
-        # Renderer compatibility (no attachment mechanic — show agents as green)
-        self.attach_values = np.ones(self.n_agents, dtype=np.int8)
-        self.detach_values = np.zeros(self.n_agents, dtype=np.int8)
 
         self.observation_manager = ObservationManager(self)
         self.renderer = Renderer(self)
