@@ -143,6 +143,106 @@ class PettingZooToGymWrapper(gym.Env):
         self.env.close()
 
 
+def make_single_env(
+    env_name: EnvironmentEnum,
+    n_agents: int,
+    env_params: dict = None,
+):
+    """Create a single (non-vectorized) environment instance.
+
+    Shared by ``make_vec_env``'s per-env factory and by the hierarchical
+    wrapper, which needs to build its base env from the same construction logic.
+    """
+    match env_name:
+        case EnvironmentEnum.BOX2D_SALP:
+            from environments.box2d_salp.domain import SalpChainEnv
+
+            return SalpChainEnv(n_agents=n_agents, render_mode=None)
+
+        case EnvironmentEnum.MULTI_BOX:
+            from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
+
+            return MultiBoxPushEnv(
+                n_agents=n_agents,
+                n_objects=env_params.get("n_objects"),
+                render_mode=None,
+                reward_mode=env_params.get("reward_mode"),
+            )
+
+        case EnvironmentEnum.PUSH_BOX:
+            from environments.box2d_suite.push_box import PushBoxEnv
+
+            return PushBoxEnv(
+                n_agents=n_agents,
+                render_mode=None,
+                reward_mode=env_params.get("reward_mode"),
+            )
+
+        case EnvironmentEnum.SCATTER:
+            from environments.box2d_suite.scatter import ScatterEnv
+
+            return ScatterEnv(
+                n_agents=n_agents,
+                render_mode=None,
+            )
+
+        case EnvironmentEnum.RENDEZVOUZ:
+            from environments.box2d_suite.rendezvouz import RendezvouzEnv
+
+            return RendezvouzEnv(
+                n_agents=n_agents,
+                render_mode=None,
+            )
+
+        case EnvironmentEnum.CONTACT:
+            from environments.box2d_suite.contact import ContactEnv
+
+            return ContactEnv(
+                n_agents=n_agents,
+                render_mode=None,
+            )
+
+        case EnvironmentEnum.HRL_SKILL:
+            from algorithms.hierarchical.hrl_env import HierarchicalSkillEnv
+
+            return HierarchicalSkillEnv(env_params=env_params)
+
+        case EnvironmentEnum.MPE_SPREAD:
+            from mpe2 import simple_spread_v3
+
+            pz_env = simple_spread_v3.parallel_env(
+                N=n_agents,
+                local_ratio=0.5,
+                max_cycles=25,
+                continuous_actions=False,
+                dynamic_rescaling=True,
+                render_mode=None,
+            )
+            # Wrap PettingZoo env to make it Gymnasium-compatible
+            return PettingZooToGymWrapper(pz_env)
+
+        case EnvironmentEnum.MPE_SIMPLE:
+            from mpe2 import simple_v3
+
+            pz_env = simple_v3.parallel_env(
+                max_cycles=25,
+                continuous_actions=False,
+                render_mode=None,
+            )
+            # Wrap PettingZoo env to make it Gymnasium-compatible
+            return PettingZooToGymWrapper(pz_env)
+
+        case EnvironmentEnum.SMACV2:
+            from environments.smacv2.wrapper import SMACv2ToGymWrapper
+
+            return SMACv2ToGymWrapper(map_name=env_params.get("env_variant"))
+
+        case EnvironmentEnum.SMACLITE:
+            from environments.smaclite.wrapper import SmacliteToGymWrapper
+
+            return SmacliteToGymWrapper(map_name=env_params.get("env_variant"))
+
+
 def make_vec_env(
     env_name: EnvironmentEnum,
     n_agents: int,
@@ -166,97 +266,21 @@ def make_vec_env(
     # Create factory functions that return NEW environment instances
     def make_env_fn():
         """Factory function that creates a new environment instance"""
-        match env_name:
-            case EnvironmentEnum.BOX2D_SALP:
-                from environments.box2d_salp.domain import SalpChainEnv
-
-                return SalpChainEnv(n_agents=n_agents, render_mode=None)
-
-            case EnvironmentEnum.MULTI_BOX:
-                from environments.box2d_suite.multi_box_push import MultiBoxPushEnv
-
-                return MultiBoxPushEnv(
-                    n_agents=n_agents,
-                    n_objects=env_params.get("n_objects"),
-                    render_mode=None,
-                    reward_mode=env_params.get("reward_mode"),
-                )
-
-            case EnvironmentEnum.PUSH_BOX:
-                from environments.box2d_suite.push_box import PushBoxEnv
-
-                return PushBoxEnv(
-                    n_agents=n_agents,
-                    render_mode=None,
-                    reward_mode=env_params.get("reward_mode"),
-                )
-
-            case EnvironmentEnum.SCATTER:
-                from environments.box2d_suite.scatter import ScatterEnv
-
-                return ScatterEnv(
-                    n_agents=n_agents,
-                    render_mode=None,
-                )
-
-            case EnvironmentEnum.RENDEZVOUZ:
-                from environments.box2d_suite.rendezvouz import RendezvouzEnv
-
-                return RendezvouzEnv(
-                    n_agents=n_agents,
-                    render_mode=None,
-                )
-
-            case EnvironmentEnum.CONTACT:
-                from environments.box2d_suite.contact import ContactEnv
-
-                return ContactEnv(
-                    n_agents=n_agents,
-                    render_mode=None,
-                )
-
-            case EnvironmentEnum.MPE_SPREAD:
-                from mpe2 import simple_spread_v3
-
-                pz_env = simple_spread_v3.parallel_env(
-                    N=n_agents,
-                    local_ratio=0.5,
-                    max_cycles=25,
-                    continuous_actions=False,
-                    dynamic_rescaling=True,
-                    render_mode=None,
-                )
-                # Wrap PettingZoo env to make it Gymnasium-compatible
-                return PettingZooToGymWrapper(pz_env)
-
-            case EnvironmentEnum.MPE_SIMPLE:
-                from mpe2 import simple_v3
-
-                pz_env = simple_v3.parallel_env(
-                    max_cycles=25,
-                    continuous_actions=False,
-                    render_mode=None,
-                )
-                # Wrap PettingZoo env to make it Gymnasium-compatible
-                return PettingZooToGymWrapper(pz_env)
-
-            case EnvironmentEnum.SMACV2:
-                from environments.smacv2.wrapper import SMACv2ToGymWrapper
-
-                return SMACv2ToGymWrapper(map_name=env_params.get("env_variant"))
-
-            case EnvironmentEnum.SMACLITE:
-                from environments.smaclite.wrapper import SmacliteToGymWrapper
-
-                return SmacliteToGymWrapper(map_name=env_params.get("env_variant"))
+        return make_single_env(env_name, n_agents, env_params)
 
     # Create list of factory functions (not environment instances!)
     env_fns = [make_env_fn for _ in range(n_envs)]
 
     # Create vectorized environment using Gymnasium's API
     if use_async and n_envs > 1:
+        # The hierarchical wrapper loads torch skill actors inside each worker.
+        # The default "fork" start method deadlocks when torch is used in a
+        # forked child (inherited OpenMP/thread state); "forkserver" spawns the
+        # workers from a clean server process, avoiding it. Other envs never
+        # touch torch in the worker, so they keep the default.
+        context = "forkserver" if env_name == EnvironmentEnum.HRL_SKILL else None
         # AsyncVectorEnv runs environments in parallel using multiprocessing
-        return AsyncVectorEnv(env_fns)
+        return AsyncVectorEnv(env_fns, context=context)
     else:
         # SyncVectorEnv runs environments sequentially (useful for debugging)
         return SyncVectorEnv(env_fns)

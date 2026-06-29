@@ -23,5 +23,7 @@ class EnvironmentEnum(StrEnum):
     CONTACT = "contact"
     SMACV2 = "smacv2"
     SMACLITE = "smaclite"
+    # Hierarchical macro-action controller over frozen low-level skills
+    HRL_SKILL = "hrl_skill"
     # JAXMARL
     SMAX = "SMAX"

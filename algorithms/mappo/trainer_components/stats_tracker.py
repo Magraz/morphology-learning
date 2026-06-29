@@ -17,6 +17,7 @@ class TrainingStatsTracker:
             self.training_stats["reward"] = []
             self.training_stats["intrinsic_reward"] = []
             self.training_stats["extrinsic_reward"] = []
+            self.training_stats["action_distribution"] = []
             self.training_stats["episodes"] = []
             self.training_stats["training_time"] = []
             self.training_stats["collection_time"] = []
@@ -63,6 +64,7 @@ class TrainingStatsTracker:
         eval_time: float,
         intrinsic_reward: float = 0.0,
         extrinsic_reward: float = 0.0,
+        action_distribution: list | None = None,
     ) -> float:
         elapsed_time = time.time() - self.training_start_time
         self.total_training_time = elapsed_time
@@ -71,6 +73,10 @@ class TrainingStatsTracker:
         self.training_stats["reward"].append(reward)
         self.training_stats["intrinsic_reward"].append(intrinsic_reward)
         self.training_stats["extrinsic_reward"].append(extrinsic_reward)
+        # Only recorded for discrete-action runs (e.g. the hierarchical skill
+        # selector); left empty for continuous envs to keep the series clean.
+        if action_distribution is not None:
+            self.training_stats["action_distribution"].append(action_distribution)
         self.training_stats["episodes"].append(episodes_completed)
         self.training_stats["training_time"].append(elapsed_time)
         self.training_stats["collection_time"].append(collection_time)
@@ -85,6 +91,9 @@ class TrainingStatsTracker:
         self.training_stats["reward"] = stats.get("reward", [])
         self.training_stats["intrinsic_reward"] = stats.get("intrinsic_reward", [])
         self.training_stats["extrinsic_reward"] = stats.get("extrinsic_reward", [])
+        self.training_stats["action_distribution"] = stats.get(
+            "action_distribution", []
+        )
         self.training_stats["episodes"] = stats.get("episodes", [])
         self.training_stats["training_time"] = stats.get("training_time", [])
         self.training_stats["collection_time"] = stats.get("collection_time", [])

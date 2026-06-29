@@ -23,6 +23,10 @@ class RolloutResult:
     # ``mean_extrinsic_reward`` is the raw environment reward over the same steps.
     mean_intrinsic_reward: float = 0.0
     mean_extrinsic_reward: float = 0.0
+    # Normalized frequency of each discrete action over the rollout (length
+    # n_actions, sums to 1). For the hierarchical controller these are the
+    # skill-selection fractions. None for continuous-action envs.
+    action_distribution: list | None = None
 
 
 class RolloutCollector:
@@ -46,6 +50,17 @@ class RolloutCollector:
         self.discrete = discrete
         self.entropy_conditioning = entropy_conditioning
         self.hypergraph_runtime = hypergraph_runtime
+
+        # Number of discrete actions, for the per-rollout action/skill histogram.
+        # Read from the env's action space (MultiDiscrete -> nvec[0], else n).
+        self.n_actions = None
+        if self.discrete:
+            act_space = self.vec_env.single_action_space
+            nvec = getattr(act_space, "nvec", None)
+            if nvec is not None:
+                self.n_actions = int(np.asarray(nvec).reshape(-1)[0])
+            elif hasattr(act_space, "n"):
+                self.n_actions = int(act_space.n)
 
         # Coordination-graph novelty exploration. A single batched episodic k-NN
         # rewarder scores all streams at once: one stream per env ("team") or per
@@ -92,6 +107,14 @@ class RolloutCollector:
         intrinsic_reward_sum = 0.0
         extrinsic_reward_sum = 0.0
         reward_step_count = 0
+
+        # Per-rollout histogram of selected discrete actions (= skills for the
+        # hierarchical controller), summed over all envs/agents/steps.
+        action_counts = (
+            np.zeros(self.n_actions, dtype=np.int64)
+            if self.n_actions
+            else None
+        )
 
         self.agent.reset_obs_history()
         critic_obs_history = None
@@ -160,6 +183,10 @@ class RolloutCollector:
                 if actions_array.ndim == 3 and actions_array.shape[-1] == 1:
                     actions_array = actions_array.squeeze(-1)
                 actions_array = actions_array.astype(np.int32)
+                if action_counts is not None:
+                    action_counts += np.bincount(
+                        actions_array.ravel(), minlength=self.n_actions
+                    )[: self.n_actions]
 
             _env_t0 = time.perf_counter()
             next_obs, rewards, terminateds, truncateds, infos = self.vec_env.step(
@@ -225,6 +252,12 @@ class RolloutCollector:
 
         final_values = self._compute_final_values(obs, infos, batch_size)
 
+        action_distribution = None
+        if action_counts is not None:
+            total = int(action_counts.sum())
+            if total > 0:
+                action_distribution = (action_counts / total).tolist()
+
         denom = max(reward_step_count, 1)
         return RolloutResult(
             step_count=total_step_count,
@@ -233,6 +266,7 @@ class RolloutCollector:
             env_time=env_time,
             mean_intrinsic_reward=intrinsic_reward_sum / denom,
             mean_extrinsic_reward=extrinsic_reward_sum / denom,
+            action_distribution=action_distribution,
         )
 
     def _get_team_intrinsic_rewards(self, next_obs, dones) -> np.ndarray:

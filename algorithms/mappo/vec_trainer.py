@@ -37,6 +37,7 @@ class VecMAPPOTrainer:
         self.device = device
         self.dirs = dirs
         self.params = params
+        self.environment = env_params.get("environment")
         self.critic_type = model_params.critic_type
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_conditioning = model_params.entropy_conditioning
@@ -60,7 +61,12 @@ class VecMAPPOTrainer:
         obs_space = self.vec_env.single_observation_space
         act_space = self.vec_env.single_action_space
         observation_dim = obs_space.shape[1]
-        global_state_dim = observation_dim * env_params.get("n_agents")
+        # Number of *learning* (high-level) agents comes from the env's
+        # observation space, not the batch yaml. For ordinary envs this equals
+        # env_params["n_agents"]; for the hierarchical team scope it is 1 (a
+        # single high-level controller) while the base env still has many agents.
+        n_agents = obs_space.shape[0]
+        global_state_dim = observation_dim * n_agents
 
         if isinstance(act_space, gym.spaces.MultiDiscrete):
             action_dim = int(act_space.nvec[0])
@@ -72,6 +78,7 @@ class VecMAPPOTrainer:
             EnvironmentEnum.MPE_SIMPLE,
             EnvironmentEnum.SMACV2,
             EnvironmentEnum.SMACLITE,
+            EnvironmentEnum.HRL_SKILL,
         ]
         hyperedge_fns = None
         uses_hypergraph_critic = self.critic_type in (
@@ -108,7 +115,7 @@ class VecMAPPOTrainer:
             observation_dim,
             global_state_dim,
             action_dim,
-            env_params.get("n_agents"),
+            n_agents,
             self.params,
             self.device,
             self.discrete,
@@ -136,7 +143,7 @@ class VecMAPPOTrainer:
             vec_env=self.vec_env,
             agent=self.agent,
             device=self.device,
-            n_agents=env_params.get("n_agents"),
+            n_agents=n_agents,
             n_parallel_envs=env_params.get("n_envs"),
             discrete=self.discrete,
             entropy_conditioning=self.entropy_conditioning,
@@ -164,6 +171,27 @@ class VecMAPPOTrainer:
     @property
     def training_stats(self):
         return self.stats_tracker.training_stats
+
+    def _format_action_distribution(self, dist) -> str:
+        """Render the per-rollout action/skill distribution for the log line.
+
+        For the hierarchical controller the action indices are skills, so label
+        them with ``SKILL_ORDER`` names; otherwise show indexed fractions.
+        Returns "" for continuous-action runs (dist is None).
+        """
+        if not dist:
+            return ""
+        if self.environment == EnvironmentEnum.HRL_SKILL:
+            from algorithms.hierarchical.skills import SKILL_ORDER
+
+            labels = SKILL_ORDER
+            body = " ".join(
+                f"{(labels[i] if i < len(labels) else i)}={p:.2f}"
+                for i, p in enumerate(dist)
+            )
+            return f"Skills: {body} | "
+        body = " ".join(f"{i}:{p:.2f}" for i, p in enumerate(dist))
+        return f"Actions: {body} | "
 
     def _get_total_memory_mb(self):
         """Return RSS for the trainer process and all live child processes."""
@@ -238,6 +266,7 @@ class VecMAPPOTrainer:
                 eval_time=eval_time,
                 intrinsic_reward=rollout.mean_intrinsic_reward,
                 extrinsic_reward=rollout.mean_extrinsic_reward,
+                action_distribution=rollout.action_distribution,
             )
 
             steps_per_second = steps_completed / elapsed_time if elapsed_time > 0 else 0
@@ -250,11 +279,15 @@ class VecMAPPOTrainer:
                     if self.agent.use_intrinsic_reward
                     else ""
                 )
+                skill_str = self._format_action_distribution(
+                    rollout.action_distribution
+                )
                 print(
                     f"Steps: {steps_completed}/{total_steps} ({steps_completed/total_steps*100:.1f}%) | "
                     f"Episodes: {episodes_completed} | "
                     f"Reward: {self.training_stats['reward'][-1]:.2f} | "
                     f"{intrinsic_str}"
+                    f"{skill_str}"
                     f"Time: {elapsed_time:.1f}s | "
                     f"FPS: {steps_per_second:.1f} | "
                     f"Mem: {mem:.0f}MB | "
