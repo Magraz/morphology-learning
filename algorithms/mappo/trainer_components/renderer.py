@@ -335,6 +335,23 @@ class PolicyRenderer:
                 render_env.envs[0].render_mode = "human"
                 return render_env
 
+            case EnvironmentEnum.HRL_SKILL:
+                # n_envs=1 yields a SyncVectorEnv (built in-process, no
+                # forkserver) so the obs is batched to (1, n_agents, obs_dim) —
+                # the shape get_actions_batched expects. Flip the wrapper's base
+                # env into human render mode; the box2d renderer only checks
+                # render_mode at draw time, so setting it after construction is
+                # enough.
+                render_env = make_vec_env(
+                    self.env_name,
+                    self.n_agents,
+                    1,
+                    use_async=True,
+                    env_params=self.env_params,
+                )
+                render_env.envs[0].base_env.render_mode = "human"
+                return render_env
+
             case EnvironmentEnum.MPE_SPREAD:
                 from mpe2 import simple_spread_v3
                 from algorithms.create_env import PettingZooToGymWrapper

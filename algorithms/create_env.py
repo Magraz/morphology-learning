@@ -242,6 +242,13 @@ def make_single_env(
 
             return SmacliteToGymWrapper(map_name=env_params.get("env_variant"))
 
+        case _:
+            valid = ", ".join(e.value for e in EnvironmentEnum)
+            raise ValueError(
+                f"Unknown environment {env_name!r}. "
+                f"Pass --environment as one of: {valid}."
+            )
+
 
 def make_vec_env(
     env_name: EnvironmentEnum,

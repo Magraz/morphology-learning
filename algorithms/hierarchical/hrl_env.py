@@ -129,6 +129,7 @@ class HierarchicalSkillEnv(gym.Env):
         terminated = False
         truncated = False
         info = {}
+        render_human = getattr(self.base_env, "render_mode", None) == "human"
         for _ in range(self.macro_len):
             low_level_actions = self._low_level_actions(skill_idx)
             obs, reward, terminated, truncated, info = self.base_env.step(
@@ -136,6 +137,11 @@ class HierarchicalSkillEnv(gym.Env):
             )
             self._last_obs = np.asarray(obs)
             total_reward += reward
+            # Draw every low-level step so the human window shows each physics
+            # step at the renderer's fps, instead of one frame per macro-action
+            # (which made the motion look ~macro_len times too fast).
+            if render_human:
+                self.base_env.render()
             if terminated or truncated:
                 break
 
