@@ -23,6 +23,11 @@ def run_algorithm(
     with open(batch_file, "r") as file:
         batch_config = yaml.safe_load(file)
 
+    # A batch is tied to the algorithm/environment it was built for, so it may
+    # declare them as defaults. Explicit CLI values still win when provided.
+    algorithm = algorithm or batch_config.get("algorithm", "")
+    environment = environment or batch_config.get("environment", "")
+
     env_config = batch_config.get("env", {})
     random_seeds = batch_config.get("random_seeds")
 
@@ -32,7 +37,7 @@ def run_algorithm(
     exp_file = batch_dir / f"{experiment_name}.yaml"
 
     with open(exp_file, "r") as file:
-        exp_dict = yaml.unsafe_load(file)
+        exp_dict = yaml.safe_load(file)
 
     # Random seeds are shared across the whole batch, so they live in the batch
     # config. Inject them into each experiment's params (overriding any
@@ -78,6 +83,21 @@ def run_algorithm(
 
             exp_config = MAPPO_JAX_Experiment(**exp_dict)
             runner = MAPPO_JAX_Runner(
+                exp_config.device,
+                batch_dir,
+                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
+        case AlgorithmEnum.DCG:
+            from algorithms.dcg.run import DCG_Runner
+            from algorithms.dcg.types import Experiment as DCG_Experiment
+
+            exp_config = DCG_Experiment(**exp_dict)
+            runner = DCG_Runner(
                 exp_config.device,
                 batch_dir,
                 (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),

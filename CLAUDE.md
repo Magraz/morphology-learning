@@ -2,6 +2,17 @@ Whenever building new code, try to reuse as much code as possible. If the new fu
 
 Always keep the CLAUDE.md file up to date to reflect the current functionality and architecture of the code.
 
+## Experiment config loading (`run_algorithm` in `algorithms/algorithms.py`)
+
+Each batch dir under `experiments/yamls/<batch>/` has a `_batch.yaml` (env block
++ optional `random_seeds`) and one named experiment yaml per variant. The loader:
+
+- Reads both with `yaml.safe_load` (no `!!python` tags are used anywhere).
+- `_batch.yaml` may declare top-level `algorithm:` / `environment:` defaults so a
+  batch records the algorithm/env it was built for. `run_trial.py --algorithm` /
+  `--environment` still override when passed; otherwise the batch defaults are
+  used. Populated for the `9a`/`dcg` batches.
+
 ## Box2D suite observations
 
 All `environments/box2d_suite` envs share `ObservationManager.get_observation`
@@ -148,6 +159,64 @@ SDL_VIDEODRIVER=dummy python -m algorithms.tests.visualize_coordination_graph \
 
 Plan: `plans/coordination_graph_novelty.md`.
 
+## Hierarchical macro-action controller (`algorithms/hierarchical/`)
+
+A high-level policy that, instead of emitting low-level forces, **selects which
+of 4 frozen pre-trained skills to run** as a fixed-duration macro-action. The
+controller is trained with the ordinary MAPPO stack — the trick is a gym wrapper
+that makes "pick a skill, run it for K steps" look like one discrete env step.
+
+- **Skills** (`skills.py`). A skill is a frozen, eval-mode `MAPPOActor`. The 4
+  box2d tasks share `ObservationManager`, so every skill actor takes the same
+  `obs_dim=40` local obs and emits the same `action_dim=2` force; only their
+  critics differ (unused — we run actors only). `load_skill_actor` reads
+  `checkpoint["network"]`, keeps the `"actor."`-prefixed keys (strip one prefix:
+  `actor.actor.0.weight -> actor.0.weight`) and loads them into a fresh
+  `MAPPOActor`. **Architecture (in/hidden/out) is inferred from the weights, not
+  the yaml** — the pre-trained `mlp_shared` actors use hidden=183, not
+  `Model_Params.hidden_dim=168`. `SKILL_ORDER = [contact, scatter, push_box,
+  rendezvouz]` fixes the discrete action index → skill mapping;
+  `resolve_skill_checkpoint` prefers `models_finished.pth`, falling back to
+  `models_checkpoint.pth` (e.g. `scatter_9a` only ships the checkpoint).
+- **Wrapper** (`hrl_env.py`). `HierarchicalSkillEnv(gym.Env)` builds a base env
+  via the shared `make_single_env` factory and loads the 4 skills once.
+  `decision_scope`:
+  - `"agent"`: each agent picks its own skill. Obs `(n_agents, 40)`, action
+    `MultiDiscrete([4]*n_agents)`.
+  - `"team"`: one skill for all agents. Obs `(1, n_agents*40)` (flattened team
+    state), action `MultiDiscrete([4])` → a single high-level agent.
+  Each `step` runs the chosen skill(s) for `macro_len` (default 10) low-level
+  steps — agents sharing a skill are batched through that actor in one forward —
+  accumulating reward and stopping early on done. `torch.set_num_threads(1)` per
+  worker.
+- **Wiring.** `EnvironmentEnum.HRL_SKILL = "hrl_skill"`; `make_single_env`
+  (factored out of `make_vec_env`'s closure so the wrapper can reuse it) builds
+  the wrapper. `make_vec_env` launches HRL workers with the **`forkserver`** MP
+  start method — the default `fork` deadlocks when each worker `torch.load`s
+  models (inherited OpenMP/thread state); other envs keep `fork`. `forkserver`
+  re-imports the entry module, so HRL training **must** be launched under an
+  `if __name__ == '__main__':` guard (`run_trial.py` already is).
+  `vec_trainer` adds `HRL_SKILL` to its discrete list and derives the *learning*
+  agent count from `obs_space.shape[0]` (1 for team scope, n_agents otherwise) —
+  behavior-preserving for normal envs where that equals `env_params["n_agents"]`.
+- **Config.** Batches `experiments/yamls/hrl_{agent,team}_multi_box_push_9a/`
+  carry the macro knobs in the `_batch.yaml` `env:` block (`base_environment`,
+  `decision_scope`, `macro_len`, `skill_experiment`, `skill_trial`); the
+  `mlp_shared.yaml` is a standard discrete-MAPPO config. Run with:
+  ```
+  python run_trial.py --batch hrl_agent_multi_box_push_9a --name mlp_shared \
+      --algorithm mappo --environment hrl_skill --trial_id 0
+  ```
+- **Skill-selection logging.** `RolloutCollector` tallies the chosen discrete
+  actions over each rollout (`np.bincount`) and returns a normalized
+  `action_distribution` on `RolloutResult`; `vec_trainer` records it into
+  `training_stats["action_distribution"]` (one fractions-vector per iteration,
+  recorded only for discrete runs) and prints it on the log line — labeled with
+  `SKILL_ORDER` names for HRL (`Skills: contact=0.19 scatter=0.25 ...`) via
+  `_format_action_distribution`. Use it to watch the controller specialize off a
+  uniform `1/n` split. Generic to any discrete env (shown as `Actions: i:p`).
+- Plan: `plans/now-i-want-you-wise-graham.md`.
+
 ## Hypergraph backend: `dhg` shim (`hypergraphs/hg_compat.py`)
 
 The upstream `dhg` (DeepHypergraph) package pins `torch<2`, which blocked
@@ -176,3 +245,64 @@ everywhere as `import hypergraphs.hg_compat as dhg`.
 - NOT ported: `hypergraphs/hypegraph_training.py`, a standalone Cora/GCN demo
   that uses `dhg.models.GCN` / `dhg.data.Cora` / `dhg.metrics`. It is not part
   of the MAPPO runtime and still requires the real `dhg` to run.
+
+## DCG coordination-graph algorithm (`algorithms/dcg/`)
+
+DCG (Deep Coordination Graph, Böhmer et al. 2020) is integrated as a first-class
+algorithm alongside MAPPO/IPPO: launch it with `run_trial.py --algorithm dcg`
+(`AlgorithmEnum.DCG`, dispatched in `algorithms/algorithms.py`). Unlike MAPPO's
+on-policy vectorized PPO, DCG is **off-policy episodic Q-learning** — RNN feature
+agents → per-agent utility `f_i` and per-edge payoff `f_ij` nets → max-sum
+message passing over a coordination graph → double-Q TD targets from an episode
+replay buffer.
+
+- **Vendored core + adapter.** The upstream PyMARL project lives unmodified
+  under `algorithms/dcg/src` (controller `controllers/dcg_controller.py`,
+  learner `learners/dcg_learner.py`, `components/episode_buffer.py`, action
+  selectors, `modules/agents/rnn_feature_agent.py`, mixers). The framework
+  adapter wraps it: `types.py` (dataclasses `DCG_Params` / `DCG_Model_Params` /
+  `Experiment`), `args_builder.py` (translates the dataclasses + env dims into
+  the flat `args` namespace the vendored modules read — the single config
+  bridge), `logger_shim.py` (a `log_stat`/`console_logger` stand-in for Sacred),
+  `trainer.py` (`DCGTrainer`), and `run.py` (`DCG_Runner(Runner)`). `_vendor.py`
+  puts `src/` on `sys.path` so `from controllers.dcg_controller import ...`
+  resolves (no repo-root name collisions). The `controllers/__init__.py` and
+  `learners/__init__.py` registries were trimmed to the DCG stack; the alt
+  controllers/learners (`cg_mac`, `low_rank_q`, `coma`, `qtran`) are still
+  vendored but unregistered (out of scope, and some need `torch_scatter`).
+- **Discrete envs only.** DCG requires a `MultiDiscrete` action space +
+  available-action masks. It targets the SMAC-style envs (`smaclite`,
+  `smacv2`), whose gym wrappers already surface `info["avail_actions"]`
+  `(n_envs, n_agents, n_actions)`. Continuous box2d envs are unsupported
+  (`DCGTrainer.__init__` raises on a non-discrete action space). Global state is
+  the concatenation of per-agent obs (`obs_dim * n_agents`), matching MAPPO;
+  only the optional duelling bias / mixers consume it.
+- **`torch_scatter` removed.** `dcg_controller.py`'s 3 `scatter_add` sites now
+  use a native-torch `_scatter_add` helper (`out.scatter_add_` with a broadcast
+  index), dropping the compiled, version-pinned dependency — same motivation as
+  the `dhg` shim. Verified numerically against a reference. The vendored
+  `episode_buffer._parse_slices` now returns a tuple (torch>=2 deprecates
+  list-of-slices tensor indexing).
+- **Collection loop** (`DCGTrainer._collect`) replaces PyMARL's
+  `parallel_runner`: it drives a gym `AsyncVectorEnv` (built by the shared
+  `make_vec_env`) in lockstep, packing transitions into DCG's `EpisodeBatch`
+  (shape `(n_envs, episode_limit+1)`). Each env is **frozen on its first
+  done**; the stored `terminated` field is the gym `terminated` flag only, so a
+  time-limit `truncated` keeps `terminated=0` and its TD target still bootstraps
+  (PyMARL semantics). Under Gymnasium's default `NEXT_STEP` autoreset the
+  terminal observation is returned at the done step, so the stored next state is
+  correct. Frozen envs still get stepped (the vector API requires it) with a
+  valid fallback action (`cur_avail.argmax`) — a dummy `0` would be an illegal
+  action once a frozen env auto-resets into a fresh live episode.
+- **Checkpoint / stats.** `save_agent`/`load_agent` write a single `.pth`
+  (agent + utility/payoff nets + optimiser + RNG) as `models_finished.pth` /
+  `models_checkpoint.pth`; `_StatsBook` pickles `training_stats_*.pkl`.
+  `--checkpoint` resumes from the last saved step (verified).
+- **Config.** `experiments/yamls/dcg_smaclite_2s3z/` — `_batch.yaml` (env block +
+  `random_seeds`) and `dcg.yaml` (params + model_params); `dcg_test.yaml` is a
+  tiny fast-run variant. Launch:
+  ```
+  python run_trial.py --batch dcg_smaclite_2s3z --name dcg \
+      --algorithm dcg --environment smaclite --trial_id 0
+  ```
+- Plan: `plans/okay-the-following-is-composed-truffle.md`.

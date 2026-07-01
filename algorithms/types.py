@@ -6,4 +6,5 @@ class AlgorithmEnum(StrEnum):
     PPO = "ppo"
     MAPPO = "mappo"
     MAPPO_JAX = "mappo_jax"
+    DCG = "dcg"
     TD3 = "td3"
