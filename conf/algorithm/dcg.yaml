@@ -1,0 +1,25 @@
+# @package _global_
+# DCG (Deep Coordination Graph) base params. Off-policy episodic Q-learning;
+# discrete envs only (smaclite/smacv2). The model group (conf/model/dcg.yaml)
+# supplies model_params; the env group publishes environment/env_variant.
+algorithm: dcg
+params:
+  n_total_steps: 2000000
+  buffer_size: 32
+  batch_size: 8
+  lr: 0.0005
+  optim_alpha: 0.99
+  optim_eps: 0.00001
+  gamma: 0.99
+  grad_norm_clip: 10.0
+  double_q: true
+  target_update_interval: 200
+  epsilon_start: 1.0
+  epsilon_finish: 0.05
+  epsilon_anneal_time: 50000
+  episode_limit: 200
+  test_interval: 20000
+  test_nepisode: 20
+  save_model_interval: 200000
+  log_interval: 5000
+  learner_log_interval: 10000

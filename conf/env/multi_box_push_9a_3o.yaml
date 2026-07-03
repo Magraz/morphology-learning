@@ -1,0 +1,16 @@
+# @package _global_
+env:
+  name: multi_box_push
+  # n_envs is set centrally in conf/config.yaml (autoscales to usable_cores //
+  # n_jobs) and wins over this group via `_self_`; pin a fixed count on the CLI
+  # with `env.n_envs=<N>`.
+  n_agents: 9
+  n_objects: 3
+  reward_mode: dense
+params:
+  batch_size: 10240             # env-scoped; merges over the algorithm defaults
+  val_coef: 0.8                 # box2d uses 0.8 (dataclass default is 0.5)
+hyperedges:                     # interpolation source for predefined-hgnn model files
+  proximity: [proximity]
+  contact: [contact]
+  mix: [proximity, contact]

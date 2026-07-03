@@ -1,0 +1,6 @@
+# @package _global_
+model_params:
+  critic_type: gnn
+  use_intrinsic_reward: true
+  intrinsic_reward_mode: agent
+  intrinsic_reward_coef: 0.1

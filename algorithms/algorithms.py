@@ -1,49 +1,27 @@
-import yaml
 from pathlib import Path
 
 from algorithms.types import AlgorithmEnum
 
 
-def run_algorithm(
-    batch_dir: Path,
-    batch_name: str,
-    experiment_name: str,
+def _dispatch(
     algorithm: str,
-    environment: str,
+    exp_dict: dict,
+    env_config: dict,
+    batch_dir: Path,
+    results_dir: Path,
     trial_id: str,
     view: bool = False,
     checkpoint: bool = False,
     evaluate: bool = False,
 ):
+    """Build the per-algorithm Experiment + Runner and run it.
 
-    # Load batch config. The env config is nested under an `env:` block and the
-    # batch-wide `random_seeds` live at the top level.
-    batch_file = batch_dir / "_batch.yaml"
-
-    with open(batch_file, "r") as file:
-        batch_config = yaml.safe_load(file)
-
-    # A batch is tied to the algorithm/environment it was built for, so it may
-    # declare them as defaults. Explicit CLI values still win when provided.
-    algorithm = algorithm or batch_config.get("algorithm", "")
-    environment = environment or batch_config.get("environment", "")
-
-    env_config = batch_config.get("env", {})
-    random_seeds = batch_config.get("random_seeds")
-
-    env_config["environment"] = environment
-
-    # Load experiment config
-    exp_file = batch_dir / f"{experiment_name}.yaml"
-
-    with open(exp_file, "r") as file:
-        exp_dict = yaml.safe_load(file)
-
-    # Random seeds are shared across the whole batch, so they live in the batch
-    # config. Inject them into each experiment's params (overriding any
-    # per-experiment value) so the runners can keep reading params.random_seeds.
-    if random_seeds is not None:
-        exp_dict.setdefault("params", {})["random_seeds"] = random_seeds
+    The single dispatch tail behind the Hydra entry point (`train.py`).
+    `batch_dir` is only used by the runners for `combined_affinities` checkpoint
+    resolution (`batch_dir.parents[1]/results`); `results_dir` is the runner's
+    `trials_dir` (`results/<batch>/<name>`), under which it writes
+    `<trial_id>/{logs,models,videos}`.
+    """
 
     match (algorithm):
 
@@ -55,7 +33,7 @@ def run_algorithm(
             runner = IPPO_Runner(
                 exp_config.device,
                 batch_dir,
-                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                results_dir,
                 trial_id,
                 checkpoint,
                 exp_config,
@@ -70,7 +48,7 @@ def run_algorithm(
             runner = MAPPO_Runner(
                 exp_config.device,
                 batch_dir,
-                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                results_dir,
                 trial_id,
                 checkpoint,
                 exp_config,
@@ -85,7 +63,7 @@ def run_algorithm(
             runner = MAPPO_JAX_Runner(
                 exp_config.device,
                 batch_dir,
-                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                results_dir,
                 trial_id,
                 checkpoint,
                 exp_config,
@@ -100,7 +78,7 @@ def run_algorithm(
             runner = DCG_Runner(
                 exp_config.device,
                 batch_dir,
-                (Path(batch_dir).parents[1] / "results" / batch_name / experiment_name),
+                results_dir,
                 trial_id,
                 checkpoint,
                 exp_config,

@@ -283,9 +283,13 @@ def make_vec_env(
         # The hierarchical wrapper loads torch skill actors inside each worker.
         # The default "fork" start method deadlocks when torch is used in a
         # forked child (inherited OpenMP/thread state); "forkserver" spawns the
-        # workers from a clean server process, avoiding it. Other envs never
-        # touch torch in the worker, so they keep the default.
-        context = "forkserver" if env_name == EnvironmentEnum.HRL_SKILL else None
+        # workers from a clean server process, avoiding it. Other envs pin
+        # "fork" explicitly rather than relying on the ambient default: under
+        # the joblib/loky launcher the ambient start method inside a worker is
+        # "loky" (spawn-like), which would force AsyncVectorEnv to pickle its
+        # shared-memory buffers (mmap) and crash with "cannot pickle
+        # 'mmap.mmap'". Pinning "fork" passes those buffers by inheritance.
+        context = "forkserver" if env_name == EnvironmentEnum.HRL_SKILL else "fork"
         # AsyncVectorEnv runs environments in parallel using multiprocessing
         return AsyncVectorEnv(env_fns, context=context)
     else:

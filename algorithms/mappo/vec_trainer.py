@@ -37,21 +37,21 @@ class VecMAPPOTrainer:
         self.device = device
         self.dirs = dirs
         self.params = params
-        self.environment = env_params.get("environment")
+        self.environment = env_params.get("name")
         self.critic_type = model_params.critic_type
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_conditioning = model_params.entropy_conditioning
 
         self.n_eval_episodes = 5
         self.eval_env = make_vec_env(
-            env_params.get("environment"),
+            self.environment,
             env_params.get("n_agents"),
             self.n_eval_episodes,
             use_async=True,
             env_params=env_params,
         )
         self.vec_env = make_vec_env(
-            env_params.get("environment"),
+            self.environment,
             env_params.get("n_agents"),
             env_params.get("n_envs"),
             use_async=True,
@@ -73,7 +73,7 @@ class VecMAPPOTrainer:
         else:
             action_dim = act_space.shape[1]
 
-        self.discrete = env_params.get("environment") in [
+        self.discrete = self.environment in [
             EnvironmentEnum.MPE_SPREAD,
             EnvironmentEnum.MPE_SIMPLE,
             EnvironmentEnum.SMACV2,

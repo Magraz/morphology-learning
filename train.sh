@@ -3,12 +3,19 @@
 
 BATCH=${1}
 ALGORITHM=${2}
-ENVIRONMENT=${3}
+ENVIRONMENT=${3}   # vestigial: env identity now lives in conf/env/${BATCH}
 TRIAL_ID=${4}
 EXP_NAME=${5}
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-uv run python3 ${SCRIPT_DIR}/run_trial.py --batch ${BATCH} --algorithm ${ALGORITHM} --environment ${ENVIRONMENT} --trial_id ${TRIAL_ID} --name ${EXP_NAME} --checkpoint
+# Hydra entry point. BATCH -> env group, EXP_NAME -> model group. The batch must
+# be migrated into conf/ (conf/env/${BATCH}.yaml + conf/model/${EXP_NAME}.yaml).
+uv run python3 ${SCRIPT_DIR}/train.py \
+    env=${BATCH} \
+    model=${EXP_NAME} \
+    algorithm=${ALGORITHM} \
+    trial_id=${TRIAL_ID} \
+    checkpoint=true
 
 echo "Finished trial ${BATCH}_${EXP_NAME}_${TRIAL_ID}"

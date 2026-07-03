@@ -1,0 +1,5 @@
+# @package _global_
+model_params:
+  critic_type: multi_hgnn
+  hyperedge_fn_names: ${hyperedges.proximity}
+  counterfactual_credit: true

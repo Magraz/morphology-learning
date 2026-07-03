@@ -1,0 +1,8 @@
+# @package _global_
+model_params:
+  critic_type: multi_hgnn
+  hypergraph_mode: learned_grouping
+  grouping_history_len: 8
+  grouping_loss_coef: 0.1
+  grouping_entropy_coef: 0.01
+  grouping_resample_interval: 10

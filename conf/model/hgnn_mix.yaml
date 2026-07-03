@@ -1,0 +1,6 @@
+# @package _global_
+# hypergraph_mode is left at its dataclass default ("predefined"), matching the
+# legacy yaml which did not set it. hyperedge_fn_names is env-specific.
+model_params:
+  critic_type: multi_hgnn
+  hyperedge_fn_names: ${hyperedges.mix}

@@ -1,0 +1,7 @@
+# @package hydra.launcher
+# Joblib launcher whose concurrency tracks the top-level `n_jobs` knob, so the
+# sweep layer and per-job `env.n_envs` (= usable_cores // n_jobs) stay balanced.
+# Select with `hydra/launcher=joblib_auto`; set `n_jobs=<N>` to fan out.
+defaults:
+  - joblib          # pull in the plugin's built-in joblib launcher schema
+n_jobs: ${n_jobs}   # absolute interpolation to the top-level knob

@@ -2,16 +2,84 @@ Whenever building new code, try to reuse as much code as possible. If the new fu
 
 Always keep the CLAUDE.md file up to date to reflect the current functionality and architecture of the code.
 
-## Experiment config loading (`run_algorithm` in `algorithms/algorithms.py`)
+## Experiment config: Hydra is the sole path (`conf/` + `train.py`)
 
-Each batch dir under `experiments/yamls/<batch>/` has a `_batch.yaml` (env block
-+ optional `random_seeds`) and one named experiment yaml per variant. The loader:
+Runs are launched **only** through the Hydra entry point `train.py`. The legacy
+yaml loader (`run_algorithm` in `algorithms/algorithms.py`) and its argparse CLI
+(`run_trial.py`) have been **retired** — the `experiments/yamls/<batch>/` files
+remain on disk as source material to migrate into `conf/`, but nothing loads them
+at runtime any more.
 
-- Reads both with `yaml.safe_load` (no `!!python` tags are used anywhere).
-- `_batch.yaml` may declare top-level `algorithm:` / `environment:` defaults so a
-  batch records the algorithm/env it was built for. `run_trial.py --algorithm` /
-  `--environment` still override when passed; otherwise the batch defaults are
-  used. Populated for the `9a`/`dcg` batches.
+`train.py` composes a run from orthogonal groups (**algorithm × env × model ×
+seeds**), resolves it, and hands the result to the shared dispatch tail
+`_dispatch(algorithm, exp_dict, env_config, batch_dir, results_dir, trial_id,
+...)` in `algorithms/algorithms.py`. `_dispatch` builds the per-algo
+`Experiment(**exp_dict)` → constructs the Runner → `train()`/`view()`/
+`evaluate()`. `batch_dir` (`experiments/yamls/<batch>`) is only used by runners
+for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`);
+`results_dir` is the runner's `trials_dir` (`results/<batch>/<name>`).
+
+- `conf/config.yaml` — defaults list (`algorithm: mappo`, `env: ...`, `model:
+  ...`, `seeds: standard`, `_self_`) + top-level `device`/`trial_id`/`view`/
+  `checkpoint`/`evaluate`. Group order sets precedence (later wins): algorithm
+  supplies base `params`/`model_params`; env overrides env-scoped `params`
+  (`batch_size`, `val_coef`) and publishes a `hyperedges` map; model overrides
+  `model_params`; seeds injects `params.random_seeds`. `hydra.job.chdir=false` +
+  `output_subdir=null` + null log handlers keep cwd/paths/results untouched.
+- `conf/algorithm/{mappo,...}.yaml`, `conf/env/<batch>.yaml`,
+  `conf/model/<variant>.yaml`, `conf/seeds/{standard,...}.yaml`. **Env/model
+  filenames equal the old batch/variant names** so `results/<batch>/<name>/
+  <trial_id>/` and existing checkpoints resolve. Model files hold only the
+  `model_params` delta (env-specific `hyperedge_fn_names` interpolate the env's
+  map, e.g. `${hyperedges.mix}`), mirroring the legacy variant's keys exactly.
+- `train.py` — `@hydra.main`; `OmegaConf.to_container(resolve=True)` →
+  `_build_dispatch_args(cfg, choices)` → `_dispatch`. `choices` (env/model) come
+  from `HydraConfig.get().runtime.choices` and preserve the output layout.
+  Run: `uv run python train.py env=multi_box_push_9a_3o model=hgnn_mix trial_id=0`;
+  sweep: `uv run python train.py -m model=mlp_shared,gnn_critic trial_id=0,1,2`
+  (add `hydra/launcher=joblib_auto` for local parallelism).
+- **Parallelism autoscaling (two nested layers).** Layer 1 is the sweep: with
+  the joblib launcher each cross-product job runs in its own loky worker. Layer 2
+  is per-job rollout collection: `make_vec_env` forks `env.n_envs` box2d
+  subprocesses. The two multiply, so the budget is `n_jobs × n_envs ≲ cores`.
+  A single top-level knob `n_jobs` (in `conf/config.yaml`, default `1`) drives
+  both: `conf/config.yaml`'s `_self_` block sets `env.n_envs:
+  ${envs_per_job:${n_jobs}}` → `usable_cores // n_jobs` **centrally** for every
+  env group (it wins over the selected `conf/env/*` because `_self_` is last;
+  pin a fixed count on the CLI with `env.n_envs=<N>`), and the
+  `hydra/launcher=joblib_auto` group
+  (`conf/hydra/launcher/joblib_auto.yaml`, wraps the plugin's `joblib` and sets
+  `n_jobs: ${n_jobs}`) makes joblib run that many at once. Resolvers `cores` /
+  `envs_per_job` are registered at `train.py` import; `_usable_cores()` reads the
+  CPU-affinity mask (`os.sched_getaffinity`) so it respects `taskset` / cgroup /
+  SLURM quotas. So `n_jobs=1` (default) → one run using all cores for envs;
+  `-m ... n_jobs=4 hydra/launcher=joblib_auto` → 4 concurrent jobs × `cores//4`
+  envs each. Override `env.n_envs=<N>` on the CLI to opt out of autoscaling.
+  **Fork context is pinned** in `make_vec_env` (`context="fork"` for non-HRL,
+  `"forkserver"` for HRL) rather than the ambient default: inside a loky worker
+  the default start method is `"loky"` (spawn-like), which forces
+  `AsyncVectorEnv` to pickle its `shared_memory` buffers and crashes with
+  `cannot pickle 'mmap.mmap'`. `Runner.__init__` floors torch threads at
+  `max(1, get_num_threads()//2)` since a loky worker can start with 1 thread.
+- **Migration status:** `multi_box_push_9a_3o` (MAPPO) and `dcg_smaclite_2s3z`
+  (DCG) are currently ported into `conf/`. Other batches under
+  `experiments/yamls/` must be migrated to `conf/env` + `conf/model` before they
+  can run. To add a batch: create `conf/env/<batch>.yaml` (from `_batch.yaml`'s
+  `env:` block + `params` overrides + `hyperedges` map) and one
+  `conf/model/<variant>.yaml` per experiment yaml (the `model_params` delta); the
+  env/model filenames must equal the old batch/variant names to preserve the
+  `results/<batch>/<name>` layout. The DCG port also added
+  `conf/algorithm/dcg.yaml` (the `params` block); DCG's env group must expose
+  `environment`/`n_agents`/`env_variant` under `env:` (the trainer reads
+  `env_params.get("environment")`, not `name`), and the default `seeds: standard`
+  list already matches the old DCG seed list for `trial_id` indexing. Non-box2d
+  batches (smac, dcg, ippo/jax) may also need `vec_trainer`
+  `self.env_name`/`self.env_variant` wiring. The convenience wrappers `train.sh` /
+  `scripts/evaluate.sh` translate `(BATCH, ALGORITHM, ENVIRONMENT, TRIAL_ID,
+  EXP_NAME)` positional args into Hydra overrides (`env=$BATCH model=$EXP_NAME
+  algorithm=$ALGORITHM ...`); `$ENVIRONMENT` is vestigial. The `scripts/hpc/*`
+  launchers still reference the removed `run_trial.py` and must be updated to
+  `train.py` before use.
 
 ## Box2D suite observations
 
@@ -195,17 +263,18 @@ that makes "pick a skill, run it for K steps" look like one discrete env step.
   start method — the default `fork` deadlocks when each worker `torch.load`s
   models (inherited OpenMP/thread state); other envs keep `fork`. `forkserver`
   re-imports the entry module, so HRL training **must** be launched under an
-  `if __name__ == '__main__':` guard (`run_trial.py` already is).
+  `if __name__ == '__main__':` guard (Hydra's `train.py` already is).
   `vec_trainer` adds `HRL_SKILL` to its discrete list and derives the *learning*
   agent count from `obs_space.shape[0]` (1 for team scope, n_agents otherwise) —
   behavior-preserving for normal envs where that equals `env_params["n_agents"]`.
 - **Config.** Batches `experiments/yamls/hrl_{agent,team}_multi_box_push_9a/`
   carry the macro knobs in the `_batch.yaml` `env:` block (`base_environment`,
   `decision_scope`, `macro_len`, `skill_experiment`, `skill_trial`); the
-  `mlp_shared.yaml` is a standard discrete-MAPPO config. Run with:
+  `mlp_shared.yaml` is a standard discrete-MAPPO config. Once migrated into
+  `conf/` (`conf/env/hrl_agent_multi_box_push_9a.yaml` + the model file), run with:
   ```
-  python run_trial.py --batch hrl_agent_multi_box_push_9a --name mlp_shared \
-      --algorithm mappo --environment hrl_skill --trial_id 0
+  uv run python train.py env=hrl_agent_multi_box_push_9a model=mlp_shared \
+      algorithm=mappo trial_id=0
   ```
 - **Skill-selection logging.** `RolloutCollector` tallies the chosen discrete
   actions over each rollout (`np.bincount`) and returns a normalized
@@ -249,7 +318,7 @@ everywhere as `import hypergraphs.hg_compat as dhg`.
 ## DCG coordination-graph algorithm (`algorithms/dcg/`)
 
 DCG (Deep Coordination Graph, Böhmer et al. 2020) is integrated as a first-class
-algorithm alongside MAPPO/IPPO: launch it with `run_trial.py --algorithm dcg`
+algorithm alongside MAPPO/IPPO: launch it with `train.py algorithm=dcg`
 (`AlgorithmEnum.DCG`, dispatched in `algorithms/algorithms.py`). Unlike MAPPO's
 on-policy vectorized PPO, DCG is **off-policy episodic Q-learning** — RNN feature
 agents → per-agent utility `f_i` and per-edge payoff `f_ij` nets → max-sum
@@ -297,12 +366,13 @@ replay buffer.
 - **Checkpoint / stats.** `save_agent`/`load_agent` write a single `.pth`
   (agent + utility/payoff nets + optimiser + RNG) as `models_finished.pth` /
   `models_checkpoint.pth`; `_StatsBook` pickles `training_stats_*.pkl`.
-  `--checkpoint` resumes from the last saved step (verified).
-- **Config.** `experiments/yamls/dcg_smaclite_2s3z/` — `_batch.yaml` (env block +
-  `random_seeds`) and `dcg.yaml` (params + model_params); `dcg_test.yaml` is a
-  tiny fast-run variant. Launch:
+  `checkpoint=true` resumes from the last saved step (verified).
+- **Config.** Ported into `conf/`: `conf/algorithm/dcg.yaml` (`params`),
+  `conf/model/dcg.yaml` (`model_params`), `conf/env/dcg_smaclite_2s3z.yaml`
+  (`env:` block — `environment`/`n_agents`/`env_variant`). Source material stays
+  at `experiments/yamls/dcg_smaclite_2s3z/` (`_batch.yaml`, `dcg.yaml`, and the
+  tiny fast-run `dcg_test.yaml`). Launch:
   ```
-  python run_trial.py --batch dcg_smaclite_2s3z --name dcg \
-      --algorithm dcg --environment smaclite --trial_id 0
+  uv run python train.py env=dcg_smaclite_2s3z model=dcg algorithm=dcg trial_id=0
   ```
 - Plan: `plans/okay-the-following-is-composed-truffle.md`.
