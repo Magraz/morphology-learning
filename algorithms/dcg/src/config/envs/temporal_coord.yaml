@@ -1,0 +1,23 @@
+# ---- Temporal Coordination Game (didactic toy for phase-conditioned CG payoffs).
+#      See src/envs/temporal_coord.py for the full description.
+
+env: "temporal_coord"
+
+env_args:
+    n_agents: 2               # 2 agents = the clean pairwise didactic case
+    episode_limit: 32         # steps per episode
+
+    duration_min: 2           # macro-action duration ~ U{duration_min .. duration_max}
+    duration_max: 6           # random => forces asynchrony & makes phase the only
+                              #           source of remaining-duration information
+    cooldown: 6               # forced rest after each macro; blocks "always active"
+                              #           optima and forces timed hand-offs
+
+    mode: "relay"             # "relay" (take turns) or "sync" (be active together)
+    misalign_penalty: 0.5     # sync:  penalty per step when only *some* agents active
+    collision_penalty: 1.0    # relay: penalty per step when >1 agent active
+
+    observe_own_phase: True       # agent sees its own remaining duration
+    observe_partner_phase: True   # THE DURATION TERM: ablate to False to remove it
+
+t_max: 500000                 # total environment steps for the experiment
