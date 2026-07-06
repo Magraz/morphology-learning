@@ -6,9 +6,9 @@
 # model_params; the env group publishes environment/base_environment/macro_len.
 algorithm: dcg_macro
 params:
-  n_total_steps: 20000000
-  buffer_size: 32
-  batch_size: 8
+  n_total_steps: 2000000
+  buffer_size: 2048
+  batch_size: 32
   lr: 0.0005
   optim_alpha: 0.99
   optim_eps: 0.00001
@@ -18,10 +18,10 @@ params:
   target_update_interval: 200
   epsilon_start: 1.0
   epsilon_finish: 0.05
-  epsilon_anneal_time: 50000
+  epsilon_anneal_time: 250000
   # macro-steps per episode: base env truncates at 1024 low-level steps and
-  # macro_len=10 => ~103 macro-steps, so 200 comfortably covers a full episode.
-  episode_limit: 200
+  # macro_len=10 => ~103 macro-steps, so 110 covers a full episode with headroom.
+  episode_limit: 110
   test_interval: 20000
   test_nepisode: 20
   save_model_interval: 200000
