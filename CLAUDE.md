@@ -376,3 +376,44 @@ replay buffer.
   uv run python train.py env=dcg_smaclite_2s3z model=dcg algorithm=dcg trial_id=0
   ```
 - Plan: `plans/okay-the-following-is-composed-truffle.md`.
+
+## DCG over macro-actions (`algorithms/dcg_macro/`)
+
+`dcg_macro` (`AlgorithmEnum.DCG_MACRO = "dcg_macro"`) runs the **unmodified DCG
+core** over the hierarchical macro-action interface, so DCG's discrete
+coordination-graph Q-learning drives a continuous box2d task (e.g.
+`multi_box_push`) by **selecting frozen skills** instead of low-level forces. It
+is the DCG analogue of the hierarchical MAPPO controller.
+
+- **No DCG code change; the env supplies the macro mechanism.** DCG needs a
+  `MultiDiscrete` action space, which `HierarchicalSkillEnv`
+  (`algorithms/hierarchical/hrl_env.py`) already provides: the discrete action
+  picks one of 4 frozen skills (`SKILL_ORDER`) and runs it for `macro_len`
+  low-level steps. So `dcg_macro` is a **thin package** — `algorithms/dcg_macro/
+  run.py` defines `DCG_Runner` but imports the trainer/types straight from
+  `algorithms.dcg` (`from algorithms.dcg.trainer import DCGTrainer`); the vendored
+  PyMARL core is reused, not duplicated. (The rest of the `algorithms/dcg_macro/`
+  copy — `trainer.py`/`args_builder.py`/`src/` etc. — is currently unused dead
+  weight; delete if the package need not diverge from `dcg`.)
+- **Wiring.** `algorithms/types.py` adds the enum; `algorithms/algorithms.py`
+  `_dispatch` adds a `case AlgorithmEnum.DCG_MACRO` mirroring `DCG` but importing
+  `algorithms.dcg_macro.run.DCG_Runner` (and reusing `algorithms.dcg.types.
+  Experiment`). `make_vec_env` already pins the `forkserver` start method for
+  `HRL_SKILL` (each worker `torch.load`s the skill actors), so DCG's two vec
+  envs build correctly. The box2d/HRL envs surface no `info["avail_actions"]`, so
+  DCG's `_get_avail` falls back to an all-ones mask — correct, since all 4 skills
+  are always selectable.
+- **Config.** `conf/algorithm/dcg_macro.yaml` (`params`, same as `dcg` but with
+  `episode_limit: 200` ≥ the ~103 macro-steps of a 1024-step base env at
+  `macro_len=10`), `conf/model/dcg_macro.yaml` (DCG `model_params`, verbatim from
+  `dcg`), and `conf/env/dcg_macro_multi_box_push_9a.yaml` — the HRL-wrapped env
+  block: `environment: hrl_skill` (DCG reads this), `base_environment:
+  multi_box_push`, `decision_scope: agent` (each of 9 agents picks a skill →
+  9-node coordination graph, `MultiDiscrete([4]*9)`, obs `(9, 40)`), `macro_len`,
+  `skill_experiment: mlp_shared`, `skill_trial: "0"`. The 4 skills load from
+  `experiments/results/{contact,scatter,push_box,rendezvouz}_9a/mlp_shared/0/`.
+  Launch:
+  ```
+  uv run python train.py env=dcg_macro_multi_box_push_9a model=dcg_macro \
+      algorithm=dcg_macro trial_id=0
+  ```

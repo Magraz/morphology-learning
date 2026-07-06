@@ -85,6 +85,24 @@ def _dispatch(
                 env_config,
             )
 
+        case AlgorithmEnum.DCG_MACRO:
+            # DCG over macro-actions: identical DCG core (reused from
+            # algorithms.dcg), but the env group wraps a continuous box2d env in
+            # HierarchicalSkillEnv so DCG sees a discrete skill-selection action.
+            from algorithms.dcg_macro.run import DCG_Runner
+            from algorithms.dcg.types import Experiment as DCG_Experiment
+
+            exp_config = DCG_Experiment(**exp_dict)
+            runner = DCG_Runner(
+                exp_config.device,
+                batch_dir,
+                results_dir,
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
     if view:
         runner.view()
     elif evaluate:

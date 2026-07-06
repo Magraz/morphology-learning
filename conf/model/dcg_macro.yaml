@@ -1,0 +1,19 @@
+# @package _global_
+# DCG model_params (coordination-graph + message-passing config) for the
+# macro-action variant. Paired with `algorithm=dcg_macro`; consumed by
+# DCG_Model_Params in algorithms/dcg/types.py (reused via the thin dcg_macro
+# package). Identical to conf/model/dcg.yaml.
+model_params:
+  rnn_hidden_dim: 128
+  cg_edges: "full"
+  cg_utilities_hidden_dim: null
+  cg_payoffs_hidden_dim: null
+  cg_payoff_rank: null
+  msg_iterations: 8
+  msg_normalized: true
+  msg_anytime: true
+  duelling: false
+  mixing_embed_dim: 32
+  obs_last_action: true
+  obs_agent_id: true
+  mixer: null
