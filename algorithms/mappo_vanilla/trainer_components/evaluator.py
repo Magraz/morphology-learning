@@ -1,0 +1,112 @@
+import numpy as np
+import torch
+
+from algorithms.mappo.entropy_helpers import update_left_padded_history
+
+
+class PolicyEvaluator:
+    def __init__(
+        self,
+        *,
+        eval_env,
+        agent,
+        n_eval_episodes: int,
+        discrete: bool,
+        entropy_conditioning: bool,
+        hypergraph_runtime,
+    ):
+        self.eval_env = eval_env
+        self.agent = agent
+        self.n_eval_episodes = n_eval_episodes
+        self.discrete = discrete
+        self.entropy_conditioning = entropy_conditioning
+        self.hypergraph_runtime = hypergraph_runtime
+
+    def evaluate(self) -> float:
+        """Evaluate current policy using parallel episodes."""
+        self.agent.network_old.eval()
+        n_eps = self.n_eval_episodes
+
+        # HYGMA mode intentionally keeps groups frozen during eval.
+        # Hypergraphs come from the latest discovered grouping state.
+        with torch.no_grad():
+            eval_seeds = [int(np.random.randint(0, 2**31)) for _ in range(n_eps)]
+            obs, infos = self.eval_env.reset(seed=eval_seeds)
+            current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+            episode_rewards = np.zeros(n_eps)
+            finished = np.zeros(n_eps, dtype=bool)
+            critic_obs_history = None
+            critic_sig_history = None
+            critic_history_counts = None
+            if self.agent.critic_type == "hg_cross_attention":
+                critic_obs_history = torch.zeros(
+                    n_eps,
+                    self.agent.critic_seq_len,
+                    self.agent.n_agents,
+                    self.agent.observation_dim,
+                    dtype=torch.float32,
+                )
+                critic_sig_history = torch.zeros(
+                    n_eps, self.agent.critic_seq_len, dtype=torch.long
+                )
+                critic_history_counts = torch.zeros(n_eps, dtype=torch.long)
+
+            while not finished.all():
+                global_states = obs.reshape(n_eps, -1)
+
+                eval_hgs, eval_sig_ids = self.hypergraph_runtime.build_inference_hypergraphs(
+                    obs, infos, n_eps
+                )
+                eval_entropies = (
+                    self.hypergraph_runtime.compute_entropies_for_critic(eval_sig_ids)
+                    if self.entropy_conditioning
+                    else None
+                )
+
+                critic_obs_sequences = None
+                critic_signature_sequences = None
+                if self.agent.critic_type == "hg_cross_attention":
+                    obs_step = torch.from_numpy(
+                        np.ascontiguousarray(obs, dtype=np.float32)
+                    )
+                    sig_step = torch.tensor(eval_sig_ids, dtype=torch.long)
+                    prev_counts = critic_history_counts.clone()
+                    critic_obs_history, critic_history_counts = update_left_padded_history(
+                        critic_obs_history, obs_step, critic_history_counts
+                    )
+                    critic_sig_history, _ = update_left_padded_history(
+                        critic_sig_history, sig_step, prev_counts
+                    )
+                    critic_obs_sequences = critic_obs_history.clone()
+                    critic_signature_sequences = critic_sig_history.clone()
+
+                actions_t, _, _ = self.agent.get_actions_batched(
+                    obs,
+                    global_states,
+                    deterministic=True,
+                    action_masks=current_masks,
+                    hypergraphs=eval_hgs,
+                    entropies=eval_entropies,
+                    critic_obs_sequences=critic_obs_sequences,
+                    critic_signature_sequences=critic_signature_sequences,
+                )
+                actions = actions_t.cpu().numpy()
+
+                if self.discrete:
+                    if actions.ndim == 3 and actions.shape[-1] == 1:
+                        actions = actions.squeeze(-1)
+                    actions = actions.astype(np.int32)
+
+                obs, rewards, terminated, truncated, infos = self.eval_env.step(actions)
+                current_masks = infos.get("avail_actions") if isinstance(infos, dict) else None
+
+                dones = np.logical_or(terminated, truncated)
+                if critic_obs_history is not None and dones.any():
+                    critic_obs_history[dones] = 0.0
+                    critic_sig_history[dones] = 0
+                    critic_history_counts[dones] = 0
+                episode_rewards[~finished] += rewards[~finished]
+                finished |= dones
+
+        self.agent.network_old.train()
+        return float(episode_rewards.mean())

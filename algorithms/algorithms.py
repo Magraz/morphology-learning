@@ -55,6 +55,21 @@ def _dispatch(
                 env_config,
             )
 
+        case AlgorithmEnum.MAPPO_VANILLA:
+            from algorithms.mappo_vanilla.run import MAPPO_Vanilla_Runner
+            from algorithms.mappo_vanilla.types import Experiment as MAPPO_Experiment
+
+            exp_config = MAPPO_Experiment(**exp_dict)
+            runner = MAPPO_Runner(
+                exp_config.device,
+                batch_dir,
+                results_dir,
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
         case AlgorithmEnum.MAPPO_JAX:
             from algorithms.mappo_jax.run import MAPPO_JAX_Runner
             from algorithms.mappo_jax.types import Experiment as MAPPO_JAX_Experiment

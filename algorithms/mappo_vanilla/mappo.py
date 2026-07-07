@@ -1,0 +1,1454 @@
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+from algorithms.mappo.types import MAPPO_Params, Model_Params
+from algorithms.mappo.networks.encoders import LocalStateEncoder, HypergraphStateEncoder
+from algorithms.mappo.networks.models import MAPPONetwork
+from algorithms.mappo.hg_cache import HypergraphCache
+from algorithms.mappo.entropy_helpers import EntropyPredictorHelper
+
+
+class MAPPOAgent:
+    """Multi-Agent PPO with centralized critic"""
+
+    def __init__(
+        self,
+        observation_dim: int,
+        global_state_dim: int,
+        action_dim: int,
+        n_agents: int,
+        params: MAPPO_Params,
+        device: str,
+        discrete: bool,
+        n_parallel_envs: int,
+        model_params: Model_Params,
+        hyperedge_fns: list[tuple] = None,
+    ):
+        self.device = "cuda" if torch.cuda.is_available() else device
+        self.n_agents = n_agents
+        self.observation_dim = observation_dim
+        self.global_state_dim = global_state_dim
+        self.discrete = discrete
+        self.share_actor = params.parameter_sharing
+        self.n_parallel_envs = n_parallel_envs
+        self.critic_type = model_params.critic_type
+        self.n_hyperedge_types = model_params.n_hyperedge_types
+        self.critic_seq_len = model_params.critic_seq_len
+        # Hyperedge builder specs: list of (fn, source) where source is "obs"
+        # or an info-dict key name (e.g. "agents_2_objects")
+        self.hyperedge_fns = hyperedge_fns or []
+        # Entropy conditioning of HGNN critics
+        self.entropy_conditioning = model_params.entropy_conditioning
+        # COMA-style per-agent counterfactual baseline (multi_hgnn only).
+        self.counterfactual_credit = model_params.counterfactual_credit
+        if self.counterfactual_credit and self.critic_type != "multi_hgnn":
+            raise ValueError(
+                "counterfactual_credit is only supported for "
+                "critic_type='multi_hgnn'; got "
+                f"critic_type={self.critic_type!r}."
+            )
+        # Auxiliary LSTM entropy predictor config
+        self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
+        self.entropy_pred_coef = model_params.entropy_pred_coef
+        # Learned affinity config
+        self.hypergraph_mode = model_params.hypergraph_mode
+        self.hygma_history_len = model_params.hygma_history_len
+        self.affinity_loss_coef = model_params.affinity_loss_coef
+        # Learned grouping (autoregressive hyperedge generator) config
+        self.grouping_history_len = model_params.grouping_history_len
+        self.grouping_loss_coef = model_params.grouping_loss_coef
+        self.grouping_entropy_coef = model_params.grouping_entropy_coef
+
+        # Coordination-graph novelty exploration (gnn critic only)
+        self.use_intrinsic_reward = model_params.use_intrinsic_reward
+        self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
+        self.intrinsic_descriptor_source = model_params.intrinsic_descriptor_source
+        self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
+        self.intrinsic_reward_k = model_params.intrinsic_reward_k
+        self.intrinsic_reward_memory_capacity = (
+            model_params.intrinsic_reward_memory_capacity
+        )
+        if self.use_intrinsic_reward and self.critic_type != "gnn":
+            raise ValueError(
+                "use_intrinsic_reward (coordination-graph novelty) is only "
+                f"supported for critic_type='gnn'; got {self.critic_type!r}."
+            )
+
+        # PPO hyperparameters
+        self.gamma = params.gamma
+        self.gae_lambda = params.lmbda
+        self.clip_epsilon = params.eps_clip
+        self.entropy_coef = params.ent_coef
+        self.value_coef = params.val_coef
+        self.grad_clip = params.grad_clip
+
+        # Create network
+        network_kwargs = dict(
+            observation_dim=observation_dim,
+            global_state_dim=global_state_dim,
+            action_dim=action_dim,
+            n_agents=n_agents,
+            hidden_dim=(
+                round(model_params.hidden_dim * 1.09)
+                if self.critic_type == "mlp"
+                else model_params.hidden_dim
+            ),
+            discrete=discrete,
+            share_actor=self.share_actor,
+            critic_type=self.critic_type,
+            n_hyperedge_types=self.n_hyperedge_types,
+            critic_seq_len=self.critic_seq_len,
+            entropy_conditioning=self.entropy_conditioning,
+            hypergraph_mode=self.hypergraph_mode,
+            history_len=self.hygma_history_len,
+            grouping_history_len=self.grouping_history_len,
+        )
+        self.network = MAPPONetwork(**network_kwargs).to(self.device)
+
+        # Create old network for PPO
+        self.network_old = MAPPONetwork(**network_kwargs).to(self.device)
+
+        self.network_old.load_state_dict(self.network.state_dict())
+
+        self.local_state_encoder = None
+        self.hypergraph_state_encoder = None
+
+        # Optimizer for all parameters
+        self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
+
+        # Hypergraph cache (owns signature maps, edge lists, dhg objects, entropy values)
+        self.hg_cache = HypergraphCache(
+            n_agents=n_agents,
+            n_parallel_envs=n_parallel_envs,
+        )
+
+        # Entropy predictor helper (owns obs history, sequence building, loss)
+        self.entropy_helper = EntropyPredictorHelper(
+            n_parallel_envs=n_parallel_envs,
+            n_agents=n_agents,
+            observation_dim=observation_dim,
+            seq_len=self.entropy_pred_seq_len,
+        )
+
+        # Affinity training: stores aggregated history snapshots from rollout
+        self._affinity_history_snapshots = []
+
+        # Learned grouping: per-(env, t) token sequences sampled at rollout
+        self._grouping_tokens: list[list[list[int]]] = [
+            [] for _ in range(n_parallel_envs)
+        ]
+
+        # Buffers for each agent
+        self.reset_buffers()
+
+    def store_affinity_snapshot(self, agg_history: np.ndarray) -> None:
+        """Store an aggregated observation history snapshot for affinity training.
+
+        Called by HypergraphRuntime each time clustering runs.
+
+        Args:
+            agg_history: (n_agents, history_len, obs_dim) numpy array.
+        """
+        self._affinity_history_snapshots.append(agg_history.copy())
+
+    def compute_affinity_loss(self) -> torch.Tensor:
+        """Compute auxiliary loss for the affinity transformer.
+
+        Uses stored history snapshots from the last rollout. Encourages the
+        affinity matrix to be decisive (low binary entropy) rather than
+        uniformly uncertain.
+        """
+        transformer = self.network.affinity_transformer
+        if transformer is None or not self._affinity_history_snapshots:
+            return torch.tensor(0.0, device=self.device)
+
+        total_loss = torch.tensor(0.0, device=self.device)
+        for snapshot in self._affinity_history_snapshots:
+            x = torch.from_numpy(snapshot).to(self.device)
+            affinity = transformer(x)
+            # Binary-entropy regulariser: push off-diagonal values toward 0 or 1
+            mask = ~torch.eye(self.n_agents, dtype=torch.bool, device=self.device)
+            a = affinity[mask]
+            entropy = -(a * torch.log(a + 1e-8) + (1 - a) * torch.log(1 - a + 1e-8))
+            total_loss = total_loss + entropy.mean()
+
+        return total_loss / len(self._affinity_history_snapshots)
+
+    def compute_grouping_loss(
+        self,
+        env_indices: list[int],
+        ts_indices: list[int],
+        advantages: torch.Tensor,
+    ) -> torch.Tensor:
+        """REINFORCE-style loss for the GroupingTransformer.
+
+        Treats the autoregressive hyperedge generator as a policy whose action
+        is the sampled token sequence. The reward signal is the standardized
+        per-(env, t) advantage already computed for PPO; raising the
+        log-probability of token sequences whose downstream rollouts had
+        positive advantage pushes the structure toward edges the critic finds
+        useful.
+
+        Args:
+            env_indices: List of env_idx for each minibatch sample.
+            ts_indices: List of timestep-within-env for each minibatch sample.
+            advantages: (B,) tensor of standardized advantages on training device.
+
+        Returns:
+            Scalar loss tensor (zero when no usable samples).
+        """
+        gt = self.network.grouping_transformer
+        device = advantages.device
+        if gt is None:
+            return torch.tensor(0.0, device=device)
+
+        # Gather per-sample token sequences and observation histories.
+        token_lists: list[list[int]] = []
+        obs_histories: list[torch.Tensor] = []
+        valid_advantages: list[torch.Tensor] = []
+        seq_len = self.grouping_history_len
+
+        for k, (env_idx, t) in enumerate(zip(env_indices, ts_indices)):
+            env_tokens = self._grouping_tokens[env_idx]
+            if t >= len(env_tokens) or not env_tokens[t]:
+                continue
+            token_lists.append(env_tokens[t])
+
+            # Build the obs-history window ending at timestep t for this env:
+            #   shape (n_agents, seq_len, obs_dim), zero-left-padded.
+            agent_obs = []
+            for agent_idx in range(self.n_agents):
+                traj = self.observations[env_idx][agent_idx]
+                window = traj[max(0, t - seq_len + 1) : t + 1]
+                if not window:
+                    continue
+                stacked = torch.stack(window, dim=0)
+                pad_len = seq_len - stacked.shape[0]
+                if pad_len > 0:
+                    pad = torch.zeros(
+                        pad_len, self.observation_dim, dtype=stacked.dtype
+                    )
+                    stacked = torch.cat([pad, stacked], dim=0)
+                agent_obs.append(stacked)
+            if len(agent_obs) != self.n_agents:
+                token_lists.pop()
+                continue
+            obs_histories.append(torch.stack(agent_obs, dim=0))
+            valid_advantages.append(advantages[k])
+
+        if not token_lists:
+            return torch.tensor(0.0, device=device)
+
+        max_len = max(len(s) for s in token_lists)
+        eos_id = gt.eos_id
+        padded = torch.full(
+            (len(token_lists), max_len), eos_id, dtype=torch.long, device=device
+        )
+        lengths = torch.zeros(len(token_lists), dtype=torch.long, device=device)
+        for i, seq in enumerate(token_lists):
+            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
+            lengths[i] = len(seq)
+
+        obs_hist_tensor = torch.stack(obs_histories, dim=0).to(device)
+
+        logits = gt(obs_hist_tensor, padded)  # (B, L, vocab)
+        # log_softmax handles the -inf masked entries cleanly.
+        log_probs = F.log_softmax(logits, dim=-1)
+        gathered = log_probs.gather(-1, padded.unsqueeze(-1)).squeeze(-1)  # (B, L)
+        pos = torch.arange(max_len, device=device).unsqueeze(0)
+        valid = pos < lengths.unsqueeze(-1)
+        seq_log_prob = (gathered * valid.float()).sum(dim=-1)  # (B,)
+
+        adv = torch.stack(valid_advantages).detach()
+        pg_loss = -(adv * seq_log_prob).mean()
+
+        # Entropy bonus over the per-step categorical distributions, summed over
+        # valid (non-padded) positions. -inf-masked logits give probs=0 there;
+        # treat 0 * log(0) as 0 so the masked vocabulary entries don't contribute.
+        probs = log_probs.exp()
+        step_entropy = -(
+            probs
+            * torch.where(
+                torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs)
+            )
+        ).sum(
+            dim=-1
+        )  # (B, L)
+        seq_entropy = (step_entropy * valid.float()).sum(dim=-1)  # (B,)
+        entropy_bonus = seq_entropy.mean()
+
+        return pg_loss - self.grouping_entropy_coef * entropy_bonus
+
+    def reset_buffers(self):
+        """Reset experience buffers - separate for each parallel environment"""
+        # Buffers indexed by [env_idx][agent_idx]
+        self.observations = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        self.global_states = [[] for _ in range(self.n_parallel_envs)]
+        self.actions = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        self.rewards = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        self.log_probs = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        self.values = [[] for _ in range(self.n_parallel_envs)]
+        self.dones = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        self.action_masks = [
+            [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
+        ]
+        # Clear hypergraph caches and per-trajectory buffers
+        self.hg_cache.reset()
+        self._affinity_history_snapshots = []
+        self._grouping_tokens = [[] for _ in range(self.n_parallel_envs)]
+
+    def reset_obs_history(self, env_mask=None):
+        """Zero out obs history. If env_mask given, only reset those envs."""
+        self.entropy_helper.reset_obs_history(env_mask)
+
+    def get_actions_batched(
+        self,
+        observations_batch,
+        global_states_batch,
+        deterministic=False,
+        action_masks=None,
+        hypergraphs=None,
+        entropies=None,
+        critic_obs_sequences=None,
+        critic_signature_sequences=None,
+    ):
+        """
+        Get actions for all agents in all environments in a single batched forward pass.
+
+        Args:
+            observations_batch: numpy (n_envs, n_agents, obs_dim)
+            global_states_batch: numpy (n_envs, global_state_dim)
+            deterministic: Whether to use deterministic actions
+            action_masks: numpy (n_envs, n_agents, n_actions) or None
+            hypergraphs: list[dhg.Hypergraph] of shape [n_hyperedge_types] or None.
+                         Each is a block-diagonal batched hypergraph over n_envs.
+                         Required when critic_type="multi_hgnn".
+            entropies: Optional (n_envs, n_types) tensor of structural entropy
+                       values for critic conditioning.
+            critic_obs_sequences: Optional (n_envs, seq_len, n_agents, obs_dim)
+                                  tensor for temporal hg_cross_attention critic.
+            critic_signature_sequences: Optional (n_envs, seq_len) tensor of
+                                        hypergraph signature IDs aligned with
+                                        ``critic_obs_sequences``.
+
+        Returns:
+            actions:   tensor (n_envs, n_agents, action_dim) on self.device
+            log_probs: tensor (n_envs, n_agents)             on self.device
+            values:    tensor (n_envs, 1)                    on self.device
+        """
+        n_envs = observations_batch.shape[0]
+
+        with torch.no_grad():
+            obs_tensor, gs_tensor, masks_tensor = self._to_device_tensors(
+                observations_batch, global_states_batch, action_masks
+            )
+            pred_entropy_flat = self._predict_entropy_conditioning(obs_tensor, n_envs)
+            actions, log_probs = self._run_actors(
+                obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
+            )
+            values = self._run_centralized_critic(
+                obs_tensor,
+                gs_tensor,
+                n_envs,
+                hypergraphs=hypergraphs,
+                entropies=entropies,
+                critic_obs_sequences=critic_obs_sequences,
+                critic_signature_sequences=critic_signature_sequences,
+            )
+
+        return actions, log_probs, values
+
+    def _to_device_tensors(self, observations_batch, global_states_batch, action_masks):
+        """Convert numpy rollout inputs to device tensors."""
+        obs_tensor = torch.from_numpy(
+            np.ascontiguousarray(observations_batch, dtype=np.float32)
+        ).to(
+            self.device
+        )  # (n_envs, n_agents, obs_dim)
+        gs_tensor = torch.from_numpy(
+            np.ascontiguousarray(global_states_batch, dtype=np.float32)
+        ).to(
+            self.device
+        )  # (n_envs, global_state_dim)
+        masks_tensor = (
+            torch.from_numpy(np.ascontiguousarray(action_masks, dtype=np.float32)).to(
+                self.device
+            )
+            if action_masks is not None
+            else None
+        )  # (n_envs, n_agents, n_actions) or None
+        return obs_tensor, gs_tensor, masks_tensor
+
+    def _predict_entropy_conditioning(self, obs_tensor, n_envs):
+        """Run the entropy predictor over the rolling/eval obs history.
+
+        Returns (n_envs * n_agents, 2 * n_types) or None.
+        """
+        if self.network_old.entropy_predictor is None:
+            return None
+
+        if n_envs == self.n_parallel_envs:
+            # Training collection — use persistent rolling buffer
+            obs_seqs = self.entropy_helper.update_obs_history(obs_tensor)
+        else:
+            # Eval/render — use obs as single-step sequence (zero-padded)
+            obs_seqs = self.entropy_helper.make_eval_sequences(obs_tensor)
+        obs_seqs_flat = obs_seqs.reshape(
+            n_envs * self.n_agents, self.entropy_pred_seq_len, -1
+        ).to(self.device)
+        agent_ids = torch.arange(self.n_agents, device=self.device).repeat(n_envs)
+        pred_mean, pred_log_var = self.network_old.entropy_predictor.forward_batch(
+            obs_seqs_flat, agent_ids
+        )
+        return torch.cat([pred_mean, pred_log_var], dim=-1)
+
+    def _run_actors(
+        self, obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
+    ):
+        """Run actors over all envs/agents; returns (actions, log_probs)."""
+        if self.share_actor:
+            # Fuse envs and agents into one batch: single forward pass total
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+            if pred_entropy_flat is not None:
+                obs_flat = self.entropy_helper.condition_obs(
+                    obs_flat, pred_entropy_flat
+                )
+            masks_flat = (
+                masks_tensor.reshape(n_envs * self.n_agents, -1)
+                if masks_tensor is not None
+                else None
+            )
+            actions_flat, log_probs_flat = self.network_old.act(
+                obs_flat,
+                agent_idx=0,
+                deterministic=deterministic,
+                action_mask=masks_flat,
+            )
+            actions = actions_flat.reshape(n_envs, self.n_agents, -1)
+            log_probs = log_probs_flat.reshape(n_envs, self.n_agents, -1).squeeze(-1)
+            return actions, log_probs
+
+        # One batched pass per agent (n_agents passes, each over all envs)
+        pred_entropy_per_agent = (
+            pred_entropy_flat.reshape(n_envs, self.n_agents, -1)
+            if pred_entropy_flat is not None
+            else None
+        )
+        actions_list = []
+        log_probs_list = []
+        for agent_idx in range(self.n_agents):
+            agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
+            if pred_entropy_per_agent is not None:
+                agent_obs = self.entropy_helper.condition_obs(
+                    agent_obs, pred_entropy_per_agent[:, agent_idx, :]
+                )
+            agent_mask = (
+                masks_tensor[:, agent_idx, :] if masks_tensor is not None else None
+            )
+            a, lp = self.network_old.act(
+                agent_obs, agent_idx, deterministic, action_mask=agent_mask
+            )
+            actions_list.append(a)  # (n_envs, action_dim)
+            log_probs_list.append(lp)  # (n_envs, 1)
+        actions = torch.stack(actions_list, dim=1)  # (n_envs, n_agents, action_dim)
+        log_probs = torch.stack(log_probs_list, dim=1).squeeze(-1)  # (n_envs, n_agents)
+        return actions, log_probs
+
+    def _run_centralized_critic(
+        self,
+        obs_tensor,
+        gs_tensor,
+        n_envs,
+        hypergraphs=None,
+        entropies=None,
+        critic_obs_sequences=None,
+        critic_signature_sequences=None,
+    ):
+        """Dispatch to the configured centralized critic; returns (n_envs, 1)."""
+        if (
+            self.critic_type == "hg_cross_attention"
+            and critic_obs_sequences is not None
+        ):
+            critic_obs_sequences = critic_obs_sequences.to(self.device)
+            critic_signature_sequences = critic_signature_sequences.to(self.device)
+            critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
+                critic_signature_sequences, device=self.device
+            )
+            critic_entropies = (
+                self.hg_cache.get_entropies_for_signature_sequences(
+                    critic_signature_sequences, device=self.device
+                )
+                if self.entropy_conditioning
+                else None
+            )
+            return self.network_old.get_value_batched(
+                critic_obs_sequences,
+                critic_hgs,
+                n_envs,
+                entropies=critic_entropies,
+            )
+        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
+            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
+            return self.network_old.get_value_batched(
+                obs_flat, hypergraphs, n_envs, entropies=entropies
+            )
+        return self.network_old.get_value(gs_tensor)
+
+    @property
+    def intrinsic_feature_dim(self) -> int:
+        """Length of the per-rewarder coordination descriptor vector.
+
+        For "team" mode this is the whole-graph descriptor length; for "agent"
+        mode it is one agent's descriptor length. Computed once from a dummy
+        forward so it stays in sync with the critic's actual head/d_model config.
+        """
+        if getattr(self, "_intrinsic_feature_dim", None) is None:
+            with torch.no_grad():
+                dummy = torch.zeros(
+                    1, self.n_agents, self.observation_dim, device=self.device
+                ).reshape(1, -1)
+                desc = self.network_old.coordination_descriptor(
+                    dummy,
+                    mode=self.intrinsic_reward_mode,
+                    source=self.intrinsic_descriptor_source,
+                )
+            # team: (1, team_dim) -> team_dim; agent: (1, N, agent_dim) -> agent_dim
+            self._intrinsic_feature_dim = int(desc.shape[-1])
+        return self._intrinsic_feature_dim
+
+    def compute_coordination_features(self, obs) -> np.ndarray:
+        """Coordination-graph descriptor for the novelty bonus, read from the
+        dual-purpose attention encoder under no_grad via the behavior network.
+
+        Args:
+            obs: np (n_envs, n_agents, obs_dim).
+
+        Returns:
+            "team" mode:  (n_envs, team_dim)
+            "agent" mode: (n_envs, n_agents, agent_dim)
+        """
+        gs = obs.reshape(obs.shape[0], -1)
+        with torch.no_grad():
+            gs_t = torch.from_numpy(np.ascontiguousarray(gs, dtype=np.float32)).to(
+                self.device
+            )
+            desc = self.network_old.coordination_descriptor(
+                gs_t,
+                mode=self.intrinsic_reward_mode,
+                source=self.intrinsic_descriptor_source,
+            )
+        return desc.cpu().numpy()
+
+    def store_transitions_batch(
+        self,
+        obs,  # np (n_envs, n_agents, obs_dim)
+        global_states,  # np (n_envs, gs_dim)
+        actions,  # np (n_envs, n_agents) discrete or (n_envs, n_agents, action_dim)
+        log_probs,  # np (n_envs, n_agents)
+        values,  # np (n_envs, 1)
+        rewards,  # np (n_envs,)
+        dones,  # np (n_envs,)
+        action_masks=None,  # np (n_envs, n_agents, n_actions) or None
+        hg_signature_ids=None,  # list[int] of length n_envs or None
+        entropies=None,  # torch tensor (n_envs, n_types) or None
+        grouping_tokens=None,  # list[list[int]] of length n_envs or None
+        per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
+    ):
+        """Store transitions for all environments in one vectorized call.
+
+        Reduces tensor-creation overhead from n_envs * n_agents * 7 calls
+        down to 7 calls (one per array), then indexes into the resulting tensors.
+        """
+        n_envs = obs.shape[0]
+
+        # Per-agent rewards: (n_envs, n_agents)
+        per_agent_rewards = np.tile(
+            rewards.astype(np.float32)[:, None], (1, self.n_agents)
+        )
+
+        # Fold in the coordination-graph novelty bonus (already coef-scaled).
+        if per_agent_intrinsic_rewards is not None:
+            per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
+                np.float32
+            )
+
+        # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete
+        if self.discrete and actions.ndim == 2:
+            actions_store = actions[:, :, None].astype(np.float32)
+        else:
+            actions_store = actions.astype(np.float32)
+
+        # Expand dones: (n_envs,) -> (n_envs, n_agents)
+        dones_expanded = np.tile(dones.astype(np.float32)[:, None], (1, self.n_agents))
+
+        # Zero-copy numpy→tensor conversion (from_numpy shares memory when array
+        # is already C-contiguous float32, which gym outputs typically are)
+        obs_t = torch.from_numpy(np.ascontiguousarray(obs, dtype=np.float32))
+        gs_t = torch.from_numpy(np.ascontiguousarray(global_states, dtype=np.float32))
+        act_t = torch.from_numpy(actions_store)  # float32 C-contiguous from .astype()
+        lp_t = torch.from_numpy(np.ascontiguousarray(log_probs, dtype=np.float32))
+        val_t = torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
+        rew_t = torch.from_numpy(
+            per_agent_rewards
+        )  # float32 C-contiguous from arithmetic
+        done_t = torch.from_numpy(dones_expanded)  # float32 C-contiguous from np.tile()
+        masks_t = (
+            torch.from_numpy(np.ascontiguousarray(action_masks, dtype=np.float32))
+            if action_masks is not None
+            else None
+        )
+
+        for env_idx in range(n_envs):
+            self.global_states[env_idx].append(gs_t[env_idx])
+            self.values[env_idx].append(val_t[env_idx])
+            if hg_signature_ids is not None:
+                self.hg_cache.store_transition(
+                    env_idx=env_idx,
+                    sig_id=hg_signature_ids[env_idx],
+                    entropy_conditioning=self.entropy_conditioning,
+                    entropy_tensor=(
+                        entropies[env_idx] if entropies is not None else None
+                    ),
+                )
+            if grouping_tokens is not None:
+                self._grouping_tokens[env_idx].append(grouping_tokens[env_idx])
+            for agent_idx in range(self.n_agents):
+                self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
+                self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
+                self.rewards[env_idx][agent_idx].append(rew_t[env_idx, agent_idx])
+                self.log_probs[env_idx][agent_idx].append(lp_t[env_idx, agent_idx])
+                self.dones[env_idx][agent_idx].append(done_t[env_idx, agent_idx])
+                if masks_t is not None:
+                    self.action_masks[env_idx][agent_idx].append(
+                        masks_t[env_idx, agent_idx]
+                    )
+
+    def compute_returns_and_advantages(self, next_values):
+        """
+        Compute GAE returns and advantages, vectorized over all envs and agents.
+
+        Replaces three nested loops (n_envs × n_agents × T Python iterations)
+        with a single reversed loop over T, operating on (n_envs, n_agents) tensors.
+        Output list is dense: index = env_idx * n_agents + agent_idx.
+        """
+        T = len(self.values[0])
+
+        # --- (n_envs, T+1) critic values ---
+        env_vals_list = []
+        for env_idx in range(self.n_parallel_envs):
+            nv = next_values[env_idx]
+            if not torch.is_tensor(nv):
+                nv = torch.tensor(nv, dtype=torch.float32)
+            # self.values[env_idx]: list of T tensors of shape (1,)
+            env_vals = torch.cat(self.values[env_idx])  # (T,)
+            env_vals_list.append(torch.cat([env_vals, nv.flatten()[:1]]))  # (T+1,)
+        values_t = torch.stack(env_vals_list)  # (n_envs, T+1)
+
+        # --- (n_envs, n_agents, T) rewards and dones ---
+        rewards_t = torch.stack(
+            [
+                torch.stack(
+                    [torch.stack(self.rewards[e][a]) for a in range(self.n_agents)]
+                )
+                for e in range(self.n_parallel_envs)
+            ]
+        )  # (n_envs, n_agents, T)
+
+        dones_t = torch.stack(
+            [
+                torch.stack(
+                    [torch.stack(self.dones[e][a]) for a in range(self.n_agents)]
+                )
+                for e in range(self.n_parallel_envs)
+            ]
+        )  # (n_envs, n_agents, T)
+
+        # --- Vectorized GAE: one reversed loop over T ---
+        # Broadcast values over agent dim: (n_envs, 1, T+1)
+        vals = values_t.unsqueeze(1)
+        advantages = torch.zeros(self.n_parallel_envs, self.n_agents, T)
+        gae = torch.zeros(self.n_parallel_envs, self.n_agents)
+
+        for step in reversed(range(T)):
+            not_done = 1.0 - dones_t[:, :, step]  # (n_envs, n_agents)
+            delta = (
+                rewards_t[:, :, step]
+                + self.gamma * vals[:, :, step + 1] * not_done
+                - vals[:, :, step]
+            )
+            gae = delta + self.gamma * self.gae_lambda * not_done * gae
+            advantages[:, :, step] = gae
+
+        returns = advantages + values_t[:, :-1].unsqueeze(1)  # (n_envs, n_agents, T)
+
+        # Flatten to list indexed by env_idx * n_agents + agent_idx
+        all_returns = []
+        all_advantages = []
+        for env_idx in range(self.n_parallel_envs):
+            for agent_idx in range(self.n_agents):
+                all_returns.append(returns[env_idx, agent_idx].detach())
+                all_advantages.append(advantages[env_idx, agent_idx].detach())
+
+        return all_returns, all_advantages
+
+    def update_shared(
+        self,
+        all_advantages,
+        all_returns,
+        minibatch_size,
+        epochs,
+        train_device,
+    ):
+
+        # Training statistics
+        stats = {
+            "total_loss": 0,
+            "policy_loss": 0,
+            "value_loss": 0,
+            "entropy_loss": 0,
+            "entropy_pred_loss": 0,
+            "affinity_loss": 0,
+            "grouping_loss": 0,
+        }
+        num_updates = 0
+
+        # Build timestep-centric tensors so the centralized critic runs once per
+        # (env, timestep) batch element rather than once per duplicated agent sample.
+        all_obs = []
+        all_global_states = []
+        all_actions = []
+        all_old_log_probs = []
+        all_returns_combined = []
+        all_advantages_combined = []
+        all_masks = []
+        all_ts_indices = []
+        all_obs_sequences = []
+        all_entropy_targets = []
+
+        has_masks = len(self.action_masks[0][0]) > 0
+        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
+        use_entropy_pred = (
+            self.network.entropy_predictor is not None
+            and len(self.hg_cache.entropies[0]) > 0
+        )
+        use_affinity = (
+            self.network.affinity_transformer is not None
+            and len(self._affinity_history_snapshots) > 0
+        )
+        use_grouping = (
+            self.network.grouping_transformer is not None
+            and len(self._grouping_tokens[0]) > 0
+        )
+
+        if use_hgnn:
+            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
+            ts_to_entropies = self.hg_cache.get_flat_entropies(
+                train_device, self.entropy_conditioning
+            )
+            trajectory_lengths = [
+                len(self.values[env_idx])
+                for env_idx in range(self.n_parallel_envs)
+                if len(self.values[env_idx]) > 0
+            ]
+
+        # Flat-ts -> (env_idx, timestep_within_env) lookup for grouping loss.
+        flat_to_env_t: list[tuple[int, int]] = []
+        if use_grouping:
+            for env_idx in range(self.n_parallel_envs):
+                T_env = len(self.values[env_idx])
+                for local_t in range(T_env):
+                    flat_to_env_t.append((env_idx, local_t))
+
+        ts_offset = 0
+        for env_idx in range(self.n_parallel_envs):
+            if len(self.values[env_idx]) == 0:
+                continue
+
+            T = len(self.values[env_idx])
+            env_global_states = torch.stack(self.global_states[env_idx])
+            env_obs = []
+            env_actions = []
+            env_old_log_probs = []
+            env_returns = []
+            env_advantages = []
+            env_obs_sequences = []
+
+            for agent_idx in range(self.n_agents):
+                if len(self.observations[env_idx][agent_idx]) == 0:
+                    continue
+
+                data_idx = env_idx * self.n_agents + agent_idx
+                if data_idx >= len(all_advantages):
+                    continue
+
+                advantages = all_advantages[data_idx]
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
+
+                obs = torch.stack(self.observations[env_idx][agent_idx])
+                actions = torch.stack(self.actions[env_idx][agent_idx])
+                old_log_probs = torch.stack(self.log_probs[env_idx][agent_idx])
+                returns = all_returns[data_idx]
+
+                env_obs.append(obs)
+                env_actions.append(actions)
+                env_old_log_probs.append(old_log_probs)
+                env_returns.append(returns)
+                env_advantages.append(advantages)
+                if use_entropy_pred:
+                    env_obs_sequences.append(
+                        self.entropy_helper.build_obs_sequences(obs)
+                    )
+
+            if not env_obs:
+                ts_offset += T
+                continue
+
+            all_obs.append(torch.stack(env_obs, dim=1))
+            all_global_states.append(env_global_states)
+            all_actions.append(torch.stack(env_actions, dim=1))
+            all_old_log_probs.append(torch.stack(env_old_log_probs, dim=1))
+            all_returns_combined.append(torch.stack(env_returns, dim=1))
+            all_advantages_combined.append(torch.stack(env_advantages, dim=1))
+            if has_masks:
+                env_masks = [
+                    torch.stack(self.action_masks[env_idx][agent_idx])
+                    for agent_idx in range(self.n_agents)
+                ]
+                all_masks.append(torch.stack(env_masks, dim=1))
+            if use_hgnn:
+                all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
+            if use_entropy_pred:
+                all_obs_sequences.append(torch.stack(env_obs_sequences, dim=1))
+                entropy_t = torch.tensor(
+                    np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
+                )
+                all_entropy_targets.append(
+                    entropy_t.unsqueeze(1).expand(-1, self.n_agents, -1)
+                )
+
+            ts_offset += T
+
+        # Concatenate to timestep-major tensors:
+        # obs/actions/... shape (n_total_ts, n_agents, ...)
+        combined_obs = torch.cat(all_obs, dim=0).detach().to(train_device)
+        combined_global_states = (
+            torch.cat(all_global_states, dim=0).detach().to(train_device)
+        )
+        combined_actions = torch.cat(all_actions, dim=0).detach().to(train_device)
+        combined_old_log_probs = (
+            torch.cat(all_old_log_probs, dim=0).detach().to(train_device)
+        )
+        combined_returns = torch.cat(all_returns_combined, dim=0).to(train_device)
+        combined_advantages = torch.cat(all_advantages_combined, dim=0).to(train_device)
+        combined_masks = (
+            torch.cat(all_masks, dim=0).detach().to(train_device) if has_masks else None
+        )
+        combined_ts_indices = (
+            torch.cat(all_ts_indices).to(train_device) if use_hgnn else None
+        )
+        combined_obs_sequences = (
+            torch.cat(all_obs_sequences, dim=0).detach().to(train_device)
+            if use_entropy_pred
+            else None
+        )
+        combined_entropy_targets = (
+            torch.cat(all_entropy_targets, dim=0).detach().to(train_device)
+            if use_entropy_pred
+            else None
+        )
+        ts_to_global_states = combined_global_states if use_hgnn else None
+
+        # Create dataset
+        dataset_tensors = [
+            combined_obs,
+            combined_global_states,
+            combined_actions,
+            combined_old_log_probs,
+            combined_returns,
+            combined_advantages,
+        ]
+        if combined_masks is not None:
+            dataset_tensors.append(combined_masks)
+        if combined_ts_indices is not None:
+            dataset_tensors.append(combined_ts_indices)
+        if combined_obs_sequences is not None:
+            dataset_tensors.append(combined_obs_sequences)
+            dataset_tensors.append(combined_entropy_targets)
+
+        dataset = TensorDataset(*dataset_tensors)
+
+        timestep_minibatch_size = max(1, minibatch_size // self.n_agents)
+        dataloader = DataLoader(
+            dataset, batch_size=timestep_minibatch_size, shuffle=True
+        )
+
+        # Train for multiple epochs
+        for epoch in range(epochs):
+            for batch in dataloader:
+                # Unpack batch — order matches dataset_tensors above
+                (
+                    batch_obs,
+                    batch_global_states,
+                    batch_actions,
+                    batch_old_log_probs,
+                    batch_returns,
+                    batch_advantages,
+                    *extra,
+                ) = batch
+                batch_masks = extra.pop(0) if combined_masks is not None else None
+                batch_ts_idx = extra.pop(0).long() if use_hgnn else None
+                if use_entropy_pred:
+                    batch_obs_seq = extra.pop(0)
+                    batch_entropy_targets = extra.pop(0)
+
+                batch_n_ts = batch_obs.shape[0]
+                batch_obs_flat = batch_obs.reshape(batch_n_ts * self.n_agents, -1)
+                batch_actions_flat = batch_actions.reshape(
+                    batch_n_ts * self.n_agents, *batch_actions.shape[2:]
+                )
+                batch_old_log_probs_flat = batch_old_log_probs.reshape(-1)
+                batch_advantages_flat = batch_advantages.reshape(-1)
+                batch_masks_flat = (
+                    batch_masks.reshape(batch_n_ts * self.n_agents, -1)
+                    if batch_masks is not None
+                    else None
+                )
+
+                # Predict entropy and condition actor observations
+                pred_mean = pred_log_var = None
+                if use_entropy_pred:
+                    batch_obs_seq_flat = batch_obs_seq.reshape(
+                        batch_n_ts * self.n_agents,
+                        batch_obs_seq.shape[2],
+                        batch_obs_seq.shape[3],
+                    )
+                    batch_entropy_targets_flat = batch_entropy_targets.reshape(
+                        batch_n_ts * self.n_agents, batch_entropy_targets.shape[-1]
+                    )
+                    batch_agent_idx = torch.arange(
+                        self.n_agents, device=train_device
+                    ).repeat(batch_n_ts)
+                    pred_mean, pred_log_var = (
+                        self.network.entropy_predictor.forward_batch(
+                            batch_obs_seq_flat, batch_agent_idx
+                        )
+                    )
+                    pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
+                    batch_obs_conditioned = self.entropy_helper.condition_obs(
+                        batch_obs_flat, pred_entropy.detach()
+                    )
+                else:
+                    batch_obs_conditioned = batch_obs_flat
+
+                # Actor evaluation (batched over individual agent observations)
+                actor = self.network.get_actor(0)
+                log_probs, entropy = actor.evaluate(
+                    batch_obs_conditioned,
+                    batch_actions_flat,
+                    action_mask=batch_masks_flat,
+                )
+
+                # Critic evaluation
+                if use_hgnn:
+                    values = self.hg_cache.compute_hgnn_critic_values(
+                        network_critic=self.network.critic,
+                        batch_global_states=batch_global_states,
+                        batch_ts_indices=batch_ts_idx,
+                        ts_to_signature_ids=ts_to_signature_ids,
+                        observation_dim=self.observation_dim,
+                        device=self.device,
+                        ts_to_entropies=ts_to_entropies,
+                        ts_to_global_states=ts_to_global_states,
+                        trajectory_lengths=trajectory_lengths,
+                    )
+                elif self.critic_type == "gnn":
+                    obs_grid = batch_global_states.view(
+                        -1, self.n_agents, self.observation_dim
+                    )
+                    values = self.network.critic(obs_grid).squeeze(-1)
+                else:
+                    values = self.network.critic(batch_global_states).squeeze(-1)
+
+                # COMA-style per-agent counterfactual baseline (multi_hgnn only).
+                # V_cf(i, s) = critic(s, hg \ E_i); replaces the shared baseline
+                # in the policy loss with A_i = R_i - V_cf(i, s).
+                if use_hgnn and self.counterfactual_credit:
+                    cf_values = self.hg_cache.compute_per_agent_counterfactual_values(
+                        network_critic=self.network.critic,
+                        batch_global_states=batch_global_states,
+                        batch_ts_indices=batch_ts_idx,
+                        ts_to_signature_ids=ts_to_signature_ids,
+                        observation_dim=self.observation_dim,
+                        device=self.device,
+                    )  # (n_minibatch_ts, n_agents)
+                    cf_advantages = batch_returns - cf_values.detach()
+                    cf_advantages_flat = cf_advantages.reshape(-1)
+                    cf_advantages_flat = (
+                        cf_advantages_flat - cf_advantages_flat.mean()
+                    ) / (cf_advantages_flat.std() + 1e-8)
+                    actor_advantages = cf_advantages_flat
+                else:
+                    actor_advantages = batch_advantages_flat
+
+                # PPO objective
+                ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs_flat)
+                surr1 = ratio * actor_advantages
+                surr2 = (
+                    torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
+                    * actor_advantages
+                )
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Shared critic value is compared against each agent's return.
+                value_loss = F.mse_loss(
+                    values.unsqueeze(1).expand_as(batch_returns), batch_returns
+                )
+
+                # Entropy loss
+                entropy_loss = -entropy.mean()
+
+                # Total loss
+                loss = (
+                    policy_loss
+                    + self.value_coef * value_loss
+                    + self.entropy_coef * entropy_loss
+                )
+
+                # Auxiliary entropy prediction loss (Gaussian NLL)
+                if use_entropy_pred:
+                    entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
+                        pred_mean=pred_mean,
+                        pred_log_var=pred_log_var,
+                        targets=batch_entropy_targets_flat,
+                    )
+                    loss = loss + self.entropy_pred_coef * entropy_pred_loss
+
+                # Auxiliary affinity transformer loss
+                if use_affinity:
+                    affinity_loss = self.compute_affinity_loss()
+                    loss = loss + self.affinity_loss_coef * affinity_loss
+
+                # Auxiliary REINFORCE loss for the GroupingTransformer
+                grouping_loss = None
+                if use_grouping and batch_ts_idx is not None:
+                    ts_per_sample = batch_ts_idx.detach().cpu().tolist()
+                    env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
+                    local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
+                    # Per-(env,t) advantage = mean over agents, then normalized.
+                    mb_adv = batch_advantages.mean(dim=-1)
+                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                    grouping_loss = self.compute_grouping_loss(
+                        env_indices, local_t_indices, mb_adv
+                    )
+                    loss = loss + self.grouping_loss_coef * grouping_loss
+
+                # Optimize
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.network.parameters(), self.grad_clip
+                )
+                self.optimizer.step()
+
+                # Update statistics
+                stats["total_loss"] += loss.item()
+                stats["policy_loss"] += policy_loss.item()
+                stats["value_loss"] += value_loss.item()
+                stats["entropy_loss"] += entropy_loss.item()
+                if use_entropy_pred:
+                    stats["entropy_pred_loss"] += entropy_pred_loss.item()
+                if use_affinity:
+                    stats["affinity_loss"] += affinity_loss.item()
+                if grouping_loss is not None:
+                    stats["grouping_loss"] += grouping_loss.item()
+                num_updates += 1
+
+        return stats, num_updates
+
+    def update_independent_actors(
+        self,
+        all_advantages,
+        all_returns,
+        minibatch_size,
+        epochs,
+        train_device,
+    ):
+
+        # Training statistics
+        stats = {
+            "total_loss": 0,
+            "policy_loss": 0,
+            "value_loss": 0,
+            "entropy_loss": 0,
+            "entropy_pred_loss": 0,
+            "affinity_loss": 0,
+            "grouping_loss": 0,
+        }
+        num_updates = 0
+
+        has_masks = len(self.action_masks[0][0]) > 0
+        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
+        use_entropy_pred = (
+            self.network.entropy_predictor is not None
+            and len(self.hg_cache.entropies[0]) > 0
+        )
+        use_affinity = (
+            self.network.affinity_transformer is not None
+            and len(self._affinity_history_snapshots) > 0
+        )
+        use_grouping = (
+            self.network.grouping_transformer is not None
+            and len(self._grouping_tokens[0]) > 0
+        )
+
+        flat_to_env_t: list[tuple[int, int]] = []
+        if use_grouping:
+            for env_idx in range(self.n_parallel_envs):
+                T_env = len(self.values[env_idx])
+                for local_t in range(T_env):
+                    flat_to_env_t.append((env_idx, local_t))
+
+        if use_hgnn:
+            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
+            ts_to_entropies = self.hg_cache.get_flat_entropies(
+                train_device, self.entropy_conditioning
+            )
+            ts_to_global_states = (
+                torch.cat(
+                    [
+                        torch.stack(self.global_states[env_idx])
+                        for env_idx in range(self.n_parallel_envs)
+                        if len(self.values[env_idx]) > 0
+                    ],
+                    dim=0,
+                )
+                .detach()
+                .to(train_device)
+            )
+            trajectory_lengths = [
+                len(self.values[env_idx])
+                for env_idx in range(self.n_parallel_envs)
+                if len(self.values[env_idx]) > 0
+            ]
+
+        # Update each agent separately (independent actors)
+        for agent_idx in range(self.n_agents):
+            # Collect data for this agent across all environments
+            agent_obs = []
+            agent_global_states = []
+            agent_actions = []
+            agent_old_log_probs = []
+            agent_returns = []
+            agent_advantages = []
+            agent_masks = []
+            agent_ts_indices = []
+            agent_raw_obs_for_seq = []
+            agent_entropy_targets = []
+
+            ts_offset = 0
+            for env_idx in range(self.n_parallel_envs):
+                T = len(self.values[env_idx]) if len(self.values[env_idx]) > 0 else 0
+
+                if len(self.observations[env_idx][agent_idx]) == 0:
+                    ts_offset += T
+                    continue
+
+                # Get the index in the flattened advantages/returns list
+                data_idx = env_idx * self.n_agents + agent_idx
+
+                if data_idx >= len(all_advantages):
+                    ts_offset += T
+                    continue
+
+                # Normalize advantages for this agent in this environment
+                advantages = all_advantages[data_idx]
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
+
+                # Stack data
+                obs = torch.stack(self.observations[env_idx][agent_idx])
+                actions = torch.stack(self.actions[env_idx][agent_idx])
+                old_log_probs = torch.stack(self.log_probs[env_idx][agent_idx])
+                returns = all_returns[data_idx]
+                global_states = torch.stack(self.global_states[env_idx])
+
+                # Append to agent-specific lists
+                agent_obs.append(obs)
+                agent_global_states.append(global_states)
+                agent_actions.append(actions)
+                agent_old_log_probs.append(old_log_probs)
+                agent_returns.append(returns)
+                agent_advantages.append(advantages)
+
+                if has_masks:
+                    agent_masks.append(
+                        torch.stack(self.action_masks[env_idx][agent_idx])
+                    )
+
+                if use_hgnn:
+                    agent_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
+
+                if use_entropy_pred:
+                    agent_raw_obs_for_seq.append(obs)  # (T, obs_dim)
+                    entropy_t = torch.tensor(
+                        np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
+                    )  # (T, n_types)
+                    agent_entropy_targets.append(entropy_t)
+
+                ts_offset += T
+
+            if len(agent_obs) == 0:
+                continue  # No data for this agent
+
+            # Concatenate data for this agent from all environments and move to training device
+            obs_combined = torch.cat(agent_obs, dim=0).detach().to(train_device)
+            global_states_combined = (
+                torch.cat(agent_global_states, dim=0).detach().to(train_device)
+            )
+            actions_combined = torch.cat(agent_actions, dim=0).detach().to(train_device)
+            old_log_probs_combined = (
+                torch.cat(agent_old_log_probs, dim=0).detach().to(train_device)
+            )
+            returns_combined = torch.cat(agent_returns, dim=0).to(train_device)
+            advantages_combined = torch.cat(agent_advantages, dim=0).to(train_device)
+            masks_combined = (
+                torch.cat(agent_masks, dim=0).detach().to(train_device)
+                if has_masks
+                else None
+            )
+            ts_indices_combined = (
+                torch.cat(agent_ts_indices).to(train_device) if use_hgnn else None
+            )
+            obs_sequences_combined = (
+                self.entropy_helper.build_obs_sequences_batched(
+                    torch.stack(agent_raw_obs_for_seq)
+                )
+                .detach()
+                .to(train_device)
+                if use_entropy_pred
+                else None
+            )
+            entropy_targets_combined = (
+                torch.cat(agent_entropy_targets, dim=0).detach().to(train_device)
+                if use_entropy_pred
+                else None
+            )
+
+            # Create dataset for this agent
+            dataset_tensors = [
+                obs_combined,
+                global_states_combined,
+                actions_combined,
+                old_log_probs_combined,
+                returns_combined,
+                advantages_combined,
+            ]
+            if masks_combined is not None:
+                dataset_tensors.append(masks_combined)
+            if ts_indices_combined is not None:
+                dataset_tensors.append(ts_indices_combined)
+            if obs_sequences_combined is not None:
+                dataset_tensors.append(obs_sequences_combined)
+                dataset_tensors.append(entropy_targets_combined)
+
+            dataset = TensorDataset(*dataset_tensors)
+            dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
+
+            # Train for multiple epochs
+            for epoch in range(epochs):
+                for batch in dataloader:
+                    # Unpack batch — order matches dataset_tensors above
+                    (
+                        batch_obs,
+                        batch_global_states,
+                        batch_actions,
+                        batch_old_log_probs,
+                        batch_returns,
+                        batch_advantages,
+                        *extra,
+                    ) = batch
+                    batch_masks = extra.pop(0) if masks_combined is not None else None
+                    batch_ts_idx = extra.pop(0).long() if use_hgnn else None
+                    if use_entropy_pred:
+                        batch_obs_seq = extra.pop(0)
+                        batch_entropy_targets = extra.pop(0)
+
+                    # Predict entropy and condition actor observations
+                    pred_mean = pred_log_var = None
+                    if use_entropy_pred:
+                        pred_mean, pred_log_var = self.network.entropy_predictor(
+                            batch_obs_seq, agent_idx
+                        )
+                        pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
+                        batch_obs_conditioned = self.entropy_helper.condition_obs(
+                            batch_obs, pred_entropy.detach()
+                        )
+                    else:
+                        batch_obs_conditioned = batch_obs
+
+                    # Actor evaluation
+                    actor = self.network.get_actor(agent_idx)
+                    log_probs, entropy = actor.evaluate(
+                        batch_obs_conditioned, batch_actions, action_mask=batch_masks
+                    )
+
+                    # Critic evaluation
+                    if use_hgnn:
+                        values = self.hg_cache.compute_hgnn_critic_values(
+                            network_critic=self.network.critic,
+                            batch_global_states=batch_global_states,
+                            batch_ts_indices=batch_ts_idx,
+                            ts_to_signature_ids=ts_to_signature_ids,
+                            observation_dim=self.observation_dim,
+                            device=self.device,
+                            ts_to_entropies=ts_to_entropies,
+                            ts_to_global_states=ts_to_global_states,
+                            trajectory_lengths=trajectory_lengths,
+                        )
+                    elif self.critic_type == "gnn":
+                        obs_grid = batch_global_states.view(
+                            -1, self.n_agents, self.observation_dim
+                        )
+                        values = self.network.critic(obs_grid).squeeze(-1)
+                    else:
+                        values = self.network.critic(batch_global_states).squeeze(-1)
+
+                    # PPO objective
+                    ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs)
+                    surr1 = ratio * batch_advantages
+                    surr2 = (
+                        torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
+                        * batch_advantages
+                    )
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    # Value loss
+                    value_loss = F.mse_loss(values, batch_returns)
+
+                    # Entropy loss
+                    entropy_loss = -entropy.mean()
+
+                    # Total loss
+                    loss = (
+                        policy_loss
+                        + self.value_coef * value_loss
+                        + self.entropy_coef * entropy_loss
+                    )
+
+                    # Auxiliary entropy prediction loss (Gaussian NLL)
+                    if use_entropy_pred:
+                        entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
+                            pred_mean=pred_mean,
+                            pred_log_var=pred_log_var,
+                            targets=batch_entropy_targets,
+                        )
+                        loss = loss + self.entropy_pred_coef * entropy_pred_loss
+
+                    # Auxiliary affinity transformer loss
+                    if use_affinity:
+                        affinity_loss = self.compute_affinity_loss()
+                        loss = loss + self.affinity_loss_coef * affinity_loss
+
+                    # Auxiliary REINFORCE loss for the GroupingTransformer.
+                    # Only run on agent_idx == 0 — the same hyperedge sample is
+                    # shared across all agents, and we don't want to update it
+                    # n_agents times per minibatch.
+                    grouping_loss = None
+                    if use_grouping and agent_idx == 0 and batch_ts_idx is not None:
+                        ts_per_sample = batch_ts_idx.detach().cpu().tolist()
+                        env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
+                        local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
+                        mb_adv = batch_advantages
+                        mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+                        grouping_loss = self.compute_grouping_loss(
+                            env_indices, local_t_indices, mb_adv
+                        )
+                        loss = loss + self.grouping_loss_coef * grouping_loss
+
+                    # Optimize
+                    self.optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.network.parameters(), self.grad_clip
+                    )
+                    self.optimizer.step()
+
+                    # Update statistics
+                    stats["total_loss"] += loss.item()
+                    stats["policy_loss"] += policy_loss.item()
+                    stats["value_loss"] += value_loss.item()
+                    stats["entropy_loss"] += entropy_loss.item()
+                    if use_entropy_pred:
+                        stats["entropy_pred_loss"] += entropy_pred_loss.item()
+                    if use_affinity:
+                        stats["affinity_loss"] += affinity_loss.item()
+                    if grouping_loss is not None:
+                        stats["grouping_loss"] += grouping_loss.item()
+                    num_updates += 1
+
+        return stats, num_updates
+
+    def update(self, next_value=0, minibatch_size=128, epochs=10):
+        """Update all agents using shared critic"""
+
+        self.hg_cache.clear_minibatch_cache()
+
+        # Compute returns and advantages
+        all_returns, all_advantages = self.compute_returns_and_advantages(next_value)
+
+        # Pre-update explained variance: how well the centralized critic's
+        # stored predictions explain the GAE returns on this rollout.
+        # Ordering of all_returns is env_idx * n_agents + agent_idx, so values
+        # for each env are repeated n_agents times contiguously to align.
+        with torch.no_grad():
+            flat_returns = torch.cat(all_returns)
+            flat_values = torch.cat(
+                [
+                    torch.cat(self.values[e]).repeat(self.n_agents)
+                    for e in range(self.n_parallel_envs)
+                ]
+            )
+            var_returns = flat_returns.var()
+            explained_variance = 1.0 - (flat_returns - flat_values).var() / (
+                var_returns + 1e-8
+            )
+
+        # Update each agent (or all at once if sharing actor)
+        if self.share_actor:
+            stats, num_updates = self.update_shared(
+                all_advantages, all_returns, minibatch_size, epochs, self.device
+            )
+
+        else:
+            stats, num_updates = self.update_independent_actors(
+                all_advantages, all_returns, minibatch_size, epochs, self.device
+            )
+
+        # Update old network
+        self.network_old.load_state_dict(self.network.state_dict())
+
+        # Reset buffers
+        self.reset_buffers()
+
+        # Average statistics
+        for key in stats:
+            stats[key] /= max(1, num_updates)
+
+        stats["explained_variance"] = float(explained_variance.item())
+
+        return stats
