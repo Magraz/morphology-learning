@@ -42,7 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from algorithms.create_env import make_vec_env  # noqa: E402
 from algorithms.mappo.mappo import MAPPOAgent  # noqa: E402
 from algorithms.mappo.types import MAPPO_Params, Model_Params  # noqa: E402
-from algorithms.mappo.utils import set_global_seeds  # noqa: E402
+from algorithms.utils import set_global_seeds  # noqa: E402
 from environments.types import EnvironmentEnum  # noqa: E402
 
 DEFAULTS = {
@@ -71,8 +71,11 @@ def parse_args():
         default=0.05,
         help="hide edges with adjacency weight below this",
     )
-    p.add_argument("--show-labels", action="store_true",
-                   help="annotate each drawn edge with its weight value")
+    p.add_argument(
+        "--show-labels",
+        action="store_true",
+        help="annotate each drawn edge with its weight value",
+    )
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
@@ -232,15 +235,39 @@ def draw_graph(ax, adj, cmap, vmax, threshold, show_labels):
             )
             if show_labels:
                 mx, my = (pos[i] + pos[j]) / 2
-                ax.text(mx, my, f"{wgt:.2f}", ha="center", va="center",
-                        fontsize=6, color="black", zorder=4,
-                        bbox=dict(boxstyle="round,pad=0.1", fc="white",
-                                  ec="none", alpha=0.6))
-    ax.scatter(pos[:, 0], pos[:, 1], s=300, c="white", edgecolors="black",
-               linewidths=1.5, zorder=2)
+                ax.text(
+                    mx,
+                    my,
+                    f"{wgt:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color="black",
+                    zorder=4,
+                    bbox=dict(
+                        boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.6
+                    ),
+                )
+    ax.scatter(
+        pos[:, 0],
+        pos[:, 1],
+        s=300,
+        c="white",
+        edgecolors="black",
+        linewidths=1.5,
+        zorder=2,
+    )
     for i in range(n):
-        ax.text(pos[i, 0], pos[i, 1], str(i), ha="center", va="center",
-                fontsize=9, fontweight="bold", zorder=3)
+        ax.text(
+            pos[i, 0],
+            pos[i, 1],
+            str(i),
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            zorder=3,
+        )
     ax.set_xlim(-1.3, 1.3)
     ax.set_ylim(-1.3, 1.3)
     ax.set_aspect("equal")
@@ -291,8 +318,9 @@ def build_figure(frames, adjacencies, cum_rewards, n_snapshots, threshold, show_
 
     fig.suptitle("Attention-GNN critic coordination graphs", fontsize=14)
     sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
-    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), orientation="horizontal",
-                        fraction=0.04, aspect=50)
+    cbar = fig.colorbar(
+        sm, ax=axes.ravel().tolist(), orientation="horizontal", fraction=0.04, aspect=50
+    )
     cbar.set_label("edge weight (symmetric attention adjacency)")
     return fig
 

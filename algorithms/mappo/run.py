@@ -4,7 +4,7 @@ from algorithms.runner import Runner
 from pathlib import Path
 
 from algorithms.mappo.vec_trainer import VecMAPPOTrainer
-from algorithms.mappo.utils import set_global_seeds
+from algorithms.utils import set_global_seeds
 
 import numpy as np
 import matplotlib.pyplot as plt

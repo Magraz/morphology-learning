@@ -3,11 +3,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
-from algorithms.mappo.types import MAPPO_Params, Model_Params
-from algorithms.mappo.networks.encoders import LocalStateEncoder, HypergraphStateEncoder
-from algorithms.mappo.networks.models import MAPPONetwork
-from algorithms.mappo.hg_cache import HypergraphCache
-from algorithms.mappo.entropy_helpers import EntropyPredictorHelper
+from algorithms.mappo_vanilla.types import MAPPO_Params, Model_Params
+from algorithms.mappo_vanilla.networks.models import MAPPONetwork
 
 
 class MAPPOAgent:
@@ -24,7 +21,6 @@ class MAPPOAgent:
         discrete: bool,
         n_parallel_envs: int,
         model_params: Model_Params,
-        hyperedge_fns: list[tuple] = None,
     ):
         self.device = "cuda" if torch.cuda.is_available() else device
         self.n_agents = n_agents
@@ -34,47 +30,6 @@ class MAPPOAgent:
         self.share_actor = params.parameter_sharing
         self.n_parallel_envs = n_parallel_envs
         self.critic_type = model_params.critic_type
-        self.n_hyperedge_types = model_params.n_hyperedge_types
-        self.critic_seq_len = model_params.critic_seq_len
-        # Hyperedge builder specs: list of (fn, source) where source is "obs"
-        # or an info-dict key name (e.g. "agents_2_objects")
-        self.hyperedge_fns = hyperedge_fns or []
-        # Entropy conditioning of HGNN critics
-        self.entropy_conditioning = model_params.entropy_conditioning
-        # COMA-style per-agent counterfactual baseline (multi_hgnn only).
-        self.counterfactual_credit = model_params.counterfactual_credit
-        if self.counterfactual_credit and self.critic_type != "multi_hgnn":
-            raise ValueError(
-                "counterfactual_credit is only supported for "
-                "critic_type='multi_hgnn'; got "
-                f"critic_type={self.critic_type!r}."
-            )
-        # Auxiliary LSTM entropy predictor config
-        self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
-        self.entropy_pred_coef = model_params.entropy_pred_coef
-        # Learned affinity config
-        self.hypergraph_mode = model_params.hypergraph_mode
-        self.hygma_history_len = model_params.hygma_history_len
-        self.affinity_loss_coef = model_params.affinity_loss_coef
-        # Learned grouping (autoregressive hyperedge generator) config
-        self.grouping_history_len = model_params.grouping_history_len
-        self.grouping_loss_coef = model_params.grouping_loss_coef
-        self.grouping_entropy_coef = model_params.grouping_entropy_coef
-
-        # Coordination-graph novelty exploration (gnn critic only)
-        self.use_intrinsic_reward = model_params.use_intrinsic_reward
-        self.intrinsic_reward_mode = model_params.intrinsic_reward_mode
-        self.intrinsic_descriptor_source = model_params.intrinsic_descriptor_source
-        self.intrinsic_reward_coef = model_params.intrinsic_reward_coef
-        self.intrinsic_reward_k = model_params.intrinsic_reward_k
-        self.intrinsic_reward_memory_capacity = (
-            model_params.intrinsic_reward_memory_capacity
-        )
-        if self.use_intrinsic_reward and self.critic_type != "gnn":
-            raise ValueError(
-                "use_intrinsic_reward (coordination-graph novelty) is only "
-                f"supported for critic_type='gnn'; got {self.critic_type!r}."
-            )
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -90,20 +45,10 @@ class MAPPOAgent:
             global_state_dim=global_state_dim,
             action_dim=action_dim,
             n_agents=n_agents,
-            hidden_dim=(
-                round(model_params.hidden_dim * 1.09)
-                if self.critic_type == "mlp"
-                else model_params.hidden_dim
-            ),
+            hidden_dim=model_params.hidden_dim,
             discrete=discrete,
             share_actor=self.share_actor,
             critic_type=self.critic_type,
-            n_hyperedge_types=self.n_hyperedge_types,
-            critic_seq_len=self.critic_seq_len,
-            entropy_conditioning=self.entropy_conditioning,
-            hypergraph_mode=self.hypergraph_mode,
-            history_len=self.hygma_history_len,
-            grouping_history_len=self.grouping_history_len,
         )
         self.network = MAPPONetwork(**network_kwargs).to(self.device)
 
@@ -118,168 +63,8 @@ class MAPPOAgent:
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
 
-        # Hypergraph cache (owns signature maps, edge lists, dhg objects, entropy values)
-        self.hg_cache = HypergraphCache(
-            n_agents=n_agents,
-            n_parallel_envs=n_parallel_envs,
-        )
-
-        # Entropy predictor helper (owns obs history, sequence building, loss)
-        self.entropy_helper = EntropyPredictorHelper(
-            n_parallel_envs=n_parallel_envs,
-            n_agents=n_agents,
-            observation_dim=observation_dim,
-            seq_len=self.entropy_pred_seq_len,
-        )
-
-        # Affinity training: stores aggregated history snapshots from rollout
-        self._affinity_history_snapshots = []
-
-        # Learned grouping: per-(env, t) token sequences sampled at rollout
-        self._grouping_tokens: list[list[list[int]]] = [
-            [] for _ in range(n_parallel_envs)
-        ]
-
         # Buffers for each agent
         self.reset_buffers()
-
-    def store_affinity_snapshot(self, agg_history: np.ndarray) -> None:
-        """Store an aggregated observation history snapshot for affinity training.
-
-        Called by HypergraphRuntime each time clustering runs.
-
-        Args:
-            agg_history: (n_agents, history_len, obs_dim) numpy array.
-        """
-        self._affinity_history_snapshots.append(agg_history.copy())
-
-    def compute_affinity_loss(self) -> torch.Tensor:
-        """Compute auxiliary loss for the affinity transformer.
-
-        Uses stored history snapshots from the last rollout. Encourages the
-        affinity matrix to be decisive (low binary entropy) rather than
-        uniformly uncertain.
-        """
-        transformer = self.network.affinity_transformer
-        if transformer is None or not self._affinity_history_snapshots:
-            return torch.tensor(0.0, device=self.device)
-
-        total_loss = torch.tensor(0.0, device=self.device)
-        for snapshot in self._affinity_history_snapshots:
-            x = torch.from_numpy(snapshot).to(self.device)
-            affinity = transformer(x)
-            # Binary-entropy regulariser: push off-diagonal values toward 0 or 1
-            mask = ~torch.eye(self.n_agents, dtype=torch.bool, device=self.device)
-            a = affinity[mask]
-            entropy = -(a * torch.log(a + 1e-8) + (1 - a) * torch.log(1 - a + 1e-8))
-            total_loss = total_loss + entropy.mean()
-
-        return total_loss / len(self._affinity_history_snapshots)
-
-    def compute_grouping_loss(
-        self,
-        env_indices: list[int],
-        ts_indices: list[int],
-        advantages: torch.Tensor,
-    ) -> torch.Tensor:
-        """REINFORCE-style loss for the GroupingTransformer.
-
-        Treats the autoregressive hyperedge generator as a policy whose action
-        is the sampled token sequence. The reward signal is the standardized
-        per-(env, t) advantage already computed for PPO; raising the
-        log-probability of token sequences whose downstream rollouts had
-        positive advantage pushes the structure toward edges the critic finds
-        useful.
-
-        Args:
-            env_indices: List of env_idx for each minibatch sample.
-            ts_indices: List of timestep-within-env for each minibatch sample.
-            advantages: (B,) tensor of standardized advantages on training device.
-
-        Returns:
-            Scalar loss tensor (zero when no usable samples).
-        """
-        gt = self.network.grouping_transformer
-        device = advantages.device
-        if gt is None:
-            return torch.tensor(0.0, device=device)
-
-        # Gather per-sample token sequences and observation histories.
-        token_lists: list[list[int]] = []
-        obs_histories: list[torch.Tensor] = []
-        valid_advantages: list[torch.Tensor] = []
-        seq_len = self.grouping_history_len
-
-        for k, (env_idx, t) in enumerate(zip(env_indices, ts_indices)):
-            env_tokens = self._grouping_tokens[env_idx]
-            if t >= len(env_tokens) or not env_tokens[t]:
-                continue
-            token_lists.append(env_tokens[t])
-
-            # Build the obs-history window ending at timestep t for this env:
-            #   shape (n_agents, seq_len, obs_dim), zero-left-padded.
-            agent_obs = []
-            for agent_idx in range(self.n_agents):
-                traj = self.observations[env_idx][agent_idx]
-                window = traj[max(0, t - seq_len + 1) : t + 1]
-                if not window:
-                    continue
-                stacked = torch.stack(window, dim=0)
-                pad_len = seq_len - stacked.shape[0]
-                if pad_len > 0:
-                    pad = torch.zeros(
-                        pad_len, self.observation_dim, dtype=stacked.dtype
-                    )
-                    stacked = torch.cat([pad, stacked], dim=0)
-                agent_obs.append(stacked)
-            if len(agent_obs) != self.n_agents:
-                token_lists.pop()
-                continue
-            obs_histories.append(torch.stack(agent_obs, dim=0))
-            valid_advantages.append(advantages[k])
-
-        if not token_lists:
-            return torch.tensor(0.0, device=device)
-
-        max_len = max(len(s) for s in token_lists)
-        eos_id = gt.eos_id
-        padded = torch.full(
-            (len(token_lists), max_len), eos_id, dtype=torch.long, device=device
-        )
-        lengths = torch.zeros(len(token_lists), dtype=torch.long, device=device)
-        for i, seq in enumerate(token_lists):
-            padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-            lengths[i] = len(seq)
-
-        obs_hist_tensor = torch.stack(obs_histories, dim=0).to(device)
-
-        logits = gt(obs_hist_tensor, padded)  # (B, L, vocab)
-        # log_softmax handles the -inf masked entries cleanly.
-        log_probs = F.log_softmax(logits, dim=-1)
-        gathered = log_probs.gather(-1, padded.unsqueeze(-1)).squeeze(-1)  # (B, L)
-        pos = torch.arange(max_len, device=device).unsqueeze(0)
-        valid = pos < lengths.unsqueeze(-1)
-        seq_log_prob = (gathered * valid.float()).sum(dim=-1)  # (B,)
-
-        adv = torch.stack(valid_advantages).detach()
-        pg_loss = -(adv * seq_log_prob).mean()
-
-        # Entropy bonus over the per-step categorical distributions, summed over
-        # valid (non-padded) positions. -inf-masked logits give probs=0 there;
-        # treat 0 * log(0) as 0 so the masked vocabulary entries don't contribute.
-        probs = log_probs.exp()
-        step_entropy = -(
-            probs
-            * torch.where(
-                torch.isfinite(log_probs), log_probs, torch.zeros_like(log_probs)
-            )
-        ).sum(
-            dim=-1
-        )  # (B, L)
-        seq_entropy = (step_entropy * valid.float()).sum(dim=-1)  # (B,)
-        entropy_bonus = seq_entropy.mean()
-
-        return pg_loss - self.grouping_entropy_coef * entropy_bonus
 
     def reset_buffers(self):
         """Reset experience buffers - separate for each parallel environment"""
@@ -304,14 +89,6 @@ class MAPPOAgent:
         self.action_masks = [
             [[] for _ in range(self.n_agents)] for _ in range(self.n_parallel_envs)
         ]
-        # Clear hypergraph caches and per-trajectory buffers
-        self.hg_cache.reset()
-        self._affinity_history_snapshots = []
-        self._grouping_tokens = [[] for _ in range(self.n_parallel_envs)]
-
-    def reset_obs_history(self, env_mask=None):
-        """Zero out obs history. If env_mask given, only reset those envs."""
-        self.entropy_helper.reset_obs_history(env_mask)
 
     def get_actions_batched(
         self,
@@ -319,10 +96,6 @@ class MAPPOAgent:
         global_states_batch,
         deterministic=False,
         action_masks=None,
-        hypergraphs=None,
-        entropies=None,
-        critic_obs_sequences=None,
-        critic_signature_sequences=None,
     ):
         """
         Get actions for all agents in all environments in a single batched forward pass.
@@ -332,16 +105,6 @@ class MAPPOAgent:
             global_states_batch: numpy (n_envs, global_state_dim)
             deterministic: Whether to use deterministic actions
             action_masks: numpy (n_envs, n_agents, n_actions) or None
-            hypergraphs: list[dhg.Hypergraph] of shape [n_hyperedge_types] or None.
-                         Each is a block-diagonal batched hypergraph over n_envs.
-                         Required when critic_type="multi_hgnn".
-            entropies: Optional (n_envs, n_types) tensor of structural entropy
-                       values for critic conditioning.
-            critic_obs_sequences: Optional (n_envs, seq_len, n_agents, obs_dim)
-                                  tensor for temporal hg_cross_attention critic.
-            critic_signature_sequences: Optional (n_envs, seq_len) tensor of
-                                        hypergraph signature IDs aligned with
-                                        ``critic_obs_sequences``.
 
         Returns:
             actions:   tensor (n_envs, n_agents, action_dim) on self.device
@@ -354,18 +117,13 @@ class MAPPOAgent:
             obs_tensor, gs_tensor, masks_tensor = self._to_device_tensors(
                 observations_batch, global_states_batch, action_masks
             )
-            pred_entropy_flat = self._predict_entropy_conditioning(obs_tensor, n_envs)
             actions, log_probs = self._run_actors(
-                obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
+                obs_tensor, masks_tensor, n_envs, deterministic
             )
             values = self._run_centralized_critic(
                 obs_tensor,
                 gs_tensor,
                 n_envs,
-                hypergraphs=hypergraphs,
-                entropies=entropies,
-                critic_obs_sequences=critic_obs_sequences,
-                critic_signature_sequences=critic_signature_sequences,
             )
 
         return actions, log_probs, values
@@ -391,29 +149,6 @@ class MAPPOAgent:
         )  # (n_envs, n_agents, n_actions) or None
         return obs_tensor, gs_tensor, masks_tensor
 
-    def _predict_entropy_conditioning(self, obs_tensor, n_envs):
-        """Run the entropy predictor over the rolling/eval obs history.
-
-        Returns (n_envs * n_agents, 2 * n_types) or None.
-        """
-        if self.network_old.entropy_predictor is None:
-            return None
-
-        if n_envs == self.n_parallel_envs:
-            # Training collection — use persistent rolling buffer
-            obs_seqs = self.entropy_helper.update_obs_history(obs_tensor)
-        else:
-            # Eval/render — use obs as single-step sequence (zero-padded)
-            obs_seqs = self.entropy_helper.make_eval_sequences(obs_tensor)
-        obs_seqs_flat = obs_seqs.reshape(
-            n_envs * self.n_agents, self.entropy_pred_seq_len, -1
-        ).to(self.device)
-        agent_ids = torch.arange(self.n_agents, device=self.device).repeat(n_envs)
-        pred_mean, pred_log_var = self.network_old.entropy_predictor.forward_batch(
-            obs_seqs_flat, agent_ids
-        )
-        return torch.cat([pred_mean, pred_log_var], dim=-1)
-
     def _run_actors(
         self, obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
     ):
@@ -421,10 +156,7 @@ class MAPPOAgent:
         if self.share_actor:
             # Fuse envs and agents into one batch: single forward pass total
             obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
-            if pred_entropy_flat is not None:
-                obs_flat = self.entropy_helper.condition_obs(
-                    obs_flat, pred_entropy_flat
-                )
+
             masks_flat = (
                 masks_tensor.reshape(n_envs * self.n_agents, -1)
                 if masks_tensor is not None
@@ -441,19 +173,11 @@ class MAPPOAgent:
             return actions, log_probs
 
         # One batched pass per agent (n_agents passes, each over all envs)
-        pred_entropy_per_agent = (
-            pred_entropy_flat.reshape(n_envs, self.n_agents, -1)
-            if pred_entropy_flat is not None
-            else None
-        )
         actions_list = []
         log_probs_list = []
         for agent_idx in range(self.n_agents):
             agent_obs = obs_tensor[:, agent_idx, :]  # (n_envs, obs_dim)
-            if pred_entropy_per_agent is not None:
-                agent_obs = self.entropy_helper.condition_obs(
-                    agent_obs, pred_entropy_per_agent[:, agent_idx, :]
-                )
+
             agent_mask = (
                 masks_tensor[:, agent_idx, :] if masks_tensor is not None else None
             )
@@ -471,39 +195,12 @@ class MAPPOAgent:
         obs_tensor,
         gs_tensor,
         n_envs,
-        hypergraphs=None,
-        entropies=None,
-        critic_obs_sequences=None,
-        critic_signature_sequences=None,
     ):
         """Dispatch to the configured centralized critic; returns (n_envs, 1)."""
-        if (
-            self.critic_type == "hg_cross_attention"
-            and critic_obs_sequences is not None
-        ):
-            critic_obs_sequences = critic_obs_sequences.to(self.device)
-            critic_signature_sequences = critic_signature_sequences.to(self.device)
-            critic_hgs = self.hg_cache.build_sequence_batched_hypergraphs(
-                critic_signature_sequences, device=self.device
-            )
-            critic_entropies = (
-                self.hg_cache.get_entropies_for_signature_sequences(
-                    critic_signature_sequences, device=self.device
-                )
-                if self.entropy_conditioning
-                else None
-            )
-            return self.network_old.get_value_batched(
-                critic_obs_sequences,
-                critic_hgs,
-                n_envs,
-                entropies=critic_entropies,
-            )
+
         if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
             obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
-            return self.network_old.get_value_batched(
-                obs_flat, hypergraphs, n_envs, entropies=entropies
-            )
+            return self.network_old.get_value_batched(obs_flat, n_envs)
         return self.network_old.get_value(gs_tensor)
 
     @property

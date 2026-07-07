@@ -2,7 +2,7 @@ from pathlib import Path
 
 from algorithms.dcg.trainer import DCGTrainer
 from algorithms.dcg.types import DCG_Model_Params, DCG_Params, Experiment
-from algorithms.mappo.utils import set_global_seeds
+from algorithms.utils import set_global_seeds
 from algorithms.runner import Runner
 
 
