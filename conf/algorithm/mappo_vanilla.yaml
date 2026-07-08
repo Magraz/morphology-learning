@@ -2,7 +2,7 @@
 # Shared MAPPO params (constant within a batch) + base model_params.
 # Env-scoped keys (batch_size, val_coef, and n_total_steps when it differs) are
 # set by the env group; model_params deltas come from the model group.
-algorithm: mappo
+algorithm: mappo_vanilla
 params:
   n_epochs: 6
   n_total_steps: 20000000.0     # float on purpose; env groups override when different

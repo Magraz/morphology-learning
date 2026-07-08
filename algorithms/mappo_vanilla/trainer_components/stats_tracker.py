@@ -15,8 +15,6 @@ class TrainingStatsTracker:
             self.training_stats = defaultdict(list)
             self.training_stats["total_steps"] = []
             self.training_stats["reward"] = []
-            self.training_stats["intrinsic_reward"] = []
-            self.training_stats["extrinsic_reward"] = []
             self.training_stats["action_distribution"] = []
             self.training_stats["episodes"] = []
             self.training_stats["training_time"] = []
@@ -62,8 +60,6 @@ class TrainingStatsTracker:
         collection_time: float,
         update_time: float,
         eval_time: float,
-        intrinsic_reward: float = 0.0,
-        extrinsic_reward: float = 0.0,
         action_distribution: list | None = None,
     ) -> float:
         elapsed_time = time.time() - self.training_start_time
@@ -71,8 +67,6 @@ class TrainingStatsTracker:
 
         self.training_stats["total_steps"].append(steps_completed)
         self.training_stats["reward"].append(reward)
-        self.training_stats["intrinsic_reward"].append(intrinsic_reward)
-        self.training_stats["extrinsic_reward"].append(extrinsic_reward)
         # Only recorded for discrete-action runs (e.g. the hierarchical skill
         # selector); left empty for continuous envs to keep the series clean.
         if action_distribution is not None:
@@ -89,8 +83,6 @@ class TrainingStatsTracker:
         self.training_stats = defaultdict(list)
         self.training_stats["total_steps"] = stats.get("total_steps", [])
         self.training_stats["reward"] = stats.get("reward", [])
-        self.training_stats["intrinsic_reward"] = stats.get("intrinsic_reward", [])
-        self.training_stats["extrinsic_reward"] = stats.get("extrinsic_reward", [])
         self.training_stats["action_distribution"] = stats.get(
             "action_distribution", []
         )

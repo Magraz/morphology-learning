@@ -57,9 +57,6 @@ class MAPPOAgent:
 
         self.network_old.load_state_dict(self.network.state_dict())
 
-        self.local_state_encoder = None
-        self.hypergraph_state_encoder = None
-
         # Optimizer for all parameters
         self.optimizer = optim.Adam(self.network.parameters(), lr=params.lr)
 
@@ -149,9 +146,7 @@ class MAPPOAgent:
         )  # (n_envs, n_agents, n_actions) or None
         return obs_tensor, gs_tensor, masks_tensor
 
-    def _run_actors(
-        self, obs_tensor, masks_tensor, pred_entropy_flat, n_envs, deterministic
-    ):
+    def _run_actors(self, obs_tensor, masks_tensor, n_envs, deterministic):
         """Run actors over all envs/agents; returns (actions, log_probs)."""
         if self.share_actor:
             # Fuse envs and agents into one batch: single forward pass total
@@ -203,51 +198,6 @@ class MAPPOAgent:
             return self.network_old.get_value_batched(obs_flat, n_envs)
         return self.network_old.get_value(gs_tensor)
 
-    @property
-    def intrinsic_feature_dim(self) -> int:
-        """Length of the per-rewarder coordination descriptor vector.
-
-        For "team" mode this is the whole-graph descriptor length; for "agent"
-        mode it is one agent's descriptor length. Computed once from a dummy
-        forward so it stays in sync with the critic's actual head/d_model config.
-        """
-        if getattr(self, "_intrinsic_feature_dim", None) is None:
-            with torch.no_grad():
-                dummy = torch.zeros(
-                    1, self.n_agents, self.observation_dim, device=self.device
-                ).reshape(1, -1)
-                desc = self.network_old.coordination_descriptor(
-                    dummy,
-                    mode=self.intrinsic_reward_mode,
-                    source=self.intrinsic_descriptor_source,
-                )
-            # team: (1, team_dim) -> team_dim; agent: (1, N, agent_dim) -> agent_dim
-            self._intrinsic_feature_dim = int(desc.shape[-1])
-        return self._intrinsic_feature_dim
-
-    def compute_coordination_features(self, obs) -> np.ndarray:
-        """Coordination-graph descriptor for the novelty bonus, read from the
-        dual-purpose attention encoder under no_grad via the behavior network.
-
-        Args:
-            obs: np (n_envs, n_agents, obs_dim).
-
-        Returns:
-            "team" mode:  (n_envs, team_dim)
-            "agent" mode: (n_envs, n_agents, agent_dim)
-        """
-        gs = obs.reshape(obs.shape[0], -1)
-        with torch.no_grad():
-            gs_t = torch.from_numpy(np.ascontiguousarray(gs, dtype=np.float32)).to(
-                self.device
-            )
-            desc = self.network_old.coordination_descriptor(
-                gs_t,
-                mode=self.intrinsic_reward_mode,
-                source=self.intrinsic_descriptor_source,
-            )
-        return desc.cpu().numpy()
-
     def store_transitions_batch(
         self,
         obs,  # np (n_envs, n_agents, obs_dim)
@@ -258,10 +208,6 @@ class MAPPOAgent:
         rewards,  # np (n_envs,)
         dones,  # np (n_envs,)
         action_masks=None,  # np (n_envs, n_agents, n_actions) or None
-        hg_signature_ids=None,  # list[int] of length n_envs or None
-        entropies=None,  # torch tensor (n_envs, n_types) or None
-        grouping_tokens=None,  # list[list[int]] of length n_envs or None
-        per_agent_intrinsic_rewards=None,  # np (n_envs, n_agents) or None
     ):
         """Store transitions for all environments in one vectorized call.
 
@@ -274,12 +220,6 @@ class MAPPOAgent:
         per_agent_rewards = np.tile(
             rewards.astype(np.float32)[:, None], (1, self.n_agents)
         )
-
-        # Fold in the coordination-graph novelty bonus (already coef-scaled).
-        if per_agent_intrinsic_rewards is not None:
-            per_agent_rewards = per_agent_rewards + per_agent_intrinsic_rewards.astype(
-                np.float32
-            )
 
         # Ensure trailing action dim for storage: (n_envs, n_agents, 1) for discrete
         if self.discrete and actions.ndim == 2:
@@ -310,17 +250,7 @@ class MAPPOAgent:
         for env_idx in range(n_envs):
             self.global_states[env_idx].append(gs_t[env_idx])
             self.values[env_idx].append(val_t[env_idx])
-            if hg_signature_ids is not None:
-                self.hg_cache.store_transition(
-                    env_idx=env_idx,
-                    sig_id=hg_signature_ids[env_idx],
-                    entropy_conditioning=self.entropy_conditioning,
-                    entropy_tensor=(
-                        entropies[env_idx] if entropies is not None else None
-                    ),
-                )
-            if grouping_tokens is not None:
-                self._grouping_tokens[env_idx].append(grouping_tokens[env_idx])
+
             for agent_idx in range(self.n_agents):
                 self.observations[env_idx][agent_idx].append(obs_t[env_idx, agent_idx])
                 self.actions[env_idx][agent_idx].append(act_t[env_idx, agent_idx])
@@ -435,38 +365,6 @@ class MAPPOAgent:
         all_entropy_targets = []
 
         has_masks = len(self.action_masks[0][0]) > 0
-        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
-        use_entropy_pred = (
-            self.network.entropy_predictor is not None
-            and len(self.hg_cache.entropies[0]) > 0
-        )
-        use_affinity = (
-            self.network.affinity_transformer is not None
-            and len(self._affinity_history_snapshots) > 0
-        )
-        use_grouping = (
-            self.network.grouping_transformer is not None
-            and len(self._grouping_tokens[0]) > 0
-        )
-
-        if use_hgnn:
-            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
-            ts_to_entropies = self.hg_cache.get_flat_entropies(
-                train_device, self.entropy_conditioning
-            )
-            trajectory_lengths = [
-                len(self.values[env_idx])
-                for env_idx in range(self.n_parallel_envs)
-                if len(self.values[env_idx]) > 0
-            ]
-
-        # Flat-ts -> (env_idx, timestep_within_env) lookup for grouping loss.
-        flat_to_env_t: list[tuple[int, int]] = []
-        if use_grouping:
-            for env_idx in range(self.n_parallel_envs):
-                T_env = len(self.values[env_idx])
-                for local_t in range(T_env):
-                    flat_to_env_t.append((env_idx, local_t))
 
         ts_offset = 0
         for env_idx in range(self.n_parallel_envs):
@@ -505,10 +403,6 @@ class MAPPOAgent:
                 env_old_log_probs.append(old_log_probs)
                 env_returns.append(returns)
                 env_advantages.append(advantages)
-                if use_entropy_pred:
-                    env_obs_sequences.append(
-                        self.entropy_helper.build_obs_sequences(obs)
-                    )
 
             if not env_obs:
                 ts_offset += T
@@ -526,16 +420,6 @@ class MAPPOAgent:
                     for agent_idx in range(self.n_agents)
                 ]
                 all_masks.append(torch.stack(env_masks, dim=1))
-            if use_hgnn:
-                all_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
-            if use_entropy_pred:
-                all_obs_sequences.append(torch.stack(env_obs_sequences, dim=1))
-                entropy_t = torch.tensor(
-                    np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
-                )
-                all_entropy_targets.append(
-                    entropy_t.unsqueeze(1).expand(-1, self.n_agents, -1)
-                )
 
             ts_offset += T
 
@@ -554,20 +438,6 @@ class MAPPOAgent:
         combined_masks = (
             torch.cat(all_masks, dim=0).detach().to(train_device) if has_masks else None
         )
-        combined_ts_indices = (
-            torch.cat(all_ts_indices).to(train_device) if use_hgnn else None
-        )
-        combined_obs_sequences = (
-            torch.cat(all_obs_sequences, dim=0).detach().to(train_device)
-            if use_entropy_pred
-            else None
-        )
-        combined_entropy_targets = (
-            torch.cat(all_entropy_targets, dim=0).detach().to(train_device)
-            if use_entropy_pred
-            else None
-        )
-        ts_to_global_states = combined_global_states if use_hgnn else None
 
         # Create dataset
         dataset_tensors = [
@@ -580,11 +450,6 @@ class MAPPOAgent:
         ]
         if combined_masks is not None:
             dataset_tensors.append(combined_masks)
-        if combined_ts_indices is not None:
-            dataset_tensors.append(combined_ts_indices)
-        if combined_obs_sequences is not None:
-            dataset_tensors.append(combined_obs_sequences)
-            dataset_tensors.append(combined_entropy_targets)
 
         dataset = TensorDataset(*dataset_tensors)
 
@@ -607,10 +472,6 @@ class MAPPOAgent:
                     *extra,
                 ) = batch
                 batch_masks = extra.pop(0) if combined_masks is not None else None
-                batch_ts_idx = extra.pop(0).long() if use_hgnn else None
-                if use_entropy_pred:
-                    batch_obs_seq = extra.pop(0)
-                    batch_entropy_targets = extra.pop(0)
 
                 batch_n_ts = batch_obs.shape[0]
                 batch_obs_flat = batch_obs.reshape(batch_n_ts * self.n_agents, -1)
@@ -627,29 +488,8 @@ class MAPPOAgent:
 
                 # Predict entropy and condition actor observations
                 pred_mean = pred_log_var = None
-                if use_entropy_pred:
-                    batch_obs_seq_flat = batch_obs_seq.reshape(
-                        batch_n_ts * self.n_agents,
-                        batch_obs_seq.shape[2],
-                        batch_obs_seq.shape[3],
-                    )
-                    batch_entropy_targets_flat = batch_entropy_targets.reshape(
-                        batch_n_ts * self.n_agents, batch_entropy_targets.shape[-1]
-                    )
-                    batch_agent_idx = torch.arange(
-                        self.n_agents, device=train_device
-                    ).repeat(batch_n_ts)
-                    pred_mean, pred_log_var = (
-                        self.network.entropy_predictor.forward_batch(
-                            batch_obs_seq_flat, batch_agent_idx
-                        )
-                    )
-                    pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
-                    batch_obs_conditioned = self.entropy_helper.condition_obs(
-                        batch_obs_flat, pred_entropy.detach()
-                    )
-                else:
-                    batch_obs_conditioned = batch_obs_flat
+
+                batch_obs_conditioned = batch_obs_flat
 
                 # Actor evaluation (batched over individual agent observations)
                 actor = self.network.get_actor(0)
@@ -660,46 +500,9 @@ class MAPPOAgent:
                 )
 
                 # Critic evaluation
-                if use_hgnn:
-                    values = self.hg_cache.compute_hgnn_critic_values(
-                        network_critic=self.network.critic,
-                        batch_global_states=batch_global_states,
-                        batch_ts_indices=batch_ts_idx,
-                        ts_to_signature_ids=ts_to_signature_ids,
-                        observation_dim=self.observation_dim,
-                        device=self.device,
-                        ts_to_entropies=ts_to_entropies,
-                        ts_to_global_states=ts_to_global_states,
-                        trajectory_lengths=trajectory_lengths,
-                    )
-                elif self.critic_type == "gnn":
-                    obs_grid = batch_global_states.view(
-                        -1, self.n_agents, self.observation_dim
-                    )
-                    values = self.network.critic(obs_grid).squeeze(-1)
-                else:
-                    values = self.network.critic(batch_global_states).squeeze(-1)
+                values = self.network.critic(batch_global_states).squeeze(-1)
 
-                # COMA-style per-agent counterfactual baseline (multi_hgnn only).
-                # V_cf(i, s) = critic(s, hg \ E_i); replaces the shared baseline
-                # in the policy loss with A_i = R_i - V_cf(i, s).
-                if use_hgnn and self.counterfactual_credit:
-                    cf_values = self.hg_cache.compute_per_agent_counterfactual_values(
-                        network_critic=self.network.critic,
-                        batch_global_states=batch_global_states,
-                        batch_ts_indices=batch_ts_idx,
-                        ts_to_signature_ids=ts_to_signature_ids,
-                        observation_dim=self.observation_dim,
-                        device=self.device,
-                    )  # (n_minibatch_ts, n_agents)
-                    cf_advantages = batch_returns - cf_values.detach()
-                    cf_advantages_flat = cf_advantages.reshape(-1)
-                    cf_advantages_flat = (
-                        cf_advantages_flat - cf_advantages_flat.mean()
-                    ) / (cf_advantages_flat.std() + 1e-8)
-                    actor_advantages = cf_advantages_flat
-                else:
-                    actor_advantages = batch_advantages_flat
+                actor_advantages = batch_advantages_flat
 
                 # PPO objective
                 ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs_flat)
@@ -725,34 +528,6 @@ class MAPPOAgent:
                     + self.entropy_coef * entropy_loss
                 )
 
-                # Auxiliary entropy prediction loss (Gaussian NLL)
-                if use_entropy_pred:
-                    entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
-                        pred_mean=pred_mean,
-                        pred_log_var=pred_log_var,
-                        targets=batch_entropy_targets_flat,
-                    )
-                    loss = loss + self.entropy_pred_coef * entropy_pred_loss
-
-                # Auxiliary affinity transformer loss
-                if use_affinity:
-                    affinity_loss = self.compute_affinity_loss()
-                    loss = loss + self.affinity_loss_coef * affinity_loss
-
-                # Auxiliary REINFORCE loss for the GroupingTransformer
-                grouping_loss = None
-                if use_grouping and batch_ts_idx is not None:
-                    ts_per_sample = batch_ts_idx.detach().cpu().tolist()
-                    env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
-                    local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
-                    # Per-(env,t) advantage = mean over agents, then normalized.
-                    mb_adv = batch_advantages.mean(dim=-1)
-                    mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-                    grouping_loss = self.compute_grouping_loss(
-                        env_indices, local_t_indices, mb_adv
-                    )
-                    loss = loss + self.grouping_loss_coef * grouping_loss
-
                 # Optimize
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -766,12 +541,7 @@ class MAPPOAgent:
                 stats["policy_loss"] += policy_loss.item()
                 stats["value_loss"] += value_loss.item()
                 stats["entropy_loss"] += entropy_loss.item()
-                if use_entropy_pred:
-                    stats["entropy_pred_loss"] += entropy_pred_loss.item()
-                if use_affinity:
-                    stats["affinity_loss"] += affinity_loss.item()
-                if grouping_loss is not None:
-                    stats["grouping_loss"] += grouping_loss.item()
+
                 num_updates += 1
 
         return stats, num_updates
@@ -798,49 +568,8 @@ class MAPPOAgent:
         num_updates = 0
 
         has_masks = len(self.action_masks[0][0]) > 0
-        use_hgnn = self.critic_type in ("multi_hgnn", "hg_cross_attention")
-        use_entropy_pred = (
-            self.network.entropy_predictor is not None
-            and len(self.hg_cache.entropies[0]) > 0
-        )
-        use_affinity = (
-            self.network.affinity_transformer is not None
-            and len(self._affinity_history_snapshots) > 0
-        )
-        use_grouping = (
-            self.network.grouping_transformer is not None
-            and len(self._grouping_tokens[0]) > 0
-        )
 
         flat_to_env_t: list[tuple[int, int]] = []
-        if use_grouping:
-            for env_idx in range(self.n_parallel_envs):
-                T_env = len(self.values[env_idx])
-                for local_t in range(T_env):
-                    flat_to_env_t.append((env_idx, local_t))
-
-        if use_hgnn:
-            ts_to_signature_ids = self.hg_cache.get_flat_signature_ids()
-            ts_to_entropies = self.hg_cache.get_flat_entropies(
-                train_device, self.entropy_conditioning
-            )
-            ts_to_global_states = (
-                torch.cat(
-                    [
-                        torch.stack(self.global_states[env_idx])
-                        for env_idx in range(self.n_parallel_envs)
-                        if len(self.values[env_idx]) > 0
-                    ],
-                    dim=0,
-                )
-                .detach()
-                .to(train_device)
-            )
-            trajectory_lengths = [
-                len(self.values[env_idx])
-                for env_idx in range(self.n_parallel_envs)
-                if len(self.values[env_idx]) > 0
-            ]
 
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
@@ -897,16 +626,6 @@ class MAPPOAgent:
                         torch.stack(self.action_masks[env_idx][agent_idx])
                     )
 
-                if use_hgnn:
-                    agent_ts_indices.append(torch.arange(ts_offset, ts_offset + T))
-
-                if use_entropy_pred:
-                    agent_raw_obs_for_seq.append(obs)  # (T, obs_dim)
-                    entropy_t = torch.tensor(
-                        np.stack(self.hg_cache.entropies[env_idx]), dtype=torch.float32
-                    )  # (T, n_types)
-                    agent_entropy_targets.append(entropy_t)
-
                 ts_offset += T
 
             if len(agent_obs) == 0:
@@ -928,23 +647,6 @@ class MAPPOAgent:
                 if has_masks
                 else None
             )
-            ts_indices_combined = (
-                torch.cat(agent_ts_indices).to(train_device) if use_hgnn else None
-            )
-            obs_sequences_combined = (
-                self.entropy_helper.build_obs_sequences_batched(
-                    torch.stack(agent_raw_obs_for_seq)
-                )
-                .detach()
-                .to(train_device)
-                if use_entropy_pred
-                else None
-            )
-            entropy_targets_combined = (
-                torch.cat(agent_entropy_targets, dim=0).detach().to(train_device)
-                if use_entropy_pred
-                else None
-            )
 
             # Create dataset for this agent
             dataset_tensors = [
@@ -957,11 +659,6 @@ class MAPPOAgent:
             ]
             if masks_combined is not None:
                 dataset_tensors.append(masks_combined)
-            if ts_indices_combined is not None:
-                dataset_tensors.append(ts_indices_combined)
-            if obs_sequences_combined is not None:
-                dataset_tensors.append(obs_sequences_combined)
-                dataset_tensors.append(entropy_targets_combined)
 
             dataset = TensorDataset(*dataset_tensors)
             dataloader = DataLoader(dataset, batch_size=minibatch_size, shuffle=True)
@@ -980,23 +677,12 @@ class MAPPOAgent:
                         *extra,
                     ) = batch
                     batch_masks = extra.pop(0) if masks_combined is not None else None
-                    batch_ts_idx = extra.pop(0).long() if use_hgnn else None
-                    if use_entropy_pred:
-                        batch_obs_seq = extra.pop(0)
-                        batch_entropy_targets = extra.pop(0)
+                    batch_ts_idx = None
 
                     # Predict entropy and condition actor observations
                     pred_mean = pred_log_var = None
-                    if use_entropy_pred:
-                        pred_mean, pred_log_var = self.network.entropy_predictor(
-                            batch_obs_seq, agent_idx
-                        )
-                        pred_entropy = torch.cat([pred_mean, pred_log_var], dim=-1)
-                        batch_obs_conditioned = self.entropy_helper.condition_obs(
-                            batch_obs, pred_entropy.detach()
-                        )
-                    else:
-                        batch_obs_conditioned = batch_obs
+
+                    batch_obs_conditioned = batch_obs
 
                     # Actor evaluation
                     actor = self.network.get_actor(agent_idx)
@@ -1005,19 +691,8 @@ class MAPPOAgent:
                     )
 
                     # Critic evaluation
-                    if use_hgnn:
-                        values = self.hg_cache.compute_hgnn_critic_values(
-                            network_critic=self.network.critic,
-                            batch_global_states=batch_global_states,
-                            batch_ts_indices=batch_ts_idx,
-                            ts_to_signature_ids=ts_to_signature_ids,
-                            observation_dim=self.observation_dim,
-                            device=self.device,
-                            ts_to_entropies=ts_to_entropies,
-                            ts_to_global_states=ts_to_global_states,
-                            trajectory_lengths=trajectory_lengths,
-                        )
-                    elif self.critic_type == "gnn":
+
+                    if self.critic_type == "gnn":
                         obs_grid = batch_global_states.view(
                             -1, self.n_agents, self.observation_dim
                         )
@@ -1047,36 +722,6 @@ class MAPPOAgent:
                         + self.entropy_coef * entropy_loss
                     )
 
-                    # Auxiliary entropy prediction loss (Gaussian NLL)
-                    if use_entropy_pred:
-                        entropy_pred_loss = self.entropy_helper.compute_prediction_loss(
-                            pred_mean=pred_mean,
-                            pred_log_var=pred_log_var,
-                            targets=batch_entropy_targets,
-                        )
-                        loss = loss + self.entropy_pred_coef * entropy_pred_loss
-
-                    # Auxiliary affinity transformer loss
-                    if use_affinity:
-                        affinity_loss = self.compute_affinity_loss()
-                        loss = loss + self.affinity_loss_coef * affinity_loss
-
-                    # Auxiliary REINFORCE loss for the GroupingTransformer.
-                    # Only run on agent_idx == 0 — the same hyperedge sample is
-                    # shared across all agents, and we don't want to update it
-                    # n_agents times per minibatch.
-                    grouping_loss = None
-                    if use_grouping and agent_idx == 0 and batch_ts_idx is not None:
-                        ts_per_sample = batch_ts_idx.detach().cpu().tolist()
-                        env_indices = [flat_to_env_t[ts][0] for ts in ts_per_sample]
-                        local_t_indices = [flat_to_env_t[ts][1] for ts in ts_per_sample]
-                        mb_adv = batch_advantages
-                        mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
-                        grouping_loss = self.compute_grouping_loss(
-                            env_indices, local_t_indices, mb_adv
-                        )
-                        loss = loss + self.grouping_loss_coef * grouping_loss
-
                     # Optimize
                     self.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -1090,12 +735,7 @@ class MAPPOAgent:
                     stats["policy_loss"] += policy_loss.item()
                     stats["value_loss"] += value_loss.item()
                     stats["entropy_loss"] += entropy_loss.item()
-                    if use_entropy_pred:
-                        stats["entropy_pred_loss"] += entropy_pred_loss.item()
-                    if use_affinity:
-                        stats["affinity_loss"] += affinity_loss.item()
-                    if grouping_loss is not None:
-                        stats["grouping_loss"] += grouping_loss.item()
+
                     num_updates += 1
 
         return stats, num_updates

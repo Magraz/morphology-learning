@@ -1,13 +1,13 @@
-from algorithms.mappo.types import Experiment, MAPPO_Params, Model_Params
-from algorithms.runner import Runner
 from pathlib import Path
-
-from algorithms.mappo.vec_trainer import VecMAPPOTrainer
-from algorithms.utils import set_global_seeds
-
 import numpy as np
 import matplotlib.pyplot as plt
 import imageio
+
+from algorithms.runner import Runner
+from algorithms.utils import set_global_seeds
+
+from algorithms.mappo_vanilla.types import Experiment, MAPPO_Params, Model_Params
+from algorithms.mappo_vanilla.vec_trainer import VecMAPPOTrainer
 
 
 class MAPPO_Vanilla_Runner(Runner):

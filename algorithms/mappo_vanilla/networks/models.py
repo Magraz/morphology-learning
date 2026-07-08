@@ -1,18 +1,10 @@
 import torch
 import torch.nn as nn
 
-from algorithms.mappo.networks.actors import MAPPOActor, MAPPO_Hybrid_Actor
-from algorithms.mappo.networks.critics import (
+from algorithms.mappo_vanilla.networks.actors import MAPPOActor
+from algorithms.mappo_vanilla.networks.critics import (
     MAPPOCritic,
-    MultiHGNNCritic,
-    HGNNCrossAttentionCritic,
 )
-from algorithms.mappo.networks.gnn_critic import AttentionGNNCritic
-from algorithms.mappo.networks.encoders import (
-    AffinityTransformer,
-    HypergraphEntropyPredictor,
-)
-from algorithms.mappo.networks.grouping_transformer import GroupingTransformer
 
 
 class MAPPONetwork(nn.Module):
@@ -27,13 +19,6 @@ class MAPPONetwork(nn.Module):
         hidden_dim: int = 128,
         discrete: bool = False,
         share_actor: bool = True,  # Whether to share actor parameters
-        critic_type: str = "mlp",  # "mlp" | "multi_hgnn" | "hg_cross_attention" | "gnn"
-        n_hyperedge_types: int = 0,  # Required when critic_type uses hypergraphs
-        critic_seq_len: int = 1,
-        entropy_conditioning: bool = False,
-        hypergraph_mode: str = "predefined",
-        history_len: int = 0,
-        grouping_history_len: int = 0,
     ):
         super(MAPPONetwork, self).__init__()
 
@@ -41,13 +26,6 @@ class MAPPONetwork(nn.Module):
         self.observation_dim = observation_dim
         self.discrete = discrete
         self.share_actor = share_actor
-        self.critic_type = critic_type
-        # Extra actor input features from predicted entropy: [mean, log_var] per type
-        self.entropy_pred_dim = (
-            2 * n_hyperedge_types
-            if entropy_conditioning and n_hyperedge_types > 0
-            else 0
-        )
 
         if share_actor:
             # Single shared actor for all agents
@@ -57,108 +35,30 @@ class MAPPONetwork(nn.Module):
                     action_dim,
                     hidden_dim,
                     self.discrete,
-                    entropy_pred_dim=self.entropy_pred_dim,
                 )
             else:
                 self.actor = MAPPOActor(
                     observation_dim,
                     action_dim,
                     hidden_dim,
-                    entropy_pred_dim=self.entropy_pred_dim,
                 )
 
         else:
             # Separate actor for each agent
-            if self.discrete:
-                self.actors = nn.ModuleList(
-                    [
-                        MAPPOActor(
-                            observation_dim,
-                            action_dim,
-                            hidden_dim,
-                            discrete,
-                            entropy_pred_dim=self.entropy_pred_dim,
-                        )
-                        for _ in range(n_agents)
-                    ]
-                )
-            else:
-                self.actors = nn.ModuleList(
-                    [
-                        MAPPO_Hybrid_Actor(observation_dim, action_dim, hidden_dim)
-                        for _ in range(n_agents)
-                    ]
-                )
+            self.actors = nn.ModuleList(
+                [
+                    MAPPOActor(
+                        observation_dim,
+                        action_dim,
+                        hidden_dim,
+                        discrete,
+                    )
+                    for _ in range(n_agents)
+                ]
+            )
 
         # Centralized critic (always shared)
-        if critic_type == "multi_hgnn":
-            assert (
-                n_hyperedge_types > 0
-            ), "n_hyperedge_types must be > 0 for multi_hgnn critic"
-            self.critic = MultiHGNNCritic(
-                n_hyperedge_types,
-                n_agents,
-                observation_dim,
-                hidden_dim=hidden_dim * 2,
-                entropy_conditioning=entropy_conditioning,
-            )
-        elif critic_type == "hg_cross_attention":
-            assert (
-                n_hyperedge_types > 0
-            ), "n_hyperedge_types must be > 0 for hg_cross_attention critic"
-            self.critic = HGNNCrossAttentionCritic(
-                n_hyperedge_types,
-                n_agents,
-                observation_dim,
-                hidden_dim=hidden_dim,
-                seq_len=critic_seq_len,
-                entropy_conditioning=entropy_conditioning,
-            )
-        elif critic_type == "gnn":
-            # Attention encoder + per-head GCN over the all-agent observation
-            # grid. Consumes obs (reshaped from global_state), not hypergraphs.
-            self.critic = AttentionGNNCritic(
-                observation_dim,
-                n_agents,
-                hidden_dim=hidden_dim,
-            )
-        else:
-            self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
-
-        # Auxiliary LSTM predictor of hypergraph structural entropy
-        self.entropy_predictor = (
-            HypergraphEntropyPredictor(
-                n_agents, observation_dim, n_hyperedge_types, hidden_dim=64
-            )
-            if entropy_conditioning and n_hyperedge_types > 0
-            else None
-        )
-
-        # Learned affinity transformer for dynamic grouping
-        self.affinity_transformer = (
-            AffinityTransformer(
-                n_agents=n_agents,
-                observation_dim=observation_dim,
-                history_length=history_len,
-                d_model=hidden_dim,
-            )
-            if hypergraph_mode == "learned_affinity" and history_len > 0
-            else None
-        )
-
-        # Autoregressive hyperedge generator for learned coordination groupings.
-        # Single hyperedge type, no overlap (each agent belongs to one group).
-        self.grouping_transformer = (
-            GroupingTransformer(
-                n_agents=n_agents,
-                observation_dim=observation_dim,
-                history_length=grouping_history_len,
-                d_model=hidden_dim,
-                allow_overlap=True,
-            )
-            if hypergraph_mode == "learned_grouping" and grouping_history_len > 0
-            else None
-        )
+        self.critic = MAPPOCritic(global_state_dim, hidden_dim * 2)
 
     def get_actor(self, agent_idx):
         """Get the actor for a specific agent"""
@@ -179,8 +79,6 @@ class MAPPONetwork(nn.Module):
         actions,
         agent_idx,
         action_mask=None,
-        hypergraphs=None,
-        entropies=None,
     ):
         """Evaluate actions for training
 
@@ -190,19 +88,13 @@ class MAPPONetwork(nn.Module):
             actions: Actions to evaluate.
             agent_idx: Agent index for actor selection.
             action_mask: Optional action mask for discrete actions.
-            hypergraphs: List of dhg.Hypergraph (required for multi_hgnn critic).
-            entropies: Optional (n_types,) tensor for entropy conditioning.
         """
+
         actor = self.get_actor(agent_idx)
         log_probs, entropy = actor.evaluate(obs, actions, action_mask=action_mask)
 
         # Get values from centralized critic
-        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
-            values = self.critic(obs, hypergraphs, entropies=entropies).squeeze(-1)
-        elif self.critic_type == "gnn":
-            values = self.critic(self._to_obs_grid(global_states)).squeeze(-1)
-        else:
-            values = self.critic(global_states).squeeze(-1)
+        values = self.critic(global_states).squeeze(-1)
 
         return log_probs, values, entropy
 
@@ -211,34 +103,9 @@ class MAPPONetwork(nn.Module):
 
         Args:
             global_state: Global state for MLP critic, or per-agent obs (n_agents, obs_dim) for multi_hgnn.
-            hypergraphs: List of dhg.Hypergraph (required for multi_hgnn critic).
-            entropies: Optional (n_types,) tensor for entropy conditioning.
         """
-        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
-            return self.critic(global_state, hypergraphs, entropies=entropies)
-        if self.critic_type == "gnn":
-            return self.critic(self._to_obs_grid(global_state))
+
         return self.critic(global_state)
-
-    def coordination_descriptor(
-        self, global_state, mode: str = "team", source: str = "adjacency"
-    ):
-        """Extract a coordination-graph descriptor from the attention critic for
-        novelty-based exploration. Only valid for the "gnn" critic.
-
-        Args:
-            global_state: flat all-agent state (..., n_agents * obs_dim) — the same
-                          layout the critic consumes.
-            mode/source:  forwarded to ``AttentionGNNCritic.coordination_descriptor``.
-        """
-        if self.critic_type != "gnn":
-            raise ValueError(
-                "coordination_descriptor requires critic_type='gnn'; got "
-                f"{self.critic_type!r}."
-            )
-        return self.critic.coordination_descriptor(
-            self._to_obs_grid(global_state), mode=mode, source=source
-        )
 
     def _to_obs_grid(self, global_state):
         """Reshape a flat all-agent global state (..., n_agents * obs_dim) into
@@ -246,22 +113,6 @@ class MAPPONetwork(nn.Module):
         consumes. global_state is built as obs.reshape(batch, -1) upstream."""
         return global_state.view(
             *global_state.shape[:-1], self.n_agents, self.observation_dim
-        )
-
-    def get_value_batched(self, obs_flat, batched_hgs, n_graphs, entropies=None):
-        """Batched value estimation for multi_hgnn critic.
-
-        Args:
-            obs_flat: (n_graphs * n_agents, obs_dim) concatenated observations.
-            batched_hgs: List of block-diagonal dhg.Hypergraph, one per type.
-            n_graphs: Number of graphs batched together.
-            entropies: Optional (n_graphs, n_types) tensor for entropy conditioning.
-
-        Returns:
-            Value estimates of shape (n_graphs, 1).
-        """
-        return self.critic.forward_batched(
-            obs_flat, batched_hgs, n_graphs, entropies=entropies
         )
 
 
@@ -272,7 +123,6 @@ if __name__ == "__main__":
     n_agents = 5
     action_dim = 5
     hidden_dim = 168
-    n_hyperedge_types = 2
 
     def count_params(module):
         return sum(p.numel() for p in module.parameters())
@@ -296,69 +146,5 @@ if __name__ == "__main__":
         action_dim,
         n_agents,
         hidden_dim=round(hidden_dim * 1.09),
-        critic_type="mlp",
     )
     print_breakdown(net1, "Condition 1: MLP Critic (no hypergraph)")
-
-    # 2) Multi-HGNN critic, no entropy conditioning
-    net2 = MAPPONetwork(
-        obs_dim,
-        obs_dim * n_agents,
-        action_dim,
-        n_agents,
-        hidden_dim=hidden_dim,
-        critic_type="multi_hgnn",
-        n_hyperedge_types=n_hyperedge_types,
-        entropy_conditioning=False,
-    )
-    print_breakdown(net2, "Condition 2: Multi-HGNN Critic (no entropy conditioning)")
-
-    # 3) Multi-HGNN critic + entropy conditioning + entropy predictor
-    net3 = MAPPONetwork(
-        obs_dim,
-        obs_dim * n_agents,
-        action_dim,
-        n_agents,
-        hidden_dim=hidden_dim,
-        critic_type="multi_hgnn",
-        n_hyperedge_types=n_hyperedge_types,
-        entropy_conditioning=True,
-    )
-    print_breakdown(
-        net3, "Condition 3: Multi-HGNN Critic + Entropy Conditioning + Predictor"
-    )
-
-    # 4) HG Cross-Attention critic
-    net4 = MAPPONetwork(
-        obs_dim,
-        obs_dim * n_agents,
-        action_dim,
-        n_agents,
-        hidden_dim=round(80),
-        critic_type="hg_cross_attention",
-        n_hyperedge_types=n_hyperedge_types,
-    )
-    print_breakdown(net4, "Condition 4: HG Cross-Attention Critic")
-
-    # 5) Attention-GNN critic
-    net5 = MAPPONetwork(
-        obs_dim,
-        obs_dim * n_agents,
-        action_dim,
-        n_agents,
-        hidden_dim=hidden_dim,
-        critic_type="gnn",
-        gnn_d_model=64,
-        gnn_n_heads=4,
-        gnn_n_gcn_layers=2,
-    )
-    print_breakdown(net5, "Condition 5: Attention-GNN Critic")
-
-    # Smoke-test the GNN critic value path: flat global state -> (batch, 1).
-    batch = 3
-    global_state = torch.randn(batch, obs_dim * n_agents)
-    value = net5.get_value(global_state)
-    assert value.shape == (batch, 1), value.shape
-    print(f"\n  GNN get_value output shape: {tuple(value.shape)}  (batch, 1)")
-
-    print()

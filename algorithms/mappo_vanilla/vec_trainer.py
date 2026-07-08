@@ -11,18 +11,16 @@ import numpy as np
 import psutil
 
 from algorithms.create_env import make_vec_env
-from algorithms.mappo.hypergraph import build_hyperedge_fns_from_names
-from algorithms.mappo.mappo import MAPPOAgent
-from algorithms.mappo.trainer_components import (
+from algorithms.mappo_vanilla.mappo import MAPPOAgent
+from algorithms.mappo_vanilla.trainer_components import (
     CheckpointIO,
-    HypergraphRuntime,
     PolicyEvaluator,
     PolicyRenderer,
     RolloutCollector,
     TrainingStatsTracker,
 )
-from algorithms.mappo.types import Model_Params
-from environments.types import EnvironmentEnum, EnvironmentParams
+from algorithms.mappo_vanilla.types import Model_Params
+from environments.types import EnvironmentEnum
 
 
 class VecMAPPOTrainer:
@@ -39,8 +37,6 @@ class VecMAPPOTrainer:
         self.params = params
         self.environment = env_params.get("name")
         self.critic_type = model_params.critic_type
-        self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
-        self.entropy_conditioning = model_params.entropy_conditioning
 
         self.n_eval_episodes = 5
         self.eval_env = make_vec_env(
@@ -80,37 +76,7 @@ class VecMAPPOTrainer:
             EnvironmentEnum.SMACLITE,
             EnvironmentEnum.HRL_SKILL,
         ]
-        hyperedge_fns = None
-        uses_hypergraph_critic = self.critic_type in (
-            "multi_hgnn",
-            "hg_cross_attention",
-        )
-        if uses_hypergraph_critic and model_params.hypergraph_mode == "predefined":
-            if not model_params.hyperedge_fn_names:
-                raise ValueError(
-                    "hypergraph_mode='predefined' with a hypergraph critic requires "
-                    "model_params.hyperedge_fn_names to be a non-empty list."
-                )
 
-            env_ctx: dict = {}
-            if self.env_name == EnvironmentEnum.SMACLITE:
-                from environments.smaclite.wrapper import SmacliteToGymWrapper
-
-                probe = SmacliteToGymWrapper(map_name=self.env_variant)
-                try:
-                    env_ctx = {
-                        "n_enemies": probe.n_enemies,
-                        "enemy_feat_size": probe.enemy_feat_size,
-                        "ally_feat_size": probe.ally_feat_size,
-                    }
-                finally:
-                    probe.close()
-
-            hyperedge_fns = build_hyperedge_fns_from_names(
-                env_name=self.env_name,
-                fn_names=model_params.hyperedge_fn_names,
-                env_ctx=env_ctx,
-            )
         self.agent = MAPPOAgent(
             observation_dim,
             global_state_dim,
@@ -121,7 +87,6 @@ class VecMAPPOTrainer:
             self.discrete,
             env_params.get("n_envs"),
             model_params=model_params,
-            hyperedge_fns=hyperedge_fns,
         )
 
         # Sync device — agent may have upgraded to CUDA in its __init__
@@ -129,16 +94,6 @@ class VecMAPPOTrainer:
 
         self._process = psutil.Process()
 
-        self.hypergraph_runtime = HypergraphRuntime(
-            agent=self.agent,
-            device=self.device,
-            n_agents=env_params.get("n_envs"),
-            n_parallel_envs=env_params.get("n_envs"),
-            critic_type=self.critic_type,
-            model_params=model_params,
-            batch_dir=self.dirs.get("batch"),
-            hyperedge_fns=hyperedge_fns,
-        )
         self.rollout_collector = RolloutCollector(
             vec_env=self.vec_env,
             agent=self.agent,
@@ -146,24 +101,18 @@ class VecMAPPOTrainer:
             n_agents=n_agents,
             n_parallel_envs=env_params.get("n_envs"),
             discrete=self.discrete,
-            entropy_conditioning=self.entropy_conditioning,
-            hypergraph_runtime=self.hypergraph_runtime,
         )
         self.evaluator = PolicyEvaluator(
             eval_env=self.eval_env,
             agent=self.agent,
             n_eval_episodes=self.n_eval_episodes,
             discrete=self.discrete,
-            entropy_conditioning=self.entropy_conditioning,
-            hypergraph_runtime=self.hypergraph_runtime,
         )
         self.renderer = PolicyRenderer(
             agent=self.agent,
             device=self.device,
             env_params=env_params,
             discrete=self.discrete,
-            entropy_conditioning=self.entropy_conditioning,
-            hypergraph_runtime=self.hypergraph_runtime,
         )
         self.checkpoint_io = CheckpointIO(agent=self.agent, device=self.device)
         self.stats_tracker = TrainingStatsTracker()

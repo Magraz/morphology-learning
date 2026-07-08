@@ -25,7 +25,6 @@ class MAPPO_Params:
 @dataclass
 class Model_Params:
     hidden_dim: int
-    critic_type: str  # "mlp" | "multi_hgnn" | "hg_cross_attention" | "gnn"
 
 
 @dataclass
