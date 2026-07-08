@@ -1,0 +1,5 @@
+# @package _global_
+# Vanilla MAPPO model: a plain MLP actor + centralized MLP critic. No hypergraph
+# / GNN / entropy-conditioning knobs (see conf/algorithm/mappo_vanilla.yaml).
+model_params:
+  hidden_dim: 168

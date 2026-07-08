@@ -29,7 +29,6 @@ class MAPPOAgent:
         self.discrete = discrete
         self.share_actor = params.parameter_sharing
         self.n_parallel_envs = n_parallel_envs
-        self.critic_type = model_params.critic_type
 
         # PPO hyperparameters
         self.gamma = params.gamma
@@ -48,7 +47,6 @@ class MAPPOAgent:
             hidden_dim=model_params.hidden_dim,
             discrete=discrete,
             share_actor=self.share_actor,
-            critic_type=self.critic_type,
         )
         self.network = MAPPONetwork(**network_kwargs).to(self.device)
 
@@ -117,11 +115,7 @@ class MAPPOAgent:
             actions, log_probs = self._run_actors(
                 obs_tensor, masks_tensor, n_envs, deterministic
             )
-            values = self._run_centralized_critic(
-                obs_tensor,
-                gs_tensor,
-                n_envs,
-            )
+            values = self.network_old.get_value(gs_tensor)
 
         return actions, log_probs, values
 
@@ -184,19 +178,6 @@ class MAPPOAgent:
         actions = torch.stack(actions_list, dim=1)  # (n_envs, n_agents, action_dim)
         log_probs = torch.stack(log_probs_list, dim=1).squeeze(-1)  # (n_envs, n_agents)
         return actions, log_probs
-
-    def _run_centralized_critic(
-        self,
-        obs_tensor,
-        gs_tensor,
-        n_envs,
-    ):
-        """Dispatch to the configured centralized critic; returns (n_envs, 1)."""
-
-        if self.critic_type in ("multi_hgnn", "hg_cross_attention"):
-            obs_flat = obs_tensor.reshape(n_envs * self.n_agents, -1)
-            return self.network_old.get_value_batched(obs_flat, n_envs)
-        return self.network_old.get_value(gs_tensor)
 
     def store_transitions_batch(
         self,
@@ -345,9 +326,6 @@ class MAPPOAgent:
             "policy_loss": 0,
             "value_loss": 0,
             "entropy_loss": 0,
-            "entropy_pred_loss": 0,
-            "affinity_loss": 0,
-            "grouping_loss": 0,
         }
         num_updates = 0
 
@@ -360,25 +338,19 @@ class MAPPOAgent:
         all_returns_combined = []
         all_advantages_combined = []
         all_masks = []
-        all_ts_indices = []
-        all_obs_sequences = []
-        all_entropy_targets = []
 
         has_masks = len(self.action_masks[0][0]) > 0
 
-        ts_offset = 0
         for env_idx in range(self.n_parallel_envs):
             if len(self.values[env_idx]) == 0:
                 continue
 
-            T = len(self.values[env_idx])
             env_global_states = torch.stack(self.global_states[env_idx])
             env_obs = []
             env_actions = []
             env_old_log_probs = []
             env_returns = []
             env_advantages = []
-            env_obs_sequences = []
 
             for agent_idx in range(self.n_agents):
                 if len(self.observations[env_idx][agent_idx]) == 0:
@@ -405,7 +377,6 @@ class MAPPOAgent:
                 env_advantages.append(advantages)
 
             if not env_obs:
-                ts_offset += T
                 continue
 
             all_obs.append(torch.stack(env_obs, dim=1))
@@ -420,8 +391,6 @@ class MAPPOAgent:
                     for agent_idx in range(self.n_agents)
                 ]
                 all_masks.append(torch.stack(env_masks, dim=1))
-
-            ts_offset += T
 
         # Concatenate to timestep-major tensors:
         # obs/actions/... shape (n_total_ts, n_agents, ...)
@@ -486,15 +455,10 @@ class MAPPOAgent:
                     else None
                 )
 
-                # Predict entropy and condition actor observations
-                pred_mean = pred_log_var = None
-
-                batch_obs_conditioned = batch_obs_flat
-
                 # Actor evaluation (batched over individual agent observations)
                 actor = self.network.get_actor(0)
                 log_probs, entropy = actor.evaluate(
-                    batch_obs_conditioned,
+                    batch_obs_flat,
                     batch_actions_flat,
                     action_mask=batch_masks_flat,
                 )
@@ -502,14 +466,12 @@ class MAPPOAgent:
                 # Critic evaluation
                 values = self.network.critic(batch_global_states).squeeze(-1)
 
-                actor_advantages = batch_advantages_flat
-
                 # PPO objective
                 ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs_flat)
-                surr1 = ratio * actor_advantages
+                surr1 = ratio * batch_advantages_flat
                 surr2 = (
                     torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
-                    * actor_advantages
+                    * batch_advantages_flat
                 )
                 policy_loss = -torch.min(surr1, surr2).mean()
 
@@ -561,15 +523,10 @@ class MAPPOAgent:
             "policy_loss": 0,
             "value_loss": 0,
             "entropy_loss": 0,
-            "entropy_pred_loss": 0,
-            "affinity_loss": 0,
-            "grouping_loss": 0,
         }
         num_updates = 0
 
         has_masks = len(self.action_masks[0][0]) > 0
-
-        flat_to_env_t: list[tuple[int, int]] = []
 
         # Update each agent separately (independent actors)
         for agent_idx in range(self.n_agents):
@@ -581,23 +538,15 @@ class MAPPOAgent:
             agent_returns = []
             agent_advantages = []
             agent_masks = []
-            agent_ts_indices = []
-            agent_raw_obs_for_seq = []
-            agent_entropy_targets = []
 
-            ts_offset = 0
             for env_idx in range(self.n_parallel_envs):
-                T = len(self.values[env_idx]) if len(self.values[env_idx]) > 0 else 0
-
                 if len(self.observations[env_idx][agent_idx]) == 0:
-                    ts_offset += T
                     continue
 
                 # Get the index in the flattened advantages/returns list
                 data_idx = env_idx * self.n_agents + agent_idx
 
                 if data_idx >= len(all_advantages):
-                    ts_offset += T
                     continue
 
                 # Normalize advantages for this agent in this environment
@@ -625,8 +574,6 @@ class MAPPOAgent:
                     agent_masks.append(
                         torch.stack(self.action_masks[env_idx][agent_idx])
                     )
-
-                ts_offset += T
 
             if len(agent_obs) == 0:
                 continue  # No data for this agent
@@ -677,28 +624,15 @@ class MAPPOAgent:
                         *extra,
                     ) = batch
                     batch_masks = extra.pop(0) if masks_combined is not None else None
-                    batch_ts_idx = None
-
-                    # Predict entropy and condition actor observations
-                    pred_mean = pred_log_var = None
-
-                    batch_obs_conditioned = batch_obs
 
                     # Actor evaluation
                     actor = self.network.get_actor(agent_idx)
                     log_probs, entropy = actor.evaluate(
-                        batch_obs_conditioned, batch_actions, action_mask=batch_masks
+                        batch_obs, batch_actions, action_mask=batch_masks
                     )
 
                     # Critic evaluation
-
-                    if self.critic_type == "gnn":
-                        obs_grid = batch_global_states.view(
-                            -1, self.n_agents, self.observation_dim
-                        )
-                        values = self.network.critic(obs_grid).squeeze(-1)
-                    else:
-                        values = self.network.critic(batch_global_states).squeeze(-1)
+                    values = self.network.critic(batch_global_states).squeeze(-1)
 
                     # PPO objective
                     ratio = torch.exp(log_probs.squeeze(-1) - batch_old_log_probs)
@@ -742,8 +676,6 @@ class MAPPOAgent:
 
     def update(self, next_value=0, minibatch_size=128, epochs=10):
         """Update all agents using shared critic"""
-
-        self.hg_cache.clear_minibatch_cache()
 
         # Compute returns and advantages
         all_returns, all_advantages = self.compute_returns_and_advantages(next_value)

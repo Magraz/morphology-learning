@@ -35,8 +35,7 @@ class VecMAPPOTrainer:
         self.device = device
         self.dirs = dirs
         self.params = params
-        self.environment = env_params.get("name")
-        self.critic_type = model_params.critic_type
+        self.environment = env_params.get("environment")
 
         self.n_eval_episodes = 5
         self.eval_env = make_vec_env(
@@ -213,8 +212,6 @@ class VecMAPPOTrainer:
                 collection_time=collection_time,
                 update_time=update_time,
                 eval_time=eval_time,
-                intrinsic_reward=rollout.mean_intrinsic_reward,
-                extrinsic_reward=rollout.mean_extrinsic_reward,
                 action_distribution=rollout.action_distribution,
             )
 
@@ -222,12 +219,6 @@ class VecMAPPOTrainer:
 
             if steps_completed % log_every < rollout.step_count:
                 mem = self._get_total_memory_mb()
-                intrinsic_str = (
-                    f"Intrinsic: {rollout.mean_intrinsic_reward:.4f} "
-                    f"(extr {rollout.mean_extrinsic_reward:.4f}) | "
-                    if self.agent.use_intrinsic_reward
-                    else ""
-                )
                 skill_str = self._format_action_distribution(
                     rollout.action_distribution
                 )
@@ -235,7 +226,6 @@ class VecMAPPOTrainer:
                     f"Steps: {steps_completed}/{total_steps} ({steps_completed/total_steps*100:.1f}%) | "
                     f"Episodes: {episodes_completed} | "
                     f"Reward: {self.training_stats['reward'][-1]:.2f} | "
-                    f"{intrinsic_str}"
                     f"{skill_str}"
                     f"Time: {elapsed_time:.1f}s | "
                     f"FPS: {steps_per_second:.1f} | "
@@ -274,11 +264,6 @@ class VecMAPPOTrainer:
 
     def render(self, capture_video=False):
         return self.renderer.render(capture_video=capture_video)
-
-    def build_snapshot_figure(self, frames, hypergraphs, n_snapshots=4):
-        return self.renderer.build_snapshot_figure(
-            frames, hypergraphs, n_snapshots=n_snapshots
-        )
 
     def close_environments(self):
         """Properly close all vectorized environments."""

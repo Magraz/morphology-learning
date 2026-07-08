@@ -98,27 +98,12 @@ class MAPPONetwork(nn.Module):
 
         return log_probs, values, entropy
 
-    def get_value(self, global_state, hypergraphs=None, entropies=None):
-        """Get value from centralized critic
-
-        Args:
-            global_state: Global state for MLP critic, or per-agent obs (n_agents, obs_dim) for multi_hgnn.
-        """
-
+    def get_value(self, global_state):
+        """Get value from the centralized MLP critic."""
         return self.critic(global_state)
-
-    def _to_obs_grid(self, global_state):
-        """Reshape a flat all-agent global state (..., n_agents * obs_dim) into
-        the per-agent observation grid (..., n_agents, obs_dim) the GNN critic
-        consumes. global_state is built as obs.reshape(batch, -1) upstream."""
-        return global_state.view(
-            *global_state.shape[:-1], self.n_agents, self.observation_dim
-        )
 
 
 if __name__ == "__main__":
-    import numpy as np
-
     obs_dim = 22
     n_agents = 5
     action_dim = 5
@@ -127,24 +112,13 @@ if __name__ == "__main__":
     def count_params(module):
         return sum(p.numel() for p in module.parameters())
 
-    def print_breakdown(net, label):
-        print(f"\n{'='*60}")
-        print(f"  {label}")
-        print(f"{'='*60}")
-        actor = net.actor if net.share_actor else net.actors
-        print(f"  Actor:              {count_params(actor):>10,}")
-        print(f"  Critic:             {count_params(net.critic):>10,}")
-        if net.entropy_predictor is not None:
-            print(f"  Entropy Predictor:  {count_params(net.entropy_predictor):>10,}")
-        print(f"  {'─'*40}")
-        print(f"  Total:              {count_params(net):>10,}")
-
-    # 1) MLP critic, no hypergraph
-    net1 = MAPPONetwork(
+    net = MAPPONetwork(
         obs_dim,
         obs_dim * n_agents,
         action_dim,
         n_agents,
-        hidden_dim=round(hidden_dim * 1.09),
+        hidden_dim=hidden_dim,
     )
-    print_breakdown(net1, "Condition 1: MLP Critic (no hypergraph)")
+    print(f"Actor:  {count_params(net.actor):>10,}")
+    print(f"Critic: {count_params(net.critic):>10,}")
+    print(f"Total:  {count_params(net):>10,}")
