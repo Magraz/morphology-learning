@@ -1,6 +1,6 @@
 # @package _global_
 env:
-  name: multi_box_push
+  environment: multi_box_push
   # n_envs is set centrally in conf/config.yaml (autoscales to usable_cores //
   # n_jobs) and wins over this group via `_self_`; pin a fixed count on the CLI
   # with `env.n_envs=<N>`.

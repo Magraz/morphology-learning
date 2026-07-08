@@ -1,0 +1,21 @@
+# @package _global_
+# multi_box_push wrapped by HierarchicalSkillEnv so DCG sees a discrete
+# skill-selection action (MultiDiscrete([n_skills] * n_agents) in `agent` scope).
+# DCGTrainer reads env.get("environment") -> hrl_skill and passes this whole
+# block to HierarchicalSkillEnv, which re-reads base_environment/n_agents/
+# macro_len/decision_scope/skill_experiment/skill_trial/device from it.
+# n_envs autoscales centrally in conf/config.yaml (pin with env.n_envs=<N>).
+env:
+  environment: hrl_skill            # MAPPO renderer / DCG trainer read env.get("environment")
+  base_environment: multi_box_push  # continuous env the frozen skills run in
+  n_agents: 9
+  n_objects: 3
+  reward_mode: dense
+  decision_scope: agent             # each agent picks its own skill (9-node CG)
+  macro_len: 10                     # low-level steps per macro-action
+  skill_experiment: mlp_shared      # which trained actors to load as skills
+  skill_trial: "0"
+  device: cpu
+
+params:
+  batch_size: 1024             # env-scoped; merges over the algorithm defaults

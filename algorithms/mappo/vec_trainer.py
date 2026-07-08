@@ -37,7 +37,7 @@ class VecMAPPOTrainer:
         self.device = device
         self.dirs = dirs
         self.params = params
-        self.environment = env_params.get("name")
+        self.environment = env_params.get("environment")
         self.critic_type = model_params.critic_type
         self.entropy_pred_seq_len = model_params.entropy_pred_seq_len
         self.entropy_conditioning = model_params.entropy_conditioning
