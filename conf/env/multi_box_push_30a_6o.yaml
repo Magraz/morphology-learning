@@ -1,0 +1,8 @@
+# @package _global_
+env:
+  environment: multi_box_push
+  n_agents: 30
+  n_objects: 6
+
+params:
+  batch_size: 2048             # env-scoped; merges over the algorithm defaults
