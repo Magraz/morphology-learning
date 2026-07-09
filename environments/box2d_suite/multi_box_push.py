@@ -32,6 +32,10 @@ from environments.box2d_suite.utils import (
     update_object_mass_from_contacts,
 )
 
+# Agent body radius (matches Agent's default) — used to size boxes so a side
+# can fit at least `coupling` agents lined up against it.
+_AGENT_RADIUS = 0.4
+
 
 class MultiBoxPushEnv(gym.Env):
     metadata = {"render_fps": 30}
@@ -164,8 +168,6 @@ class MultiBoxPushEnv(gym.Env):
         """Create n_objects square boxes with dynamically assigned colors."""
         self.objects.clear()
 
-        half_size = (1.5, 1.5)
-
         # Assign colors from COLORS_LIST, offset by n_agents to avoid collision
         color_offset = self.n_agents
         colors = [
@@ -187,6 +189,14 @@ class MultiBoxPushEnv(gym.Env):
         min_separation = 4.0
 
         for i in range(self.n_objects):
+            # Size the box so each side can fit at least `coupling` agents lined
+            # up against it: side >= coupling * agent_diameter, i.e.
+            # half_extent >= coupling * agent_radius. Never smaller than the 1.5
+            # baseline.
+            coupling = self.objects_push_coupling_list[i]
+            half_extent = max(1.5, coupling * _AGENT_RADIUS)
+            half_size = (half_extent, half_extent)
+
             shape = b2PolygonShape(box=half_size)
 
             fixture_def = b2FixtureDef(
@@ -520,7 +530,7 @@ class MultiBoxPushEnv(gym.Env):
 
 if __name__ == "__main__":
     # Create the environment with rendering
-    env = MultiBoxPushEnv(render_mode="human", n_agents=12, n_objects=6, max_steps=1024)
+    env = MultiBoxPushEnv(render_mode="human", n_agents=30, n_objects=6, max_steps=1024)
     obs, info = env.reset()
 
     running = True
