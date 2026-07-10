@@ -75,7 +75,9 @@ def _build_dispatch_args(cfg, choices):
     # batch_dir keeps the legacy shape (experiments/yamls/<batch>) so runners can
     # resolve combined_affinities checkpoints via batch_dir.parents[1]/results.
     batch_dir = Path("experiments") / "yamls" / batch
-    results_dir = Path("experiments") / "results" / batch / name
+    results_dir = (
+        Path(__file__).resolve().parent / "experiments" / "results" / batch / name
+    )
 
     return dict(
         algorithm=algorithm,
