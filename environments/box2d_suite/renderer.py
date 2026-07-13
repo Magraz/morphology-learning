@@ -10,6 +10,15 @@ from environments.box2d_suite.utils import COLORS_LIST
 class Renderer:
     """Encapsulates all pygame rendering for MultiBoxPushEnv."""
 
+    # Sensor-overlay palette (see _draw_sensor_overlay).
+    SECTOR_COLOR = (170, 170, 170)
+    AGENT_DENSITY_COLOR = (0, 0, 255)
+    OBJECT_DENSITY_COLOR = (230, 120, 0)
+    LIDAR_CLEAR_COLOR = (205, 205, 205)
+    LIDAR_HIT_COLOR = (220, 50, 50)
+    BOX_VEC_COLOR = (190, 0, 190)
+    GOAL_COLOR = (0, 150, 0)
+
     def __init__(self, env):
         self.env = env
 
@@ -58,7 +67,8 @@ class Renderer:
         # Draw agent indices on top of agents
         self._draw_agent_indices()
 
-        # self._draw_density_sensors()  # Add this before or after drawing agents
+        # Observation overlay for one focus agent (env.render_sensor_agent)
+        self._draw_sensor_overlay()
 
         # Draw force vectors
         # self._draw_force_vectors()
@@ -144,103 +154,184 @@ class Renderer:
                         2,
                     )  # Outline
 
-    def _draw_density_sensors(self):
-        """Draw density sensors for each agent as sector outlines with text values"""
+    def _to_screen(self, x, y):
+        """World (x, y) -> screen pixels (y flipped)."""
+        return (int(x * self.scale), int(self.screen_size[1] - y * self.scale))
+
+    def _draw_sensor_overlay(self):
+        """Draw the observation of a single focus agent on top of the world.
+
+        Shows every spatial component of `ObservationManager.get_observation`:
+        the 8+8 density sectors (agents / objects), the lidar scan,
+        `nearest_box_vec` and `goal_distance`. The values come straight from
+        `ObservationManager.get_sensor_readout`, i.e. the same code paths that
+        build the policy's observation, so the overlay cannot drift from it.
+
+        The focus agent is `env.render_sensor_agent` (default 0) — drawing all
+        agents at once is unreadable past a handful of them.
+        """
+        obs_manager = getattr(self.env, "observation_manager", None)
+        if obs_manager is None or not self.env.agents:
+            return
+
         if self._sensor_font is None:
             pygame.font.init()
             self._sensor_font = pygame.font.SysFont("Arial", 12)
 
-        n_sectors = 8  # Now 8 sectors
+        idx = getattr(self.env, "render_sensor_agent", 0) % len(self.env.agents)
+        agent = self.env.agents[idx]
+        readout = obs_manager.get_sensor_readout(idx)
+
+        origin = (agent.position.x, agent.position.y)
+        center = self._to_screen(*origin)
+
+        # Lidar goes down first so the density sectors and the goal/box vectors
+        # stay legible on top of it.
+        self._draw_lidar(origin, center, readout)
+        self._draw_density_sectors(center, readout)
+        self._draw_goal_distance(origin, center)
+        self._draw_nearest_box_vec(origin, center, readout)
+
+        # Ring the focus agent so it is obvious which observation this is.
+        pygame.draw.circle(
+            self.screen, (0, 0, 0), center, int(agent.radius * self.scale) + 3, 2
+        )
+        self._draw_sensor_hud(idx, readout)
+
+    def _draw_density_sectors(self, center, readout):
+        """8 agent-density + 8 object-density sectors around the focus agent."""
+        n_sectors = 8
         sector_step = 360 / n_sectors
-        shift_degrees = 22.5  # Shift sectors counter-clockwise
+        shift_degrees = 22.5  # Sectors are shifted counter-clockwise (see obs manager)
 
-        for agent in self.env.agents:
-            # Get agent position in screen coordinates
-            center_x = agent.position.x * self.scale
-            center_y = self.screen_size[1] - agent.position.y * self.scale
+        agent_densities = readout["density"][:n_sectors]
+        object_densities = readout["density"][n_sectors : n_sectors * 2]
+        sensor_radius = readout["sector_radius"] * self.scale
 
-            # Get sensor values - now returns 16 density values (8 agent + 8 target) + rel coords
-            sensors = self.env.observation_manager.calculate_density_sensors(
-                agent.index, self.env.sector_sensor_radius
+        center_x, center_y = center
+        bounds = pygame.Rect(
+            int(center_x - sensor_radius),
+            int(center_y - sensor_radius),
+            int(sensor_radius * 2),
+            int(sensor_radius * 2),
+        )
+
+        for sector in range(n_sectors):
+            start_rad = math.radians(sector * sector_step + shift_degrees)
+            end_rad = math.radians((sector + 1) * sector_step + shift_degrees)
+
+            # Sector boundary spokes + the arc closing them off.
+            for ray_rad in (start_rad, end_rad):
+                edge = (
+                    int(center_x + sensor_radius * math.cos(ray_rad)),
+                    int(center_y - sensor_radius * math.sin(ray_rad)),
+                )
+                pygame.draw.line(self.screen, self.SECTOR_COLOR, center, edge, 1)
+            pygame.draw.arc(
+                self.screen, self.SECTOR_COLOR, bounds, start_rad, end_rad, 1
             )
-            agent_densities = sensors[:n_sectors]
-            target_densities = sensors[n_sectors : n_sectors * 2]
 
-            sensor_radius = (
-                self.env.sector_sensor_radius * self.scale
-            )  # Radius of detection circle
+            # Values at the middle of the sector: A = agents, O = objects. Both
+            # are "closeness" in [0, 1] (1 - centroid_dist / radius), 0 == empty.
+            mid_rad = (start_rad + end_rad) / 2
+            text_x = center_x + sensor_radius * 0.55 * math.cos(mid_rad)
+            text_y = center_y - sensor_radius * 0.55 * math.sin(mid_rad)
 
-            # Draw each sector outline
-            for sector in range(n_sectors):
-                start_angle = sector * sector_step + shift_degrees
-                end_angle = (sector + 1) * sector_step + shift_degrees
-
-                # Calculate arc points
-                start_rad = math.radians(start_angle)
-                end_rad = math.radians(end_angle)
-
-                # Starting point on the arc
-                start_x = center_x + sensor_radius * math.cos(start_rad)
-                start_y = center_y - sensor_radius * math.sin(start_rad)
-
-                # Ending point on the arc
-                end_x = center_x + sensor_radius * math.cos(end_rad)
-                end_y = center_y - sensor_radius * math.sin(end_rad)
-
-                # Draw agent density lines (blue)
-                pygame.draw.line(
-                    self.screen,
-                    (0, 0, 255),  # Blue color for agent density
-                    (int(center_x), int(center_y)),
-                    (int(start_x), int(start_y)),
-                    1,
+            for line, (label, value, color) in enumerate(
+                (
+                    ("A", agent_densities[sector], self.AGENT_DENSITY_COLOR),
+                    ("O", object_densities[sector], self.OBJECT_DENSITY_COLOR),
                 )
-
-                pygame.draw.line(
-                    self.screen,
-                    (0, 0, 255),  # Blue color for agent density
-                    (int(center_x), int(center_y)),
-                    (int(end_x), int(end_y)),
-                    1,
+            ):
+                # Grey out empty sectors so the occupied ones stand out.
+                shown = color if value > 0 else (150, 150, 150)
+                surface = self._sensor_font.render(f"{label}:{value:.2f}", True, shown)
+                rect = surface.get_rect(
+                    center=(int(text_x), int(text_y) - 6 + line * 12)
                 )
+                self.screen.blit(surface, rect)
 
-                # Draw the arc connecting the two points (for agent density)
-                pygame.draw.arc(
-                    self.screen,
-                    (0, 0, 255),  # Blue color for agent density
-                    pygame.Rect(
-                        int(center_x - sensor_radius),
-                        int(center_y - sensor_radius),
-                        int(sensor_radius * 2),
-                        int(sensor_radius * 2),
-                    ),
-                    start_rad,
-                    end_rad,
-                    1,
-                )
+    def _draw_lidar(self, origin, center, readout):
+        """Lidar rays out to their hit points, with a dot at each hit."""
+        obs_manager = self.env.observation_manager
+        lidar = readout["lidar"]
+        max_range = readout["lidar_range"]
+        dirs = obs_manager.lidar_directions(readout["n_lidar_rays"])
 
-                # Calculate text position at the middle of the sector
-                mid_angle = math.radians((start_angle + end_angle) / 2)
-                text_distance = (
-                    sensor_radius * 0.3
-                )  # Position text at 70% of the radius
-                text_x = center_x + text_distance * math.cos(mid_angle)
-                text_y = center_y - text_distance * math.sin(mid_angle)
+        for r, fraction in enumerate(lidar):
+            hit = self._to_screen(
+                origin[0] + float(dirs[r, 0]) * max_range * float(fraction),
+                origin[1] + float(dirs[r, 1]) * max_range * float(fraction),
+            )
+            # fraction == 1.0 means the ray reached full range without hitting
+            # anything — draw it faint and unterminated.
+            clear = fraction >= 1.0
+            pygame.draw.line(
+                self.screen,
+                self.LIDAR_CLEAR_COLOR if clear else self.LIDAR_HIT_COLOR,
+                center,
+                hit,
+                1,
+            )
+            if not clear:
+                pygame.draw.circle(self.screen, self.LIDAR_HIT_COLOR, hit, 3)
 
-                # Format the density values
-                text_line1 = f"A:{agent_densities[sector]:.3f}"
-                text_line2 = f"T:{target_densities[sector]:.3f}"
+    def _draw_nearest_box_vec(self, origin, center, readout):
+        """Arrow to the nearest object — the (dx, dy) the policy is fed."""
+        # Normalized by world_width in the observation; scale it back to world units.
+        vec = readout["nearest_box_vec"] * float(self.env.world_width)
+        if not vec.any():  # no objects in this env — the obs is a zero vector
+            return
 
-                # Render the text
-                surface1 = self._sensor_font.render(text_line1, True, (0, 0, 0))
-                surface2 = self._sensor_font.render(text_line2, True, (0, 0, 0))
+        tip = self._to_screen(origin[0] + float(vec[0]), origin[1] + float(vec[1]))
+        pygame.draw.line(self.screen, self.BOX_VEC_COLOR, center, tip, 3)
+        self._draw_arrow_head(center, tip, self.BOX_VEC_COLOR)
 
-                # Position lines centered vertically
-                rect1 = surface1.get_rect(center=(int(text_x), int(text_y) - 6))
-                rect2 = surface2.get_rect(center=(int(text_x), int(text_y) + 6))
+    def _draw_goal_distance(self, origin, center):
+        """Segment from the agent to the target band, along the env's goal axis."""
+        target_areas = getattr(self.env, "target_areas", None)
+        if not target_areas:  # no goal region — the obs is 0
+            return
 
-                self.screen.blit(surface1, rect1)
-                self.screen.blit(surface2, rect2)
+        target = target_areas[0]
+        # Match the observation: the distance is measured along one axis only.
+        if getattr(self.env, "goal_axis", "y") == "x":
+            tip = self._to_screen(target.x, origin[1])
+        else:
+            tip = self._to_screen(origin[0], target.y)
+
+        pygame.draw.line(self.screen, self.GOAL_COLOR, center, tip, 3)
+        self._draw_arrow_head(center, tip, self.GOAL_COLOR)
+
+    def _draw_arrow_head(self, start, end, color, size=9):
+        """Filled triangle at `end`, pointing away from `start`."""
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            return
+        ux, uy = dx / length, dy / length
+        # Two points size/2 either side of the shaft, size back from the tip.
+        left = (end[0] - ux * size - uy * size / 2, end[1] - uy * size + ux * size / 2)
+        right = (end[0] - ux * size + uy * size / 2, end[1] - uy * size - ux * size / 2)
+        pygame.draw.polygon(self.screen, color, [end, left, right])
+
+    def _draw_sensor_hud(self, idx, readout):
+        """Legend + the scalar obs values for the focus agent, top-left."""
+        box_vec = readout["nearest_box_vec"]
+        lines = [
+            (f"agent {idx} observation", (0, 0, 0)),
+            ("A: agent density (8 sectors)", self.AGENT_DENSITY_COLOR),
+            ("O: object density (8 sectors)", self.OBJECT_DENSITY_COLOR),
+            (f"lidar: {readout['n_lidar_rays']} rays", self.LIDAR_HIT_COLOR),
+            (
+                f"nearest_box_vec: ({box_vec[0]:+.3f}, {box_vec[1]:+.3f})",
+                self.BOX_VEC_COLOR,
+            ),
+            (f"goal_distance: {readout['goal_distance']:+.3f}", self.GOAL_COLOR),
+        ]
+        for i, (text, color) in enumerate(lines):
+            surface = self._sensor_font.render(text, True, color)
+            self.screen.blit(surface, (10, 10 + i * 14))
 
     def _draw_target_areas(self):
         """Draw target areas with their coupling requirements"""

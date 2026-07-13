@@ -72,9 +72,20 @@ class ObservationManager:
 
         return 0.0
 
-    def get_observation(self):
-        # Cache all positions once — eliminates redundant Box2D bridge calls across
-        # _calculate_density_sensors_all and _is_agent_touching_object
+    @property
+    def n_lidar_rays(self):
+        return getattr(self.env, "n_lidar_rays", N_LIDAR_RAYS)
+
+    @property
+    def lidar_range(self):
+        return getattr(self.env, "lidar_range", self.sector_sensor_radius)
+
+    def _refresh_caches(self):
+        """Snapshot every Box2D position read needed to build an observation.
+
+        Cache all positions once — eliminates redundant Box2D bridge calls across
+        _calculate_density_sensors_all and _is_agent_touching_object.
+        """
         self._agent_pos_cache = np.array(
             [[ag.position.x, ag.position.y] for ag in self.env.agents], dtype=np.float32
         )  # (n_agents, 2)
@@ -88,6 +99,36 @@ class ObservationManager:
         ).reshape(
             -1, 2
         )  # (n_objects, 2)
+
+    def get_sensor_readout(self, agent_idx):
+        """Per-agent sensor values for the render overlay, in observation units.
+
+        Returns exactly what ``get_observation`` feeds the policy for this agent
+        (same code paths, so the overlay cannot drift from the observation), plus
+        the radii the renderer needs to place them. Refreshes the position caches
+        itself, so it is safe to call outside a ``get_observation`` step.
+        """
+        self._refresh_caches()
+        return {
+            "density": self._calculate_density_sensors_all(self.sector_sensor_radius)[
+                agent_idx
+            ],  # (16,) — 0-7 agents, 8-15 objects
+            "lidar": self._calculate_lidar(
+                agent_idx, self.n_lidar_rays, self.lidar_range
+            ),  # (n_rays,) in [0, 1]
+            "nearest_box_vec": self._calculate_nearest_box_vectors()[
+                agent_idx
+            ],  # (2,), normalized by world_width
+            "goal_distance": float(
+                self._calculate_goal_distances()[agent_idx]
+            ),  # signed, normalized along the goal axis
+            "sector_radius": self.sector_sensor_radius,
+            "lidar_range": self.lidar_range,
+            "n_lidar_rays": self.n_lidar_rays,
+        }
+
+    def get_observation(self):
+        self._refresh_caches()
 
         # Derive all_states from cache (no separate position reads)
         center = np.array(
@@ -118,10 +159,7 @@ class ObservationManager:
         )
 
         # Lidar: nearest-obstacle distance along N evenly spaced rays per agent.
-        all_lidar = self._calculate_lidar_all(
-            getattr(self.env, "n_lidar_rays", N_LIDAR_RAYS),
-            getattr(self.env, "lidar_range", self.sector_sensor_radius),
-        )
+        all_lidar = self._calculate_lidar_all(self.n_lidar_rays, self.lidar_range)
 
         # Goal-relative features (egocentric, so no absolute world anchor):
         #   nearest_box_vec — relative (dx, dy) to the closest object, per axis
@@ -163,13 +201,31 @@ class ObservationManager:
 
         return np.array(observations, dtype=np.float32)
 
-    def _calculate_neighbor_fractions(self, radius):
-        """Fraction of all agents within `radius` of each agent (self included)."""
+    def _pairwise_agent_distances(self):
+        """(A, A) euclidean distance between every agent pair; zero on the diagonal."""
         agent_pos = self._agent_pos_cache  # (A, 2)
         diff = agent_pos[:, np.newaxis, :] - agent_pos[np.newaxis, :, :]
-        dist = np.linalg.norm(diff, axis=-1)  # (A, A), zero on the diagonal
+        return np.linalg.norm(diff, axis=-1)
+
+    def _calculate_neighbor_fractions(self, radius):
+        """Fraction of all agents within `radius` of each agent (self included)."""
+        dist = self._pairwise_agent_distances()  # (A, A)
         within = (dist <= radius).sum(axis=1).astype(np.float32)  # (A,)
         return within / float(self.env.n_agents)
+
+    def get_proximity_adjacency(self, radius):
+        """(A, A) float32 0/1 communication graph: 1 where two agents are within
+        `radius` of each other.
+
+        Self-loops are included — an agent's distance to itself is 0, so the
+        diagonal is always 1. `radius=inf` yields the complete graph.
+
+        Refreshes the position caches itself, so it is safe to call outside a
+        ``get_observation`` step (same contract as ``get_sensor_readout``).
+        """
+        self._refresh_caches()
+        dist = self._pairwise_agent_distances()  # (A, A)
+        return (dist <= radius).astype(np.float32)
 
     def _calculate_nearest_box_vectors(self):
         """Relative (dx, dy) from each agent to its nearest object.
@@ -216,40 +272,60 @@ class ObservationManager:
             )
         return goal_d.astype(np.float32)
 
-    def _calculate_lidar_all(self, n_rays, max_range):
-        """
-        Lidar-style range scan for every agent via Box2D raycasts.
+    @staticmethod
+    def lidar_directions(n_rays):
+        """Unit direction of each lidar ray, world frame (shape (n_rays, 2)).
 
-        Casts `n_rays` evenly spaced rays (world frame, matching the density
-        sensor convention) out to `max_range` from each agent. Each ray returns
-        the normalized distance to the nearest obstacle hit — agents, objects,
-        and boundary walls are all picked up by the physics raycast. The casting
-        agent is ignored so a ray never hits its own body.
-
-        Returns:
-            np.ndarray of shape (n_agents, n_rays) in [0, 1]:
-                fraction of `max_range` to the closest hit, or 1.0 if the ray
-                reaches its full length without hitting anything.
+        Shared by the scan itself and the render overlay, so the drawn rays and
+        the sensed rays cannot disagree.
         """
         angles = np.arange(n_rays) * (2 * np.pi / n_rays)
-        dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1)  # (R, 2)
+        return np.stack([np.cos(angles), np.sin(angles)], axis=1)
 
-        lidar = np.ones((self.env.n_agents, n_rays), dtype=np.float32)
-        for i, agent in enumerate(self.env.agents):
-            ox, oy = float(self._agent_pos_cache[i][0]), float(
-                self._agent_pos_cache[i][1]
+    def _calculate_lidar(self, agent_idx, n_rays, max_range):
+        """Lidar-style range scan for one agent via Box2D raycasts.
+
+        Casts `n_rays` evenly spaced rays (world frame, matching the density
+        sensor convention) out to `max_range`. Each ray returns the normalized
+        distance to the nearest obstacle hit — agents, objects, and boundary
+        walls are all picked up by the physics raycast. The casting agent is
+        ignored so a ray never hits its own body.
+
+        Returns:
+            np.ndarray of shape (n_rays,) in [0, 1]: fraction of `max_range` to
+                the closest hit, or 1.0 if the ray reaches its full length
+                without hitting anything.
+        """
+        dirs = self.lidar_directions(n_rays)  # (R, 2)
+        agent = self.env.agents[agent_idx]
+        ox = float(self._agent_pos_cache[agent_idx][0])
+        oy = float(self._agent_pos_cache[agent_idx][1])
+        origin = b2Vec2(ox, oy)
+
+        lidar = np.ones(n_rays, dtype=np.float32)
+        for r in range(n_rays):
+            end = b2Vec2(
+                ox + float(dirs[r, 0]) * max_range,
+                oy + float(dirs[r, 1]) * max_range,
             )
-            origin = b2Vec2(ox, oy)
-            for r in range(n_rays):
-                end = b2Vec2(
-                    ox + float(dirs[r, 0]) * max_range,
-                    oy + float(dirs[r, 1]) * max_range,
-                )
-                cb = _ClosestHitCallback(agent)
-                self.env.world.RayCast(cb, origin, end)
-                if cb.hit:
-                    lidar[i, r] = cb.fraction  # already normalized to [0, 1]
+            cb = _ClosestHitCallback(agent)
+            self.env.world.RayCast(cb, origin, end)
+            if cb.hit:
+                lidar[r] = cb.fraction  # already normalized to [0, 1]
         return lidar
+
+    def _calculate_lidar_all(self, n_rays, max_range):
+        """Lidar scan for every agent — see `_calculate_lidar`.
+
+        Returns:
+            np.ndarray of shape (n_agents, n_rays) in [0, 1].
+        """
+        return np.stack(
+            [
+                self._calculate_lidar(i, n_rays, max_range)
+                for i in range(self.env.n_agents)
+            ]
+        )
 
     def _calculate_density_sensors_all(self, sensor_radius):
         """
@@ -321,104 +397,3 @@ class ObservationManager:
                 )
 
         return sensors  # (n_agents, 16)
-
-    def calculate_density_sensors(self, agent_idx, sensor_radius):
-        """
-        Calculate normalized distance to centroid of agents and objects in 8 sectors around an agent.
-        Distances are normalized by the sensor_radius so values are in [0, 1].
-        0.0 means no entities in that sector, otherwise value is distance/sensor_radius.
-
-        Returns a vector of 16 values:
-        - First 8 values: normalized distance to centroid of agents in sectors 0-7
-        - Next 8 values: normalized distance to centroid of objects in sectors 0-7
-        """
-        agent_pos = np.array(
-            [
-                self.env.agents[agent_idx].position.x,
-                self.env.agents[agent_idx].position.y,
-            ]
-        )
-
-        n_sectors = 8
-        sector_radian_step = (2 * np.pi) / n_sectors
-        shift_radians = np.radians(22.5)
-
-        # Collect positions per sector for agents and objects
-        agent_sector_positions = [[] for _ in range(n_sectors)]
-        object_sector_positions = [[] for _ in range(n_sectors)]
-
-        # Check each other agent
-        for other_idx, other_agent in enumerate(self.env.agents):
-            if other_idx == agent_idx:
-                continue
-
-            other_pos = np.array([other_agent.position.x, other_agent.position.y])
-            relative_pos = other_pos - agent_pos
-            distance = np.linalg.norm(relative_pos)
-
-            # Skip if outside sensor radius
-            if distance > sensor_radius:
-                continue
-
-            # Calculate angle in range [0, 2pi)
-            angle = np.arctan2(relative_pos[1], relative_pos[0])
-            angle -= shift_radians
-            if angle < 0:
-                angle += 2 * np.pi
-            elif angle >= 2 * np.pi:
-                angle -= 2 * np.pi
-
-            sector = int(angle / sector_radian_step) % n_sectors
-            agent_sector_positions[sector].append(other_pos)
-
-        # Check each dynamic object
-        for obj in getattr(self.env, "objects", []):
-            obj_pos = np.array([obj.position.x, obj.position.y])
-            relative_pos = obj_pos - agent_pos
-            distance = np.linalg.norm(relative_pos)
-
-            # Skip if outside sensor radius
-            if distance > sensor_radius:
-                continue
-
-            # Calculate angle in range [0, 2pi)
-            angle = np.arctan2(relative_pos[1], relative_pos[0])
-            angle -= shift_radians
-            if angle < 0:
-                angle += 2 * np.pi
-            elif angle >= 2 * np.pi:
-                angle -= 2 * np.pi
-
-            sector = int(angle / sector_radian_step) % n_sectors
-            object_sector_positions[sector].append(obj_pos)
-
-        # Compute normalized distance to centroid per sector
-        agent_centroid_distances = np.zeros(n_sectors, dtype=np.float32)
-        object_centroid_distances = np.zeros(n_sectors, dtype=np.float32)
-
-        for s in range(n_sectors):
-            # Agent centroid distance (inverted and normalized by sensor_radius)
-            if len(agent_sector_positions[s]) > 0:
-                centroid = np.mean(agent_sector_positions[s], axis=0)
-                agent_centroid_distances[s] = 1.0 - (
-                    np.linalg.norm(centroid - agent_pos) / sensor_radius
-                )
-            else:
-                agent_centroid_distances[s] = 0.0
-
-            # Object centroid distance (inverted and normalized by sensor_radius)
-            if len(object_sector_positions[s]) > 0:
-                centroid = np.mean(object_sector_positions[s], axis=0)
-                object_centroid_distances[s] = 1.0 - (
-                    np.linalg.norm(centroid - agent_pos) / sensor_radius
-                )
-            else:
-                object_centroid_distances[s] = 0.0
-
-        # Combine all values into one array
-        return np.concatenate(
-            [
-                agent_centroid_distances,  # 8 values, normalized [0, 1]
-                object_centroid_distances,  # 8 values, normalized [0, 1]
-            ]
-        )

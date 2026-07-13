@@ -48,6 +48,7 @@ class MultiBoxPushEnv(gym.Env):
         coupling_def: str = "even",
         max_steps: int = 1024,
         reward_mode: str = "dense",
+        comm_radius: float | None = None,
     ):
         super().__init__()
 
@@ -131,6 +132,16 @@ class MultiBoxPushEnv(gym.Env):
 
         # Add parameters for nearest neighbor detection
         self.neighbor_detection_range = 3.0  # Maximum range to detect neighbors
+
+        # Radius of the agent-to-agent communication graph published on
+        # info["adjacency"]. Defaults to the density-sensor range, so an agent
+        # only talks to agents it can already sense. `inf` gives the complete
+        # graph. World-unit (not fractional) radius: world_width scales as
+        # sqrt(n_entities), so a fixed radius keeps the expected neighbor count
+        # roughly constant as the team grows.
+        self.comm_radius = (
+            self.world_width / 3.0 if comm_radius is None else float(comm_radius)
+        )
 
         # Step tracking for truncation
         self.max_steps = max_steps
@@ -409,6 +420,12 @@ class MultiBoxPushEnv(gym.Env):
             "agent_positions": [
                 {"x": ag.position.x, "y": ag.position.y} for ag in self.agents
             ],
+            # (n_agents, n_agents) float32 0/1 proximity communication graph,
+            # self-loops included. Paired with the observation returned alongside
+            # it, so a policy may condition on both.
+            "adjacency": self.observation_manager.get_proximity_adjacency(
+                self.comm_radius
+            ),
             "task_reward": task_reward,
             "agents_2_objects": self.get_agents_touching_objects(),
         }

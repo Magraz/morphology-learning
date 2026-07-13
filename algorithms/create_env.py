@@ -167,6 +167,7 @@ def make_single_env(
                 n_objects=env_params.get("n_objects"),
                 render_mode=None,
                 reward_mode=env_params.get("reward_mode"),
+                comm_radius=env_params.get("comm_radius"),
             )
 
         case EnvironmentEnum.PUSH_BOX:
