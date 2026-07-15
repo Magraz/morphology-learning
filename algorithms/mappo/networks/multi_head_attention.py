@@ -58,8 +58,15 @@ class MultiHeadAttention(nn.Module):
         """
         Args:
             x:    (batch, n_agents, d_model)
-            mask: optional (batch, n_agents) bool tensor — True marks valid
-                  agents, False marks padding that should not be attended to.
+            mask: optional bool tensor, either
+                  - (batch, n_agents): a *padding* mask. True marks valid agents,
+                    False marks padding that no query may attend to.
+                  - (batch, n_agents, n_agents): an *edge* mask. ``mask[b, i, j]``
+                    is True if query i may attend to key j, so each agent can be
+                    restricted to its own neighbourhood (e.g. a proximity
+                    communication graph). Every row must contain at least one
+                    True — a fully-masked row softmaxes to NaN. Adjacencies with
+                    self-loops satisfy this by construction.
         Returns:
             out:  (batch, n_agents, d_model) — attended features.
             attn: (batch, n_heads, n_agents, n_agents) — attention scores,
@@ -74,9 +81,17 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
 
         if mask is not None:
-            # (B, 1, 1, N) broadcast over heads and query positions.
-            key_mask = mask.view(B, 1, 1, N)
-            scores = scores.masked_fill(~key_mask, float("-inf"))
+            if mask.dim() == 2:
+                # (B, 1, 1, N) broadcast over heads and query positions.
+                attn_mask = mask.view(B, 1, 1, N)
+            elif mask.dim() == 3:
+                # (B, 1, N, N) broadcast over heads only — per-query neighbourhoods.
+                attn_mask = mask.unsqueeze(1)
+            else:
+                raise ValueError(
+                    f"mask must be (B, N) or (B, N, N), got shape {tuple(mask.shape)}"
+                )
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
 
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
