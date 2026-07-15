@@ -66,8 +66,8 @@ def _build_dispatch_args(cfg, choices):
     env_config = dict(c["env"])
 
     exp_dict = {"device": c["device"], "params": c["params"]}
-    if algorithm in ("ippo", "mappo_jax"):
-        # IPPO / MAPPO_JAX take `model` as a bare string, not a model_params dict.
+    if algorithm == "ippo":
+        # IPPO takes `model` as a bare string, not a model_params dict.
         exp_dict["model"] = c.get("model_name", "")
     else:
         exp_dict["model_params"] = c["model_params"]

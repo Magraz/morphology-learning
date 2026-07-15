@@ -1,10 +1,28 @@
-from typing import NamedTuple, Tuple, Callable
+"""Jitted collect/update/eval functions for MAPPO over a functional MJX env.
+
+The env contract is the gymnax-style API of ``MultiBoxPushMJX``:
+``reset(key) -> (obs, state)`` and ``step(state, actions) -> (obs, state,
+reward, terminated, truncated, info)`` with obs ``(n_agents, obs_dim)``,
+continuous actions ``(n_agents, action_dim)`` in [-1, 1], a scalar team reward,
+and **no auto-reset** — this module supplies the resets.
+
+The structure deliberately mirrors ``mappo_vanilla``'s trainer components:
+- ``collect_fn`` == ``RolloutCollector.collect``: resets all envs at the top of
+  every rollout (vanilla re-seeds its vec env each collect), scans ``n_steps``,
+  restarts any env that finishes mid-rollout (vanilla's gymnasium vec env
+  auto-resets), and bootstraps the final value from the last observation.
+- ``update_fn`` == ``MAPPOAgent.update`` (see ``mappo.ppo_update``).
+- ``eval_fn`` == ``PolicyEvaluator.evaluate``: deterministic parallel episodes,
+  per-episode returns accumulated until each episode first finishes.
+"""
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
 from algorithms.mappo_jax.types import MAPPOConfig, Transition
-from algorithms.mappo_jax.network import MAPPOActor, MAPPOCritic, sample_action
+from algorithms.mappo_jax.network import sample_action
 from algorithms.mappo_jax.mappo import (
     ActorCriticTrainState,
     create_train_state,
@@ -13,199 +31,192 @@ from algorithms.mappo_jax.mappo import (
 
 
 class RunnerState(NamedTuple):
-    """Carries all mutable state through each update step."""
+    """Carries all mutable state between update iterations.
+
+    No env state: like vanilla, every rollout starts from freshly reset envs.
+    """
 
     train_state: ActorCriticTrainState
-    env_state: object  # JaxMARL environment State pytree
-    last_obs: dict  # {agent_name: (n_envs, obs_dim)}
-    rng: jax.random.PRNGKey
+    rng: jax.Array
 
 
-def make_train(config: MAPPOConfig, env) -> Tuple[Callable, Callable, int]:
-    """Build JIT-compiled init and update_step functions for JAX MAPPO.
+def make_train(config: MAPPOConfig, env):
+    """Build jitted train functions for a functional MJX env.
 
     Returns:
         init_fn(rng) -> RunnerState
-        update_step_fn(runner_state) -> (RunnerState, metrics_dict)
-        num_updates: total number of update steps to run
+        collect_fn(runner_state) -> (RunnerState, trajectory, last_value, rollout_stats)
+        update_fn(runner_state, trajectory, last_value) -> (RunnerState, losses)
+        eval_fn(train_state, rng) -> mean episode return over n_eval_episodes
+        num_updates: total number of update iterations to run
     """
-    agents = env.agents
-    n_agents = env.num_agents
+    n_agents = env.n_agents
+    obs_dim = env.observation_dim
+    action_dim = env.action_dim
+    discrete = False  # the MJX suite is continuous force control
 
-    first_agent = agents[0]
-    obs_dim = env.observation_spaces[first_agent].shape[0]
-    global_state_dim = obs_dim * n_agents
-
-    from jaxmarl.environments.spaces import Discrete as JaxDiscrete
-
-    discrete = isinstance(env.action_spaces[first_agent], JaxDiscrete)
-    action_dim = (
-        env.action_spaces[first_agent].n
-        if discrete
-        else env.action_spaces[first_agent].shape[0]
-    )
-
-    has_action_mask = hasattr(env, "get_avail_actions")
-    num_updates = config.n_total_steps // (config.n_steps * config.n_envs)
-
-    # -------------------------------------------------------------------------
-    # init: initialize train state and vectorized envs
-    # -------------------------------------------------------------------------
-    @jax.jit
-    def init_fn(rng: jax.random.PRNGKey) -> RunnerState:
-        rng, init_rng, env_rng = jax.random.split(rng, 3)
-
-        train_state = create_train_state(
-            init_rng, config, obs_dim, global_state_dim, action_dim, discrete
+    if not config.parameter_sharing:
+        raise NotImplementedError(
+            "mappo_jax implements the shared-actor path only "
+            "(parameter_sharing=true); use mappo_vanilla for independent actors"
         )
 
-        env_rngs = jax.random.split(env_rng, config.n_envs)
-        obs, env_state = jax.vmap(env.reset)(env_rngs)
+    num_updates = int(config.n_total_steps) // (config.n_steps * config.n_envs)
 
-        return RunnerState(
-            train_state=train_state,
-            env_state=env_state,
-            last_obs=obs,
-            rng=rng,
+    v_reset = jax.vmap(env.reset)
+    v_step = jax.vmap(env.step)
+
+    def _actor_forward(train_state, obs, rng, deterministic):
+        """Shared actor over (batch, n_agents, obs_dim) in one fused pass."""
+        b = obs.shape[0]
+        actions_flat, log_probs_flat = sample_action(
+            rng,
+            train_state.actor_ts.apply_fn,
+            train_state.actor_ts.params,
+            obs.reshape(b * n_agents, obs_dim),
+            discrete,
+            deterministic=deterministic,
+        )
+        return (
+            actions_flat.reshape(b, n_agents, action_dim),
+            log_probs_flat.reshape(b, n_agents),
         )
 
-    # -------------------------------------------------------------------------
-    # update_step: one trajectory collection + one PPO update
-    # -------------------------------------------------------------------------
-    def _env_step(carry, _):
-        train_state, env_state, last_obs, rng = carry
-        rng, step_rng, action_rng = jax.random.split(rng, 3)
-
-        obs_stacked = jnp.stack(
-            [last_obs[agent] for agent in agents], axis=1
-        )  # (n_envs, n_agents, obs_dim)
-        global_state = obs_stacked.reshape(config.n_envs, -1)
-
-        values = train_state.critic_ts.apply_fn(
+    def _values(train_state, global_state):
+        return train_state.critic_ts.apply_fn(
             train_state.critic_ts.params, global_state
         )
 
-        if has_action_mask:
-            avail_actions = jax.vmap(env.get_avail_actions)(env_state)
-            masks_stacked = jnp.stack(
-                [avail_actions[agent] for agent in agents], axis=1
-            )
-        else:
-            masks_stacked = jnp.ones(
-                (config.n_envs, n_agents, action_dim), dtype=jnp.float32
-            )
-
-        if config.parameter_sharing:
-            obs_flat = obs_stacked.reshape(-1, obs_dim)
-            masks_flat = masks_stacked.reshape(-1, action_dim)
-            actions_flat, log_probs_flat = sample_action(
-                action_rng,
-                train_state.actor_ts.apply_fn,
-                train_state.actor_ts.params,
-                obs_flat,
-                discrete,
-                deterministic=False,
-                action_mask=masks_flat if has_action_mask else None,
-            )
-            actions_arr = actions_flat.reshape(config.n_envs, n_agents)
-            log_probs_arr = log_probs_flat.reshape(config.n_envs, n_agents)
-        else:
-            obs_per_agent = jnp.transpose(obs_stacked, (1, 0, 2))
-            masks_per_agent = jnp.transpose(masks_stacked, (1, 0, 2))
-            agent_rngs = jax.random.split(action_rng, n_agents)
-
-            def _per_agent_act(agent_obs, agent_mask, agent_rng):
-                return sample_action(
-                    agent_rng,
-                    train_state.actor_ts.apply_fn,
-                    train_state.actor_ts.params,
-                    agent_obs,
-                    discrete,
-                    deterministic=False,
-                    action_mask=agent_mask if has_action_mask else None,
-                )
-
-            actions_per_agent, log_probs_per_agent = jax.vmap(_per_agent_act)(
-                obs_per_agent, masks_per_agent, agent_rngs
-            )
-            actions_arr = jnp.transpose(actions_per_agent, (1, 0))
-            log_probs_arr = jnp.transpose(log_probs_per_agent, (1, 0))
-
-        actions_dict = {agent: actions_arr[:, i] for i, agent in enumerate(agents)}
-
-        step_rngs = jax.random.split(step_rng, config.n_envs)
-        next_obs, next_env_state, reward, done, _ = jax.vmap(env.step)(
-            step_rngs, env_state, actions_dict
-        )
-
-        rewards_stacked = jnp.stack(
-            [reward[agent] for agent in agents], axis=1
-        )
-        done_all = done["__all__"]
-
-        transition = Transition(
-            obs=obs_stacked,
-            global_state=global_state,
-            action=actions_arr,
-            reward=rewards_stacked,
-            done=done_all,
-            log_prob=log_probs_arr,
-            value=values,
-            action_mask=masks_stacked,
-        )
-
-        carry = (train_state, next_env_state, next_obs, rng)
-        return carry, transition
+    # ------------------------------------------------------------------ init
 
     @jax.jit
-    def update_step_fn(runner_state: RunnerState):
-        # Collect n_steps of experience
-        initial_carry = (
-            runner_state.train_state,
-            runner_state.env_state,
-            runner_state.last_obs,
-            runner_state.rng,
+    def init_fn(rng: jax.Array) -> RunnerState:
+        rng, init_rng = jax.random.split(rng)
+        train_state = create_train_state(
+            init_rng, config, obs_dim, obs_dim * n_agents, action_dim, discrete
         )
-        final_carry, trajectory = jax.lax.scan(
-            _env_step, initial_carry, None, length=config.n_steps
-        )
-        train_state, env_state, last_obs, rng = final_carry
-        # last_done: whether each env's last collected step ended the episode
-        last_done = trajectory.done[-1]
+        return RunnerState(train_state=train_state, rng=rng)
 
-        # Bootstrap value
-        last_obs_stacked = jnp.stack(
-            [last_obs[agent] for agent in agents], axis=1
-        )
-        last_gs = last_obs_stacked.reshape(config.n_envs, -1)
-        last_value = train_state.critic_ts.apply_fn(
-            train_state.critic_ts.params, last_gs
-        )
-        last_value = last_value * (1.0 - last_done)
+    # ------------------------------------------------------------------ collect
 
-        # PPO update
+    def _env_step(carry, _):
+        train_state, env_state, obs, rng = carry
+        rng, action_rng, reset_rng = jax.random.split(rng, 3)
+
+        global_state = obs.reshape(config.n_envs, -1)
+        values = _values(train_state, global_state)
+        actions, log_probs = _actor_forward(
+            train_state, obs, action_rng, deterministic=False
+        )
+
+        next_obs, next_env_state, reward, terminated, truncated, _ = v_step(
+            env_state, actions
+        )
+        done = jnp.logical_or(terminated, truncated)
+
+        # The MJX env does not auto-reset; restart finished envs so the rollout
+        # continues with fresh episodes (vanilla's gymnasium vec env does this).
+        # lax.cond skips the reset work on the common no-done step.
+        def _restart_done(operand):
+            cur_obs, cur_state = operand
+            reset_obs, reset_state = v_reset(
+                jax.random.split(reset_rng, config.n_envs)
+            )
+
+            def _select(r, c):
+                d = done.reshape((-1,) + (1,) * (c.ndim - 1))
+                return jnp.where(d, r, c)
+
+            return _select(reset_obs, cur_obs), jax.tree.map(
+                _select, reset_state, cur_state
+            )
+
+        next_obs, next_env_state = jax.lax.cond(
+            done.any(), _restart_done, lambda operand: operand,
+            (next_obs, next_env_state),
+        )
+
+        transition = Transition(
+            obs=obs,
+            global_state=global_state,
+            action=actions,
+            reward=reward,
+            done=done,
+            log_prob=log_probs,
+            value=values,
+        )
+        return (train_state, next_env_state, next_obs, rng), transition
+
+    @jax.jit
+    def collect_fn(runner_state: RunnerState):
+        train_state, rng = runner_state
+        rng, reset_rng = jax.random.split(rng)
+
+        # Fresh episodes every rollout, matching vanilla's per-collect reset
+        obs, env_state = v_reset(jax.random.split(reset_rng, config.n_envs))
+
+        (train_state, _, last_obs, rng), trajectory = jax.lax.scan(
+            _env_step,
+            (train_state, env_state, obs, rng),
+            None,
+            length=config.n_steps,
+        )
+
+        # Bootstrap value for GAE (done masking happens inside compute_gae)
+        last_value = _values(train_state, last_obs.reshape(config.n_envs, -1))
+
+        rollout_stats = {
+            "mean_reward": trajectory.reward.mean(),
+            "episode_count": trajectory.done.sum(),
+        }
+        return (
+            RunnerState(train_state=train_state, rng=rng),
+            trajectory,
+            last_value,
+            rollout_stats,
+        )
+
+    # ------------------------------------------------------------------ update
+
+    @jax.jit
+    def update_fn(runner_state: RunnerState, trajectory, last_value):
+        train_state, rng = runner_state
         rng, update_rng = jax.random.split(rng)
         train_state, losses = ppo_update(
             train_state, update_rng, trajectory, last_value, config, discrete
         )
+        return RunnerState(train_state=train_state, rng=rng), losses
 
-        # Metrics: mean reward per step across all envs and agents
-        mean_reward = trajectory.reward.sum(axis=-1).mean()
-        # Fraction of steps where an episode ended (proxy for episode rate)
-        episode_done_rate = trajectory.done.mean()
+    # ------------------------------------------------------------------ eval
 
-        metrics = {
-            "mean_reward": mean_reward,
-            "episode_done_rate": episode_done_rate,
-            **losses,
-        }
+    @jax.jit
+    def eval_fn(train_state: ActorCriticTrainState, rng: jax.Array):
+        """Deterministic parallel-episode evaluation (PolicyEvaluator parity)."""
+        keys = jax.random.split(rng, config.n_eval_episodes)
+        obs, env_state = jax.vmap(env.reset)(keys)
+        finished = jnp.zeros(config.n_eval_episodes, dtype=bool)
+        episode_rewards = jnp.zeros(config.n_eval_episodes)
 
-        new_runner_state = RunnerState(
-            train_state=train_state,
-            env_state=env_state,
-            last_obs=last_obs,
-            rng=rng,
+        def _eval_step(carry, _):
+            obs, env_state, finished, episode_rewards = carry
+            actions, _ = _actor_forward(
+                train_state, obs, jax.random.PRNGKey(0), deterministic=True
+            )
+            next_obs, next_env_state, reward, terminated, truncated, _ = jax.vmap(
+                env.step
+            )(env_state, actions)
+            episode_rewards = episode_rewards + jnp.where(finished, 0.0, reward)
+            finished = finished | terminated | truncated
+            return (next_obs, next_env_state, finished, episode_rewards), None
+
+        # Fixed-length scan (jit needs static bounds); finished episodes keep
+        # stepping but their rewards are masked out, like vanilla's `finished`.
+        (_, _, _, episode_rewards), _ = jax.lax.scan(
+            _eval_step,
+            (obs, env_state, finished, episode_rewards),
+            None,
+            length=env.max_steps,
         )
-        return new_runner_state, metrics
+        return episode_rewards.mean()
 
-    return init_fn, update_step_fn, num_updates
+    return init_fn, collect_fn, update_fn, eval_fn, num_updates

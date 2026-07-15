@@ -1,12 +1,24 @@
-import numpy as np
+"""Flax actor/critic mirroring ``mappo_vanilla.networks``.
+
+Same architectures and initialization as the torch versions: 2-layer Tanh MLPs
+with orthogonal init (sqrt(2) hidden, 0.01 actor head, 1.0 critic head), a
+state-independent learned ``log_action_std`` initialized at -0.5 and clamped to
+[-5, 2] for continuous actions. Distributions are implemented inline (diagonal
+Gaussian / categorical) instead of pulling in distrax; log-probs and entropies
+are summed over action dims exactly like the torch ``Normal`` path.
+"""
+
+import math
 from typing import Optional
+
+import numpy as np
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-import distrax
 
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 class MAPPOActor(nn.Module):
@@ -48,7 +60,7 @@ class MAPPOActor(nn.Module):
 
 
 class MAPPOCritic(nn.Module):
-    """Centralized critic. 2-layer MLP with Tanh, hidden_dim=256."""
+    """Centralized critic. 2-layer MLP with Tanh."""
 
     hidden_dim: int = 256
 
@@ -75,36 +87,41 @@ class MAPPOCritic(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Pure helper functions for action sampling / evaluation (JIT-friendly)
+# Distribution math (diagonal Gaussian / masked categorical), JIT-friendly
 # ---------------------------------------------------------------------------
 
 
-def get_pi_discrete(
-    actor_apply_fn,
-    params,
-    obs: jnp.ndarray,
-    action_mask: Optional[jnp.ndarray] = None,
-) -> distrax.Categorical:
-    """Build a masked Categorical distribution from actor output."""
-    logits = actor_apply_fn(params, obs)
+def _gaussian_log_prob(action, mean, log_std):
+    """Sum of per-dim Normal log-probs (torch's `dist.log_prob(a).sum(-1)`)."""
+    var = jnp.exp(2.0 * log_std)
+    per_dim = -0.5 * ((action - mean) ** 2 / var) - log_std - 0.5 * _LOG_2PI
+    return per_dim.sum(axis=-1)
+
+
+def _gaussian_entropy(log_std, batch_shape):
+    """Sum of per-dim Normal entropies, broadcast to the batch."""
+    ent = (0.5 * (1.0 + _LOG_2PI) + log_std).sum()
+    return jnp.full(batch_shape, ent)
+
+
+def _masked_logits(logits, action_mask):
     if action_mask is not None:
         logits = logits + (1.0 - action_mask) * (-1e9)
-    return distrax.Categorical(logits=logits)
+    return logits
 
 
-def get_pi_continuous(
-    actor_apply_fn,
-    params,
-    obs: jnp.ndarray,
-) -> distrax.MultivariateNormalDiag:
-    """Build a Normal distribution from actor output."""
-    means, log_std = actor_apply_fn(params, obs)
-    log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
-    return distrax.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_std))
+def _categorical_log_prob(logits, action):
+    log_p = jax.nn.log_softmax(logits, axis=-1)
+    return jnp.take_along_axis(log_p, action[..., None], axis=-1).squeeze(-1)
+
+
+def _categorical_entropy(logits):
+    log_p = jax.nn.log_softmax(logits, axis=-1)
+    return -(jnp.exp(log_p) * log_p).sum(axis=-1)
 
 
 def sample_action(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     actor_apply_fn,
     params,
     obs: jnp.ndarray,
@@ -114,19 +131,21 @@ def sample_action(
 ):
     """Sample action and log_prob from the actor. Pure function."""
     if discrete:
-        pi = get_pi_discrete(actor_apply_fn, params, obs, action_mask)
+        logits = _masked_logits(actor_apply_fn(params, obs), action_mask)
         if deterministic:
-            action = jnp.argmax(pi.logits, axis=-1)
+            action = jnp.argmax(logits, axis=-1)
         else:
-            action = pi.sample(seed=rng)
-        log_prob = pi.log_prob(action)
+            action = jax.random.categorical(rng, logits, axis=-1)
+        log_prob = _categorical_log_prob(logits, action)
     else:
-        pi = get_pi_continuous(actor_apply_fn, params, obs)
+        mean, log_std = actor_apply_fn(params, obs)
+        log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
         if deterministic:
-            action = pi.loc
+            action = mean
         else:
-            action = pi.sample(seed=rng)
-        log_prob = pi.log_prob(action)
+            noise = jax.random.normal(rng, mean.shape)
+            action = mean + jnp.exp(log_std) * noise
+        log_prob = _gaussian_log_prob(action, mean, log_std)
 
     return action, log_prob
 
@@ -141,12 +160,13 @@ def evaluate_action(
 ):
     """Evaluate log_prob and entropy for given actions. Pure function."""
     if discrete:
-        pi = get_pi_discrete(actor_apply_fn, params, obs, action_mask)
-        log_prob = pi.log_prob(action)
-        entropy = pi.entropy()
+        logits = _masked_logits(actor_apply_fn(params, obs), action_mask)
+        log_prob = _categorical_log_prob(logits, action)
+        entropy = _categorical_entropy(logits)
     else:
-        pi = get_pi_continuous(actor_apply_fn, params, obs)
-        log_prob = pi.log_prob(action)
-        entropy = pi.entropy()
+        mean, log_std = actor_apply_fn(params, obs)
+        log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        log_prob = _gaussian_log_prob(action, mean, log_std)
+        entropy = _gaussian_entropy(log_std, log_prob.shape)
 
     return log_prob, entropy

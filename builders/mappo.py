@@ -36,7 +36,6 @@ for i, experiment_name in enumerate(EXPERIMENTS_LIST):
             lmbda=0.95,
             ent_coef=0.01,
             val_coef=0.8,
-            std_coef=0.0,
             lr=3e-4,
         ),
     )

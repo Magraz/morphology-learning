@@ -18,7 +18,6 @@ class MAPPO_Params:
     eps_clip: float = 0.2
     ent_coef: float = 0.01
     val_coef: float = 0.5
-    std_coef: float = 0.0
     grad_clip: float = 0.5
 
 

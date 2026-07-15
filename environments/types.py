@@ -17,6 +17,8 @@ class EnvironmentEnum(StrEnum):
     MPE_SIMPLE = "mpe_simple"
     BOX2D_SALP = "box2d_salp"
     MULTI_BOX = "multi_box_push"
+    # MuJoCo-MJX port of multi_box_push (functional JAX API, mappo_jax only)
+    MULTI_BOX_MJX = "multi_box_push_mjx"
     PUSH_BOX = "push_box"
     SCATTER = "scatter"
     RENDEZVOUZ = "rendezvouz"

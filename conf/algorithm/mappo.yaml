@@ -13,7 +13,6 @@ params:
   lmbda: 0.95
   eps_clip: 0.2
   ent_coef: 0.01
-  std_coef: 0.0
   grad_clip: 0.5
 model_params:
   hidden_dim: 168

@@ -1,0 +1,18 @@
+# @package _global_
+# JAX MAPPO (algorithms/mappo_jax): logically mirrors mappo_vanilla, but runs
+# fully jitted over the functional MJX envs (env=multi_box_push_mjx_* only).
+# Same params surface as mappo_vanilla so the two are drop-in comparable.
+algorithm: mappo_jax
+params:
+  n_epochs: 6
+  n_total_steps: 20000000.0     # float on purpose; env groups override when different
+  n_minibatches: 8
+  parameter_sharing: true       # mappo_jax implements the shared-actor path only
+  lr: 0.0003
+  gamma: 0.99
+  lmbda: 0.95
+  eps_clip: 0.2
+  ent_coef: 0.01
+  grad_clip: 0.5
+model_params:
+  hidden_dim: 168

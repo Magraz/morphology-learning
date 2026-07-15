@@ -19,7 +19,6 @@ class Params:
     grad_clip: float
     ent_coef: float
     val_coef: float
-    std_coef: float
     lmbda: float
 
 

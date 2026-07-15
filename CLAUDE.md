@@ -109,6 +109,28 @@ observation is egocentric. `nearest_box_vec` + `goal_distance` restore goal
 grounding (where to push, and how far) without reintroducing an absolute
 world-frame anchor.
 
+### Sensor overlay (debug rendering)
+
+`Renderer._draw_sensor_overlay` (`renderer.py`) draws the observation of **one
+focus agent** on top of the world: the 8+8 density sectors (`A:` agents / `O:`
+objects), the lidar scan (rays to their hit points, red dot on a hit, faint when
+clear), a magenta `nearest_box_vec` arrow, a green `goal_distance` segment along
+the env's goal axis, and a HUD legend with the scalar values. The focus agent is
+`env.render_sensor_agent` (default 0) — drawing every agent is unreadable past a
+handful, and costs a raycast pass per agent per frame.
+
+Values come from `ObservationManager.get_sensor_readout(agent_idx)`, which calls
+the **same** `_calculate_*` paths as `get_observation` (verified equal to the
+corresponding obs slices), so the overlay cannot drift from what the policy sees.
+`get_sensor_readout` calls `_refresh_caches()` itself, so it is safe outside a
+`get_observation` step. The lidar scan is factored into a per-agent
+`_calculate_lidar` (`_calculate_lidar_all` loops it) so the overlay raycasts only
+the focus agent, and `ObservationManager.lidar_directions` is shared by the scan
+and the drawing. Envs with no `objects` / no `target_areas` (scatter,
+rendezvouz) simply skip the box/goal arrows. The old scalar
+`calculate_density_sensors` — a duplicate of the vectorized math, used only by
+the renderer — was deleted.
+
 The total dimension is exported as `OBS_DIM` (= `BASE_OBS_DIM + N_LIDAR_RAYS`) from
 `observation.py`; every env's `observation_space` must use `OBS_DIM` so the layout
 stays in sync. Per-env overrides `n_lidar_rays` / `lidar_range` are read via
@@ -157,6 +179,124 @@ machinery (boundary, observation, renderer, contact listener, target band).
 - Wired into `algorithms/create_env.py` `make_vec_env` (reads `reward_mode` from
   `env_params`). Run the manual debugger with
   `SDL_VIDEODRIVER=dummy python -m environments.box2d_suite.push_box`.
+
+## MJX multi-box-push (`environments/mjx_suite/multi_box_push_mjx.py`)
+
+`MultiBoxPushMJX` is a MuJoCo-MJX port of the Box2D `multi_box_push` env with a
+functional, fully `jit`/`vmap`-able gymnax-style API: `reset(key) -> (obs,
+EnvState)`, `step(state, actions) -> (obs, state, reward, terminated,
+truncated, info)`; no auto-reset (caller's job). `EnvState` is a registered
+dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
+`delivered`.
+
+- **2D by construction.** Bodies own only planar DOFs (agents: slide-x/y;
+  boxes: slide-x/y + hinge-yaw), gravity is zero, walls are four inward-facing
+  planes — there is no z DOF, so MJX never computes out-of-plane dynamics.
+  Options: `integrator="implicitfast"` (implicit joint damping — the same
+  semantics as Box2D's `v /= 1 + d*dt`) and the default **pyramidal** friction
+  cone (elliptic NaNs out on GPU/f32 when a light coupled box is crushed
+  against a wall by many agents).
+- **Parity with Box2D.** Same world sizing, spawn regions, coupling list, box
+  sizing, target band, reward (shaping + one-time +100/box, dense/sparse),
+  boundary-contact termination, and the exact 40-dim `OBS_DIM` observation
+  layout (constants imported from `box2d_suite/observation.py`). Verified by
+  posing both engines identically and diffing all 40 dims: everything equal to
+  f32 precision, lidar within 4e-4. Box2D damping/mass constants are emulated
+  with joint damping = coeff × mass (× inertia for the hinge).
+- **Coupling mechanic** is a per-step override of `body_mass` / `body_inertia`
+  / `dof_damping` on the `mjx.Model` pytree (`_model_for`) — jit-safe because
+  the model is an argument to `mjx.step`. Touch detection is the same
+  rotated-box surface-distance test as Box2D's.
+- **Sensors in JAX**: density sectors / neighbor fraction / nearest-box /
+  goal distance are direct jnp ports; lidar is one vmapped `mjx.ray` call with
+  ray origins offset just past the caster's own surface (`bodyexclude` is
+  static numpy inside mjx, so self-exclusion can't be traced); per-agent
+  contact normal force = sum of the 4 pyramidal facet rows at each contact's
+  `efc_address` (verified ≈100 N steady-state for a 100 N push). A dummy
+  `<material>` asset works around an mjx.ray crash on material-less models.
+- Spawns use shuffled jittered grids (same regions/min separations as the
+  Box2D rejection sampling — jit needs static shapes). Reward shaping is live
+  from step 1 (Box2D pays 0 on its first step); box sizes fixed per instance
+  (as in Box2D). `info` carries `adjacency`, `agents_2_objects` as a dense
+  (O, A) 0/1 matrix, positions, `delivered`.
+- **Renderer** (`environments/mjx_suite/renderer.py`): the env stays pure JAX;
+  `MJXRenderer(env)` is a host-side subclass of the Box2D suite `Renderer`
+  that consumes an `EnvState` — it inherits the walls / target-band / sensor-
+  overlay drawing (the env exposes a real `ObjectTargetArea`; a
+  `SimpleNamespace` shim supplies `observation_manager.lidar_directions`) and
+  reimplements only the body drawing from a numpy snapshot. `render(state,
+  obs=obs, focus_agent=i)` returns an (H, W, 3) uint8 frame in the default
+  `rgb_array` mode (headless-safe) or draws to a window with `mode="human"`;
+  the overlay is sliced from the actual observation vector. Extras over
+  Box2D: green outline + live `touching/coupling` counter on each box,
+  delivered boxes washed out. `save_video(frames, "out.mp4"|".gif")` via
+  imageio. Vmapped states: index one env with `jax.tree.map(lambda x: x[i],
+  state)`. The same module also has `MuJoCoNativeRenderer(env, camera="iso"|
+  "top")` — native MuJoCo OpenGL rendering via `mujoco.Renderer` against a
+  cosmetic **visual twin** model (`env._build_xml(..., visual=True)`: same
+  bodies/joints so the MJX qpos copies straight into a host `MjData` +
+  `mj_forward`; adds contype-0 floor/walls/target-band/skybox/light, never
+  stepped). Coupled boxes tint green, delivered fade translucent. Needs
+  `MUJOCO_GL=egl` headless. Demo (writes mp4 + png, scripted delivery via the
+  shared `scripted_push_action`): `MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run
+  python -m environments.mjx_suite.renderer [--native iso|top]`.
+- Demo/sanity check (scripted delivery rollout + vmapped throughput):
+  `uv run python -m environments.mjx_suite.multi_box_push_mjx`. Step-matched
+  wall-clock shootout vs Box2D (`profile_multi_box_push.py`, Box2D on all
+  cores via AsyncVectorEnv, MJX vmapped on GPU): at 30a/6o, 100 eps x 1024
+  steps, MJX 15.0s (6.8k steps/s) vs Box2D 56.5s (1.8k steps/s) — 3.8x, plus
+  a one-time ~7s MJX compile. Not wired into `create_env` (torch MAPPO gains
+  nothing from it), but it **is** the training env of the fully-jitted
+  `mappo_jax` stack (below) via `EnvironmentEnum.MULTI_BOX_MJX =
+  "multi_box_push_mjx"`.
+
+## JAX MAPPO (`algorithms/mappo_jax/`)
+
+`algorithm=mappo_jax` (`AlgorithmEnum.MAPPO_JAX`) is a fully-jitted MAPPO that
+trains **directly on the functional MJX env** (`MultiBoxPushMJX` — the only
+supported env; the old JaxMARL dict-API path was removed). It is a deliberate
+logic mirror of `mappo_vanilla` so runs are drop-in comparable:
+
+- **Same per-iteration cadence** (`run.py` ≙ `VecMAPPOTrainer.train`): jitted
+  `collect_fn` (≙ `RolloutCollector.collect` — resets all envs at the top of
+  every rollout, scans `n_steps = batch_size // n_envs`, restarts envs that
+  finish mid-rollout since MJX has no auto-reset, bootstraps the final value) →
+  jitted `update_fn` (≙ `MAPPOAgent.update`) → jitted deterministic `eval_fn`
+  (≙ `PolicyEvaluator`, 5 parallel episodes → the `reward` stat). Deviation:
+  eval runs every 10 updates (+ the last), not every iteration — it scans a
+  full `env.max_steps` sequentially, which would dominate wall-clock — and the
+  `reward` stat carries the last eval forward in between.
+- **Same PPO update semantics** (`mappo.py`): env-level GAE on the scalar team
+  reward with the shared critic (vanilla tiles it per agent — identical math),
+  per-env-stream advantage normalization (unbiased std), timestep-centric
+  minibatches (`(batch // n_minibatches) // n_agents` timesteps each, critic
+  once per timestep), combined loss `policy + val_coef*value +
+  ent_coef*entropy` (actor/critic use separate Adams — equivalent, no shared
+  params), pre-update `explained_variance`. Known deviations: the trailing
+  partial minibatch is dropped (jit needs static shapes), shared-actor only
+  (`parameter_sharing=false` raises), continuous actions only in practice.
+- **Same networks** (`network.py`, flax): 2-layer Tanh MLPs with the same
+  orthogonal init, actor hidden = `model_params.hidden_dim`, critic hidden =
+  `2*hidden_dim`, learned state-independent `log_action_std` (init -0.5, clamp
+  [-5, 2]). Distributions are hand-rolled diagonal-Gaussian/categorical
+  (no distrax; `flax`+`optax` are deps, `distrax`/`chex`/`jaxmarl` are not).
+- **Same outputs**: reuses `TrainingStatsTracker`, writing
+  `training_stats_{checkpoint,finished}.pkl` with the exact vanilla key set
+  (plotting notebooks read them unchanged) under `results/<env>/<model>/
+  <trial_id>/logs`. Params are flax msgpack (`models_{checkpoint,finished}
+  .msgpack`), not torch `.pth`. Checkpoints are written but **resume is not
+  implemented**. `view()` renders 10 deterministic episodes via `MJXRenderer`
+  (video + reward plot, like vanilla); `evaluate()` prints the mean eval return.
+- **Config**: `conf/algorithm/mappo_jax.yaml` (same params surface as
+  `mappo_vanilla`), `conf/env/multi_box_push_mjx_9a_3o.yaml`, model group
+  `mlp` (plain `hidden_dim`; `mlp_shared` carries full-MAPPO keys like
+  `critic_type` that `Model_Params` rejects). The central `env.n_envs` autoscale
+  targets subprocess envs — for vmapped MJX pin it on the CLI (must divide
+  `batch_size`):
+  ```
+  uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o \
+      model=mlp trial_id=0 env.n_envs=32
+  ```
 
 ## Coordination-graph novelty exploration (gnn critic)
 

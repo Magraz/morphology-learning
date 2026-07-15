@@ -1,3 +1,24 @@
+"""PPO update mirroring ``mappo_vanilla.mappo.MAPPOAgent.update`` in JAX.
+
+Parity notes (vs. the torch implementation):
+- GAE runs once per env on the team reward + shared critic value; vanilla tiles
+  the reward per agent, but with identical rewards and a shared value the
+  per-agent advantages are identical, so env-level GAE broadcast to agents is
+  the same computation.
+- Advantages are normalized per (env) trajectory over the rollout steps with an
+  unbiased std (torch ``.std()``), matching vanilla's per-(env, agent) stream
+  normalization.
+- Minibatches are timestep-centric like ``update_shared``: one sample is one
+  (step, env) element carrying all agents, the critic runs once per element,
+  and the timestep minibatch size is ``(batch // n_minibatches) // n_agents``.
+  (Deviation: the trailing partial minibatch is dropped — jit needs static
+  shapes; torch's DataLoader keeps it.)
+- Actor and critic use separate Adam optimizers; since they share no
+  parameters this is equivalent to vanilla's single Adam over the combined
+  loss ``policy + val_coef * value + ent_coef * entropy``.
+- ``explained_variance`` is the same pre-update diagnostic vanilla computes.
+"""
+
 from typing import NamedTuple, Tuple
 
 import jax
@@ -21,18 +42,24 @@ class ActorCriticTrainState(NamedTuple):
 
 
 def create_train_state(
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     config: MAPPOConfig,
     obs_dim: int,
     global_state_dim: int,
     action_dim: int,
     discrete: bool,
 ) -> ActorCriticTrainState:
-    """Initialize actor/critic params and optimizers."""
+    """Initialize actor/critic params and optimizers.
+
+    Matches ``MAPPONetwork``: actor hidden = ``hidden_dim``, centralized critic
+    hidden = ``2 * hidden_dim``.
+    """
     rng_actor, rng_critic = jax.random.split(rng)
 
-    actor = MAPPOActor(action_dim=action_dim, hidden_dim=128, discrete=discrete)
-    critic = MAPPOCritic(hidden_dim=256)
+    actor = MAPPOActor(
+        action_dim=action_dim, hidden_dim=config.hidden_dim, discrete=discrete
+    )
+    critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim)
 
     actor_params = actor.init(rng_actor, jnp.zeros(obs_dim))
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))
@@ -72,7 +99,7 @@ def compute_gae(
     """Compute GAE advantages and returns via reverse scan.
 
     Args:
-        rewards:    (n_steps, n_envs)  — summed across agents
+        rewards:    (n_steps, n_envs)  — team reward
         values:     (n_steps, n_envs)
         dones:      (n_steps, n_envs)  — episode-level done
         last_value: (n_envs,)          — bootstrap value
@@ -82,7 +109,6 @@ def compute_gae(
         advantages: (n_steps, n_envs)
         returns:    (n_steps, n_envs)
     """
-    # Append bootstrap value
     values_with_bootstrap = jnp.concatenate(
         [values, last_value[None]], axis=0
     )  # (n_steps+1, n_envs)
@@ -90,12 +116,13 @@ def compute_gae(
     def _scan_fn(gae, t):
         # t counts backward: 0 = last step, 1 = second-to-last, ...
         step = rewards.shape[0] - 1 - t
+        not_done = 1.0 - dones[step]
         delta = (
             rewards[step]
-            + gamma * values_with_bootstrap[step + 1] * (1.0 - dones[step])
+            + gamma * values_with_bootstrap[step + 1] * not_done
             - values_with_bootstrap[step]
         )
-        gae = delta + gamma * gae_lambda * (1.0 - dones[step]) * gae
+        gae = delta + gamma * gae_lambda * not_done * gae
         return gae, gae
 
     _, advantages_reversed = jax.lax.scan(
@@ -115,19 +142,19 @@ def compute_gae(
 
 def ppo_update(
     train_state: ActorCriticTrainState,
-    rng: jax.random.PRNGKey,
+    rng: jax.Array,
     trajectory: Transition,
     last_value: jnp.ndarray,
     config: MAPPOConfig,
     discrete: bool,
 ) -> Tuple[ActorCriticTrainState, dict]:
-    """Full PPO update: GAE → multi-epoch minibatch gradient steps.
+    """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
 
     Args:
         train_state: current actor/critic TrainState
         rng: PRNG key
         trajectory: Transition with leading dim n_steps
-        last_value: (n_envs,) bootstrap values
+        last_value: (n_envs,) bootstrap values (GAE masks dones internally)
         config: hyperparameters
         discrete: action space type
 
@@ -137,64 +164,66 @@ def ppo_update(
     n_steps, n_envs, n_agents = trajectory.obs.shape[:3]
     obs_dim = trajectory.obs.shape[3]
 
-    # Sum per-agent rewards for the shared critic
-    rewards_sum = trajectory.reward.sum(axis=-1)  # (n_steps, n_envs)
-
-    # Use episode-level dones
+    dones = trajectory.done.astype(jnp.float32)
     advantages, returns = compute_gae(
-        rewards_sum,
+        trajectory.reward,
         trajectory.value,
-        trajectory.done,
+        dones,
         last_value,
         config.gamma,
         config.gae_lambda,
     )
 
-    # --- Flatten for minibatch training ---
-    # Actor data: flatten (steps, envs, agents) → (steps*envs*agents,)
-    obs_flat = trajectory.obs.reshape(-1, obs_dim)
-    actions_flat = trajectory.action.reshape(-1)
-    old_log_probs_flat = trajectory.log_prob.reshape(-1)
-    masks_flat = trajectory.action_mask.reshape(-1, trajectory.action_mask.shape[-1])
+    # Pre-update explained variance of the stored critic predictions
+    explained_variance = 1.0 - jnp.var(returns - trajectory.value, ddof=1) / (
+        jnp.var(returns, ddof=1) + 1e-8
+    )
 
-    # Expand advantages to per-agent: (steps, envs) → (steps, envs, agents) → flat
-    adv_expanded = jnp.broadcast_to(
-        advantages[:, :, None], (n_steps, n_envs, n_agents)
-    ).reshape(-1)
-    adv_flat = (adv_expanded - adv_expanded.mean()) / (adv_expanded.std() + 1e-8)
+    # Per-env-stream advantage normalization over the rollout steps
+    adv = (advantages - advantages.mean(axis=0)) / (
+        advantages.std(axis=0, ddof=1) + 1e-8
+    )
 
-    # Critic data: flatten (steps, envs) → (steps*envs,)
-    gs_flat = trajectory.global_state.reshape(-1, trajectory.global_state.shape[-1])
-    returns_flat = jnp.broadcast_to(
-        returns[:, :, None], (n_steps, n_envs, n_agents)
-    ).reshape(-1)
+    # --- Timestep-centric flattening: one sample per (step, env) ---
+    total_ts = n_steps * n_envs
+    obs_ts = trajectory.obs.reshape(total_ts, n_agents, obs_dim)
+    gs_ts = trajectory.global_state.reshape(total_ts, -1)
+    act_ts = trajectory.action.reshape(
+        total_ts, n_agents, *trajectory.action.shape[3:]
+    )
+    lp_ts = trajectory.log_prob.reshape(total_ts, n_agents)
+    adv_ts = adv.reshape(total_ts)
+    ret_ts = returns.reshape(total_ts)
 
-    total_samples = obs_flat.shape[0]
-    minibatch_size = total_samples // config.n_minibatches
+    # minibatch_size agent-samples => minibatch_size // n_agents timesteps
+    ts_minibatch_size = max(
+        1, (total_ts // config.n_minibatches) // n_agents
+    )
+    n_minibatches = total_ts // ts_minibatch_size
 
     def _epoch_step(carry, _epoch_idx):
         train_state, rng = carry
         rng, shuffle_rng = jax.random.split(rng)
-        perm = jax.random.permutation(shuffle_rng, total_samples)
+        perm = jax.random.permutation(shuffle_rng, total_ts)
 
         def _minibatch_step(carry, mb_idx):
             actor_ts, critic_ts = carry
-            start = mb_idx * minibatch_size
-            mb_ids = jax.lax.dynamic_slice(perm, (start,), (minibatch_size,))
+            start = mb_idx * ts_minibatch_size
+            mb_ids = jax.lax.dynamic_slice(perm, (start,), (ts_minibatch_size,))
 
-            mb_obs = obs_flat[mb_ids]
-            mb_actions = actions_flat[mb_ids]
-            mb_old_lp = old_log_probs_flat[mb_ids]
-            mb_adv = adv_flat[mb_ids]
-            mb_masks = masks_flat[mb_ids]
-            mb_gs = gs_flat[mb_ids]
-            mb_returns = returns_flat[mb_ids]
+            n_flat = ts_minibatch_size * n_agents
+            mb_obs = obs_ts[mb_ids].reshape(n_flat, obs_dim)
+            mb_actions = act_ts[mb_ids].reshape(n_flat, *act_ts.shape[2:])
+            mb_old_lp = lp_ts[mb_ids].reshape(n_flat)
+            # env-level advantage broadcast to each agent (identical per agent)
+            mb_adv = jnp.repeat(adv_ts[mb_ids], n_agents)
+            mb_gs = gs_ts[mb_ids]
+            mb_returns = ret_ts[mb_ids]
 
             # --- Actor loss ---
             def actor_loss_fn(actor_params):
                 log_probs, entropy = evaluate_action(
-                    actor_ts.apply_fn, actor_params,
-                    mb_obs, mb_actions, discrete, mb_masks,
+                    actor_ts.apply_fn, actor_params, mb_obs, mb_actions, discrete
                 )
                 ratio = jnp.exp(log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv
@@ -206,25 +235,31 @@ def ppo_update(
                 total = policy_loss + config.ent_coef * entropy_loss
                 return total, (policy_loss, entropy_loss)
 
-            (actor_loss, (policy_loss, entropy_loss)), actor_grads = (
-                jax.value_and_grad(actor_loss_fn, has_aux=True)(actor_ts.params)
-            )
+            (_, (policy_loss, entropy_loss)), actor_grads = jax.value_and_grad(
+                actor_loss_fn, has_aux=True
+            )(actor_ts.params)
             actor_ts = actor_ts.apply_gradients(grads=actor_grads)
 
-            # --- Critic loss ---
+            # --- Critic loss (once per timestep; shared value vs team return) ---
             def critic_loss_fn(critic_params):
                 values = critic_ts.apply_fn(critic_params, mb_gs)
-                return config.val_coef * jnp.mean((values - mb_returns) ** 2)
+                value_loss = jnp.mean((values - mb_returns) ** 2)
+                return config.val_coef * value_loss, value_loss
 
-            critic_loss, critic_grads = jax.value_and_grad(critic_loss_fn)(
-                critic_ts.params
-            )
+            (_, value_loss), critic_grads = jax.value_and_grad(
+                critic_loss_fn, has_aux=True
+            )(critic_ts.params)
             critic_ts = critic_ts.apply_gradients(grads=critic_grads)
 
+            # Stats mirror vanilla: raw component losses + the combined total
             losses = {
-                "total_loss": actor_loss + critic_loss,
+                "total_loss": (
+                    policy_loss
+                    + config.val_coef * value_loss
+                    + config.ent_coef * entropy_loss
+                ),
                 "policy_loss": policy_loss,
-                "value_loss": critic_loss,
+                "value_loss": value_loss,
                 "entropy_loss": entropy_loss,
             }
             return (actor_ts, critic_ts), losses
@@ -232,7 +267,7 @@ def ppo_update(
         (actor_ts, critic_ts), mb_losses = jax.lax.scan(
             _minibatch_step,
             (train_state.actor_ts, train_state.critic_ts),
-            jnp.arange(config.n_minibatches),
+            jnp.arange(n_minibatches),
         )
         new_ts = ActorCriticTrainState(actor_ts=actor_ts, critic_ts=critic_ts)
         return (new_ts, rng), mb_losses
@@ -245,5 +280,6 @@ def ppo_update(
 
     # Average losses across epochs and minibatches
     mean_losses = jax.tree.map(lambda x: x.mean(), epoch_losses)
+    mean_losses["explained_variance"] = explained_variance
 
     return train_state, mean_losses
