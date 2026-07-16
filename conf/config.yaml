@@ -4,9 +4,10 @@
 #   uv run python train.py -m model=mlp_shared,gnn_critic trial_id=0,1,2   # sweep
 #
 # Group order below sets inter-group precedence (later wins): algorithm supplies
-# the base params/model_params, env overrides env-scoped params (batch_size,
-# val_coef) + publishes the `hyperedges` map, model overrides model_params, seeds
-# injects params.random_seeds. `_self_` last lets this file's top-level keys win.
+# the base params/model_params, env overrides env-scoped params (val_coef,
+# n_total_steps) + publishes the `hyperedges` map, model overrides model_params,
+# seeds injects params.random_seeds. `_self_` last lets this file's top-level
+# keys win.
 defaults:
   - algorithm: mappo
   - env: multi_box_push_9a_3o
@@ -19,6 +20,7 @@ trial_id: debug
 view: false
 checkpoint: false
 evaluate: false
+debug: false
 
 # Parallelism budget. `n_jobs` = how many sweep jobs run at once (joblib layer);
 # `env.n_envs` auto-derives to `usable_cores // n_jobs` so the two layers never

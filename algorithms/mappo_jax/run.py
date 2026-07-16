@@ -42,9 +42,12 @@ class MAPPO_JAX_Runner:
         trials_dir: Path,
         trial_id: str,
         checkpoint: bool,
+        debug: bool,
         exp_config: Experiment,
         env_config: dict,
     ):
+        if debug:
+            jax.config.update("jax_disable_jit", True)
         # Directory setup (same layout as Runner, without the torch import)
         self.device = device
         self.trial_id = trial_id
@@ -63,12 +66,10 @@ class MAPPO_JAX_Runner:
         }
 
         self.checkpoint = checkpoint
-        self.exp_config = exp_config
-        self.env_config = env_config
 
         # Set params
-        self.params = Params(**self.exp_config.params)
-        self.model_params = Model_Params(**self.exp_config.model_params)
+        self.params = Params(**exp_config.params)
+        self.model_params = Model_Params(**exp_config.model_params)
 
         # Set seeds
         random_seed = self.params.random_seeds[0]
@@ -91,14 +92,10 @@ class MAPPO_JAX_Runner:
         )
 
         n_envs = env_config.get("n_envs")
-        n_steps = self.params.batch_size // n_envs
-        assert n_steps >= 1, (
-            f"batch_size={self.params.batch_size} < n_envs={n_envs}; "
-            "pin a smaller env.n_envs on the CLI"
-        )
+        n_steps = self.params.n_steps
 
-        # Build config from Params (n_steps derives like vanilla's rollout:
-        # batch_size env-steps split across the parallel envs)
+        # Build config from Params (the per-update batch is n_steps * n_envs
+        # env-steps, scaling with parallelism — same derivation as vanilla)
         self.config = MAPPOConfig(
             lr=self.params.lr,
             gamma=self.params.gamma,
@@ -125,12 +122,6 @@ class MAPPO_JAX_Runner:
     def train(self):
         from algorithms.mappo_vanilla.trainer_components import TrainingStatsTracker
 
-        if self.checkpoint:
-            print(
-                "WARNING: checkpoint resume is not implemented for mappo_jax; "
-                "starting from scratch (checkpoints are still saved)."
-            )
-
         init_fn, collect_fn, update_fn, eval_fn, num_updates = make_train(
             self.config, self.env
         )
@@ -138,30 +129,54 @@ class MAPPO_JAX_Runner:
         total_steps = self.config.n_total_steps
         log_every = 10e3
 
-        stats_tracker = TrainingStatsTracker()
-        stats_tracker.initialize_for_train(checkpoint=False)
-
         print("JIT-compiling init/collect/update/eval (first calls may be slow)...")
         runner_state = init_fn(jax.random.PRNGKey(self.rng_seed))
         jax.block_until_ready(runner_state)
         eval_rng = jax.random.PRNGKey(self.rng_seed + 1)
 
-        steps_completed = 0
-        episodes_completed = 0
+        # Resume from checkpoint if requested and checkpoint exists (vanilla
+        # flow: stats checkpoint restores the progress counters, the train
+        # checkpoint restores params + optimizer states + RNG keys)
+        train_ckpt_path = self.dirs["models"] / "train_checkpoint.msgpack"
+        stats_ckpt_path = self.dirs["logs"] / "training_stats_checkpoint.pkl"
 
-        print(
-            f"Starting MAPPO training for {total_steps} total environment steps "
-            f"({num_updates} updates x {steps_per_update} steps)..."
+        stats_tracker = TrainingStatsTracker()
+        checkpoint_loaded = False
+        if self.checkpoint and train_ckpt_path.exists() and stats_ckpt_path.exists():
+            runner_state, eval_rng = self._load_train_checkpoint(
+                runner_state, eval_rng, train_ckpt_path
+            )
+            with open(stats_ckpt_path, "rb") as f:
+                stats_tracker.load_from_dict(pickle.load(f))
+            checkpoint_loaded = True
+
+        resume_steps, resume_episodes = stats_tracker.initialize_for_train(
+            checkpoint=checkpoint_loaded
         )
+        steps_completed = resume_steps
+        episodes_completed = resume_episodes
+        start_update = resume_steps // steps_per_update
+
+        if resume_steps > 0:
+            print(f"Resuming MAPPO training from step {resume_steps}/{total_steps}...")
+        else:
+            print(
+                f"Starting MAPPO training for {total_steps} total environment steps "
+                f"({num_updates} updates x {steps_per_update} steps)..."
+            )
 
         # Eval costs a full env.max_steps sequential scan (episodes run to
         # truncation), so unlike vanilla it only runs every k updates; the
         # recorded `reward` stat carries the last eval forward in between to
         # keep the per-iteration series aligned.
         eval_every = 10
-        eval_reward = 0.0
+        eval_reward = (
+            stats_tracker.training_stats["reward"][-1]
+            if checkpoint_loaded and stats_tracker.training_stats["reward"]
+            else 0.0
+        )
 
-        for update in range(num_updates):
+        for update in range(start_update, num_updates):
             collection_start = time.time()
             runner_state, trajectory, last_value, rollout_stats = collect_fn(
                 runner_state
@@ -210,13 +225,12 @@ class MAPPO_JAX_Runner:
                     f"Update: {update_time:.2f}s | "
                     f"Eval: {eval_time:.2f}s"
                 )
-                self.save_training_stats(
-                    stats_tracker, self.dirs["logs"] / "training_stats_checkpoint.pkl"
-                )
+                self.save_training_stats(stats_tracker, stats_ckpt_path)
                 self.save_params(
                     runner_state.train_state,
                     self.dirs["models"] / "models_checkpoint.msgpack",
                 )
+                self._save_train_checkpoint(runner_state, eval_rng, train_ckpt_path)
 
         summary = stats_tracker.summarize(steps_completed)
         print(f"\n{'='*60}")
@@ -237,6 +251,10 @@ class MAPPO_JAX_Runner:
         self.save_params(
             runner_state.train_state, self.dirs["models"] / "models_finished.msgpack"
         )
+        # Also refresh the checkpoint pair so a later run with a larger
+        # n_total_steps and checkpoint=true extends this one seamlessly
+        self.save_training_stats(stats_tracker, stats_ckpt_path)
+        self._save_train_checkpoint(runner_state, eval_rng, train_ckpt_path)
 
     # ------------------------------------------------------------------ io
 
@@ -248,6 +266,40 @@ class MAPPO_JAX_Runner:
         }
         with open(path, "wb") as f:
             f.write(to_bytes(params_dict))
+
+    def _save_train_checkpoint(self, runner_state, eval_rng, path):
+        """Full resumable training state: params + optimizer states + step
+        counters (the TrainStates serialize as {step, params, opt_state}) and
+        both RNG chains. Progress counters live in the stats checkpoint."""
+        checkpoint = {
+            "actor_ts": runner_state.train_state.actor_ts,
+            "critic_ts": runner_state.train_state.critic_ts,
+            "rng": runner_state.rng,
+            "eval_rng": eval_rng,
+        }
+        with open(path, "wb") as f:
+            f.write(to_bytes(checkpoint))
+
+    def _load_train_checkpoint(self, runner_state, eval_rng, path):
+        """Restore a _save_train_checkpoint file into a fresh RunnerState."""
+        target = {
+            "actor_ts": runner_state.train_state.actor_ts,
+            "critic_ts": runner_state.train_state.critic_ts,
+            "rng": runner_state.rng,
+            "eval_rng": eval_rng,
+        }
+        with open(path, "rb") as f:
+            loaded = from_bytes(target, f.read())
+        print(f"Train state loaded from {path}")
+        return (
+            RunnerState(
+                train_state=runner_state.train_state._replace(
+                    actor_ts=loaded["actor_ts"], critic_ts=loaded["critic_ts"]
+                ),
+                rng=loaded["rng"],
+            ),
+            loaded["eval_rng"],
+        )
 
     def _load_train_state(self):
         """Fresh train state with params restored from the latest save."""
@@ -286,10 +338,15 @@ class MAPPO_JAX_Runner:
         import matplotlib.pyplot as plt
 
         from algorithms.mappo_jax.network import sample_action
-        from environments.mjx_suite.renderer import MJXRenderer
+        from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
         renderer = MJXRenderer(self.env)
+        try:
+            native_renderer = MuJoCoNativeRenderer(self.env)
+        except Exception as e:  # no GL context (run with MUJOCO_GL=egl headless)
+            print(f"Native MuJoCo renderer unavailable ({e}); skipping native videos")
+            native_renderer = None
         reset_fn = jax.jit(self.env.reset)
         step_fn = jax.jit(self.env.step)
 
@@ -309,9 +366,11 @@ class MAPPO_JAX_Runner:
         for episode in range(10):
             key = jax.random.PRNGKey(int(np.random.randint(0, 2**31)))
             obs, state = reset_fn(key)
-            rewards, frames = [], []
+            rewards, frames, native_frames = [], [], []
             for _ in range(self.env.max_steps):
                 frames.append(renderer.render(state, obs=np.asarray(obs)))
+                if native_renderer is not None:
+                    native_frames.append(native_renderer.render(state))
                 obs, state, reward, terminated, truncated, _ = step_fn(
                     state, policy_fn(obs)
                 )
@@ -337,12 +396,17 @@ class MAPPO_JAX_Runner:
             imageio.mimwrite(video_path, frames, fps=30, macro_block_size=1)
             print(f"Video saved to {video_path}")
 
+            if native_frames:
+                native_path = self.dirs["logs"] / f"episode_{episode}_native.mp4"
+                imageio.mimwrite(
+                    native_path, native_frames, fps=30, macro_block_size=1
+                )
+                print(f"Native video saved to {native_path}")
+
     def evaluate(self):
         """Deterministic evaluation of the saved policy (PolicyEvaluator parity)."""
         train_state = self._load_train_state()
         _, _, _, eval_fn, _ = make_train(self.config, self.env)
-        reward = float(
-            eval_fn(train_state, jax.random.PRNGKey(self.rng_seed + 1))
-        )
+        reward = float(eval_fn(train_state, jax.random.PRNGKey(self.rng_seed + 1)))
         print(f"Mean eval episode return: {reward:.2f}")
         return reward

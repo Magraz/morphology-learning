@@ -8,9 +8,6 @@ env:
   n_objects: 3
   reward_mode: dense
 
-params:
-  batch_size: 1024             # env-scoped; merges over the algorithm defaults
-
 hyperedges:                     # interpolation source for predefined-hgnn model files
   proximity: [proximity]
   contact: [contact]

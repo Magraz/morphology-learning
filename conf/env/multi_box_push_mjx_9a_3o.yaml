@@ -3,11 +3,8 @@ env:
   environment: multi_box_push_mjx
   # n_envs is set centrally in conf/config.yaml (usable_cores // n_jobs). That
   # default targets subprocess box2d envs; MJX envs are vmapped on one device,
-  # so the count is not core-bound — pin it on the CLI (e.g. env.n_envs=32; it
-  # must divide params.batch_size).
+  # so the count is not core-bound — pin it on the CLI (e.g. env.n_envs=32).
+  # The per-update batch scales with it: params.n_steps * n_envs env-steps.
   n_agents: 9
   n_objects: 3
   reward_mode: dense
-
-params:
-  batch_size: 1024             # env-scoped; merges over the algorithm defaults

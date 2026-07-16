@@ -13,6 +13,7 @@ def _dispatch(
     view: bool = False,
     checkpoint: bool = False,
     evaluate: bool = False,
+    debug: bool = False,
 ):
     """Build the per-algorithm Experiment + Runner and run it.
 
@@ -81,6 +82,7 @@ def _dispatch(
                 results_dir,
                 trial_id,
                 checkpoint,
+                debug,
                 exp_config,
                 env_config,
             )

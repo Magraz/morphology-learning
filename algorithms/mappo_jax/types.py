@@ -13,7 +13,9 @@ class Params:
     n_epochs: int
     n_total_steps: int
     n_minibatches: int
-    batch_size: int
+    # Rollout length per parallel env; the per-update batch is
+    # n_steps * env.n_envs env-steps, so it scales with parallelism.
+    n_steps: int
     parameter_sharing: bool
     random_seeds: list
 

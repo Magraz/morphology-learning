@@ -89,6 +89,7 @@ def _build_dispatch_args(cfg, choices):
         view=c["view"],
         checkpoint=c["checkpoint"],
         evaluate=c["evaluate"],
+        debug=c["debug"],
     )
 
 

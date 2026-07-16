@@ -91,6 +91,11 @@ class TrainingStatsTracker:
         self.training_stats["collection_time"] = stats.get("collection_time", [])
         self.training_stats["update_time"] = stats.get("update_time", [])
         self.training_stats["eval_time"] = stats.get("eval_time", [])
+        # Also restore the agent-stat series (losses, explained_variance, ...)
+        # so resumed runs stay index-aligned with total_steps
+        for key, value in stats.items():
+            if key not in self.training_stats:
+                self.training_stats[key] = value
 
     def to_dict(self) -> dict:
         return dict(self.training_stats)

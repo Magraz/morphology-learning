@@ -1,12 +1,13 @@
 # @package _global_
 # Shared MAPPO params (constant within a batch) + base model_params.
-# Env-scoped keys (batch_size, val_coef, and n_total_steps when it differs) are
-# set by the env group; model_params deltas come from the model group.
+# Env-scoped keys (val_coef, and n_total_steps when it differs) are set by the
+# env group; model_params deltas come from the model group.
 algorithm: mappo
 params:
   n_epochs: 6
   n_total_steps: 20000000.0     # float on purpose; env groups override when different
   n_minibatches: 8
+  n_steps: 1024                 # rollout length per env; batch = n_steps * env.n_envs
   parameter_sharing: true
   lr: 0.0003
   gamma: 0.99

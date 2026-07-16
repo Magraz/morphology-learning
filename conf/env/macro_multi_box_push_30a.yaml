@@ -15,6 +15,3 @@ env:
   skill_experiment: mlp_shared      # which trained actors to load as skills
   skill_trial: "0"
   device: cpu
-
-params:
-  batch_size: 1024             # env-scoped; merges over the algorithm defaults

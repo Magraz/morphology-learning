@@ -23,7 +23,7 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   ...`, `seeds: standard`, `_self_`) + top-level `device`/`trial_id`/`view`/
   `checkpoint`/`evaluate`. Group order sets precedence (later wins): algorithm
   supplies base `params`/`model_params`; env overrides env-scoped `params`
-  (`batch_size`, `val_coef`) and publishes a `hyperedges` map; model overrides
+  (`val_coef`, `n_total_steps`) and publishes a `hyperedges` map; model overrides
   `model_params`; seeds injects `params.random_seeds`. `hydra.job.chdir=false` +
   `output_subdir=null` + null log handlers keep cwd/paths/results untouched.
 - `conf/algorithm/{mappo,...}.yaml`, `conf/env/<batch>.yaml`,
@@ -259,7 +259,8 @@ logic mirror of `mappo_vanilla` so runs are drop-in comparable:
 
 - **Same per-iteration cadence** (`run.py` ≙ `VecMAPPOTrainer.train`): jitted
   `collect_fn` (≙ `RolloutCollector.collect` — resets all envs at the top of
-  every rollout, scans `n_steps = batch_size // n_envs`, restarts envs that
+  every rollout, scans `params.n_steps` (the per-update batch is `n_steps *
+  n_envs` env-steps in both stacks, scaling with parallelism), restarts envs that
   finish mid-rollout since MJX has no auto-reset, bootstraps the final value) →
   jitted `update_fn` (≙ `MAPPOAgent.update`) → jitted deterministic `eval_fn`
   (≙ `PolicyEvaluator`, 5 parallel episodes → the `reward` stat). Deviation:
@@ -284,15 +285,23 @@ logic mirror of `mappo_vanilla` so runs are drop-in comparable:
   `training_stats_{checkpoint,finished}.pkl` with the exact vanilla key set
   (plotting notebooks read them unchanged) under `results/<env>/<model>/
   <trial_id>/logs`. Params are flax msgpack (`models_{checkpoint,finished}
-  .msgpack`), not torch `.pth`. Checkpoints are written but **resume is not
-  implemented**. `view()` renders 10 deterministic episodes via `MJXRenderer`
-  (video + reward plot, like vanilla); `evaluate()` prints the mean eval return.
+  .msgpack`), not torch `.pth`. **Checkpoint resume works** (`checkpoint=true`):
+  the stats checkpoint restores the progress counters (vanilla flow) and
+  `models/train_checkpoint.msgpack` restores the full training state — actor/
+  critic params, optimizer states, step counters, and both RNG chains — saved
+  at every log point *and* at finish, so re-running with a larger
+  `n_total_steps` extends a finished run. (`load_from_dict` in the shared
+  `TrainingStatsTracker` now also restores the agent-loss series, so resumed
+  stats stay index-aligned — this fixed a latent vanilla resume flaw too.)
+  `view()` renders 10 deterministic episodes via `MJXRenderer`
+  (video + reward plot, like vanilla) and, when a GL context is available
+  (`MUJOCO_GL=egl` headless), also saves a `MuJoCoNativeRenderer` video per
+  episode (`episode_<i>_native.mp4`); `evaluate()` prints the mean eval return.
 - **Config**: `conf/algorithm/mappo_jax.yaml` (same params surface as
   `mappo_vanilla`), `conf/env/multi_box_push_mjx_9a_3o.yaml`, model group
   `mlp` (plain `hidden_dim`; `mlp_shared` carries full-MAPPO keys like
   `critic_type` that `Model_Params` rejects). The central `env.n_envs` autoscale
-  targets subprocess envs — for vmapped MJX pin it on the CLI (must divide
-  `batch_size`):
+  targets subprocess envs — for vmapped MJX pin it on the CLI:
   ```
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o \
       model=mlp trial_id=0 env.n_envs=32
