@@ -59,21 +59,28 @@ class MAPPOConfig:
     parameter_sharing: bool = True
     hidden_dim: int = 168
     n_eval_episodes: int = 5
+    # True when the env emits a per-agent reward (reward_mode="difference_rewards").
+    # Switches the critic to a per-agent value head and runs GAE on the agent axis;
+    # False keeps the exact scalar-team-reward path (mappo_vanilla parity).
+    per_agent_rewards: bool = False
 
 
 class Transition(NamedTuple):
     """Single timestep of rollout data across all envs.
 
-    When accumulated via jax.lax.scan the leading dim becomes n_steps. The
-    reward is the scalar team reward straight from the env (mappo_vanilla tiles
-    it per agent; with the shared critic the two are equivalent, so it is kept
-    env-level here and broadcast where needed).
+    When accumulated via jax.lax.scan the leading dim becomes n_steps.
+
+    `reward` is what the learner optimizes: the scalar team reward, or a
+    per-agent vector under `per_agent_rewards`. `team_reward` is always the
+    scalar team reward (`info["task_reward"]`) and is used only for logging, so
+    reported returns stay comparable across reward modes.
     """
 
     obs: jax.Array  # (n_envs, n_agents, obs_dim)
     global_state: jax.Array  # (n_envs, n_agents * obs_dim)
     action: jax.Array  # (n_envs, n_agents, action_dim)
-    reward: jax.Array  # (n_envs,) team reward
+    reward: jax.Array  # (n_envs,) team | (n_envs, n_agents) per-agent
     done: jax.Array  # (n_envs,) terminated | truncated
     log_prob: jax.Array  # (n_envs, n_agents)
-    value: jax.Array  # (n_envs,)
+    value: jax.Array  # (n_envs,) | (n_envs, n_agents)
+    team_reward: jax.Array  # (n_envs,) scalar team reward — logging only

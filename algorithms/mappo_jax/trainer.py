@@ -89,11 +89,15 @@ def make_train(config: MAPPOConfig, env):
 
     # ------------------------------------------------------------------ init
 
+    # Per-agent rewards need a value per agent to run GAE against.
+    n_critic_outputs = n_agents if config.per_agent_rewards else 1
+
     @jax.jit
     def init_fn(rng: jax.Array) -> RunnerState:
         rng, init_rng = jax.random.split(rng)
         train_state = create_train_state(
-            init_rng, config, obs_dim, obs_dim * n_agents, action_dim, discrete
+            init_rng, config, obs_dim, obs_dim * n_agents, action_dim, discrete,
+            n_critic_outputs=n_critic_outputs,
         )
         return RunnerState(train_state=train_state, rng=rng)
 
@@ -109,9 +113,13 @@ def make_train(config: MAPPOConfig, env):
             train_state, obs, action_rng, deterministic=False
         )
 
-        next_obs, next_env_state, reward, terminated, truncated, _ = v_step(
+        next_obs, next_env_state, reward, terminated, truncated, info = v_step(
             env_state, actions
         )
+        # `reward` is what the learner optimizes (team scalar, or per-agent
+        # difference rewards); `task_reward` is always the team scalar, so logged
+        # returns stay comparable across reward modes.
+        team_reward = info["task_reward"]
         done = jnp.logical_or(terminated, truncated)
 
         # The MJX env does not auto-reset; restart finished envs so the rollout
@@ -144,6 +152,7 @@ def make_train(config: MAPPOConfig, env):
             done=done,
             log_prob=log_probs,
             value=values,
+            team_reward=team_reward,
         )
         return (train_state, next_env_state, next_obs, rng), transition
 
@@ -166,7 +175,9 @@ def make_train(config: MAPPOConfig, env):
         last_value = _values(train_state, last_obs.reshape(config.n_envs, -1))
 
         rollout_stats = {
-            "mean_reward": trajectory.reward.mean(),
+            # Team reward, not the learner's signal — otherwise this would report
+            # mean D and be incomparable to the dense baseline.
+            "mean_reward": trajectory.team_reward.mean(),
             "episode_count": trajectory.done.sum(),
         }
         return (
@@ -202,9 +213,13 @@ def make_train(config: MAPPOConfig, env):
             actions, _ = _actor_forward(
                 train_state, obs, jax.random.PRNGKey(0), deterministic=True
             )
-            next_obs, next_env_state, reward, terminated, truncated, _ = jax.vmap(
+            next_obs, next_env_state, _, terminated, truncated, info = jax.vmap(
                 env.step
             )(env_state, actions)
+            # Always score eval on the team reward: under difference rewards the
+            # env's `reward` is per-agent, and a policy must still be judged by
+            # what the team achieved.
+            reward = info["task_reward"]
             episode_rewards = episode_rewards + jnp.where(finished, 0.0, reward)
             finished = finished | terminated | truncated
             return (next_obs, next_env_state, finished, episode_rewards), None

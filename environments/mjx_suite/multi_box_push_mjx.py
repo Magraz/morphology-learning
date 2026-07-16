@@ -19,7 +19,10 @@ Parity with the Box2D env (same layout as ``observation.py``'s OBS_DIM = 40):
 
 - observation: own_velocity(2) + density_sensors(16) + is_touching_object(1)
   + neighbor_fraction(1) + contact_force(1) + nearest_box_vec(2)
-  + goal_distance(1) + lidar(16), identical normalizations.
+  + goal_distance(1) + lidar(16), identical normalizations. The sensor math
+  lives in the suite-shared ``mjx_suite/observation.py``
+  (``MJXObservationBuilder``) — this env only supplies the qpos layout
+  (``_agent_pos`` / ``_agent_vel`` / ``_box_pose``) and its goal band.
 - reward: per-step shaping toward the top target band + one-time +100 per
   delivered box (``reward_mode="dense"`` keeps shaping, ``"sparse"`` doesn't);
   terminate when all boxes delivered or any agent touches a wall.
@@ -52,8 +55,12 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from environments.box2d_suite.observation import N_LIDAR_RAYS, OBS_DIM
 from environments.box2d_suite.utils import COLORS_LIST, ObjectTargetArea
+from environments.mjx_suite.observation import (
+    OBS_DIM,
+    MJXObservationBuilder,
+    geom_index_maps,
+)
 
 _AGENT_RADIUS = 0.4
 _AGENT_MASS = 1.0  # Box2D default-mass fallback for zero-density fixtures
@@ -62,18 +69,10 @@ _BOX_LIN_DAMPING = 5.0
 _BOX_ANG_DAMPING = 8.0
 _BOX_BASE_DENSITY_2D = 20.0  # Box2D kg/m^2
 _COUPLED_DENSITY_PER_AGENT = 0.05
-_TOUCH_EPS = 0.2  # agent counts as touching within radius + eps of a box face
 _BOX_HALF_HEIGHT = 0.4  # z half-extent; cosmetic (no z DOF), keeps contacts planar
 _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
-_N_SECTORS = 8
-_LIDAR_EPS = 1e-3  # ray origin offset past the agent surface (self-hit guard)
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
-
-
-def _impl(data):
-    """mjx 3.10 moved contact/efc arrays behind Data._impl."""
-    return getattr(data, "_impl", data)
 
 
 @jax.tree_util.register_dataclass
@@ -95,10 +94,19 @@ class MultiBoxPushMJX:
         reward_mode: str = "dense",
         comm_radius: float | None = None,
     ):
+        if reward_mode not in ("dense", "sparse", "difference_rewards"):
+            raise ValueError(
+                f"reward_mode must be dense|sparse|difference_rewards, got {reward_mode}"
+            )
         self.n_agents = n_agents
         self.n_objects = n_objects
         self.max_steps = max_steps
         self.reward_mode = reward_mode
+        # `difference_rewards` shapes the *team* reward exactly like "dense" and
+        # then decomposes it per agent; a sparse base would leave D_i zero on every
+        # step except a delivery, which is too thin to learn from.
+        self._dense = reward_mode in ("dense", "difference_rewards")
+        self._difference = reward_mode == "difference_rewards"
 
         # --- world geometry (identical to the Box2D env) ---
         total_entities = n_agents + n_objects
@@ -185,16 +193,6 @@ class MultiBoxPushMJX:
         self._box_dof_lin = jnp.asarray(box_dadr[:, :2].ravel())  # (2O,)
         self._box_dof_ang = jnp.asarray(box_dadr[:, 2])  # (O,)
 
-        # geom id -> agent/object index maps (-1 = neither), for contact forces
-        agent_of_geom = -np.ones(m.ngeom, dtype=np.int32)
-        object_of_geom = -np.ones(m.ngeom, dtype=np.int32)
-        for i in range(n_agents):
-            agent_of_geom[m.geom(f"g_agent_{i}").id] = i
-        for j in range(n_objects):
-            object_of_geom[m.geom(f"g_box_{j}").id] = j
-        self._agent_of_geom = jnp.asarray(agent_of_geom)
-        self._object_of_geom = jnp.asarray(object_of_geom)
-
         # heavy/light overrides for the coupling mechanic
         self._coupling = jnp.asarray(coupling, dtype=jnp.int32)
         self._heavy_mass = jnp.asarray(heavy_mass, dtype=jnp.float32)
@@ -202,17 +200,22 @@ class MultiBoxPushMJX:
         self._heavy_inertia = self._model.body_inertia[self._box_body_ids]  # (O, 3)
         self._box_half = jnp.asarray(self.box_half_extents, dtype=jnp.float32)
 
-        self._lidar_dirs = jnp.asarray(
-            np.stack(
-                [
-                    np.cos(np.arange(N_LIDAR_RAYS) * 2 * np.pi / N_LIDAR_RAYS),
-                    np.sin(np.arange(N_LIDAR_RAYS) * 2 * np.pi / N_LIDAR_RAYS),
-                    np.zeros(N_LIDAR_RAYS),
-                ],
-                axis=1,
-            ),
-            dtype=jnp.float32,
-        )  # (R, 3)
+        agent_of_geom, object_of_geom = geom_index_maps(m, n_agents, n_objects)
+        self.obs_builder = MJXObservationBuilder(
+            self._model,
+            n_agents=n_agents,
+            n_objects=n_objects,
+            world_width=self.world_width,
+            world_height=self.world_height,
+            velocity_norm=self.velocity_norm,
+            neighbor_detection_range=self.neighbor_detection_range,
+            agent_radius=_AGENT_RADIUS,
+            force_multiplier=self.force_multiplier,
+            sector_sensor_radius=self.sector_sensor_radius,
+            lidar_range=self.lidar_range,
+            agent_of_geom=agent_of_geom,
+            object_of_geom=object_of_geom,
+        )
 
         self._agent_spawn_grid = self._make_spawn_grid()
         self._box_spawn_slots = self._make_box_slots()
@@ -383,32 +386,30 @@ class MultiBoxPushMJX:
         return q[:, :2], q[:, 2]  # positions (O, 2), yaws (O,)
 
     def _touch_matrix(self, agent_pos, box_pos, box_yaw) -> jnp.ndarray:
-        """(A, O) bool — agent within radius + eps of a (rotated) box surface.
+        """(A, O) bool — agent within radius + eps of a (rotated) box surface."""
+        return self.obs_builder.touch_matrix(
+            agent_pos, box_pos, box_yaw, self._box_half
+        )
 
-        Port of ObservationManager._agent_object_distance: rotate into box
-        frame, clamp to the half extents, distance to the clamped point.
-        """
-        rel = agent_pos[:, None, :] - box_pos[None, :, :]  # (A, O, 2)
-        c, s = jnp.cos(box_yaw), jnp.sin(box_yaw)  # (O,)
-        local = jnp.stack(
-            [c * rel[..., 0] + s * rel[..., 1], -s * rel[..., 0] + c * rel[..., 1]],
-            axis=-1,
-        )  # (A, O, 2)
-        clamped = jnp.clip(local, -self._box_half[None, :, None],
-                           self._box_half[None, :, None])
-        dist = jnp.linalg.norm(local - clamped, axis=-1)  # (A, O)
-        return dist <= _AGENT_RADIUS + _TOUCH_EPS
-
-    def _model_for(self, data) -> mjx.Model:
+    def _model_for(self, data, active: jnp.ndarray | None = None) -> mjx.Model:
         """Per-step model with the coupling mechanic applied.
 
         A box whose coupling requirement is met (enough agents touching) gets
         the light mass; otherwise the heavy base mass. Inertia and the
         Box2D-style damping (coeff * mass / inertia) scale along with it.
+
+        `active` is an optional (A,) bool mask (traced) of agents that count as
+        *cooperating*. Masked-out agents are excluded from the touch count, so a
+        counterfactual agent does not prop up a box it is no longer pushing. The
+        coupling requirement abstracts "enough agents working together", and an
+        agent applying zero force is not working — see `_difference_rewards`.
         """
         agent_pos = self._agent_pos(data)
         box_pos, box_yaw = self._box_pose(data)
-        n_touch = self._touch_matrix(agent_pos, box_pos, box_yaw).sum(axis=0)
+        touch = self._touch_matrix(agent_pos, box_pos, box_yaw)  # (A, O)
+        if active is not None:
+            touch = touch & active[:, None]
+        n_touch = touch.sum(axis=0)
         met = n_touch >= self._coupling  # (O,)
 
         mass = jnp.where(met, self._light_mass, self._heavy_mass)  # (O,)
@@ -429,120 +430,19 @@ class MultiBoxPushMJX:
 
     # ------------------------------------------------------------------ obs
 
-    def _density_sensors(self, agent_pos, box_pos) -> jnp.ndarray:
-        """(A, 16) sector centroid-proximity sensors, cols 0-7 agents, 8-15 boxes."""
-        R = self.sector_sensor_radius
-        shift = jnp.radians(22.5)
-        step = 2 * jnp.pi / _N_SECTORS
-
-        def sector_block(rel, in_range):
-            # rel (A, N, 2), in_range (A, N) -> (A, 8)
-            ang = (jnp.arctan2(rel[..., 1], rel[..., 0]) - shift) % (2 * jnp.pi)
-            sect = (ang // step).astype(jnp.int32) % _N_SECTORS
-            onehot = jax.nn.one_hot(sect, _N_SECTORS) * in_range[..., None]  # (A,N,8)
-            count = onehot.sum(axis=1)  # (A, 8)
-            sum_rel = jnp.einsum("ans,anc->asc", onehot, rel)  # (A, 8, 2)
-            centroid_dist = jnp.linalg.norm(
-                sum_rel / jnp.maximum(count, 1.0)[..., None], axis=-1
-            )
-            return jnp.where(count > 0, 1.0 - centroid_dist / R, 0.0)
-
-        rel_aa = agent_pos[None, :, :] - agent_pos[:, None, :]  # (A, A, 2)
-        dist_aa = jnp.linalg.norm(rel_aa, axis=-1)
-        agents_block = sector_block(rel_aa, (dist_aa > 0) & (dist_aa < R))
-
-        rel_ao = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
-        dist_ao = jnp.linalg.norm(rel_ao, axis=-1)
-        objects_block = sector_block(rel_ao, dist_ao < R)
-
-        return jnp.concatenate([agents_block, objects_block], axis=1)
-
-    def _lidar(self, data, agent_pos) -> jnp.ndarray:
-        """(A, R) normalized range scan via mjx raycasts.
-
-        mjx.ray's bodyexclude is static (numpy-side), so instead of excluding
-        the caster we start each ray just outside its own sphere surface and
-        add the offset back — identical ranges, one fully vmapped call.
-        """
-        origins3 = jnp.pad(agent_pos, ((0, 0), (0, 1)))  # (A, 3), z = 0
-        start = (
-            origins3[:, None, :]
-            + self._lidar_dirs[None, :, :] * (_AGENT_RADIUS + _LIDAR_EPS)
-        ).reshape(-1, 3)
-        vecs = jnp.broadcast_to(
-            self._lidar_dirs[None], (self.n_agents, N_LIDAR_RAYS, 3)
-        ).reshape(-1, 3)
-        dist, _ = jax.vmap(lambda p, v: mjx.ray(self._model, data, p, v))(start, vecs)
-        total = _AGENT_RADIUS + _LIDAR_EPS + dist
-        frac = jnp.where(dist < 0, 1.0, jnp.clip(total / self.lidar_range, 0.0, 1.0))
-        return frac.reshape(self.n_agents, N_LIDAR_RAYS)
-
-    def _contact_forces(self, data) -> jnp.ndarray:
-        """(A,) summed contact normal force of each agent against any box.
-
-        With pyramidal friction cones and condim 3, each contact owns 4 efc
-        facet rows starting at efc_address, and the normal force is their
-        plain sum (mju_decodePyramid) — the counterpart of Box2D's PostSolve
-        normal-impulse sum / dt.
-        """
-        impl = _impl(data)
-        contact = impl.contact
-        g1, g2 = contact.geom[:, 0], contact.geom[:, 1]
-        a_idx = jnp.maximum(self._agent_of_geom[g1], self._agent_of_geom[g2])
-        is_pair = (a_idx >= 0) & (
-            jnp.maximum(self._object_of_geom[g1], self._object_of_geom[g2]) >= 0
-        )
-        addr = jnp.maximum(contact.efc_address, 0)[:, None] + jnp.arange(4)[None, :]
-        normal = impl.efc_force[addr].sum(axis=1)
-        normal = jnp.where(is_pair & (contact.efc_address >= 0), normal, 0.0)
-        seg = jnp.where(is_pair, a_idx, self.n_agents)
-        return jax.ops.segment_sum(normal, seg, num_segments=self.n_agents + 1)[
-            : self.n_agents
-        ]
-
     def _get_obs(self, data) -> jnp.ndarray:
-        agent_pos = self._agent_pos(data)
+        """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder."""
         box_pos, box_yaw = self._box_pose(data)
-
-        velocity = self._agent_vel(data) / self.velocity_norm  # (A, 2)
-        density = self._density_sensors(agent_pos, box_pos)  # (A, 16)
-        touch = self._touch_matrix(agent_pos, box_pos, box_yaw)  # (A, O)
-        is_touching = touch.any(axis=1).astype(jnp.float32)[:, None]  # (A, 1)
-
-        pair_dist = jnp.linalg.norm(
-            agent_pos[:, None, :] - agent_pos[None, :, :], axis=-1
+        return self.obs_builder.build(
+            data,
+            agent_pos=self._agent_pos(data),
+            agent_vel=self._agent_vel(data),
+            box_pos=box_pos,
+            box_yaw=box_yaw,
+            box_half=self._box_half,
+            goal_coord=self.target_y,  # band spans the top wall: goal axis is y
+            goal_axis="y",
         )
-        neighbor_fraction = (
-            (pair_dist <= self.neighbor_detection_range).mean(axis=1)
-        )[:, None]
-
-        contact_force = (self._contact_forces(data) / self.force_multiplier)[:, None]
-
-        rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
-        nearest = jnp.argmin(jnp.linalg.norm(rel, axis=-1), axis=1)  # (A,)
-        nearest_box_vec = (
-            rel[jnp.arange(self.n_agents), nearest] / self.world_width
-        )  # (A, 2)
-
-        goal_distance = (
-            (self.target_y - agent_pos[:, 1]) / self.world_height
-        )[:, None]
-
-        lidar = self._lidar(data, agent_pos)  # (A, 16)
-
-        return jnp.concatenate(
-            [
-                velocity,
-                density,
-                is_touching,
-                neighbor_fraction,
-                contact_force,
-                nearest_box_vec,
-                goal_distance,
-                lidar,
-            ],
-            axis=1,
-        ).astype(jnp.float32)
 
     # ------------------------------------------------------------------ API
 
@@ -590,44 +490,94 @@ class MultiBoxPushMJX:
         )
         return self._get_obs(data), state
 
-    def step(self, state: EnvState, actions: jnp.ndarray):
-        """actions: (n_agents, 2) in [-1, 1]. Returns
-        (obs, state, reward, terminated, truncated, info)."""
-        ctrl = jnp.clip(actions, -1.0, 1.0).reshape(-1)
-
+    def _advance(
+        self, state: EnvState, actions: jnp.ndarray, active: jnp.ndarray | None = None
+    ):
+        """One physics step. `active` (A,) bool zeroes masked agents' force *and*
+        drops them from the coupling count (see `_model_for`)."""
+        ctrl = jnp.clip(actions, -1.0, 1.0)
+        if active is not None:
+            ctrl = ctrl * active[:, None]
         # mass update from pre-step positions, then physics (Box2D ordering)
-        model_t = self._model_for(state.data)
-        data = state.data.replace(ctrl=ctrl)
-        data = mjx.step(model_t, data)
+        model_t = self._model_for(state.data, active)
+        data = state.data.replace(ctrl=ctrl.reshape(-1))
+        return mjx.step(model_t, data)
 
+    def _task_reward(self, state: EnvState, data):
+        """Team reward for a post-step `data` against the pre-step `state`.
+
+        Pure in (state, data), so counterfactual branches reuse it directly —
+        no recursion through `step`. Returns
+        (reward, newly_delivered, boundary_hit, dist).
+        """
         agent_pos = self._agent_pos(data)
-        box_pos, box_yaw = self._box_pose(data)
+        box_pos, _ = self._box_pose(data)
 
         # boundary termination: any agent touching a wall plane
         lo = self.boundary_thickness + _AGENT_RADIUS + _WALL_EPS
-        boundary_hit = jnp.any(
-            (agent_pos < lo) | (agent_pos > self.world_width - lo)
-        )
+        boundary_hit = jnp.any((agent_pos < lo) | (agent_pos > self.world_width - lo))
 
         # reward: shaping toward the band + one-time delivery bonus
         dist = self.target_y - box_pos[:, 1]  # (O,) signed, matches Box2D
-        shaping = jnp.sum(
-            (state.prev_box_goal_dist - dist) * (~state.delivered)
-        )
+        shaping = jnp.sum((state.prev_box_goal_dist - dist) * (~state.delivered))
         in_band = (jnp.abs(box_pos[:, 0] - self.target_x) <= self.target_half_w) & (
             jnp.abs(box_pos[:, 1] - self.target_y) <= self.target_half_h
         )
         newly_delivered = in_band & ~state.delivered
         completion = 100.0 * newly_delivered.sum()
-        task_reward = completion + jnp.where(
-            self.reward_mode == "dense", shaping, 0.0
-        )
+        task_reward = completion + (shaping if self._dense else 0.0)
 
         # Box2D skips reward/delivery bookkeeping on a boundary hit
         reward = jnp.where(boundary_hit, 0.0, task_reward)
-        delivered = jnp.where(boundary_hit, state.delivered,
-                              state.delivered | newly_delivered)
+        return reward, newly_delivered, boundary_hit, dist
 
+    def _difference_rewards(
+        self, state: EnvState, actions: jnp.ndarray, g_factual: jnp.ndarray
+    ) -> jnp.ndarray:
+        """(A,) exact single-step difference rewards `D_i = G - G_-i`.
+
+        Fork the pre-step state once per agent and re-run *the same* step with
+        agent i contributing nothing: zero force **and** dropped from the coupling
+        count. Only agent i's participation differs, so D_i is exact, not an
+        estimate — this is what the pure functional env buys us.
+
+        The coupling exclusion is what gives the signal its structure. With force
+        zeroed alone, a limp agent would still be counted as touching, the box
+        would stay light, and D_i would collapse to agent i's marginal force
+        share (roughly additive, sum_i D_i ~ G). Dropping it from the count
+        instead asks "was agent i *necessary*": if a box needs 3 touchers and
+        exactly 3 are on it, removing any one makes the box heavy and it stops
+        moving, so all three score D_i ~ G; if 5 are on it, the coupling still
+        holds without agent i and it correctly scores ~0. Credit is therefore
+        non-additive by design (sum_i D_i can far exceed G).
+
+        Costs A extra `mjx.step` calls per env step, vmapped over the agent axis.
+        Single-step by necessity: a multi-step counterfactual would need to know
+        what agents do *next*, which is the policy's business, not the env's.
+        """
+        agent_ids = jnp.arange(self.n_agents)
+
+        def counterfactual(i):
+            data = self._advance(state, actions, active=agent_ids != i)
+            reward, _, _, _ = self._task_reward(state, data)
+            return reward
+
+        return g_factual - jax.vmap(counterfactual)(agent_ids)
+
+    def step(self, state: EnvState, actions: jnp.ndarray):
+        """actions: (n_agents, 2) in [-1, 1]. Returns
+        (obs, state, reward, terminated, truncated, info).
+
+        `reward` is the scalar team reward, except under
+        `reward_mode="difference_rewards"` where it is (n_agents,) per-agent
+        difference rewards. `info["task_reward"]` always carries the team scalar.
+        """
+        data = self._advance(state, actions)
+        reward, newly_delivered, boundary_hit, dist = self._task_reward(state, data)
+
+        delivered = jnp.where(
+            boundary_hit, state.delivered, state.delivered | newly_delivered
+        )
         terminated = boundary_hit | jnp.all(delivered)
         t = state.t + 1
         truncated = t >= self.max_steps
@@ -637,6 +587,8 @@ class MultiBoxPushMJX:
             data=data, t=t, prev_box_goal_dist=dist, delivered=delivered
         )
 
+        agent_pos = self._agent_pos(data)
+        box_pos, box_yaw = self._box_pose(data)
         touch = self._touch_matrix(agent_pos, box_pos, box_yaw)
         pair_dist = jnp.linalg.norm(
             agent_pos[:, None, :] - agent_pos[None, :, :], axis=-1
@@ -651,6 +603,9 @@ class MultiBoxPushMJX:
             "box_positions": box_pos,
             "delivered": delivered,
         }
+
+        if self._difference:
+            reward = self._difference_rewards(state, actions, reward)
         return obs, new_state, reward, terminated, truncated, info
 
 

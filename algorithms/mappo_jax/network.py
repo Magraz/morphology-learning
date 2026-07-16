@@ -60,9 +60,16 @@ class MAPPOActor(nn.Module):
 
 
 class MAPPOCritic(nn.Module):
-    """Centralized critic. 2-layer MLP with Tanh."""
+    """Centralized critic. 2-layer MLP with Tanh.
+
+    `n_outputs` > 1 gives a per-agent value head: one value per agent from the
+    same global state, needed when the env emits per-agent rewards (difference
+    rewards), since each agent then has its own return to predict. `n_outputs=1`
+    (default) keeps the original single-scalar critic exactly.
+    """
 
     hidden_dim: int = 256
+    n_outputs: int = 1
 
     @nn.compact
     def __call__(self, global_state: jnp.ndarray):
@@ -79,11 +86,13 @@ class MAPPOCritic(nn.Module):
         )(x)
         x = nn.tanh(x)
         value = nn.Dense(
-            1,
+            self.n_outputs,
             kernel_init=nn.initializers.orthogonal(1.0),
             bias_init=nn.initializers.constant(0.0),
         )(x)
-        return jnp.squeeze(value, axis=-1)
+        if self.n_outputs == 1:
+            return jnp.squeeze(value, axis=-1)
+        return value  # (..., n_outputs) — one value per agent
 
 
 # ---------------------------------------------------------------------------

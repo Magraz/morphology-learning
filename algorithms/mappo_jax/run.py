@@ -90,6 +90,10 @@ class MAPPO_JAX_Runner:
             n_objects=env_config.get("n_objects", 3),
             reward_mode=env_config.get("reward_mode", "dense"),
         )
+        # reward_mode="difference_rewards" makes the env emit a per-agent reward,
+        # which switches the critic to a per-agent value head and runs GAE on the
+        # agent axis (see MAPPOConfig.per_agent_rewards).
+        per_agent_rewards = self.env.reward_mode == "difference_rewards"
 
         n_envs = env_config.get("n_envs")
         n_steps = self.params.n_steps
@@ -111,11 +115,13 @@ class MAPPO_JAX_Runner:
             n_total_steps=int(self.params.n_total_steps),
             parameter_sharing=self.params.parameter_sharing,
             hidden_dim=self.model_params.hidden_dim,
+            per_agent_rewards=per_agent_rewards,
         )
 
         print(
             f"JAX MAPPO | env={environment} | n_envs={self.config.n_envs} | "
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
+            f"reward_mode={self.env.reward_mode} | "
             f"backend={jax.default_backend()}"
         )
 
@@ -310,6 +316,10 @@ class MAPPO_JAX_Runner:
             self.env.observation_dim * self.env.n_agents,
             self.env.action_dim,
             discrete=False,
+            # Must match training, or the restored critic params won't fit.
+            n_critic_outputs=(
+                self.env.n_agents if self.config.per_agent_rewards else 1
+            ),
         )
         path = self.dirs["models"] / "models_finished.msgpack"
         if not path.exists():
@@ -371,10 +381,12 @@ class MAPPO_JAX_Runner:
                 frames.append(renderer.render(state, obs=np.asarray(obs)))
                 if native_renderer is not None:
                     native_frames.append(native_renderer.render(state))
-                obs, state, reward, terminated, truncated, _ = step_fn(
+                obs, state, _, terminated, truncated, info = step_fn(
                     state, policy_fn(obs)
                 )
-                rewards.append(float(reward))
+                # Team reward: the env's `reward` is per-agent under
+                # difference_rewards, and the plot is of team performance.
+                rewards.append(float(info["task_reward"]))
                 if bool(terminated) or bool(truncated):
                     break
             rewards = np.asarray(rewards)

@@ -48,18 +48,20 @@ def create_train_state(
     global_state_dim: int,
     action_dim: int,
     discrete: bool,
+    n_critic_outputs: int = 1,
 ) -> ActorCriticTrainState:
     """Initialize actor/critic params and optimizers.
 
     Matches ``MAPPONetwork``: actor hidden = ``hidden_dim``, centralized critic
-    hidden = ``2 * hidden_dim``.
+    hidden = ``2 * hidden_dim``. ``n_critic_outputs`` > 1 gives the critic a
+    per-agent value head (per-agent rewards); 1 keeps the scalar critic.
     """
     rng_actor, rng_critic = jax.random.split(rng)
 
     actor = MAPPOActor(
         action_dim=action_dim, hidden_dim=config.hidden_dim, discrete=discrete
     )
-    critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim)
+    critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs)
 
     actor_params = actor.init(rng_actor, jnp.zeros(obs_dim))
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))
@@ -98,20 +100,28 @@ def compute_gae(
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Compute GAE advantages and returns via reverse scan.
 
+    Shape-agnostic in the trailing axis: with a scalar team reward everything is
+    (n_steps, n_envs); with per-agent rewards everything carries a trailing agent
+    axis (n_steps, n_envs, n_agents) and the identical recursion runs per agent.
+
     Args:
-        rewards:    (n_steps, n_envs)  — team reward
-        values:     (n_steps, n_envs)
-        dones:      (n_steps, n_envs)  — episode-level done
-        last_value: (n_envs,)          — bootstrap value
+        rewards:    (n_steps, n_envs) team | (n_steps, n_envs, n_agents) per-agent
+        values:     same shape as rewards
+        dones:      (n_steps, n_envs) — episode-level, shared by all agents
+        last_value: (n_envs,) | (n_envs, n_agents) — bootstrap value
         gamma, gae_lambda: scalars
 
     Returns:
-        advantages: (n_steps, n_envs)
-        returns:    (n_steps, n_envs)
+        advantages, returns — both shaped like rewards
     """
+    # `done` is per-env; add the agent axis so it broadcasts against per-agent
+    # values instead of colliding with them.
+    if rewards.ndim > dones.ndim:
+        dones = dones[..., None]
+
     values_with_bootstrap = jnp.concatenate(
         [values, last_value[None]], axis=0
-    )  # (n_steps+1, n_envs)
+    )  # (n_steps+1, ...)
 
     def _scan_fn(gae, t):
         # t counts backward: 0 = last step, 1 = second-to-last, ...
@@ -163,6 +173,8 @@ def ppo_update(
     """
     n_steps, n_envs, n_agents = trajectory.obs.shape[:3]
     obs_dim = trajectory.obs.shape[3]
+    # Static: (n_steps, n_envs, n_agents) rewards => per-agent credit path.
+    per_agent = trajectory.reward.ndim == 3
 
     dones = trajectory.done.astype(jnp.float32)
     advantages, returns = compute_gae(
@@ -179,7 +191,9 @@ def ppo_update(
         jnp.var(returns, ddof=1) + 1e-8
     )
 
-    # Per-env-stream advantage normalization over the rollout steps
+    # Advantage normalization per stream over the rollout steps: per-env for the
+    # team reward, per-(env, agent) under per-agent rewards — which is exactly
+    # vanilla's per-(env, agent) normalization.
     adv = (advantages - advantages.mean(axis=0)) / (
         advantages.std(axis=0, ddof=1) + 1e-8
     )
@@ -192,8 +206,12 @@ def ppo_update(
         total_ts, n_agents, *trajectory.action.shape[3:]
     )
     lp_ts = trajectory.log_prob.reshape(total_ts, n_agents)
-    adv_ts = adv.reshape(total_ts)
-    ret_ts = returns.reshape(total_ts)
+    if per_agent:
+        adv_ts = adv.reshape(total_ts, n_agents)
+        ret_ts = returns.reshape(total_ts, n_agents)
+    else:
+        adv_ts = adv.reshape(total_ts)
+        ret_ts = returns.reshape(total_ts)
 
     # minibatch_size agent-samples => minibatch_size // n_agents timesteps
     ts_minibatch_size = max(
@@ -215,8 +233,13 @@ def ppo_update(
             mb_obs = obs_ts[mb_ids].reshape(n_flat, obs_dim)
             mb_actions = act_ts[mb_ids].reshape(n_flat, *act_ts.shape[2:])
             mb_old_lp = lp_ts[mb_ids].reshape(n_flat)
-            # env-level advantage broadcast to each agent (identical per agent)
-            mb_adv = jnp.repeat(adv_ts[mb_ids], n_agents)
+            if per_agent:
+                # Each agent carries its own advantage. `.reshape(-1)` is
+                # agent-major within a timestep, matching mb_obs' flattening.
+                mb_adv = adv_ts[mb_ids].reshape(n_flat)
+            else:
+                # env-level advantage broadcast to each agent (identical per agent)
+                mb_adv = jnp.repeat(adv_ts[mb_ids], n_agents)
             mb_gs = gs_ts[mb_ids]
             mb_returns = ret_ts[mb_ids]
 
