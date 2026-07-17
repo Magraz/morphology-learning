@@ -180,7 +180,41 @@ machinery (boundary, observation, renderer, contact listener, target band).
   `env_params`). Run the manual debugger with
   `SDL_VIDEODRIVER=dummy python -m environments.box2d_suite.push_box`.
 
-## MJX multi-box-push (`environments/mjx_suite/multi_box_push_mjx.py`)
+## MJX suite
+
+### Shared observations (`environments/mjx_suite/observation.py`)
+
+`MJXObservationBuilder` is the JAX counterpart of the Box2D suite's
+`ObservationManager`: it owns the sensor math and the 40-dim `OBS_DIM` layout
+for **every** MJX port, so a new port only supplies its own qpos layout and
+goal. Pure and `jit`/`vmap`-able; the env passes plain arrays (agent positions/
+velocities, box poses) plus the `mjx.Data` (needed for lidar raycasts and the
+efc contact-force decode).
+
+- Construct with the `mjx.Model` + world/normalization constants
+  (`world_width/height`, `velocity_norm`, `neighbor_detection_range`,
+  `agent_radius`, `force_multiplier`; `sector_sensor_radius` defaults to
+  `world_width/3` and `lidar_range` to the sector radius, as in Box2D). Contact
+  attribution needs the geom→entity maps from the helper `geom_index_maps(mj_model,
+  n_agents, n_objects)` (naming convention `g_agent_{i}` / `g_box_{j}`).
+- `build(data, agent_pos, agent_vel, box_pos=, box_yaw=, box_half=,
+  goal_coord=, goal_axis=)` returns `(A, OBS_DIM)`; the components are also
+  exposed individually (`touch_matrix`, `density_sensors`, `neighbor_fractions`,
+  `pairwise_agent_distances`, `nearest_box_vectors`, `goal_distances`, `lidar`,
+  `contact_forces`) — `_touch_matrix` (coupling) and the renderer reuse them.
+- **Generalizes past multi_box_push**, mirroring the Box2D fallbacks: `n_objects=0`
+  (scatter/rendezvouz) zeros the object density block, `is_touching_object`,
+  `nearest_box_vec` and the contact force; `goal_coord=None` (contact/scatter/
+  rendezvouz have no `target_areas`) zeros `goal_distance`; and `goal_axis`
+  takes a **traced** axis index (0=x, 1=y) as well as the static `"x"`/`"y"`,
+  so push_box's per-episode goal wall stays jit/vmap-able.
+- Verified bit-identical to the pre-extraction inline implementation across a
+  150-step rollout, all 40 dims. Note when checking such things: MJX rollouts
+  are **not reproducible across processes** (`mjx.ray` differs ~3e-4 run to run,
+  which chaos amplifies) — compare both implementations on the *same* states in
+  one process instead.
+
+### MJX multi-box-push (`environments/mjx_suite/multi_box_push_mjx.py`)
 
 `MultiBoxPushMJX` is a MuJoCo-MJX port of the Box2D `multi_box_push` env with a
 functional, fully `jit`/`vmap`-able gymnax-style API: `reset(key) -> (obs,
@@ -199,14 +233,41 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
 - **Parity with Box2D.** Same world sizing, spawn regions, coupling list, box
   sizing, target band, reward (shaping + one-time +100/box, dense/sparse),
   boundary-contact termination, and the exact 40-dim `OBS_DIM` observation
-  layout (constants imported from `box2d_suite/observation.py`). Verified by
+  layout (built by the shared `MJXObservationBuilder` above). Verified by
   posing both engines identically and diffing all 40 dims: everything equal to
   f32 precision, lidar within 4e-4. Box2D damping/mass constants are emulated
   with joint damping = coeff × mass (× inertia for the hinge).
 - **Coupling mechanic** is a per-step override of `body_mass` / `body_inertia`
   / `dof_damping` on the `mjx.Model` pytree (`_model_for`) — jit-safe because
   the model is an argument to `mjx.step`. Touch detection is the same
-  rotated-box surface-distance test as Box2D's.
+  rotated-box surface-distance test as Box2D's. `_model_for(data, active=None)`
+  takes an optional traced (A,) mask of *cooperating* agents; masked agents are
+  dropped from the touch count (used by the difference-reward counterfactual).
+- **`reward_mode="difference_rewards"`** makes `step` return a **(n_agents,)**
+  per-agent reward instead of the team scalar: the exact single-step difference
+  reward `D_i = G - G_-i`, from forking the pre-step state once per agent
+  (`_difference_rewards`, vmapped) and re-running the same step with agent i
+  contributing nothing — zero force *and* dropped from the coupling count.
+  `info["task_reward"]` still carries the team scalar in **every** mode, so
+  logging/eval stay comparable. The team reward is shaped exactly as `"dense"`
+  (a sparse base would leave D zero except on delivery steps). `step` is
+  factored into `_advance` (physics) + `_task_reward` (pure in
+  `(state, data)`), so counterfactual branches reuse both with no recursion.
+  Costs A extra `mjx.step` calls, but they vmap onto spare GPU: measured **1.17x**
+  wall-clock (332 -> 284 FPS at 9a/3o, n_envs=8), not the ~9x the step count
+  suggests.
+  - **Known property, important before using it:** single-step D is *additive
+    force attribution*, not coalition credit — `sum_i D_i / G ~ 1.1`. Box mass
+    affects acceleration, not instantaneous velocity, so a heavy box still
+    coasts and one step cannot reveal the coupling mechanic. The coalition
+    structure (each of the 3 required agents individually necessary, so
+    `sum_i D_i / G -> ~3.2`) only appears at counterfactual windows of **n >= 30**
+    steps (measured: n=1 -> 1.12, n=15 -> 2.41, n=30 -> 3.26, n=60 -> 3.22,
+    saturating at the coupling number). A windowed counterfactual costs the
+    *same* compute when amortized (A*K extra steps per K steps == A per step)
+    but must roll forward with the **policy**, so it belongs in the trainer, not
+    the env. Single-step D is still a legitimate learnability signal (agent i's
+    gradient stops being polluted by teammates' noise).
 - **Sensors in JAX**: density sectors / neighbor fraction / nearest-box /
   goal distance are direct jnp ports; lidar is one vmapped `mjx.ray` call with
   ray origins offset just past the caster's own surface (`bodyexclude` is
@@ -297,13 +358,34 @@ logic mirror of `mappo_vanilla` so runs are drop-in comparable:
   (video + reward plot, like vanilla) and, when a GL context is available
   (`MUJOCO_GL=egl` headless), also saves a `MuJoCoNativeRenderer` video per
   episode (`episode_<i>_native.mp4`); `evaluate()` prints the mean eval return.
+- **Per-agent rewards / difference rewards.** When the env's
+  `reward_mode="difference_rewards"` (env group `multi_box_push_mjx_9a_3o_dr`),
+  `run.py` sets `MAPPOConfig.per_agent_rewards=True` and the stack switches to a
+  per-agent credit path; otherwise **nothing changes** (the scalar path is
+  byte-for-byte the original). What the flag switches:
+  `Transition.reward` `(n_envs,)` -> `(n_envs, n_agents)` and `value` likewise;
+  `MAPPOCritic(n_outputs=n_agents)` grows a **per-agent value head** (one value
+  per agent off the same global state — each agent now has its own return to
+  predict); `compute_gae` broadcasts `done` over a trailing agent axis and runs
+  the identical recursion per agent (verified: feeding per-agent rewards that are
+  identical reproduces the team result exactly); the minibatch advantage stops
+  being `jnp.repeat`'d from the env level and is taken per agent. Advantage
+  normalization then becomes per-(env, agent) — which is exactly what vanilla
+  does. `Transition.team_reward` (`info["task_reward"]`) is carried purely for
+  logging so `mean_reward`, `eval_fn` and `view()` always report **team**
+  performance and stay comparable to the dense baseline. Stats keys are
+  unchanged, so the plotting notebooks read either arm.
 - **Config**: `conf/algorithm/mappo_jax.yaml` (same params surface as
-  `mappo_vanilla`), `conf/env/multi_box_push_mjx_9a_3o.yaml`, model group
-  `mlp` (plain `hidden_dim`; `mlp_shared` carries full-MAPPO keys like
+  `mappo_vanilla`), `conf/env/multi_box_push_mjx_9a_3o.yaml` (dense team reward)
+  and `conf/env/multi_box_push_mjx_9a_3o_dr.yaml` (difference rewards), model
+  group `mlp` (plain `hidden_dim`; `mlp_shared` carries full-MAPPO keys like
   `critic_type` that `Model_Params` rejects). The central `env.n_envs` autoscale
   targets subprocess envs — for vmapped MJX pin it on the CLI:
   ```
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o \
+      model=mlp trial_id=0 env.n_envs=32
+  # difference-rewards arm (same command, _dr env group):
+  uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o_dr \
       model=mlp trial_id=0 env.n_envs=32
   ```
 
@@ -565,4 +647,62 @@ is the DCG analogue of the hierarchical MAPPO controller.
   ```
   uv run python train.py env=dcg_macro_multi_box_push_9a model=dcg_macro \
       algorithm=dcg_macro trial_id=0
+  ```
+
+## Oracle difference rewards (`algorithms/difference_rewards/`)
+
+A measurement stack (not wired into training) for computing **exact** difference
+rewards `D_i = G(z) - G(z_-i + c_i)` by forking the pure functional MJX env.
+
+**Status:** the research direction it was built for — *difference rewards under
+asynchronous macro-actions* — was explored and **abandoned as tautological** (an
+estimator fed a knowingly-wrong commitment state produces wrong credit; and the
+non-tautological rescue, an async-specific counterfactual-scope ambiguity, was
+measured and falsified: sync 0.626 vs async 0.680 cross-horizon stability). See
+`plans/async_difference_rewards.md`. The **oracle itself is the reusable asset** and
+does not depend on asynchrony: it enables auditing what learned counterfactual
+baselines (vendored COMA, `algorithms/mappo/hg_cache.py:414`) actually recover —
+normally uncheckable, since most envs cannot rewind.
+
+- **`environments/mjx_suite/macro_skills.py`** — 4 scripted, deterministic JAX skills
+  (`SKILL_ORDER = [contact, push, scatter, rendezvous]`, index = discrete action) plus
+  `null_action`, the counterfactual default `c_i` (not policy-selectable). Skills are
+  scripted rather than the frozen torch actors of `algorithms/hierarchical/skills.py`:
+  being deterministic they make the forked counterfactual exact. **They sense only
+  within `env.sector_sensor_radius`** — a global centroid gives a distant, physically
+  irrelevant agent a causal channel into every teammate and manufactures false credit.
+  `skill_scatter` carries `_wall_repulsion`; without it agents walk into the boundary,
+  which `MultiBoxPushMJX` terminates with zero reward.
+- **`environments/mjx_suite/macro_wrapper.py`** — `AsyncMacroMJX` + `MacroState`
+  (`EnvState` + per-agent `skill_idx`/`elapsed`/`remaining`), pure and jit/vmap-able.
+  One `step` is one **low-level** step: the policy is queried every step but only
+  agents whose commitment expired adopt the proposed skill, so decision points
+  decouple while shapes stay static. Obs = `MACRO_OBS_DIM` (the shared 40-dim `OBS_DIM`
+  + one-hot skill + remaining/elapsed). Conditions: `d_min == d_max, stagger=False`
+  reproduces the `HierarchicalSkillEnv` lockstep exactly (the control); `stagger=True`
+  offsets phases; `d_min < d_max` varies durations. `commit`/`step_committed` are split
+  out so the oracle can fork *after* commitment.
+- **`algorithms/difference_rewards/oracle.py`** — exact `D_i` by **forking the
+  simulator** (`MultiBoxPushMJX` is pure, so a state can be replayed under a
+  counterfactual — no learned model, unlike COMA/Dr.Reinforce). One vmap over
+  `[-1, 0..A-1]` runs the factual + every counterfactual in one compiled call under
+  **common random numbers**. `aligned_belief` collapses commitment phase to the joint
+  mean = the synchronous estimator's belief. Two invariants that are easy to get
+  wrong: the counterfactual rollout **must let agents re-decide** (frozen skills make
+  `remaining`/`elapsed` inert and the sync/async estimators coincide identically), and
+  `aligned_belief` must collapse to the **mean** phase, not reset to nominal `L`, or
+  the control shows spurious bias.
+- **`algorithms/difference_rewards/bias_study.py`** — the (abandoned) falsification,
+  no training. Compares `D_oracle` vs `D_sync` from the same physical state under the
+  same rollout key. Result: sync estimator exact under synchrony (pearson 1.0, bias
+  0.0), collapses under any asynchrony (pearson ~0.3, `norm_bias ~1.0`, sign wrong
+  ~25%) — but this is **near-tautological**, see the status note above. Two reusable
+  methodology points survive: compute metrics **per state then aggregate** (credit
+  scale varies ~100x across states, so pooled ratios are meaningless — a first attempt
+  produced a garbage `norm_bias=29.9` from a small denominator), and measure only at
+  **engaged** states (at reset every `D_i` is 0, so attribution tests pass vacuously —
+  the first verification run was a false pass for exactly this reason).
+  ```
+  MUJOCO_GL=egl uv run python -m algorithms.difference_rewards.bias_study \
+      --n-states 24 --horizon 60
   ```

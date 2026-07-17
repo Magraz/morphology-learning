@@ -5,7 +5,7 @@
 algorithm: mappo_jax
 params:
   n_epochs: 6
-  n_total_steps: 20000000.0     # float on purpose; env groups override when different
+  n_total_steps: 100000000.0     # float on purpose; env groups override when different
   n_minibatches: 8
   n_steps: 1024                 # rollout length per env; batch = n_steps * env.n_envs
   parameter_sharing: true       # mappo_jax implements the shared-actor path only
