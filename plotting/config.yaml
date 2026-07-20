@@ -1,16 +1,32 @@
 #Experiment config
 moving_avg_window_size: 1
-datapoints: [50000, 30000]
 base_path: "/home/magraz/morphology-learning/experiments/results"
 
 # batches: ["multi_box_push_test"]
 # batches: ["smacv2_5m_vs_6m"]
-batches: ["smaclite_2s3z_test"]
+# batches: ["rendezvouz_12a"]
+# batches: ["scatter_12a"]
+# batches: ["contact_12a"]
+# batches: ["multi_box_push_9a_3o", "hrl_skill_agent_9a", "hrl_skill_team_9a"]
+# batches: ["dcg_smaclite_2s3z"]
+# batches: ["smaclite_3s_vs_5z"]
+batches: ["multi_box_push_mjx_20a_5o_dr", "multi_box_push_mjx_20a_5o"]
+
+
+
 
 # experiments: ["gcn", "gat", "graph_transformer", "gcn_full", "gat_full", "graph_transformer_full"]
-experiments: ["mlp_shared"]
+# experiments: ["hygma", "hgnn_shared", "learned_affinity", "mlp_shared"]
+experiments: ["mlp"]
+custom_labels:
+  hgnn_shared: Typed Hypergraph Critic + MAPPO
+  hgnn_proximity: Typed Hypergraph Critic + MAPPO
 
-# trials: ["0", "1", "2", "3", "4"]
+plot_colors:
+  hgnn_mix: "tab:purple"
+  multi_box_push_12a_6o_dense/mlp_shared: "tab:red"
 
-trials: ["test"]
 
+# trials: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+trials: ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"]
+# trials: ["0", "1", "2"]
