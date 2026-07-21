@@ -8,7 +8,7 @@ env:
   # info["task_reward"] still carries the team scalar, so logging/eval report team
   # performance and stay comparable to the dense arm.
   environment: macro_mjx
-  n_agents: 20
-  n_objects: 5
+  n_agents: 16
+  n_objects: 4
   macro_len: 20
   reward_mode: difference_rewards

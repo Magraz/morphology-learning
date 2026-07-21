@@ -11,8 +11,8 @@ env:
   # Computed by SyncMacroMJX by forking the window per agent; the base env stays
   # dense (run.py forces this). mappo_jax flips to a per-agent critic head + GAE.
   environment: macro_mjx
-  n_agents: 20
-  n_objects: 5
+  n_agents: 16
+  n_objects: 4
   # The coupling only shows once the window is long enough for the mass change to
   # integrate into a displacement difference (empirically ~30 low-level steps for
   # this task); at macro_len=10 the windowed D is still mostly additive. This is
