@@ -745,20 +745,45 @@ normally uncheckable, since most envs cannot rewind.
     torch actors). Smoke test (interface + one-step==macro_len accumulation +
     vmap): `MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run python -m
     environments.mjx_suite.macro_wrapper`. **Training is wired into `mappo_jax`**
-    (see that section): `EnvironmentEnum.MACRO_MJX = "macro_mjx"`, env groups
-    `conf/env/macro_mjx_9a_3o.yaml` (dense team reward) and
-    `conf/env/macro_mjx_9a_3o_dr.yaml` (difference rewards — the per-macro-window
-    reward is the sum of the base env's exact single-step `D_i` over `macro_len`
-    steps, flipping `mappo_jax` to a per-agent critic head + per-agent GAE while
-    `info["task_reward"]` still logs the team scalar), both reusing the `mlp`
-    model group. Both arms verified end-to-end (train + resume + evaluate); the
-    `_dr` critic head is `n_agents`-wide, the actor a 4-way categorical over
-    skills. Launch:
+    (see that section): `EnvironmentEnum.MACRO_MJX = "macro_mjx"`, three env
+    groups, all reusing the `mlp` model group and flipping `mappo_jax` between the
+    scalar and per-agent (per-agent critic head + per-agent GAE) paths while
+    `info["task_reward"]` always logs the team scalar:
+    - `conf/env/macro_mjx_9a_3o.yaml` — **dense** team reward (scalar).
+    - `conf/env/macro_mjx_9a_3o_dr.yaml` — **single-step difference rewards**: the
+      per-macro-window reward is the sum of the base env's exact single-step `D_i`
+      over `macro_len` steps. This is *additive force attribution* (`sum_i D_i/G ~
+      1.1`): each agent credited for its instantaneous force share, NOT coalition
+      necessity — a single step can't reveal the coupling (box mass affects
+      acceleration, which needs many steps to integrate into a displacement).
+    - `conf/env/macro_mjx_9a_3o_wdr.yaml` — **windowed difference rewards**
+      (`reward_mode="windowed_difference_rewards"`, `macro_len=30`): the exact
+      *windowed* counterfactual `D_i = G(window) - G_{-i}(window)`, where `G_{-i}`
+      re-rolls the **same** macro window with agent i absent (zero force + dropped
+      from the coupling count via the `active` mask threaded into `env.step`) for
+      the WHOLE window. Holding an agent absent across the window lets the coupling
+      stall the box if i was required, so the credit reflects coalition necessity.
+      Computed by `SyncMacroMJX._step_windowed` — the factual window + an `A`-way
+      `vmap` of counterfactual windows from the same start state; **exact** because
+      the scripted skills + MJX step are deterministic (verified against a manual
+      fork). Costs `(A+1)×macro_len` base steps/decision (vmapped). The coupling
+      reveals only as the window grows (smoke test measured `sum_i D_i/G` climbing
+      `+0.04→+0.30→+0.53→+0.75` at macro_len `1→5→15→30` for one state; the
+      saturated `~coupling` ratio needs a *tight* coalition state). It is a
+      **single-macro-window** counterfactual — it does NOT span future decisions
+      (that needs the policy re-deciding, i.e. a trainer-level windowed D). The
+      fine-control (small `macro_len`) vs coalition-credit (window ≥ ~30) tension
+      is real; the `_wdr` group picks `macro_len=30` for the credit signal.
+
+    All three arms verified end-to-end (train + resume + evaluate); the `_dr`/
+    `_wdr` critic heads are `n_agents`-wide, the actor a 4-way categorical. Launch:
     ```
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o \
         model=mlp trial_id=0 env.n_envs=32
-    # difference-rewards arm (same command, _dr env group):
+    # single-step difference-rewards arm (_dr) / windowed arm (_wdr):
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_dr \
+        model=mlp trial_id=0 env.n_envs=32
+    uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_wdr \
         model=mlp trial_id=0 env.n_envs=32
     ```
 - **`algorithms/difference_rewards/oracle.py`** — exact `D_i` by **forking the

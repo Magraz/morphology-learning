@@ -564,15 +564,22 @@ class MultiBoxPushMJX:
 
         return g_factual - jax.vmap(counterfactual)(agent_ids)
 
-    def step(self, state: EnvState, actions: jnp.ndarray):
+    def step(self, state: EnvState, actions: jnp.ndarray, active: jnp.ndarray | None = None):
         """actions: (n_agents, 2) in [-1, 1]. Returns
         (obs, state, reward, terminated, truncated, info).
 
         `reward` is the scalar team reward, except under
         `reward_mode="difference_rewards"` where it is (n_agents,) per-agent
         difference rewards. `info["task_reward"]` always carries the team scalar.
+
+        `active` is an optional (A,) bool mask of *cooperating* agents (traced):
+        masked-out agents contribute zero force and are dropped from the coupling
+        count for this step (see `_advance`/`_model_for`), so a caller can roll a
+        counterfactual "agent i absent" trajectory forward — this is what the
+        windowed macro difference reward (`SyncMacroMJX`) forks over. `None` (the
+        default, == an all-True mask) is the ordinary full-participation step.
         """
-        data = self._advance(state, actions)
+        data = self._advance(state, actions, active)
         reward, newly_delivered, boundary_hit, dist = self._task_reward(state, data)
 
         delivered = jnp.where(

@@ -84,18 +84,38 @@ class MAPPO_JAX_Runner:
         #                   one decision per macro_len low-level steps), which
         #                   wraps a base MultiBoxPushMJX.
         environment = env_config.get("environment")
-        base_env = MultiBoxPushMJX(
-            n_agents=env_config.get("n_agents"),
-            n_objects=env_config.get("n_objects", 3),
-            reward_mode=env_config.get("reward_mode", "dense"),
-        )
+        reward_mode = env_config.get("reward_mode", "dense")
         if environment == EnvironmentEnum.MULTI_BOX_MJX:
-            self.env = base_env
+            self.env = MultiBoxPushMJX(
+                n_agents=env_config.get("n_agents"),
+                n_objects=env_config.get("n_objects", 3),
+                reward_mode=reward_mode,
+            )
         elif environment == EnvironmentEnum.MACRO_MJX:
-            from environments.mjx_suite.macro_wrapper import SyncMacroMJX
+            from environments.mjx_suite.macro_wrapper import (
+                WINDOWED_DIFFERENCE_REWARDS,
+                SyncMacroMJX,
+            )
 
+            # The windowed difference reward is computed by the wrapper (it forks
+            # the whole macro window per agent), so the base env must stay dense —
+            # it must not also emit its own per-step D. The single-step
+            # "difference_rewards" mode instead lives on the base env and passes
+            # through the wrapper's accumulation.
+            base_reward_mode = (
+                "dense"
+                if reward_mode == WINDOWED_DIFFERENCE_REWARDS
+                else reward_mode
+            )
+            base_env = MultiBoxPushMJX(
+                n_agents=env_config.get("n_agents"),
+                n_objects=env_config.get("n_objects", 3),
+                reward_mode=base_reward_mode,
+            )
             self.env = SyncMacroMJX(
-                base_env, macro_len=env_config.get("macro_len", 10)
+                base_env,
+                macro_len=env_config.get("macro_len", 10),
+                reward_mode=reward_mode,
             )
         else:
             raise ValueError(
@@ -103,10 +123,13 @@ class MAPPO_JAX_Runner:
                 f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
                 f"got {environment!r}"
             )
-        # reward_mode="difference_rewards" makes the env emit a per-agent reward,
-        # which switches the critic to a per-agent value head and runs GAE on the
-        # agent axis (see MAPPOConfig.per_agent_rewards).
-        per_agent_rewards = self.env.reward_mode == "difference_rewards"
+        # A per-agent reward (single-step or windowed difference rewards) switches
+        # the critic to a per-agent value head and runs GAE on the agent axis (see
+        # MAPPOConfig.per_agent_rewards). The macro wrapper exposes the flag
+        # directly; the base env is per-agent only under "difference_rewards".
+        per_agent_rewards = getattr(
+            self.env, "per_agent_rewards", self.env.reward_mode == "difference_rewards"
+        )
 
         n_envs = env_config.get("n_envs")
         n_steps = self.params.n_steps

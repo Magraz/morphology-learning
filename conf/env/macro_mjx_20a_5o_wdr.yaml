@@ -1,0 +1,21 @@
+# @package _global_
+env:
+  # Windowed-counterfactual difference-rewards arm of the hierarchical macro env.
+  # Unlike macro_mjx_9a_3o_dr (which sums the base env's *single-step* D over the
+  # window == additive force attribution), here the per-agent reward is the exact
+  # *windowed* counterfactual D_i = G(window) - G_-i(window): the same macro window
+  # re-rolled with agent i absent (zero force + dropped from the coupling count)
+  # for the WHOLE window. Holding an agent absent across the window lets the
+  # coupling mechanic act (the box stays heavy and stalls if i was required), so
+  # the credit reflects coalition necessity, not just an instantaneous force share.
+  # Computed by SyncMacroMJX by forking the window per agent; the base env stays
+  # dense (run.py forces this). mappo_jax flips to a per-agent critic head + GAE.
+  environment: macro_mjx
+  n_agents: 20
+  n_objects: 5
+  # The coupling only shows once the window is long enough for the mass change to
+  # integrate into a displacement difference (empirically ~30 low-level steps for
+  # this task); at macro_len=10 the windowed D is still mostly additive. This is
+  # the fine-control (small macro_len) vs coalition-credit (long window) tradeoff.
+  macro_len: 20
+  reward_mode: windowed_difference_rewards
