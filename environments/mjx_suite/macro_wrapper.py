@@ -230,6 +230,142 @@ class AsyncMacroMJX:
         return obs, new, reward, term, trunc, {**info, "decided": decide}
 
 
+class SyncMacroMJX:
+    """Synchronous **options** layer over ``MultiBoxPushMJX`` (pure / jit / vmap).
+
+    This is the JAX analogue of the box2d ``HierarchicalSkillEnv``
+    (``algorithms/hierarchical/hrl_env.py``) and the env the JAX MAPPO stack
+    trains a *hierarchical* (skill-selecting) policy on. Unlike its async sibling
+    ``AsyncMacroMJX`` above — whose ``step`` is one *low-level* physics step, so
+    the policy is queried every step and most proposals are discarded
+    mid-commitment — here **one ``step`` is one macro decision**:
+
+      1. Every agent adopts its proposed skill (lockstep — no in-flight
+         commitments to respect).
+      2. The chosen skills are rolled out for ``macro_len`` low-level physics
+         steps, re-deriving the (reactive, closed-loop) skill actions each step.
+      3. Reward is **accumulated** over the window and returned once; the episode
+         ends the moment any low-level step terminates/truncates, and the state
+         is frozen there.
+
+    So the trainer's per-``step`` rollout scan stores exactly **one transition
+    per genuine decision** (the SMDP / options view), which is what makes the
+    PPO credit assignment correct — the policy gradient only ever touches skill
+    choices that actually drove ``macro_len`` steps of physics. This mirrors the
+    box2d wrapper's "pick a skill, run it for K steps, that's one env step"
+    semantics (reward summed over the window, no intra-option discounting), so
+    the two hierarchical stacks stay drop-in comparable.
+
+    The macro state is just the base ``EnvState`` (no commitment bookkeeping is
+    needed under lockstep), so it plugs straight into the ``mappo_jax`` collector,
+    whose mid-rollout auto-reset already ``v_reset``/``tree.map``-s over it.
+
+    The action is a per-agent **discrete** skill index; the observation is the
+    shared 40-dim ``OBS_DIM`` (no commitment features — every agent re-decides
+    every macro step, so ``remaining``/``elapsed`` carry no information).
+    """
+
+    def __init__(
+        self,
+        env: MultiBoxPushMJX | None = None,
+        *,
+        macro_len: int = 10,
+        **env_kwargs,
+    ):
+        if macro_len < 1:
+            raise ValueError(f"macro_len must be >= 1, got {macro_len}")
+
+        self.env = env if env is not None else MultiBoxPushMJX(**env_kwargs)
+        self.n_agents = self.env.n_agents
+        self.n_skills = N_SKILLS
+        self.macro_len = int(macro_len)
+
+        # Interface the mappo_jax trainer/runner reads off the env (matching the
+        # attribute names of MultiBoxPushMJX): discrete skill selection.
+        self.observation_dim = OBS_DIM
+        self.action_dim = N_SKILLS
+        self.discrete = True
+        self.reward_mode = self.env.reward_mode
+        # One macro step consumes macro_len low-level steps, so an episode of
+        # base.max_steps low-level steps is ceil(base.max_steps / macro_len)
+        # decisions — the horizon eval/view scan over.
+        self.max_steps = -(-self.env.max_steps // self.macro_len)
+
+    # ------------------------------------------------------------ internals
+
+    def _skill_actions(
+        self, env_state: EnvState, skill_idx: jnp.ndarray
+    ) -> jnp.ndarray:
+        """(A,2) — each agent's low-level action under the skill it selected."""
+        per_skill = all_skill_actions(self.env, env_state)  # (K, A, 2)
+        idx = skill_idx[None, :, None]  # (1, A, 1), broadcasts over the xy axis
+        return jnp.take_along_axis(per_skill, idx, axis=0)[0]
+
+    # ------------------------------------------------------------------ API
+
+    def reset(self, key: jax.Array) -> tuple[jnp.ndarray, EnvState]:
+        """Delegates to the base env; the macro state is the base EnvState."""
+        return self.env.reset(key)
+
+    def step(self, state: EnvState, skills: jnp.ndarray):
+        """One macro decision: run `skills` (A,) for `macro_len` low-level steps.
+
+        Returns ``(obs, state, reward, terminated, truncated, info)`` with the
+        base env's shapes: reward is the team scalar accumulated over the window
+        (or per-agent under ``reward_mode="difference_rewards"``, summed the same
+        way), and ``info["task_reward"]`` always carries the accumulated **team**
+        scalar for logging/eval parity across reward modes.
+        """
+        skills = skills.astype(jnp.int32)
+
+        def _low_step(carry, _):
+            env_state, done, terminated, truncated, cum_r, cum_task = carry
+            actions = self._skill_actions(env_state, skills)
+            _, next_state, reward, term, trunc, info = self.env.step(
+                env_state, actions
+            )
+            active = ~done  # accumulate/advance only while the episode is live
+
+            # done broadcast to the reward rank (scalar team reward, or (A,)
+            # per-agent under difference rewards)
+            r_active = jnp.reshape(active, (1,) * reward.ndim) if reward.ndim else active
+            cum_r = cum_r + jnp.where(r_active, reward, 0.0)
+            cum_task = cum_task + jnp.where(active, info["task_reward"], 0.0)
+
+            # Freeze the state at the first done step; keep re-deciding otherwise.
+            def _freeze(n, c):
+                d = jnp.reshape(done, done.shape + (1,) * (c.ndim - done.ndim))
+                return jnp.where(d, c, n)
+
+            frozen_state = jax.tree.map(_freeze, next_state, env_state)
+            return (
+                frozen_state,
+                done | term | trunc,
+                terminated | (term & active),
+                truncated | (trunc & active),
+                cum_r,
+                cum_task,
+            ), None
+
+        zero_r = jnp.zeros(() if self.reward_mode != "difference_rewards"
+                           else (self.n_agents,))
+        init = (
+            state,
+            jnp.zeros((), dtype=bool),
+            jnp.zeros((), dtype=bool),
+            jnp.zeros((), dtype=bool),
+            zero_r,
+            jnp.zeros(()),
+        )
+        (final_state, done, terminated, truncated, cum_r, cum_task), _ = jax.lax.scan(
+            _low_step, init, None, length=self.macro_len
+        )
+
+        obs = self.env._get_obs(final_state.data)
+        info = {"task_reward": cum_task, "delivered": final_state.delivered}
+        return obs, final_state, cum_r, terminated, truncated, info
+
+
 if __name__ == "__main__":
     import argparse
     import time
@@ -304,3 +440,83 @@ if __name__ == "__main__":
     obs, vstate, r, term, trunc, info = v_step(vstate, proposed)
     assert obs.shape == (args.n_envs, args.n_agents, MACRO_OBS_DIM), obs.shape
     print(f"vmap({args.n_envs}) OK: obs {obs.shape}, reward {r.shape}")
+
+    # ---------------------------------------------------------------------- #
+    # SyncMacroMJX: the hierarchical training env (one step == one decision). #
+    # ---------------------------------------------------------------------- #
+    print("\n=== SyncMacroMJX (options / one step == one macro decision) ===")
+    macro_len = 10
+    sync_macro = SyncMacroMJX(base, macro_len=macro_len)
+    assert sync_macro.observation_dim == OBS_DIM
+    assert sync_macro.action_dim == N_SKILLS and sync_macro.discrete
+    print(
+        f"obs_dim={sync_macro.observation_dim} action_dim={sync_macro.action_dim} "
+        f"(discrete skills) macro_len={macro_len} "
+        f"macro_horizon={sync_macro.max_steps} (base {base.max_steps} low-level)"
+    )
+
+    m_reset = jax.jit(sync_macro.reset)
+    m_step = jax.jit(sync_macro.step)
+
+    t0 = time.time()
+    obs, state = m_reset(key)
+    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
+
+    # Each call advances the physics by macro_len low-level steps and returns one
+    # transition. Reward is the summed team reward over the window.
+    k, decisions, total = key, 0, 0.0
+    for _ in range(sync_macro.max_steps):
+        k, sub = jax.random.split(k)
+        proposed = jax.random.randint(sub, (args.n_agents,), 0, N_SKILLS)
+        obs, state, r, term, trunc, info = m_step(state, proposed)
+        assert r.shape == (), r.shape  # scalar team reward per decision
+        total += float(r)
+        decisions += 1
+        if bool(term) or bool(trunc):
+            break
+    # An all-random-skill policy typically truncates without delivering; the
+    # point of the smoke test is the *interface*, not the return.
+    print(
+        f"sync-macro rollout: {decisions} decisions "
+        f"(== {decisions * macro_len} low-level steps), summed team return "
+        f"{total:.2f} ({time.time() - t0:.1f}s incl. compile)"
+    )
+    assert decisions <= sync_macro.max_steps
+
+    # Reward really is accumulated over the window: one macro step must move the
+    # physics as far as macro_len base steps. Everyone pushes; we warm up until
+    # the box is moving so the compared window carries a *non-zero* reward.
+    base_step = jax.jit(base.step)
+    push = jnp.ones((args.n_agents,), jnp.int32)  # everyone -> "push"
+    _, s0 = jax.jit(sync_macro.reset)(key)
+    for _ in range(20):  # engage the box (shaping reward becomes non-zero)
+        _, s0, r_warm, term, trunc, _ = m_step(s0, push)
+        if float(r_warm) > 0.05 or bool(term) or bool(trunc):
+            break
+
+    _, _, r_macro, _, _, _ = m_step(s0, push)
+    es, r_manual = s0, 0.0  # same start, same skills, summed by hand
+    for _ in range(macro_len):
+        acts = sync_macro._skill_actions(es, push)
+        _, es, br, bterm, btrunc, _ = base_step(es, acts)
+        r_manual += float(br)
+        if bool(bterm) or bool(btrunc):
+            break
+    print(
+        f"accumulation check: macro reward {float(r_macro):.4f} vs "
+        f"hand-summed {r_manual:.4f} (should match to f32, and be non-zero)"
+    )
+    assert abs(float(r_macro) - r_manual) < 1e-3, (float(r_macro), r_manual)
+    assert abs(float(r_macro)) > 1e-3, "warm-up failed to reach an engaged state"
+
+    # vmap over envs (what the mappo_jax collector does).
+    vm_reset = jax.jit(jax.vmap(sync_macro.reset))
+    vm_step = jax.jit(jax.vmap(sync_macro.step))
+    keys = jax.random.split(key, args.n_envs)
+    obs, vstate = vm_reset(keys)
+    proposed = jax.random.randint(key, (args.n_envs, args.n_agents), 0, N_SKILLS)
+    obs, vstate, r, term, trunc, info = vm_step(vstate, proposed)
+    assert obs.shape == (args.n_envs, args.n_agents, OBS_DIM), obs.shape
+    assert r.shape == (args.n_envs,), r.shape
+    print(f"vmap({args.n_envs}) OK: obs {obs.shape}, reward {r.shape}")
+    print("SyncMacroMJX smoke test passed.")

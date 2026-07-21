@@ -1,0 +1,19 @@
+# @package _global_
+env:
+  # Hierarchical macro-action layer over multi_box_push_mjx: the policy selects
+  # among the 4 scripted skills (discrete) and each choice runs macro_len
+  # low-level physics steps (SyncMacroMJX, one transition per decision). Trained
+  # by mappo_jax exactly like the base env; the actor just has a categorical head.
+  environment: macro_mjx
+  # n_envs is set centrally in conf/config.yaml (usable_cores // n_jobs). That
+  # default targets subprocess box2d envs; MJX envs are vmapped on one device,
+  # so the count is not core-bound — pin it on the CLI (e.g. env.n_envs=32).
+  # The per-update batch scales with it: params.n_steps * n_envs env-steps.
+  n_agents: 9
+  n_objects: 3
+  # Low-level physics steps per macro decision. base.max_steps (1024) / macro_len
+  # decisions per episode; the macro horizon is ceil(1024 / macro_len).
+  macro_len: 10
+  # Team reward, accumulated over each macro window. difference_rewards is also
+  # valid (summed per-agent D over the window) but is a separate experiment.
+  reward_mode: dense

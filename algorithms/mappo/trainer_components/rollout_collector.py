@@ -224,6 +224,25 @@ class RolloutCollector:
                 else None
             )
 
+            # Truncation bootstrap (mirror of mappo_jax / mappo_vanilla). A
+            # time-limit `truncated` (vs a true `terminated`) does not end the
+            # MDP, so its return must carry `gamma * V(s_next)` forward rather
+            # than be cut to 0 by GAE's `done` mask. Under gymnasium's NEXT_STEP
+            # autoreset, `next_obs` at a truncated step is the real terminal
+            # successor, so value it directly and fold the bootstrap into the
+            # stored reward; `dones` still fires so GAE cuts the recursion and
+            # its own bootstrap term is 0 here (no double count). Placed *after*
+            # the grouping-token read so the hypergraph rebuild for `next_obs`
+            # can't clobber this step's `_last_grouping_tokens`. Logged extrinsic
+            # reward (above) stays the raw env reward.
+            if np.any(truncateds):
+                next_values = self._state_values(next_obs, infos, batch_size)
+                rewards = np.asarray(rewards, dtype=np.float32) + (
+                    self.agent.gamma
+                    * truncateds.astype(np.float32)
+                    * next_values
+                )
+
             self.agent.store_transitions_batch(
                 obs,
                 global_states,
@@ -300,21 +319,31 @@ class RolloutCollector:
         ).reshape(n_envs, n_agents)
         return self.agent.intrinsic_reward_coef * intrinsic
 
-    def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
-        final_global_states = obs.reshape(batch_size, -1)
+    def _state_values(self, obs, infos, batch_size: int) -> np.ndarray:
+        """Critic values ``V(global_state(obs))`` as a ``(batch_size,)`` numpy
+        array, using the (old) network that produced the stored rollout values.
+        Handles the hypergraph critics (which need inference hypergraphs built
+        from obs/infos) the same way as the end-of-rollout bootstrap. Used for
+        both the final-value bootstrap and the per-step truncation bootstrap.
+
+        NOTE for `learned_grouping`: building inference hypergraphs mutates the
+        runtime's `_last_grouping_tokens`, so callers inside the rollout loop
+        must invoke this only *after* reading `get_last_grouping_tokens()` for
+        the current step (the next iteration recomputes them anyway)."""
+        global_states = obs.reshape(batch_size, -1)
         with torch.no_grad():
-            final_gs_tensor = torch.from_numpy(
-                np.ascontiguousarray(final_global_states, dtype=np.float32)
+            gs_tensor = torch.from_numpy(
+                np.ascontiguousarray(global_states, dtype=np.float32)
             ).to(self.device)
 
             if self.agent.critic_type in ("multi_hgnn", "hg_cross_attention"):
-                final_batched_hgs, final_sig_ids = (
+                batched_hgs, sig_ids = (
                     self.hypergraph_runtime.build_inference_hypergraphs(
                         obs, infos, batch_size
                     )
                 )
-                final_entropies = (
-                    self.hypergraph_runtime.compute_entropies_for_critic(final_sig_ids)
+                entropies = (
+                    self.hypergraph_runtime.compute_entropies_for_critic(sig_ids)
                     if self.entropy_conditioning
                     else None
                 )
@@ -322,23 +351,13 @@ class RolloutCollector:
                     np.ascontiguousarray(obs, dtype=np.float32)
                 ).to(self.device)
                 obs_flat = obs_tensor.reshape(batch_size * self.n_agents, -1)
-                final_values = (
-                    self.agent.network_old.get_value_batched(
-                        obs_flat,
-                        final_batched_hgs,
-                        batch_size,
-                        entropies=final_entropies,
-                    )
-                    .cpu()
-                    .squeeze(-1)
-                    .tolist()
+                values = self.agent.network_old.get_value_batched(
+                    obs_flat, batched_hgs, batch_size, entropies=entropies
                 )
             else:
-                final_values = (
-                    self.agent.network_old.get_value(final_gs_tensor)
-                    .cpu()
-                    .squeeze(-1)
-                    .tolist()
-                )
+                values = self.agent.network_old.get_value(gs_tensor)
 
-        return final_values
+            return values.cpu().squeeze(-1).numpy().astype(np.float32)
+
+    def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
+        return self._state_values(obs, infos, batch_size).tolist()

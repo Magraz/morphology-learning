@@ -314,9 +314,10 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
 ## JAX MAPPO (`algorithms/mappo_jax/`)
 
 `algorithm=mappo_jax` (`AlgorithmEnum.MAPPO_JAX`) is a fully-jitted MAPPO that
-trains **directly on the functional MJX env** (`MultiBoxPushMJX` — the only
-supported env; the old JaxMARL dict-API path was removed). It is a deliberate
-logic mirror of `mappo_vanilla` so runs are drop-in comparable:
+trains **directly on the functional MJX envs** (`MultiBoxPushMJX` and its
+hierarchical macro wrapper `SyncMacroMJX`; the old JaxMARL dict-API path was
+removed). It is a deliberate logic mirror of `mappo_vanilla` so runs are
+drop-in comparable:
 
 - **Same per-iteration cadence** (`run.py` ≙ `VecMAPPOTrainer.train`): jitted
   `collect_fn` (≙ `RolloutCollector.collect` — resets all envs at the top of
@@ -336,7 +337,43 @@ logic mirror of `mappo_vanilla` so runs are drop-in comparable:
   ent_coef*entropy` (actor/critic use separate Adams — equivalent, no shared
   params), pre-update `explained_variance`. Known deviations: the trailing
   partial minibatch is dropped (jit needs static shapes), shared-actor only
-  (`parameter_sharing=false` raises), continuous actions only in practice.
+  (`parameter_sharing=false` raises). Both continuous (base `MULTI_BOX_MJX`
+  force control) **and discrete** (the hierarchical `MACRO_MJX` skill-selection
+  env, `SyncMacroMJX`) action spaces are supported: the env declares
+  `env.discrete` and `run.py`/`trainer.py` thread it into the actor head
+  (categorical logits vs diagonal Gaussian) and the `_actor_forward` reshape —
+  the shape-agnostic `ppo_update` handles integer-index actions unchanged. The
+  `MACRO_MJX` group (`conf/env/macro_mjx_9a_3o.yaml`, `model=mlp`) trains a
+  hierarchical policy that picks among 4 scripted skills every `macro_len`
+  low-level steps; verified end-to-end (train + checkpoint resume) on GPU.
+- **Truncation vs termination bootstrap** (all three MAPPO stacks: `mappo_jax`,
+  `mappo_vanilla`, `mappo`). The MJX and box2d envs already return `terminated`
+  (true episode end: boundary hit / all delivered) and `truncated` (time-limit
+  `t >= max_steps`) as *separate* flags, but GAE needs the
+  `done = terminated | truncated` mask for **two** different jobs and they
+  diverge on truncation: cutting the advantage recursion (want it on *both*, so
+  returns don't bleed across the episode boundary) vs masking the value bootstrap
+  (want it *only* on true termination — a time-limit cut-off should still carry
+  `gamma * V(s_next)` forward, not be treated as a value-0 terminal). Fix
+  (SB3-style, in the **collectors**, not the envs): at a truncated step add
+  `gamma * V(s_next)` into the stored reward and keep `done` for the recursion,
+  so GAE's own bootstrap term is 0 there (no double count). The catch is the
+  auto-reset overwriting the successor obs, handled differently per stack:
+  mappo_jax (`trainer.py:_env_step`) resets in the *same* step, so it values the
+  real `next_obs` **before** the reset cond; mappo_vanilla / mappo
+  (`trainer_components/rollout_collector.py`) ride gymnasium 1.x `NEXT_STEP`
+  autoreset, where the truncated step's `next_obs` already *is* the true terminal
+  successor (the reset obs only appears on the following step), so
+  `_state_values(next_obs)` values it directly. Shared helper `_state_values`
+  (also the body of `_compute_final_values`) uses `network_old` so the bootstrap
+  matches the stored `values`; the `mappo` copy additionally handles the
+  hypergraph critics (builds inference hypergraphs from `next_obs`) and is called
+  **after** the loop's `get_last_grouping_tokens()` read, since building
+  hypergraphs mutates `_last_grouping_tokens` under `learned_grouping`. Per-agent
+  (difference-rewards) path in `mappo_jax`: `next_value` is the per-agent critic
+  head and the truncation mask broadcasts over the agent axis. Without this,
+  episodes that run to the time limit (the common case in box2d/MJX push tasks)
+  systematically teach the critic that the final state is worth 0.
 - **Same networks** (`network.py`, flax): 2-layer Tanh MLPs with the same
   orthogonal init, actor hidden = `model_params.hidden_dim`, critic hidden =
   `2*hidden_dim`, learned state-independent `log_action_std` (init -0.5, clamp
@@ -358,6 +395,12 @@ logic mirror of `mappo_vanilla` so runs are drop-in comparable:
   (video + reward plot, like vanilla) and, when a GL context is available
   (`MUJOCO_GL=egl` headless), also saves a `MuJoCoNativeRenderer` video per
   episode (`episode_<i>_native.mp4`); `evaluate()` prints the mean eval return.
+  For the `MACRO_MJX` env `view()` renders at **low-level** granularity — it
+  holds each high-level skill choice fixed for `macro_len` steps but drives and
+  draws the base env one physics step at a time (via `render_env.step` +
+  `SyncMacroMJX._skill_actions`), so the video is smooth (1024 frames, not
+  ~103); the high-level policy re-decides at each macro boundary off the base
+  obs there, exactly as `SyncMacroMJX.step` does internally.
 - **Per-agent rewards / difference rewards.** When the env's
   `reward_mode="difference_rewards"` (env group `multi_box_push_mjx_9a_3o_dr`),
   `run.py` sets `MAPPOConfig.per_agent_rewards=True` and the stack switches to a
@@ -682,6 +725,42 @@ normally uncheckable, since most envs cannot rewind.
   reproduces the `HierarchicalSkillEnv` lockstep exactly (the control); `stagger=True`
   offsets phases; `d_min < d_max` varies durations. `commit`/`step_committed` are split
   out so the oracle can fork *after* commitment.
+  - **`SyncMacroMJX` (same module) is the active hierarchical-training env**, not
+    part of the abandoned async study: it is the JAX analogue of the box2d
+    `HierarchicalSkillEnv`, where **one `step` is one macro decision** — all
+    agents adopt their proposed skill in lockstep, the skills roll out for
+    `macro_len` low-level physics steps (reactive actions re-derived each step),
+    reward is **accumulated** over the window, and the episode freezes at the
+    first low-level done. So the `mappo_jax` rollout scan stores exactly one
+    transition per genuine decision (the SMDP/options view) — correct PPO credit
+    assignment, unlike stepping `AsyncMacroMJX` every low-level step where most
+    proposals are discarded mid-commitment. The macro state is just the base
+    `EnvState` (no commitment bookkeeping under lockstep), so it plugs into the
+    collector's `v_reset`/`tree.map` auto-reset unchanged; obs = the shared
+    40-dim `OBS_DIM` (no commitment features), action = a per-agent **discrete**
+    skill index (`action_dim=N_SKILLS`, `discrete=True`), `max_steps =
+    ceil(base.max_steps / macro_len)` decisions. Reward summed over the window
+    with no intra-option discounting, mirroring the box2d wrapper for parity.
+    Skills are the **scripted** JAX skills of `macro_skills.py` (not frozen
+    torch actors). Smoke test (interface + one-step==macro_len accumulation +
+    vmap): `MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run python -m
+    environments.mjx_suite.macro_wrapper`. **Training is wired into `mappo_jax`**
+    (see that section): `EnvironmentEnum.MACRO_MJX = "macro_mjx"`, env groups
+    `conf/env/macro_mjx_9a_3o.yaml` (dense team reward) and
+    `conf/env/macro_mjx_9a_3o_dr.yaml` (difference rewards — the per-macro-window
+    reward is the sum of the base env's exact single-step `D_i` over `macro_len`
+    steps, flipping `mappo_jax` to a per-agent critic head + per-agent GAE while
+    `info["task_reward"]` still logs the team scalar), both reusing the `mlp`
+    model group. Both arms verified end-to-end (train + resume + evaluate); the
+    `_dr` critic head is `n_agents`-wide, the actor a 4-way categorical over
+    skills. Launch:
+    ```
+    uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o \
+        model=mlp trial_id=0 env.n_envs=32
+    # difference-rewards arm (same command, _dr env group):
+    uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_dr \
+        model=mlp trial_id=0 env.n_envs=32
+    ```
 - **`algorithms/difference_rewards/oracle.py`** — exact `D_i` by **forking the
   simulator** (`MultiBoxPushMJX` is pure, so a state can be replayed under a
   counterfactual — no learned model, unlike COMA/Dr.Reinforce). One vmap over

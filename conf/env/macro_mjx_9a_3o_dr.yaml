@@ -1,0 +1,14 @@
+# @package _global_
+env:
+  # Difference-rewards arm of the hierarchical macro env: same SyncMacroMJX skill
+  # selection as macro_mjx_9a_3o, but the per-macro-window reward is the sum of
+  # the base env's exact single-step difference rewards D_i = G - G_-i over the
+  # macro_len steps. mappo_jax reads reward_mode="difference_rewards" and switches
+  # to a per-agent critic head + per-agent GAE (MAPPOConfig.per_agent_rewards).
+  # info["task_reward"] still carries the team scalar, so logging/eval report team
+  # performance and stay comparable to the dense arm.
+  environment: macro_mjx
+  n_agents: 9
+  n_objects: 3
+  macro_len: 10
+  reward_mode: difference_rewards

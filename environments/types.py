@@ -19,6 +19,10 @@ class EnvironmentEnum(StrEnum):
     MULTI_BOX = "multi_box_push"
     # MuJoCo-MJX port of multi_box_push (functional JAX API, mappo_jax only)
     MULTI_BOX_MJX = "multi_box_push_mjx"
+    # Hierarchical macro-action layer over MULTI_BOX_MJX: the policy selects
+    # among frozen scripted skills (discrete), one decision per macro_len
+    # low-level steps (SyncMacroMJX; mappo_jax only)
+    MACRO_MJX = "macro_mjx"
     PUSH_BOX = "push_box"
     SCATTER = "scatter"
     RENDEZVOUZ = "rendezvouz"

@@ -53,7 +53,9 @@ def make_train(config: MAPPOConfig, env):
     n_agents = env.n_agents
     obs_dim = env.observation_dim
     action_dim = env.action_dim
-    discrete = False  # the MJX suite is continuous force control
+    # The base MJX suite is continuous force control; the hierarchical macro env
+    # (SyncMacroMJX) selects among discrete skills. The env declares which.
+    discrete = getattr(env, "discrete", False)
 
     if not config.parameter_sharing:
         raise NotImplementedError(
@@ -77,8 +79,11 @@ def make_train(config: MAPPOConfig, env):
             discrete,
             deterministic=deterministic,
         )
+        # Discrete actions are integer skill indices (no trailing action_dim
+        # axis); continuous actions are (action_dim,) force vectors.
+        action_shape = (b, n_agents) if discrete else (b, n_agents, action_dim)
         return (
-            actions_flat.reshape(b, n_agents, action_dim),
+            actions_flat.reshape(action_shape),
             log_probs_flat.reshape(b, n_agents),
         )
 
@@ -121,6 +126,20 @@ def make_train(config: MAPPOConfig, env):
         # returns stay comparable across reward modes.
         team_reward = info["task_reward"]
         done = jnp.logical_or(terminated, truncated)
+
+        # Truncation bootstrap. A time-limit `truncated` (vs a true `terminated`)
+        # does not end the MDP, so its return should carry `gamma * V(s_next)`
+        # forward instead of being cut to 0. `done` (used below and by GAE) still
+        # fires on truncation so advantages don't bleed across the boundary AND
+        # the reset restarts the env — but that reset overwrites `next_obs`, so we
+        # must value the *real* successor here, before the reset, and fold the
+        # bootstrap into the reward (SB3-style). GAE's own `not_done` bootstrap
+        # term is then correctly 0 at this step, avoiding a double count.
+        trunc_f = truncated.astype(jnp.float32)
+        next_value = _values(train_state, next_obs.reshape(config.n_envs, -1))
+        if next_value.ndim > trunc_f.ndim:  # per-agent critic head
+            trunc_f = trunc_f[:, None]
+        reward = reward + config.gamma * trunc_f * next_value
 
         # The MJX env does not auto-reset; restart finished envs so the rollout
         # continues with fresh episodes (vanilla's gymnasium vec env does this).

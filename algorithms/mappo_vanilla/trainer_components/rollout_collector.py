@@ -110,6 +110,25 @@ class RolloutCollector:
             extrinsic_reward_sum += float(np.asarray(rewards).mean())
             reward_step_count += 1
 
+            # Truncation bootstrap (mirror of mappo_jax). A time-limit
+            # `truncated` (vs a true `terminated`) does not end the MDP, so its
+            # return must carry `gamma * V(s_next)` forward rather than be cut to
+            # 0 by GAE's `done` mask. Under gymnasium's NEXT_STEP autoreset,
+            # `next_obs` at a truncated step is the *real* terminal successor
+            # (the reset obs only appears on the following step), so we value it
+            # directly and fold the bootstrap into the stored reward. `dones`
+            # still fires on truncation, so GAE cuts the recursion (no bleed
+            # across the boundary) and its own bootstrap term is 0 here — no
+            # double count. Logged extrinsic reward (above) stays the raw env
+            # reward.
+            if np.any(truncateds):
+                next_values = self._state_values(next_obs, batch_size)
+                rewards = np.asarray(rewards, dtype=np.float32) + (
+                    self.agent.gamma
+                    * truncateds.astype(np.float32)
+                    * next_values
+                )
+
             self.agent.store_transitions_batch(
                 obs,
                 global_states,
@@ -150,17 +169,22 @@ class RolloutCollector:
             action_distribution=action_distribution,
         )
 
-    def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
-        final_global_states = obs.reshape(batch_size, -1)
+    def _state_values(self, obs, batch_size: int) -> np.ndarray:
+        """Critic values ``V(global_state(obs))`` as a ``(batch_size,)`` numpy
+        array, using the same (old) network that produced the stored rollout
+        values — so bootstraps stay consistent with the collected `values`."""
+        global_states = obs.reshape(batch_size, -1)
         with torch.no_grad():
-            final_gs_tensor = torch.from_numpy(
-                np.ascontiguousarray(final_global_states, dtype=np.float32)
+            gs_tensor = torch.from_numpy(
+                np.ascontiguousarray(global_states, dtype=np.float32)
             ).to(self.device)
-            final_values = (
-                self.agent.network_old.get_value(final_gs_tensor)
+            return (
+                self.agent.network_old.get_value(gs_tensor)
                 .cpu()
                 .squeeze(-1)
-                .tolist()
+                .numpy()
+                .astype(np.float32)
             )
 
-        return final_values
+    def _compute_final_values(self, obs, infos, batch_size: int) -> list[float]:
+        return self._state_values(obs, batch_size).tolist()

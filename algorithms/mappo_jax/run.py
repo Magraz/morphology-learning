@@ -78,18 +78,31 @@ class MAPPO_JAX_Runner:
         set_seeds(random_seed)
         self.rng_seed = random_seed
 
-        # Create the functional MJX environment
+        # Create the functional MJX environment. Two supported env groups:
+        #   MULTI_BOX_MJX — continuous force control (the base env)
+        #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
+        #                   one decision per macro_len low-level steps), which
+        #                   wraps a base MultiBoxPushMJX.
         environment = env_config.get("environment")
-        if environment != EnvironmentEnum.MULTI_BOX_MJX:
-            raise ValueError(
-                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' "
-                f"(functional JAX API); got {environment!r}"
-            )
-        self.env = MultiBoxPushMJX(
+        base_env = MultiBoxPushMJX(
             n_agents=env_config.get("n_agents"),
             n_objects=env_config.get("n_objects", 3),
             reward_mode=env_config.get("reward_mode", "dense"),
         )
+        if environment == EnvironmentEnum.MULTI_BOX_MJX:
+            self.env = base_env
+        elif environment == EnvironmentEnum.MACRO_MJX:
+            from environments.mjx_suite.macro_wrapper import SyncMacroMJX
+
+            self.env = SyncMacroMJX(
+                base_env, macro_len=env_config.get("macro_len", 10)
+            )
+        else:
+            raise ValueError(
+                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' and "
+                f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
+                f"got {environment!r}"
+            )
         # reward_mode="difference_rewards" makes the env emit a per-agent reward,
         # which switches the critic to a per-agent value head and runs GAE on the
         # agent axis (see MAPPOConfig.per_agent_rewards).
@@ -315,7 +328,7 @@ class MAPPO_JAX_Runner:
             self.env.observation_dim,
             self.env.observation_dim * self.env.n_agents,
             self.env.action_dim,
-            discrete=False,
+            discrete=getattr(self.env, "discrete", False),
             # Must match training, or the restored critic params won't fit.
             n_critic_outputs=(
                 self.env.n_agents if self.config.per_agent_rewards else 1
@@ -351,9 +364,14 @@ class MAPPO_JAX_Runner:
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
-        renderer = MJXRenderer(self.env)
+        discrete = getattr(self.env, "discrete", False)
+        # The macro env's state is the base EnvState, so the renderers (which
+        # expect a MultiBoxPushMJX) run on the wrapped base env.
+        is_macro = hasattr(self.env, "macro_len")
+        render_env = getattr(self.env, "env", self.env)
+        renderer = MJXRenderer(render_env)
         try:
-            native_renderer = MuJoCoNativeRenderer(self.env)
+            native_renderer = MuJoCoNativeRenderer(render_env)
         except Exception as e:  # no GL context (run with MUJOCO_GL=egl headless)
             print(f"Native MuJoCo renderer unavailable ({e}); skipping native videos")
             native_renderer = None
@@ -367,28 +385,61 @@ class MAPPO_JAX_Runner:
                 train_state.actor_ts.apply_fn,
                 train_state.actor_ts.params,
                 obs,
-                discrete=False,
+                discrete=discrete,
                 deterministic=True,
             )
             return actions
+
+        def _draw(state, obs):
+            """Append one rendered frame (+ native) for the given base state."""
+            frames.append(renderer.render(state, obs=np.asarray(obs)))
+            if native_renderer is not None:
+                native_frames.append(native_renderer.render(state))
+
+        # For the macro env, render at *low-level* granularity: hold the
+        # high-level skill choice fixed for macro_len steps but drive (and draw)
+        # the base env one physics step at a time, so the video is smooth instead
+        # of jumping macro_len steps per frame. The high-level policy re-decides
+        # at each macro boundary off the base obs there, exactly as SyncMacroMJX
+        # does internally.
+        base_step_fn = jax.jit(render_env.step) if is_macro else None
+        skill_actions_fn = (
+            jax.jit(self.env._skill_actions) if is_macro else None
+        )
 
         print("\nTesting trained agents...")
         for episode in range(10):
             key = jax.random.PRNGKey(int(np.random.randint(0, 2**31)))
             obs, state = reset_fn(key)
             rewards, frames, native_frames = [], [], []
-            for _ in range(self.env.max_steps):
-                frames.append(renderer.render(state, obs=np.asarray(obs)))
-                if native_renderer is not None:
-                    native_frames.append(native_renderer.render(state))
-                obs, state, _, terminated, truncated, info = step_fn(
-                    state, policy_fn(obs)
-                )
-                # Team reward: the env's `reward` is per-agent under
-                # difference_rewards, and the plot is of team performance.
-                rewards.append(float(info["task_reward"]))
-                if bool(terminated) or bool(truncated):
-                    break
+
+            if is_macro:
+                done = False
+                for _ in range(self.env.max_steps):  # macro decisions
+                    skills = policy_fn(obs)
+                    for _ in range(self.env.macro_len):  # low-level steps
+                        _draw(state, obs)
+                        actions = skill_actions_fn(state, skills)
+                        obs, state, _, terminated, truncated, info = base_step_fn(
+                            state, actions
+                        )
+                        rewards.append(float(info["task_reward"]))
+                        if bool(terminated) or bool(truncated):
+                            done = True
+                            break
+                    if done:
+                        break
+            else:
+                for _ in range(self.env.max_steps):
+                    _draw(state, obs)
+                    obs, state, _, terminated, truncated, info = step_fn(
+                        state, policy_fn(obs)
+                    )
+                    # Team reward: the env's `reward` is per-agent under
+                    # difference_rewards, and the plot is of team performance.
+                    rewards.append(float(info["task_reward"]))
+                    if bool(terminated) or bool(truncated):
+                        break
             rewards = np.asarray(rewards)
 
             print(f"REWARD: {rewards[-1]:.4f}")
