@@ -12,7 +12,10 @@ dependencies = [
     "hydra-joblib-launcher>=1.2",
     "imageio>=2.37.3",
     "imageio-ffmpeg>=0.6.0",
-    "jax[cuda13]>=0.5.3",
+    # cuda12 (not cuda13): CUDA 13 dropped Volta (CC 7.0, e.g. the dgx2 V100s
+    # in the HPC nodelist). The cu12 build supports Volta through Hopper, i.e.
+    # every GPU this project targets, so one env covers all nodes.
+    "jax[cuda12]>=0.5.3",
     "matplotlib>=3.10.8",
     "mujoco-mjx>=3.10.0",
     "mvlearn>=0.4.1",
