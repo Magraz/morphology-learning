@@ -163,6 +163,11 @@ def make_train(config: MAPPOConfig, env):
             (next_obs, next_env_state),
         )
 
+        # Per-agent activity mask. SyncMacroMJX's staggered-starts mode emits
+        # info["active"] (0 for agents offline this window); every other env omits
+        # it, so default to all-ones — which leaves the PPO loss byte-identical.
+        active_mask = info.get("active", jnp.ones((config.n_envs, n_agents)))
+
         transition = Transition(
             obs=obs,
             global_state=global_state,
@@ -172,6 +177,7 @@ def make_train(config: MAPPOConfig, env):
             log_prob=log_probs,
             value=values,
             team_reward=team_reward,
+            active_mask=active_mask,
         )
         return (train_state, next_env_state, next_obs, rng), transition
 

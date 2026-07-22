@@ -235,6 +235,30 @@ class AsyncMacroMJX:
         return obs, new, reward, term, trunc, {**info, "decided": decide}
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class StaggeredMacroState:
+    """``EnvState`` plus the per-agent commitment, for the staggered-starts study.
+
+    Forkable like ``EnvState`` (registered pytree), so it drops straight into the
+    ``mappo_jax`` collector's ``v_reset`` / ``tree.map`` auto-reset. Only used when
+    ``SyncMacroMJX(stagger_starts=True)``; the ordinary path keeps the plain
+    ``EnvState`` so it stays byte-for-byte the original.
+
+    Each agent comes online at ``onset`` (an absolute *low-level* step, sampled per
+    episode) and re-decides every ``macro_len`` low-level steps counted from that
+    onset — so decision phases stay decoupled all episode (``onset`` is not a
+    multiple of ``macro_len``). ``skill_idx`` is the in-flight skill each agent
+    flies between its own decision points; it must persist across the macro-window
+    boundary because an agent's phase generally falls mid-window. The absolute
+    low-level step is read from ``env_state.t`` (no separate counter needed).
+    """
+
+    env_state: EnvState
+    skill_idx: jax.Array  # (A,) int32 — in-flight committed skill per agent
+    onset: jax.Array  # (A,) int32 — absolute low-level step each agent comes online
+
+
 class SyncMacroMJX:
     """Synchronous **options** layer over ``MultiBoxPushMJX`` (pure / jit / vmap).
 
@@ -276,6 +300,8 @@ class SyncMacroMJX:
         *,
         macro_len: int = 10,
         reward_mode: str | None = None,
+        stagger_starts: bool = False,
+        max_start_delay: int = 0,
         **env_kwargs,
     ):
         if macro_len < 1:
@@ -303,6 +329,35 @@ class SyncMacroMJX:
             "difference_rewards", WINDOWED_DIFFERENCE_REWARDS
         )
 
+        # Staggered-starts study: each episode every agent comes online at a random
+        # absolute *low-level* step in [0, max_start_delay] and thereafter re-decides
+        # every macro_len steps counted from its own onset. Because onsets are not
+        # multiples of macro_len, the agents' decision phases stay decoupled the
+        # whole episode (persistent asynchrony), unlike the lockstep options view.
+        # Before its onset an agent is offline: null force + dropped from the
+        # coupling count (via the base env's `active` mask), and its transition is
+        # masked out of the PPO loss (see the trainer's active_mask). The world
+        # still steps normally. This tests whether the hierarchical setup — which
+        # records one transition per *global* macro window — copes with agents that
+        # begin acting, and decide, out of phase.
+        self.stagger_starts = bool(stagger_starts)
+        self.max_start_delay = int(max_start_delay)
+        if self.stagger_starts:
+            if self.max_start_delay < 1:
+                raise ValueError(
+                    f"stagger_starts needs max_start_delay >= 1 (low-level steps), "
+                    f"got {max_start_delay}"
+                )
+            if self.per_agent_rewards:
+                # The per-agent difference-reward counterfactuals fork whole windows
+                # with a *static* active mask; combining that with per-substep onset
+                # masking is a follow-up. Dense (team scalar) is the clean first test.
+                raise NotImplementedError(
+                    "stagger_starts currently supports only the dense team reward; "
+                    f"got reward_mode={self.reward_mode!r} (per-agent). The windowed "
+                    "difference-reward-under-asynchrony arm is a follow-up."
+                )
+
         # Interface the mappo_jax trainer/runner reads off the env (matching the
         # attribute names of MultiBoxPushMJX): discrete skill selection.
         self.observation_dim = OBS_DIM
@@ -325,9 +380,26 @@ class SyncMacroMJX:
 
     # ------------------------------------------------------------------ API
 
-    def reset(self, key: jax.Array) -> tuple[jnp.ndarray, EnvState]:
-        """Delegates to the base env; the macro state is the base EnvState."""
-        return self.env.reset(key)
+    def reset(self, key: jax.Array):
+        """Reset. Non-staggered: the macro state is the base ``EnvState``.
+
+        Staggered: wrap it in a ``StaggeredMacroState`` carrying each agent's
+        random low-level onset and a placeholder in-flight skill (unused before
+        onset, when the agent is offline/masked).
+        """
+        if not self.stagger_starts:
+            return self.env.reset(key)
+        k_env, k_onset = jax.random.split(key)
+        obs, env_state = self.env.reset(k_env)
+        onset = jax.random.randint(
+            k_onset, (self.n_agents,), 0, self.max_start_delay + 1
+        ).astype(jnp.int32)
+        mstate = StaggeredMacroState(
+            env_state=env_state,
+            skill_idx=jnp.zeros((self.n_agents,), dtype=jnp.int32),
+            onset=onset,
+        )
+        return obs, mstate
 
     def _rollout_window(self, state: EnvState, skills: jnp.ndarray, active):
         """Roll `skills` (fixed) forward `macro_len` low-level steps.
@@ -426,7 +498,82 @@ class SyncMacroMJX:
         info = {"task_reward": g_factual, "delivered": final_state.delivered}
         return obs, final_state, reward, terminated, truncated, info
 
-    def step(self, state: EnvState, skills: jnp.ndarray):
+    def _step_staggered(self, mstate: "StaggeredMacroState", proposed: jnp.ndarray):
+        """One global macro window under per-agent staggered onsets / phases.
+
+        The policy is queried once per window (``proposed`` (A,), off the
+        window-start obs). Within the window each agent re-decides at *its own*
+        phase boundary — the low-level step ``t`` where ``t >= onset`` and
+        ``(t - onset) % macro_len == 0`` — adopting ``proposed[i]`` there and
+        flying its previous ``skill_idx`` until then. Because ``onset`` is not a
+        multiple of ``macro_len``, those boundaries never coincide (persistent
+        asynchrony), yet each online agent hits exactly one boundary per window, so
+        the trainer still records exactly one transition per agent per window.
+
+        An agent is *offline* (null force + dropped from the coupling count, via the
+        base env's per-step ``active`` mask) until its onset. ``info["active"]`` is
+        the per-agent mask of who made a decision this window (offline-all-window
+        agents are 0), which the trainer uses to drop their transition from the
+        loss. Reward is the team scalar accumulated over the window.
+        """
+        macro = self.macro_len
+        onset = mstate.onset  # (A,) absolute low-level onset step
+
+        def _low(carry, _):
+            env_state, skill_idx, done, term, trunc, cum_task, decided_any = carry
+            t = env_state.t  # absolute low-level step (pre-step), shared clock
+            online = t >= onset  # (A,) bool — has this agent come online?
+            decide = online & (((t - onset) % macro) == 0)  # (A,) own-phase boundary
+            skill_idx = jnp.where(decide, proposed, skill_idx)
+
+            actions = self._skill_actions(env_state, skill_idx)
+            # `online` nulls offline agents' force and drops them from coupling.
+            _, next_state, _, term_s, trunc_s, info = self.env.step(
+                env_state, actions, online
+            )
+            live = ~done
+            cum_task = cum_task + jnp.where(live, info["task_reward"], 0.0)
+            decided_any = decided_any | (decide & live)
+
+            # Freeze the env state at the first done step (matches _rollout_window).
+            frozen = jax.tree.map(
+                lambda n, c: jnp.where(done, c, n), next_state, env_state
+            )
+            return (
+                frozen,
+                skill_idx,
+                done | term_s | trunc_s,
+                term | (term_s & live),
+                trunc | (trunc_s & live),
+                cum_task,
+                decided_any,
+            ), None
+
+        init = (
+            mstate.env_state,
+            mstate.skill_idx,
+            jnp.zeros((), dtype=bool),
+            jnp.zeros((), dtype=bool),
+            jnp.zeros((), dtype=bool),
+            jnp.zeros(()),
+            jnp.zeros((self.n_agents,), dtype=bool),
+        )
+        (final_state, final_skill, _, terminated, truncated, cum_task, decided), _ = (
+            jax.lax.scan(_low, init, None, length=macro)
+        )
+
+        new = StaggeredMacroState(
+            env_state=final_state, skill_idx=final_skill, onset=onset
+        )
+        obs = self.env._get_obs(final_state.data)
+        info = {
+            "task_reward": cum_task,
+            "delivered": final_state.delivered,
+            "active": decided.astype(jnp.float32),  # who decided this window
+        }
+        return obs, new, cum_task, terminated, truncated, info
+
+    def step(self, state, skills: jnp.ndarray):
         """One macro decision: run `skills` (A,) for `macro_len` low-level steps.
 
         Returns ``(obs, state, reward, terminated, truncated, info)`` with the
@@ -436,6 +583,8 @@ class SyncMacroMJX:
         scalar for logging/eval parity across reward modes.
         """
         skills = skills.astype(jnp.int32)
+        if self.stagger_starts:
+            return self._step_staggered(state, skills)
         if self.reward_mode == WINDOWED_DIFFERENCE_REWARDS:
             return self._step_windowed(state, skills)
 
@@ -445,6 +594,11 @@ class SyncMacroMJX:
         obs = self.env._get_obs(final_state.data)
         info = {"task_reward": cum_task, "delivered": final_state.delivered}
         return obs, final_state, cum_r, terminated, truncated, info
+
+    @staticmethod
+    def base_state(state):
+        """Underlying base ``EnvState`` from either macro-state representation."""
+        return state.env_state if isinstance(state, StaggeredMacroState) else state
 
 
 if __name__ == "__main__":
@@ -652,3 +806,45 @@ if __name__ == "__main__":
         Gml = float(iw["task_reward"])
         print(f"    macro_len={ml:2d}: {float(Dml.sum())/(Gml+1e-8):+.2f}")
     print("Windowed difference-reward smoke test passed.")
+
+    # ---------------------------------------------------------------------- #
+    # Staggered starts (async onset / decoupled decision phases).            #
+    # ---------------------------------------------------------------------- #
+    print("\n=== SyncMacroMJX staggered starts (async onsets) ===")
+    stag = SyncMacroMJX(base, macro_len=macro_len, stagger_starts=True,
+                        max_start_delay=3 * macro_len)
+    s_reset, s_step = jax.jit(stag.reset), jax.jit(stag.step)
+    obs, st = s_reset(key)
+    assert isinstance(st, StaggeredMacroState)
+    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
+    onset = np.asarray(st.onset)
+    phases = (onset % macro_len).tolist()
+    print(f"onset(low-level)={onset.tolist()} phases={phases}")
+    assert len(set(phases)) > 1, "decision phases should be decoupled"
+
+    k = key
+    for w in range(stag.max_steps):
+        k, sub = jax.random.split(k)
+        proposed = jax.random.randint(sub, (args.n_agents,), 0, N_SKILLS)
+        obs, st, r, term, trunc, info = s_step(st, proposed)
+        assert r.shape == (), r.shape
+        active = np.asarray(info["active"])
+        done = bool(term) or bool(trunc)
+        # active[i] => agent i decided => it was online (onset <= last window step)
+        expected_online = onset <= (w + 1) * macro_len - 1
+        assert np.all(active.astype(bool) <= expected_online), (w, active)
+        if not done:  # full windows match the schedule exactly
+            assert np.array_equal(active, expected_online.astype(np.float32)), w
+        else:
+            break
+    v_sreset = jax.jit(jax.vmap(stag.reset))
+    v_sstep = jax.jit(jax.vmap(stag.step))
+    keys = jax.random.split(key, args.n_envs)
+    obs, vst = v_sreset(keys)
+    proposed = jax.random.randint(key, (args.n_envs, args.n_agents), 0, N_SKILLS)
+    obs, vst, r, term, trunc, info = v_sstep(vst, proposed)
+    assert obs.shape == (args.n_envs, args.n_agents, OBS_DIM), obs.shape
+    assert r.shape == (args.n_envs,) and info["active"].shape == (
+        args.n_envs, args.n_agents)
+    print(f"vmap({args.n_envs}) OK: obs {obs.shape}, active {info['active'].shape}")
+    print("Staggered-starts smoke test passed.")

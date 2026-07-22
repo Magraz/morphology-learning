@@ -84,3 +84,8 @@ class Transition(NamedTuple):
     log_prob: jax.Array  # (n_envs, n_agents)
     value: jax.Array  # (n_envs,) | (n_envs, n_agents)
     team_reward: jax.Array  # (n_envs,) scalar team reward — logging only
+    # (n_envs, n_agents) 1.0/0.0 — did this agent contribute a real decision this
+    # step? All 1.0 for ordinary envs (no change); 0.0 for agents that were offline
+    # under SyncMacroMJX's staggered-starts mode, whose transition is masked out of
+    # the PPO loss. All-ones keeps the loss byte-identical to the unmasked path.
+    active_mask: jax.Array

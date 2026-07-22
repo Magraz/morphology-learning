@@ -1,0 +1,21 @@
+# @package _global_
+env:
+  # Staggered-starts ASYNCHRONY study over the hierarchical macro env. Same as
+  # macro_mjx_16a_4o (dense team reward, SyncMacroMJX, one transition per macro
+  # window), but each episode every agent comes online at a random *low-level*
+  # step and thereafter re-decides on its OWN phase (every macro_len steps counted
+  # from its onset). Because onsets are not multiples of macro_len, the agents'
+  # decision phases stay decoupled the whole episode — persistent asynchrony, not
+  # a mere late join. Offline agents apply null force, are dropped from the
+  # coupling count, and have their transitions masked out of the PPO loss. Tests
+  # whether the setup (which records one transition per global macro window) copes.
+  environment: macro_mjx
+  n_agents: 16
+  n_objects: 4
+  macro_len: 20
+  reward_mode: dense
+  # Enable the async stagger. max_start_delay is in LOW-LEVEL steps (not macro
+  # decisions) — deliberately spanning several macro_len windows so onsets land at
+  # every phase. 60 = up to 3 macro windows of delay at macro_len=20.
+  stagger_starts: true
+  max_start_delay: 50

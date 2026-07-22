@@ -116,6 +116,11 @@ class MAPPO_JAX_Runner:
                 base_env,
                 macro_len=env_config.get("macro_len", 10),
                 reward_mode=reward_mode,
+                # Staggered-starts async study: agents come online at random
+                # low-level steps and decide on their own phase (max_start_delay in
+                # low-level steps). Off by default -> ordinary lockstep options env.
+                stagger_starts=env_config.get("stagger_starts", False),
+                max_start_delay=env_config.get("max_start_delay", 0),
             )
         else:
             raise ValueError(
@@ -434,6 +439,11 @@ class MAPPO_JAX_Runner:
         for episode in range(10):
             key = jax.random.PRNGKey(int(np.random.randint(0, 2**31)))
             obs, state = reset_fn(key)
+            # Under staggered starts the macro state wraps the base EnvState; the
+            # low-level renderer drives the base env directly (stagger masking is
+            # not reflected in the video).
+            if is_macro:
+                state = self.env.base_state(state)
             rewards, frames, native_frames = [], [], []
 
             if is_macro:

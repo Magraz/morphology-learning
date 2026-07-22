@@ -206,6 +206,10 @@ def ppo_update(
         total_ts, n_agents, *trajectory.action.shape[3:]
     )
     lp_ts = trajectory.log_prob.reshape(total_ts, n_agents)
+    # Per-agent activity mask (1.0 for real decisions, 0.0 for offline agents under
+    # staggered starts). All-ones for every ordinary run — the masked means below
+    # then reduce to plain means, keeping the update byte-identical.
+    active_ts = trajectory.active_mask.reshape(total_ts, n_agents)
     if per_agent:
         adv_ts = adv.reshape(total_ts, n_agents)
         ret_ts = returns.reshape(total_ts, n_agents)
@@ -233,6 +237,10 @@ def ppo_update(
             mb_obs = obs_ts[mb_ids].reshape(n_flat, obs_dim)
             mb_actions = act_ts[mb_ids].reshape(n_flat, *act_ts.shape[2:])
             mb_old_lp = lp_ts[mb_ids].reshape(n_flat)
+            # Agent-major flattening matches mb_obs; (mb, n_agents) form for the
+            # per-agent critic. All-ones => the masked means are exact plain means.
+            mb_active_pa = active_ts[mb_ids]
+            mb_active = mb_active_pa.reshape(n_flat)
             if per_agent:
                 # Each agent carries its own advantage. `.reshape(-1)` is
                 # agent-major within a timestep, matching mb_obs' flattening.
@@ -253,8 +261,11 @@ def ppo_update(
                 surr2 = jnp.clip(
                     ratio, 1.0 - config.eps_clip, 1.0 + config.eps_clip
                 ) * mb_adv
-                policy_loss = -jnp.minimum(surr1, surr2).mean()
-                entropy_loss = -entropy.mean()
+                # Mask offline agents out of the policy gradient (their proposed
+                # skill was never executed). All-ones => plain mean.
+                denom = jnp.maximum(mb_active.sum(), 1.0)
+                policy_loss = -(jnp.minimum(surr1, surr2) * mb_active).sum() / denom
+                entropy_loss = -(entropy * mb_active).sum() / denom
                 total = policy_loss + config.ent_coef * entropy_loss
                 return total, (policy_loss, entropy_loss)
 
@@ -266,7 +277,16 @@ def ppo_update(
             # --- Critic loss (once per timestep; shared value vs team return) ---
             def critic_loss_fn(critic_params):
                 values = critic_ts.apply_fn(critic_params, mb_gs)
-                value_loss = jnp.mean((values - mb_returns) ** 2)
+                if per_agent:
+                    # Per-agent value head: mask offline agents' heads out (their
+                    # return is a masked-out 0). Team critic (scalar) is always
+                    # valid, so it stays a plain mean. All-ones => plain mean.
+                    sq = (values - mb_returns) ** 2
+                    value_loss = (sq * mb_active_pa).sum() / jnp.maximum(
+                        mb_active_pa.sum(), 1.0
+                    )
+                else:
+                    value_loss = jnp.mean((values - mb_returns) ** 2)
                 return config.val_coef * value_loss, value_loss
 
             (_, value_loss), critic_grads = jax.value_and_grad(
