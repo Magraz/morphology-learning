@@ -7,7 +7,11 @@ params:
   n_epochs: 6
   n_total_steps: 20000000.0     # float on purpose; env groups override when different
   n_minibatches: 8
-  n_steps: 1024                 # rollout length per env; batch = n_steps * env.n_envs
+  # Per-update batch in TOTAL env-steps, independent of env.n_envs (the collector
+  # gathers this many steps however many envs run in parallel). Hardware changes
+  # collection speed only; this fixes the optimization trajectory.
+  # 32768 preserves the old default on a 32-core box (1024 * 32).
+  batch_size: 32768
   parameter_sharing: true
   lr: 0.0003
   gamma: 0.99

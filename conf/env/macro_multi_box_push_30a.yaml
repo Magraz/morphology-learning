@@ -4,9 +4,13 @@
 # DCGTrainer reads env.get("environment") -> hrl_skill and passes this whole
 # block to HierarchicalSkillEnv, which re-reads base_environment/n_agents/
 # macro_len/decision_scope/skill_experiment/skill_trial/device from it.
-# n_envs autoscales centrally in conf/config.yaml (pin with env.n_envs=<N>).
 env:
   environment: hrl_skill            # DCG env type: the HRL macro-action wrapper
+  # Parallelism only. This env runs as `n_envs` subprocesses (make_vec_env), so
+  # the count is a hardware knob: it autoscales to usable_cores // n_jobs and
+  # changes only how fast a rollout is gathered. The optimization batch is fixed
+  # by `params.batch_size` (conf/algorithm/*.yaml) and is independent of it.
+  n_envs: ${envs_per_job:${n_jobs}}
   base_environment: multi_box_push  # continuous env the frozen skills run in
   n_agents: 30
   n_objects: 6

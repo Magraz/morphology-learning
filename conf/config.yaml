@@ -22,18 +22,18 @@ checkpoint: false
 evaluate: false
 debug: false
 
-# Parallelism budget. `n_jobs` = how many sweep jobs run at once (joblib layer);
-# `env.n_envs` auto-derives to `usable_cores // n_jobs` so the two layers never
-# oversubscribe. Default 1 => a single run uses all cores for rollout collection.
-# For a parallel sweep pass e.g. `n_jobs=4` (and `hydra/launcher=joblib_auto`,
-# which reads this value); n_envs shrinks to match.
+# Parallelism budget. `n_jobs` = how many sweep jobs run at once (joblib layer).
+# Subprocess-env groups set `n_envs: ${envs_per_job:${n_jobs}}` themselves so the
+# two layers never oversubscribe; pass e.g. `n_jobs=4` (with
+# `hydra/launcher=joblib_auto`, which reads this value) and their n_envs shrinks
+# to match.
+#
+# NOTE: `n_envs` is deliberately NOT set here. It used to live in this `_self_`
+# block, which (being last in the defaults list) overrode every env group and
+# made the *core count* determine the batch size — i.e. the hardware silently
+# changed the optimization trajectory. It now belongs to each env group, so the
+# batch is part of the recorded experiment definition. See conf/env/*.yaml.
 n_jobs: 1
-
-# Central autoscaling default for every env group (wins over the selected env
-# group because `_self_` is last). Pin a fixed count per run on the CLI with
-# `env.n_envs=<N>`.
-env:
-  n_envs: ${envs_per_job:${n_jobs}}
 
 #This part modifies what how hydra handles the directories. This way it stays the way I had it.
 #Maybe will go full hydra in the future

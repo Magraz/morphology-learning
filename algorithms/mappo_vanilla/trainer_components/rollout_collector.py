@@ -77,7 +77,14 @@ class RolloutCollector:
             np.zeros(self.n_actions, dtype=np.int64) if self.n_actions else None
         )
 
-        while total_step_count <= max_steps:
+        # `<`, not `<=`: the loop can only move in whole rows of `n_envs` steps
+        # (the vector env steps every env together), so `<=` took one extra full
+        # row even when `max_steps` was hit exactly — making the collected batch
+        # a function of n_envs. With `<` the batch is exactly `max_steps`
+        # whenever n_envs divides it, and overshoots by at most n_envs-1 when it
+        # does not. Cut only at row boundaries: GAE stacks per-env trajectories
+        # and requires a uniform length across envs.
+        while total_step_count < max_steps:
             global_states = obs.reshape(batch_size, -1)
 
             actions_t, log_probs_t, values_t = self.agent.get_actions_batched(

@@ -1,9 +1,11 @@
 # @package _global_
 env:
   environment: multi_box_push
-  # n_envs is set centrally in conf/config.yaml (autoscales to usable_cores //
-  # n_jobs) and wins over this group via `_self_`; pin a fixed count on the CLI
-  # with `env.n_envs=<N>`.
+  # Parallelism only. This env runs as `n_envs` subprocesses (make_vec_env), so
+  # the count is a hardware knob: it autoscales to usable_cores // n_jobs and
+  # changes only how fast a rollout is gathered. The optimization batch is fixed
+  # by `params.batch_size` (conf/algorithm/*.yaml) and is independent of it.
+  n_envs: ${envs_per_job:${n_jobs}}
   n_agents: 9
   n_objects: 3
   reward_mode: dense

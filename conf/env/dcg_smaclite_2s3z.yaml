@@ -1,8 +1,12 @@
 # @package _global_
 # SMAClite 2s3z for DCG. The DCG trainer reads `environment` (env type),
-# `n_agents`, and `env_variant` (map_name) from this block; `n_envs` autoscales
-# centrally in conf/config.yaml (pin with env.n_envs=<N> on the CLI).
+# `n_agents`, and `env_variant` (map_name) from this block.
 env:
   environment: smaclite
+  # Parallelism only. This env runs as `n_envs` subprocesses (make_vec_env), so
+  # the count is a hardware knob: it autoscales to usable_cores // n_jobs and
+  # changes only how fast a rollout is gathered. The optimization batch is fixed
+  # by `params.batch_size` (conf/algorithm/*.yaml) and is independent of it.
+  n_envs: ${envs_per_job:${n_jobs}}
   n_agents: 5
   env_variant: "2s3z"

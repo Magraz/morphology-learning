@@ -8,9 +8,11 @@ class MAPPO_Params:
     n_epochs: int
     n_total_steps: int
     n_minibatches: int
-    # Rollout length per parallel env; the per-update batch is
-    # n_steps * env.n_envs env-steps, so it scales with parallelism.
-    n_steps: int
+    # Per-update batch, in TOTAL env-steps (summed over the parallel envs).
+    # RolloutCollector.collect gathers this many steps regardless of how many
+    # envs run in parallel, so the batch — and hence num_updates — is fixed by
+    # config and independent of env.n_envs / the core count.
+    batch_size: int
     parameter_sharing: bool
     random_seeds: list
 

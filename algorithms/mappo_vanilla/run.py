@@ -68,7 +68,7 @@ class MAPPO_Vanilla_Runner(Runner):
 
         self.trainer.train(
             total_steps=self.params.n_total_steps,
-            batch_size=self.params.n_steps * self.env_config.get("n_envs"),
+            batch_size=self.params.batch_size,
             minibatches=self.params.n_minibatches,
             epochs=self.params.n_epochs,
             checkpoint=checkpoint_loaded,

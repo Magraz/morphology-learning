@@ -7,7 +7,11 @@ params:
   n_epochs: 6
   n_total_steps: 100000000.0     # float on purpose; env groups override when different
   n_minibatches: 8
-  n_steps: 1024                 # rollout length per env; batch = n_steps * env.n_envs
+  # Rollout length per env stream. Unlike the torch stacks this must stay
+  # per-env: it is the static length of the jitted collect scan. The batch is
+  # n_steps * env.n_envs, and n_envs is a literal in each MJX env group (a vmap
+  # width, never core-derived), so the batch is still fixed by config alone.
+  n_steps: 1024
   parameter_sharing: true       # mappo_jax implements the shared-actor path only
   lr: 0.0003
   gamma: 0.99

@@ -8,6 +8,14 @@ env:
   # info["task_reward"] still carries the team scalar, so logging/eval report team
   # performance and stay comparable to the dense arm.
   environment: macro_mjx
+  # BATCH DIMENSION, not a hardware knob: MJX envs are vmapped on one device, so
+  # this is the width of the batched simulation. It sets the per-update batch
+  # (params.n_steps * n_envs) and therefore num_updates, so it is a
+  # HYPERPARAMETER — keep it identical across arms you intend to compare, and
+  # never derive it from the core count. Lower it only if the GPU OOMs (the
+  # _wdr/_aligned arms fork n_envs * n_agents concurrent sims); if you do, lower
+  # it for every arm in the comparison.
+  n_envs: 32
   n_agents: 16
   n_objects: 4
   macro_len: 20
