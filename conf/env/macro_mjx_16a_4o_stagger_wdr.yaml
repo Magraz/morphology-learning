@@ -1,0 +1,27 @@
+# @package _global_
+env:
+  # Difference rewards UNDER ASYNCHRONY (global-window baseline). Combines the
+  # staggered-starts async onsets (macro_mjx_16a_4o_stagger.yaml) with the windowed
+  # difference reward (macro_mjx_16a_4o_wdr.yaml): each episode agents come online
+  # at random low-level steps and decide on their own phase, and the per-agent
+  # reward is D_i = G(window) - G_-i(window) over the GLOBAL recording window
+  # [W, W+macro_len). SyncMacroMJX._step_staggered_windowed forks the staggered
+  # window per agent; teammates REPLAY the low-level forces they applied in the
+  # factual window (open-loop, held fixed as the difference-reward formulation
+  # requires) rather than reacting to the counterfactual state, so only agent i's
+  # contribution differs. Forking StaggeredMacroState resumes in-flight commitments.
+  #
+  # KNOWN PROPERTY (the baseline's limitation): agent i's own decision window
+  # [phi_i, phi_i+L) is phase-offset from [W, W+L), so this D blends the tail of i's
+  # previous commitment with the head of its new one and pays it to the transition
+  # labelled with the new action -- mirroring the dense reward's own phase smear.
+  # The decision-aligned trainer-level variant corrects this; compare the two.
+  environment: macro_mjx
+  n_agents: 16
+  n_objects: 4
+  macro_len: 20
+  reward_mode: windowed_difference_rewards
+  # Async stagger. max_start_delay in LOW-LEVEL steps; not a multiple of macro_len
+  # so decision phases decouple. Matches macro_mjx_16a_4o_stagger.yaml.
+  stagger_starts: true
+  max_start_delay: 50

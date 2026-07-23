@@ -1,0 +1,25 @@
+# @package _global_
+env:
+  # DECISION-ALIGNED difference rewards under asynchrony (the phase-corrected arm).
+  # Same async stagger as macro_mjx_16a_4o_stagger_wdr.yaml, but the per-agent
+  # reward is D_i over agent i's OWN decision window [W+phi_i, W+phi_i+L)
+  # (phi_i = onset_i % L, its fixed phase) instead of the global recording window
+  # [W, W+L). This pairs D_i with the action i actually chose at W+phi_i: the
+  # [W, W+phi_i) tail — where i is still flying its PREVIOUS skill — is excluded and
+  # correctly credited to i's previous transition. Fixes the ~phi/L phase
+  # misattribution of the global-window baseline (macro_mjx_16a_4o_stagger_wdr.yaml).
+  #
+  # The decision window spills into the next global window, so it needs the NEXT
+  # window's proposals; it is therefore computed POST-COLLECT in the trainer
+  # (mappo_jax/trainer.py:_apply_aligned_rewards) from compact per-window snapshots
+  # + the logged next-window action. As in the other windowed paths, teammates
+  # replay their factual low-level forces open-loop (only agent i's contribution
+  # changes). Compare against macro_mjx_16a_4o_stagger_wdr.yaml: the learning-curve
+  # gap is the cost of the phase misattribution.
+  environment: macro_mjx
+  n_agents: 16
+  n_objects: 4
+  macro_len: 20
+  reward_mode: aligned_windowed_difference_rewards
+  stagger_starts: true
+  max_start_delay: 50

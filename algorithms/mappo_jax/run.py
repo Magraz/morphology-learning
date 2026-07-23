@@ -93,18 +93,21 @@ class MAPPO_JAX_Runner:
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
+                ALIGNED_WINDOWED_DIFFERENCE_REWARDS,
                 WINDOWED_DIFFERENCE_REWARDS,
                 SyncMacroMJX,
             )
 
-            # The windowed difference reward is computed by the wrapper (it forks
-            # the whole macro window per agent), so the base env must stay dense —
-            # it must not also emit its own per-step D. The single-step
-            # "difference_rewards" mode instead lives on the base env and passes
-            # through the wrapper's accumulation.
+            # The windowed difference rewards (global-window and decision-aligned)
+            # are computed by the wrapper (it forks macro windows per agent), so the
+            # base env must stay dense — it must not also emit its own per-step D.
+            # The single-step "difference_rewards" mode instead lives on the base
+            # env and passes through the wrapper's accumulation.
             base_reward_mode = (
                 "dense"
-                if reward_mode == WINDOWED_DIFFERENCE_REWARDS
+                if reward_mode in (
+                    WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS
+                )
                 else reward_mode
             )
             base_env = MultiBoxPushMJX(

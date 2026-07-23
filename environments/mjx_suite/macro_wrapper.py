@@ -31,6 +31,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from mujoco import mjx
 
 from environments.mjx_suite.macro_skills import (
     N_SKILLS,
@@ -47,9 +48,13 @@ COMMITMENT_FEAT_DIM = N_SKILLS + 2
 MACRO_OBS_DIM = OBS_DIM + COMMITMENT_FEAT_DIM
 
 # SyncMacroMJX reward modes (see the class docstring). The base env's own
-# "dense"/"difference_rewards" pass straight through; this one is computed by the
-# wrapper by forking the whole macro window per agent.
+# "dense"/"difference_rewards" pass straight through; these are computed by the
+# wrapper by forking macro windows per agent.
 WINDOWED_DIFFERENCE_REWARDS = "windowed_difference_rewards"
+# Async-only: the phase-corrected, decision-aligned windowed D (D over each
+# agent's own [φ_i, φ_i+L) window). Computed post-collect in the trainer (it needs
+# the next window's proposals); the env supplies `decision_aligned_D` + snapshots.
+ALIGNED_WINDOWED_DIFFERENCE_REWARDS = "aligned_windowed_difference_rewards"
 
 
 @jax.tree_util.register_dataclass
@@ -319,14 +324,17 @@ class SyncMacroMJX:
         # needs a *dense* base env (it forks the team reward and must not trigger
         # the base env's own per-step D).
         self.reward_mode = reward_mode if reward_mode is not None else self.env.reward_mode
-        if self.reward_mode == WINDOWED_DIFFERENCE_REWARDS and self.env.reward_mode != "dense":
+        _windowed_modes = (
+            WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS
+        )
+        if self.reward_mode in _windowed_modes and self.env.reward_mode != "dense":
             raise ValueError(
-                f"{WINDOWED_DIFFERENCE_REWARDS} needs a dense base env (it forks the "
-                f"team reward); got base reward_mode={self.env.reward_mode!r}"
+                f"{self.reward_mode} needs a dense base env (it forks the team "
+                f"reward); got base reward_mode={self.env.reward_mode!r}"
             )
         # per-agent reward signal? (per-agent critic head + per-agent GAE)
         self.per_agent_rewards = self.reward_mode in (
-            "difference_rewards", WINDOWED_DIFFERENCE_REWARDS
+            ("difference_rewards",) + _windowed_modes
         )
 
         # Staggered-starts study: each episode every agent comes online at a random
@@ -348,15 +356,22 @@ class SyncMacroMJX:
                     f"stagger_starts needs max_start_delay >= 1 (low-level steps), "
                     f"got {max_start_delay}"
                 )
-            if self.per_agent_rewards:
-                # The per-agent difference-reward counterfactuals fork whole windows
-                # with a *static* active mask; combining that with per-substep onset
-                # masking is a follow-up. Dense (team scalar) is the clean first test.
+            if self.reward_mode == "difference_rewards":
+                # The base env's single-step D forks its own per-agent
+                # counterfactual with `active=arange!=i`, ignoring the outer online
+                # mask, so offline agents would leak into it. The windowed D
+                # (computed here in `_step_staggered_windowed`, which combines the
+                # online + drop masks) is supported; dense is the plain path.
                 raise NotImplementedError(
-                    "stagger_starts currently supports only the dense team reward; "
-                    f"got reward_mode={self.reward_mode!r} (per-agent). The windowed "
-                    "difference-reward-under-asynchrony arm is a follow-up."
+                    "stagger_starts + base single-step 'difference_rewards' is "
+                    "unsupported (its counterfactual ignores the online mask); use "
+                    f"'dense' or '{WINDOWED_DIFFERENCE_REWARDS}'."
                 )
+        elif self.reward_mode == ALIGNED_WINDOWED_DIFFERENCE_REWARDS:
+            # Decision-aligned D is meaningful only when decision phases decouple.
+            raise ValueError(
+                f"{ALIGNED_WINDOWED_DIFFERENCE_REWARDS} requires stagger_starts=True"
+            )
 
         # Interface the mappo_jax trainer/runner reads off the env (matching the
         # attribute names of MultiBoxPushMJX): discrete skill selection.
@@ -401,23 +416,42 @@ class SyncMacroMJX:
         )
         return obs, mstate
 
-    def _rollout_window(self, state: EnvState, skills: jnp.ndarray, active):
+    def _rollout_window(
+        self, state: EnvState, skills: jnp.ndarray, active, replay_actions=None
+    ):
         """Roll `skills` (fixed) forward `macro_len` low-level steps.
 
         `active` is either ``None`` (all agents participate, the ordinary step)
         or an (A,) bool mask; masked-out agents contribute zero force and are
         dropped from the coupling count for the whole window (threaded into
         ``env.step``), which is what makes an "agent i absent" counterfactual
-        exact. The window freezes at the first low-level done. Returns
-        ``(final_state, cum_reward, cum_team_reward, terminated, truncated)``
+        exact.
+
+        `replay_actions` selects **where the low-level forces come from**:
+        - ``None`` (factual roll): each step re-derives the scripted skill forces
+          from the *current* state (`_skill_actions`).
+        - ``(macro_len, A, 2)`` (counterfactual roll): the agents **replay** the
+          recorded factual forces open-loop, independent of the counterfactual
+          state — so the difference reward changes only the removed agent's
+          contribution and holds every teammate's action fixed, as the DR
+          formulation requires. Agent i is still nulled by the ``active`` mask.
+
+        The window freezes at the first low-level done. Returns ``(final_state,
+        cum_reward, cum_team_reward, terminated, truncated, recorded_actions)``
         where ``cum_reward`` accumulates the base env's per-step `reward` (team
         scalar, or per-agent single-step D when the base env is in
-        difference_rewards mode) and ``cum_team_reward`` accumulates the team
-        scalar `info["task_reward"]`.
+        difference_rewards mode), ``cum_team_reward`` accumulates the team scalar
+        `info["task_reward"]`, and ``recorded_actions`` (macro_len, A, 2) is the
+        per-step action sequence actually applied (feed it back as
+        ``replay_actions`` for an exact open-loop replay).
         """
-        def _low_step(carry, _):
+        def _low_step(carry, replay_a):
             env_state, done, terminated, truncated, cum_r, cum_task = carry
-            actions = self._skill_actions(env_state, skills)
+            actions = (
+                self._skill_actions(env_state, skills)
+                if replay_actions is None
+                else replay_a
+            )
             _, next_state, reward, term, trunc, info = self.env.step(
                 env_state, actions, active
             )
@@ -441,7 +475,7 @@ class SyncMacroMJX:
                 truncated | (trunc & live),
                 cum_r,
                 cum_task,
-            ), None
+            ), actions
 
         zero_r = jnp.zeros(
             (self.n_agents,) if self.reward_mode == "difference_rewards" else ()
@@ -454,10 +488,10 @@ class SyncMacroMJX:
             zero_r,
             jnp.zeros(()),
         )
-        (final_state, _, terminated, truncated, cum_r, cum_task), _ = jax.lax.scan(
-            _low_step, init, None, length=self.macro_len
+        (final_state, _, terminated, truncated, cum_r, cum_task), recorded = (
+            jax.lax.scan(_low_step, init, replay_actions, length=self.macro_len)
         )
-        return final_state, cum_r, cum_task, terminated, truncated
+        return final_state, cum_r, cum_task, terminated, truncated, recorded
 
     def _step_windowed(self, state: EnvState, skills: jnp.ndarray):
         """One macro decision with the **windowed** difference reward.
@@ -465,12 +499,18 @@ class SyncMacroMJX:
         The per-agent reward is the exact windowed counterfactual
         ``D_i = G(window) - G_{-i}(window)``, where ``G_{-i}`` is the team reward
         of the *same* macro window re-rolled with agent i absent for the whole
-        window (zero force + dropped from the coupling count). Unlike summing the
-        base env's single-step D, holding agent i absent across the window lets
-        the coupling mechanic act — the box stays heavy and stalls if i was a
-        required member — so the credit reflects coalition necessity, not just an
-        instantaneous force share. Exact because the scripted skills and the MJX
-        step are deterministic, so the fork replays identically.
+        window (zero force + dropped from the coupling count). Following the
+        difference-reward formulation, only agent i's contribution changes: the
+        teammates **replay the exact low-level forces they applied in the factual
+        window** (recorded and fed back as ``replay_actions``), open-loop, rather
+        than re-deriving their skills from the counterfactual state — so ``D_i``
+        isolates i's physical effect and does not absorb teammates' behavioral
+        compensation. Unlike summing the base env's single-step D, holding agent i
+        absent across the window lets the coupling mechanic act — the box stays
+        heavy and stalls if i was a required member — so the credit reflects
+        coalition necessity, not just an instantaneous force share. Exact because
+        the recorded forces and the MJX step are deterministic, so the fork
+        replays identically.
 
         NOTE: this reveals the coupling only once the window is long enough for
         the mass change to integrate into a displacement difference (empirically
@@ -479,27 +519,38 @@ class SyncMacroMJX:
         does not span future decisions (that needs the policy, i.e. the trainer).
         """
         # Factual window (all agents active) — its termination is the real one.
-        final_state, _, g_factual, terminated, truncated = self._rollout_window(
+        # `rec` is the per-step factual action sequence, replayed open-loop in
+        # every counterfactual so teammates hold their actions fixed.
+        final_state, _, g_factual, terminated, truncated, rec = self._rollout_window(
             state, skills, None
         )
 
         # Counterfactual windows: agent i absent for the whole window. vmap over
         # the agent axis runs all A forks in one compiled call from the same
         # start state (common random numbers), like the difference-reward oracle.
+        # Teammates replay their factual forces (`rec`); only agent i is nulled.
         def _counterfactual(i):
             active = jnp.arange(self.n_agents) != i
-            _, _, g_cf, _, _ = self._rollout_window(state, skills, active)
+            _, _, g_cf, _, _, _ = self._rollout_window(
+                state, skills, active, replay_actions=rec
+            )
             return g_cf
 
         g_cf = jax.vmap(_counterfactual)(jnp.arange(self.n_agents))  # (A,)
         reward = g_factual - g_cf  # (A,) per-agent windowed difference reward
 
-        obs = self.env._get_obs(final_state.data)
+        obs = self.env._get_obs(final_state.data, final_state.delivered)
         info = {"task_reward": g_factual, "delivered": final_state.delivered}
         return obs, final_state, reward, terminated, truncated, info
 
-    def _step_staggered(self, mstate: "StaggeredMacroState", proposed: jnp.ndarray):
-        """One global macro window under per-agent staggered onsets / phases.
+    def _staggered_window(
+        self,
+        mstate: "StaggeredMacroState",
+        proposed: jnp.ndarray,
+        drop_agent: jnp.ndarray | int = -1,
+        replay_actions=None,
+    ):
+        """Roll one global macro window under per-agent staggered onsets / phases.
 
         The policy is queried once per window (``proposed`` (A,), off the
         window-start obs). Within the window each agent re-decides at *its own*
@@ -510,26 +561,52 @@ class SyncMacroMJX:
         asynchrony), yet each online agent hits exactly one boundary per window, so
         the trainer still records exactly one transition per agent per window.
 
-        An agent is *offline* (null force + dropped from the coupling count, via the
-        base env's per-step ``active`` mask) until its onset. ``info["active"]`` is
-        the per-agent mask of who made a decision this window (offline-all-window
-        agents are 0), which the trainer uses to drop their transition from the
-        loss. Reward is the team scalar accumulated over the window.
+        ``drop_agent`` (traced, ``-1`` == none) nulls one agent for the whole
+        window — the counterfactual "agent i absent" fork used by the windowed
+        difference reward (like the oracle's ``override_agent``). It combines with
+        the online mask: masked agents (offline **or** dropped) apply zero force
+        and are dropped from the coupling count via the base env's per-step
+        ``active`` mask.
+
+        ``replay_actions`` selects where the low-level forces come from, exactly
+        as in ``_rollout_window``: ``None`` re-derives the scripted skills from the
+        current state (the factual roll); an ``(macro_len, A, 2)`` array makes the
+        agents **replay** the recorded factual forces open-loop so the
+        counterfactual holds teammates' actions fixed. Because the factual actions
+        are recorded pre-mask, replaying them under the same ``online`` mask
+        (offline agents still zeroed by ``active``) reproduces the factual
+        trajectory exactly when ``drop_agent == -1``.
+
+        Returns ``(final_state, final_skill, cum_task, decided, terminated,
+        truncated, recorded_actions)``: ``cum_task`` is the team scalar accumulated
+        over the window; ``decided`` (A,) marks who made a decision this window
+        (offline-all-window agents are False); ``final_skill`` is the post-window
+        in-flight skills; ``recorded_actions`` (macro_len, A, 2) is the per-step
+        action sequence applied (feed back as ``replay_actions``).
         """
         macro = self.macro_len
         onset = mstate.onset  # (A,) absolute low-level onset step
+        keep = jnp.arange(self.n_agents) != drop_agent  # (A,) False only for drop_agent
 
-        def _low(carry, _):
+        def _low(carry, replay_a):
             env_state, skill_idx, done, term, trunc, cum_task, decided_any = carry
             t = env_state.t  # absolute low-level step (pre-step), shared clock
             online = t >= onset  # (A,) bool — has this agent come online?
             decide = online & (((t - onset) % macro) == 0)  # (A,) own-phase boundary
             skill_idx = jnp.where(decide, proposed, skill_idx)
 
-            actions = self._skill_actions(env_state, skill_idx)
-            # `online` nulls offline agents' force and drops them from coupling.
+            # Factual roll re-derives forces from the current state; counterfactual
+            # roll replays the recorded factual forces (teammates' actions fixed).
+            actions = (
+                self._skill_actions(env_state, skill_idx)
+                if replay_actions is None
+                else replay_a
+            )
+            # `active` nulls offline *and* dropped agents' force and drops them
+            # from the coupling count.
+            active = online & keep
             _, next_state, _, term_s, trunc_s, info = self.env.step(
-                env_state, actions, online
+                env_state, actions, active
             )
             live = ~done
             cum_task = cum_task + jnp.where(live, info["task_reward"], 0.0)
@@ -547,7 +624,7 @@ class SyncMacroMJX:
                 trunc | (trunc_s & live),
                 cum_task,
                 decided_any,
-            ), None
+            ), actions
 
         init = (
             mstate.env_state,
@@ -558,20 +635,226 @@ class SyncMacroMJX:
             jnp.zeros(()),
             jnp.zeros((self.n_agents,), dtype=bool),
         )
-        (final_state, final_skill, _, terminated, truncated, cum_task, decided), _ = (
-            jax.lax.scan(_low, init, None, length=macro)
+        (
+            (final_state, final_skill, _, terminated, truncated, cum_task, decided),
+            recorded,
+        ) = jax.lax.scan(_low, init, replay_actions, length=macro)
+        return (
+            final_state,
+            final_skill,
+            cum_task,
+            decided,
+            terminated,
+            truncated,
+            recorded,
         )
 
-        new = StaggeredMacroState(
-            env_state=final_state, skill_idx=final_skill, onset=onset
+    def _step_staggered(self, mstate: "StaggeredMacroState", proposed: jnp.ndarray):
+        """Dense staggered macro step: one window, team-scalar reward.
+
+        Thin caller over ``_staggered_window`` with no agent dropped.
+        ``info["active"]`` is the per-agent mask of who decided this window, which
+        the trainer uses to drop offline-all-window agents' transitions from the
+        loss.
+        """
+        final_state, final_skill, cum_task, decided, terminated, truncated, _ = (
+            self._staggered_window(mstate, proposed, drop_agent=-1)
         )
-        obs = self.env._get_obs(final_state.data)
+        new = StaggeredMacroState(
+            env_state=final_state, skill_idx=final_skill, onset=mstate.onset
+        )
+        obs = self.env._get_obs(final_state.data, final_state.delivered)
         info = {
             "task_reward": cum_task,
             "delivered": final_state.delivered,
             "active": decided.astype(jnp.float32),  # who decided this window
         }
         return obs, new, cum_task, terminated, truncated, info
+
+    def _step_staggered_windowed(
+        self, mstate: "StaggeredMacroState", proposed: jnp.ndarray
+    ):
+        """Staggered macro step with the **global-window** difference reward.
+
+        Async generalization of ``_step_windowed``: the per-agent reward is the
+        windowed counterfactual ``D_i = G(window) - G_{-i}(window)`` over the
+        *global* recording window ``[W, W+macro_len)``, where ``G_{-i}`` re-rolls
+        the SAME staggered window with agent i absent for the whole window (zero
+        force + dropped from the coupling count). As in ``_step_windowed``, the
+        teammates **replay their factual low-level forces** (recorded from the
+        factual roll) rather than reacting to the counterfactual state, so only
+        agent i's contribution changes. Forking ``mstate`` resumes every teammate's
+        in-flight commitment automatically — exact because the recorded forces +
+        MJX step are deterministic (common random numbers across branches).
+
+        Scope note (a known property): agent i's *own* decision window
+        ``[φ_i, φ_i+L)`` is phase-offset from ``[W, W+L)``, so this D blends the
+        tail of i's previous commitment with the head of its new one and pays it to
+        the transition labelled with the new action. That mirrors the dense
+        reward's own phase smear; the decision-aligned variant (trainer-level)
+        corrects it.
+        """
+        # Factual window — its termination is the real one, `decided` is the
+        # activity mask the trainer masks the loss with, and `rec` is the per-step
+        # factual action sequence replayed open-loop in every counterfactual.
+        final_state, final_skill, g_factual, decided, terminated, truncated, rec = (
+            self._staggered_window(mstate, proposed, drop_agent=-1)
+        )
+
+        # Counterfactual windows: agent i absent for the whole window. vmap over
+        # the agent axis runs all A forks in one compiled call from the same start
+        # state (common random numbers), like the difference-reward oracle.
+        # Teammates replay their factual forces (`rec`); only agent i is nulled.
+        def _counterfactual(i):
+            _, _, g_cf, _, _, _, _ = self._staggered_window(
+                mstate, proposed, drop_agent=i, replay_actions=rec
+            )
+            return g_cf
+
+        g_cf = jax.vmap(_counterfactual)(jnp.arange(self.n_agents))  # (A,)
+        # Never-online agents changed nothing when removed -> D_i == 0; also masked.
+        reward = jnp.where(decided, g_factual - g_cf, 0.0)  # (A,) per-agent D
+
+        new = StaggeredMacroState(
+            env_state=final_state, skill_idx=final_skill, onset=mstate.onset
+        )
+        obs = self.env._get_obs(final_state.data, final_state.delivered)
+        info = {
+            "task_reward": g_factual,
+            "delivered": final_state.delivered,
+            "active": decided.astype(jnp.float32),
+        }
+        return obs, new, reward, terminated, truncated, info
+
+    def decision_aligned_D(
+        self,
+        mstate: "StaggeredMacroState",
+        proposed: jnp.ndarray,
+        proposed_next: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """(A,) decision-aligned difference reward — the phase-corrected variant.
+
+        Credits each agent i over **its own** decision window
+        ``[W+φ_i, W+φ_i+L)`` (φ_i = ``onset_i % L``, its fixed phase; W =
+        ``env_state.t``, a multiple of L at a window boundary), rather than the
+        global recording window ``[W, W+L)``. This pairs ``D_i`` with the action i
+        actually chose at ``W+φ_i``: the ``[W, W+φ_i)`` tail (i still flying its
+        *previous* skill) is correctly excluded and lands on i's previous
+        transition instead. Fixes the ~φ/L phase misattribution of
+        ``_step_staggered_windowed``.
+
+        The window spills into the next global window ``[W+L, W+φ_i+L)``, so
+        re-decisions there need the **next** window's proposals — passed in as
+        ``proposed_next`` (the trainer supplies the logged next-window action).
+        Boundaries at ``t < W+L`` adopt ``proposed``; at ``t >= W+L``,
+        ``proposed_next``. Exact given both (deterministic skills + MJX).
+
+        Method (per agent i, vmapped): roll ``2L`` low-level steps from ``mstate``
+        (covers ``[W, W+φ_i+L)`` for any φ_i < L), factual and with agent i nulled
+        **only during its own window** (present before it, flying its previous
+        skill, so the counterfactual isolates i's *decision* not its whole
+        presence); accumulate the team reward over ``[W+φ_i, W+φ_i+L)`` in each and
+        diff. As in the other windowed paths, the teammates **replay the factual
+        low-level forces** (recorded from the shared factual roll) rather than
+        reacting to the counterfactual state, so only agent i's contribution
+        changes. The factual roll is shared across agents (nulls no one).
+        """
+        L = self.macro_len
+        A = self.n_agents
+        onset = mstate.onset  # (A,) absolute onset
+        W = mstate.env_state.t  # window start (multiple of L)
+        win_start = W + (onset % L)  # (A,) each agent's decision step this window
+
+        def _roll(null_agent, replay_actions=None):
+            """Per-step team reward over [W, W+2L); nulls null_agent in its window.
+
+            ``null_agent`` is traced; ``-1`` == factual (the ``arange==null_agent``
+            mask is then all-False, so no one is nulled and ``win_start[-1]`` is
+            harmlessly gathered). ``replay_actions`` (2L, A, 2) makes the agents
+            replay the recorded factual forces open-loop so the counterfactual
+            holds teammates' actions fixed; ``None`` re-derives them from state (the
+            factual roll). Returns ``(rewards (2L,), recorded_actions (2L, A, 2))``.
+            """
+            ws = win_start[null_agent]  # this agent's window start (inert if -1)
+
+            def _low(carry, replay_a):
+                env_state, skill_idx, done = carry
+                t = env_state.t
+                online = t >= onset
+                decide = online & (((t - onset) % L) == 0)
+                # boundaries in the current window use `proposed`; the overshoot
+                # into the next window uses `proposed_next`.
+                props = jnp.where(t >= (W + L), proposed_next, proposed)
+                skill_idx = jnp.where(decide, props, skill_idx)
+
+                actions = (
+                    self._skill_actions(env_state, skill_idx)
+                    if replay_actions is None
+                    else replay_a
+                )
+                in_win = (t >= ws) & (t < ws + L)  # null_agent's own window
+                active = online & ~((jnp.arange(A) == null_agent) & in_win)
+                _, next_state, _, term_s, trunc_s, info = self.env.step(
+                    env_state, actions, active
+                )
+                live = ~done
+                r = jnp.where(live, info["task_reward"], 0.0)
+                frozen = jax.tree.map(
+                    lambda n, c: jnp.where(done, c, n), next_state, env_state
+                )
+                return (frozen, skill_idx, done | term_s | trunc_s), (r, actions)
+
+            _, (rewards, recorded) = jax.lax.scan(
+                _low, (mstate.env_state, mstate.skill_idx, jnp.zeros((), bool)),
+                replay_actions, length=2 * L,
+            )
+            return rewards, recorded  # (2L,), (2L, A, 2)
+
+        # Factual per-step team reward + the action sequence, shared across agents;
+        # each counterfactual replays `rec` so only the nulled agent changes.
+        r_fac, rec = _roll(-1)
+        ts = W + jnp.arange(2 * L)  # absolute low-level step per scan index
+
+        def _cf(i):
+            r_cf, _ = _roll(i, replay_actions=rec)
+            win_i = (ts >= win_start[i]) & (ts < win_start[i] + L)  # i's window
+            return jnp.sum(win_i * (r_fac - r_cf))  # G_i - G_{-i} over i's window
+
+        return jax.vmap(_cf)(jnp.arange(A))  # (A,)
+
+    # -- compact state snapshot for the trainer's post-collect aligned D pass --
+    # decision_aligned_D needs the *pre-step* window state, but logging the full
+    # mjx.Data for every window is too heavy. qpos/qvel + the EnvState scalars +
+    # the commitment (skill_idx/onset) fully reconstruct it via mjx.forward. D is
+    # exact w.r.t. the reconstruction because both branches share it (the ~solver-
+    # tolerance reconstruction error cancels in the factual-minus-cf difference).
+
+    def snapshot(self, mstate: "StaggeredMacroState") -> dict:
+        es = mstate.env_state
+        return {
+            "qpos": es.data.qpos,
+            "qvel": es.data.qvel,
+            "t": es.t,
+            "prev_box_goal_dist": es.prev_box_goal_dist,
+            "delivered": es.delivered,
+            "skill_idx": mstate.skill_idx,
+            "onset": mstate.onset,
+        }
+
+    def state_from_snapshot(self, snap: dict) -> "StaggeredMacroState":
+        data = mjx.make_data(self.env._model).replace(
+            qpos=snap["qpos"], qvel=snap["qvel"]
+        )
+        data = mjx.forward(self.env._model, data)
+        env_state = EnvState(
+            data=data,
+            t=snap["t"],
+            prev_box_goal_dist=snap["prev_box_goal_dist"],
+            delivered=snap["delivered"],
+        )
+        return StaggeredMacroState(
+            env_state=env_state, skill_idx=snap["skill_idx"], onset=snap["onset"]
+        )
 
     def step(self, state, skills: jnp.ndarray):
         """One macro decision: run `skills` (A,) for `macro_len` low-level steps.
@@ -584,14 +867,21 @@ class SyncMacroMJX:
         """
         skills = skills.astype(jnp.int32)
         if self.stagger_starts:
+            # Aligned mode uses the global-window D as the in-collect placeholder;
+            # the trainer overwrites it post-collect with the decision-aligned D
+            # (which needs the next window's proposals).
+            if self.reward_mode in (
+                WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS
+            ):
+                return self._step_staggered_windowed(state, skills)
             return self._step_staggered(state, skills)
         if self.reward_mode == WINDOWED_DIFFERENCE_REWARDS:
             return self._step_windowed(state, skills)
 
-        final_state, cum_r, cum_task, terminated, truncated = self._rollout_window(
+        final_state, cum_r, cum_task, terminated, truncated, _ = self._rollout_window(
             state, skills, None
         )
-        obs = self.env._get_obs(final_state.data)
+        obs = self.env._get_obs(final_state.data, final_state.delivered)
         info = {"task_reward": cum_task, "delivered": final_state.delivered}
         return obs, final_state, cum_r, terminated, truncated, info
 
@@ -774,25 +1064,38 @@ if __name__ == "__main__":
     )
 
     # Exactness: the wrapper's D[0] must equal a hand-rolled factual-minus-
-    # counterfactual fork (agent 0 absent = zero force + dropped from coupling).
+    # counterfactual fork. Under open-loop replay the counterfactual REPLAYS the
+    # factual low-level forces (teammates' actions held fixed) with agent 0 only
+    # nulled by the `active` mask — re-deriving skills from the counterfactual
+    # state (the old reactive fork) would give a different, wrong D. Full window
+    # with freeze-on-done, matching the wrapper's scan (the completion bonus lands
+    # on the step it fires, then the state freezes).
     base_step_active = jax.jit(base.step)
 
-    def _manual_window(active):
-        es, g = s0, 0.0
-        for _ in range(w_env.macro_len):
-            acts = w_env._skill_actions(es, push)
-            _, es, _, bterm, btrunc, binfo = base_step_active(es, acts, active)
-            g += float(binfo["task_reward"])
-            if bool(bterm) or bool(btrunc):
-                break
-        return g
+    def _manual_window(active, replay=None):
+        es, g, done, rec = s0, 0.0, False, []
+        for t in range(w_env.macro_len):
+            acts = replay[t] if replay is not None else w_env._skill_actions(es, push)
+            rec.append(acts)
+            _, ns, _, bterm, btrunc, binfo = base_step_active(es, acts, active)
+            if not done:
+                g += float(binfo["task_reward"])
+            es = es if done else ns  # freeze at the first done, like the wrapper
+            done = done or bool(bterm) or bool(btrunc)
+        return g, rec
 
-    g_fact = _manual_window(jnp.ones((args.n_agents,), bool))
-    g_cf0 = _manual_window(jnp.arange(args.n_agents) != 0)
+    all_active = jnp.ones((args.n_agents,), bool)
+    g_fact, rec = _manual_window(all_active)  # factual — records the forces
+    # Replay-identity: replaying the recorded forces under the SAME mask must
+    # reproduce the factual return bit-for-bit (the recording is faithful).
+    g_replay, _ = _manual_window(all_active, replay=rec)
+    assert abs(g_replay - g_fact) < 1e-4, (g_replay, g_fact)
+    # Counterfactual: replay the SAME forces, agent 0 nulled by the active mask.
+    g_cf0, _ = _manual_window(jnp.arange(args.n_agents) != 0, replay=rec)
     d0_manual = g_fact - g_cf0
     print(
-        f"exactness check: wrapper D[0]={float(D[0]):.4f} vs manual fork "
-        f"{d0_manual:.4f} (deterministic, should match to f32)"
+        f"exactness check: wrapper D[0]={float(D[0]):.4f} vs manual replay fork "
+        f"{d0_manual:.4f} (open-loop replay, should match to f32)"
     )
     assert abs(float(D[0]) - d0_manual) < 1e-2, (float(D[0]), d0_manual)
 
@@ -848,3 +1151,43 @@ if __name__ == "__main__":
         args.n_envs, args.n_agents)
     print(f"vmap({args.n_envs}) OK: obs {obs.shape}, active {info['active'].shape}")
     print("Staggered-starts smoke test passed.")
+
+    # ---------------------------------------------------------------------- #
+    # Staggered global-window difference reward (async D_i = G - G_-i).       #
+    # ---------------------------------------------------------------------- #
+    print("\n=== staggered windowed difference reward (async, global window) ===")
+    swd = SyncMacroMJX(base, macro_len=macro_len,
+                       reward_mode=WINDOWED_DIFFERENCE_REWARDS,
+                       stagger_starts=True, max_start_delay=3 * macro_len)
+    assert swd.per_agent_rewards
+    _, stw = jax.jit(swd.reset)(key)
+    _, _, Dw, _, _, iw = jax.jit(swd.step)(stw, push)
+    assert Dw.shape == (args.n_agents,), Dw.shape
+    print(f"per-agent D shape {Dw.shape}; active shape {iw['active'].shape}")
+
+    # SYNC PARITY: with onset all-zero and a boundary-aligned start state, the
+    # windowed-stagger D must equal the independent _step_windowed path exactly.
+    es = s0  # engaged push state from the sync-macro block above
+    while int(es.t) % macro_len != 0:  # align to a macro boundary
+        _, es, _, bt, btr, _ = base_step(es, sync_macro._skill_actions(es, push))
+        if bool(bt) or bool(btr):
+            break
+    mstate0 = StaggeredMacroState(es, jnp.zeros((args.n_agents,), jnp.int32),
+                                  jnp.zeros((args.n_agents,), jnp.int32))
+    _, _, d_stag, _, _, _ = jax.jit(swd._step_staggered_windowed)(mstate0, push)
+    sync_ref = SyncMacroMJX(base, macro_len=macro_len,
+                            reward_mode=WINDOWED_DIFFERENCE_REWARDS)
+    _, _, d_sync, _, _, _ = jax.jit(sync_ref._step_windowed)(es, push)
+    gap = float(jnp.abs(d_stag - d_sync).max())
+    print(f"sync-parity max|D_stag - D_sync| = {gap:.2e} (onset=0, aligned start)")
+    assert gap < 1e-3, (np.asarray(d_stag), np.asarray(d_sync))
+
+    # OFFLINE agent -> D_i == 0 and active_i == 0
+    onset = np.zeros(args.n_agents, np.int32)
+    onset[0] = 10 * macro_len  # agent 0 never comes online
+    _, _, d_off, _, _, i_off = jax.jit(swd._step_staggered_windowed)(
+        StaggeredMacroState(es, jnp.zeros((args.n_agents,), jnp.int32),
+                            jnp.asarray(onset)), push)
+    assert float(d_off[0]) == 0.0 and float(i_off["active"][0]) == 0.0
+    print("offline agent -> D=0, active=0 OK")
+    print("Staggered windowed difference-reward smoke test passed.")

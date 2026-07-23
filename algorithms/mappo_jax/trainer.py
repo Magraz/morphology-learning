@@ -56,6 +56,11 @@ def make_train(config: MAPPOConfig, env):
     # The base MJX suite is continuous force control; the hierarchical macro env
     # (SyncMacroMJX) selects among discrete skills. The env declares which.
     discrete = getattr(env, "discrete", False)
+    # Decision-aligned windowed difference reward (async only): the env's per-step
+    # reward is a placeholder (global-window D); the true per-agent D is computed
+    # post-collect from logged snapshots + the *next* window's proposals.
+    from environments.mjx_suite.macro_wrapper import ALIGNED_WINDOWED_DIFFERENCE_REWARDS
+    aligned = getattr(env, "reward_mode", "") == ALIGNED_WINDOWED_DIFFERENCE_REWARDS
 
     if not config.parameter_sharing:
         raise NotImplementedError(
@@ -179,7 +184,45 @@ def make_train(config: MAPPOConfig, env):
             team_reward=team_reward,
             active_mask=active_mask,
         )
-        return (train_state, next_env_state, next_obs, rng), transition
+        carry = (train_state, next_env_state, next_obs, rng)
+        if aligned:
+            # Extra per-window data for the post-collect decision-aligned D pass:
+            # the compact PRE-step state (to fork from), plus the pieces needed to
+            # re-apply the truncation bootstrap to the overwritten reward. `reward`
+            # above is a placeholder (global-window D); it is discarded post-collect.
+            aux = {
+                "snapshot": env.snapshot(env_state),
+                "truncated": truncated,
+                "next_value": next_value,  # pre-reset V(s_next), per-agent head
+            }
+            return carry, (transition, aux)
+        return carry, transition
+
+    def _apply_aligned_rewards(trajectory, aux):
+        """Overwrite the placeholder reward with the decision-aligned windowed D.
+
+        Post-collect (the aligned D needs each window's *next* proposals, unknown
+        during the scan): for every (window, env) fork the logged compact snapshot
+        and run ``env.decision_aligned_D`` with ``proposed = action[w]`` and
+        ``proposed_next = action[w+1]`` (the last window reuses its own action — a
+        one-window boundary approximation; its overshoot is only reached if the
+        episode ran past the rollout). The truncation bootstrap is re-applied to
+        the new reward exactly as ``_env_step`` did to the placeholder.
+        """
+        proposed = trajectory.action  # (T, n_envs, A)
+        proposed_next = jnp.concatenate([proposed[1:], proposed[-1:]], axis=0)
+
+        def _one(snap_e, p, pn):
+            mstate = env.state_from_snapshot(snap_e)
+            return env.decision_aligned_D(mstate, p, pn)  # (A,)
+
+        # vmap over time (outer) and env (inner) — snapshots are (T, n_envs, ...).
+        aligned_D = jax.vmap(jax.vmap(_one))(
+            aux["snapshot"], proposed, proposed_next
+        )  # (T, n_envs, A)
+        trunc_f = aux["truncated"].astype(jnp.float32)[..., None]  # (T, n_envs, 1)
+        reward = aligned_D + config.gamma * trunc_f * aux["next_value"]
+        return trajectory._replace(reward=reward)
 
     @jax.jit
     def collect_fn(runner_state: RunnerState):
@@ -189,12 +232,17 @@ def make_train(config: MAPPOConfig, env):
         # Fresh episodes every rollout, matching vanilla's per-collect reset
         obs, env_state = v_reset(jax.random.split(reset_rng, config.n_envs))
 
-        (train_state, _, last_obs, rng), trajectory = jax.lax.scan(
+        (train_state, _, last_obs, rng), scan_out = jax.lax.scan(
             _env_step,
             (train_state, env_state, obs, rng),
             None,
             length=config.n_steps,
         )
+        if aligned:
+            trajectory, aux = scan_out
+            trajectory = _apply_aligned_rewards(trajectory, aux)
+        else:
+            trajectory = scan_out
 
         # Bootstrap value for GAE (done masking happens inside compute_gae)
         last_value = _values(train_state, last_obs.reshape(config.n_envs, -1))

@@ -195,13 +195,28 @@ class MJXObservationBuilder:
         """(A, A) euclidean distance between every agent pair; zero on the diagonal."""
         return jnp.linalg.norm(agent_pos[:, None, :] - agent_pos[None, :, :], axis=-1)
 
-    def nearest_box_vectors(self, agent_pos, box_pos):
-        """(A, 2) relative vector to the nearest box, normalized by world_width."""
+    def nearest_box_vectors(self, agent_pos, box_pos, delivered=None):
+        """(A, 2) relative vector to the nearest *undelivered* box, normalized by
+        world_width.
+
+        ``delivered`` is an optional (O,) bool mask; delivered boxes are dropped
+        from the nearest-box search (their distance is set to +inf) so an agent
+        stops sensing a box that has already been parked in the goal band. The
+        vector is zero when the env has no objects, or when every box is
+        delivered (no remaining target to point at).
+        """
         if self.n_objects == 0:
             return jnp.zeros((self.n_agents, 2))
         rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
-        nearest = jnp.argmin(jnp.linalg.norm(rel, axis=-1), axis=1)  # (A,)
-        return rel[jnp.arange(self.n_agents), nearest] / self.world_width
+        dist = jnp.linalg.norm(rel, axis=-1)  # (A, O)
+        if delivered is not None:
+            dist = jnp.where(delivered[None, :], jnp.inf, dist)
+        nearest = jnp.argmin(dist, axis=1)  # (A,)
+        vec = rel[jnp.arange(self.n_agents), nearest] / self.world_width
+        if delivered is not None:
+            # all boxes delivered -> argmin over +inf is meaningless; zero it out
+            vec = jnp.where(jnp.all(delivered), 0.0, vec)
+        return vec
 
     def goal_distances(self, agent_pos, goal_coord=None, goal_axis="y"):
         """(A,) signed distance to the goal center along the goal axis.
@@ -280,11 +295,14 @@ class MJXObservationBuilder:
         box_half=None,
         goal_coord=None,
         goal_axis="y",
+        delivered=None,
     ):
         """(A, obs_dim) float32 observation in the shared Box2D-suite layout.
 
         ``box_*`` may be omitted when the env has no objects. ``goal_coord`` /
         ``goal_axis`` locate the target band (see ``goal_distances``).
+        ``delivered`` is an optional (O,) bool mask of already-delivered boxes,
+        excluded from ``nearest_box_vec`` (see ``nearest_box_vectors``).
         """
         touch = self.touch_matrix(agent_pos, box_pos, box_yaw, box_half)
         is_touching = (
@@ -299,7 +317,7 @@ class MJXObservationBuilder:
                 is_touching,
                 self.neighbor_fractions(agent_pos)[:, None],
                 (self.contact_forces(data) / self.force_multiplier)[:, None],
-                self.nearest_box_vectors(agent_pos, box_pos),
+                self.nearest_box_vectors(agent_pos, box_pos, delivered),
                 self.goal_distances(agent_pos, goal_coord, goal_axis)[:, None],
                 self.lidar(data, agent_pos),
             ],

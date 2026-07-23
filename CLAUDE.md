@@ -1,3 +1,5 @@
+# When user gives instructions, push back if you think the user is wrong. Do not accept everything the user says as source truth. Use your best judgement but share your reasoning with the user and provide both options. Always go with what the user chooses after this. 
+
 Whenever building new code, try to reuse as much code as possible. If the new functionality overlaps heavily with other parts of the code, find a way to abstract and reuse the logic instead of duplicating the functionality.
 
 Always keep the CLAUDE.md file up to date to reflect the current functionality and architecture of the code.
@@ -91,9 +93,12 @@ All `environments/box2d_suite` envs share `ObservationManager.get_observation`
 - `is_touching_object` (1)
 - `neighbor_fraction` (1) — fraction of agents within `neighbor_detection_range` (incl. self)
 - `contact_force` (1) — per-agent contact force / `force_multiplier`
-- `nearest_box_vec` (2) — relative (dx, dy) to the nearest object, per axis
-  normalized by `world_width`; zero vector when the env has no objects.
-  Egocentric (no absolute world anchor).
+- `nearest_box_vec` (2) — relative (dx, dy) to the nearest **undelivered**
+  object, per axis normalized by `world_width`; zero vector when the env has no
+  objects or when every object has been delivered. Already-delivered objects
+  (`env.delivered_objects` in Box2D, the `delivered` mask in MJX) are excluded
+  from the nearest-object search, so an agent stops being drawn to a box parked
+  in the goal band. Egocentric (no absolute world anchor).
 - `goal_distance` (1) — signed relative distance from the agent to the target
   region center, measured along the env's **goal axis**: the y axis by default
   (normalized by `world_height`), or the x axis (normalized by `world_width`)
@@ -198,10 +203,16 @@ efc contact-force decode).
   attribution needs the geom→entity maps from the helper `geom_index_maps(mj_model,
   n_agents, n_objects)` (naming convention `g_agent_{i}` / `g_box_{j}`).
 - `build(data, agent_pos, agent_vel, box_pos=, box_yaw=, box_half=,
-  goal_coord=, goal_axis=)` returns `(A, OBS_DIM)`; the components are also
-  exposed individually (`touch_matrix`, `density_sensors`, `neighbor_fractions`,
-  `pairwise_agent_distances`, `nearest_box_vectors`, `goal_distances`, `lidar`,
-  `contact_forces`) — `_touch_matrix` (coupling) and the renderer reuse them.
+  goal_coord=, goal_axis=, delivered=)` returns `(A, OBS_DIM)`; the components
+  are also exposed individually (`touch_matrix`, `density_sensors`,
+  `neighbor_fractions`, `pairwise_agent_distances`, `nearest_box_vectors`,
+  `goal_distances`, `lidar`, `contact_forces`) — `_touch_matrix` (coupling) and
+  the renderer reuse them. The optional `delivered` (O,) bool mask (threaded
+  from `EnvState.delivered` by `MultiBoxPushMJX._get_obs`) drops delivered boxes
+  from `nearest_box_vectors` only — an agent stops being drawn to a box parked
+  in the goal band; all delivered → zero vector. The Box2D
+  `ObservationManager._calculate_nearest_box_vectors` does the same via
+  `env.delivered_objects`, keeping the two engines in parity.
 - **Generalizes past multi_box_push**, mirroring the Box2D fallbacks: `n_objects=0`
   (scatter/rendezvouz) zeros the object density block, `is_touching_object`,
   `nearest_box_vec` and the contact force; `goal_coord=None` (contact/scatter/
@@ -761,12 +772,20 @@ normally uncheckable, since most envs cannot rewind.
       *windowed* counterfactual `D_i = G(window) - G_{-i}(window)`, where `G_{-i}`
       re-rolls the **same** macro window with agent i absent (zero force + dropped
       from the coupling count via the `active` mask threaded into `env.step`) for
-      the WHOLE window. Holding an agent absent across the window lets the coupling
-      stall the box if i was required, so the credit reflects coalition necessity.
-      Computed by `SyncMacroMJX._step_windowed` — the factual window + an `A`-way
-      `vmap` of counterfactual windows from the same start state; **exact** because
-      the scripted skills + MJX step are deterministic (verified against a manual
-      fork). Costs `(A+1)×macro_len` base steps/decision (vmapped). The coupling
+      the WHOLE window. Per the difference-reward formulation, the counterfactual
+      changes **only agent i's** contribution: the teammates **replay the exact
+      low-level forces they applied in the factual window** (recorded from the
+      factual roll and fed back as `replay_actions`), open-loop — they do NOT
+      re-derive their skills from the counterfactual state and react to i's absence.
+      So `D_i` isolates i's physical effect and does not absorb teammates'
+      behavioral compensation. Holding an agent absent across the window still lets
+      the coupling stall the box if i was required (the mass/coupling physics acts
+      regardless of whether teammates react), so the credit reflects coalition
+      necessity. Computed by `SyncMacroMJX._step_windowed` — the factual window
+      (which records the per-step `(macro_len, A, 2)` action sequence) + an `A`-way
+      `vmap` of counterfactual windows replaying it from the same start state;
+      **exact** because the recorded forces + MJX step are deterministic (verified
+      against a manual fork). Costs `(A+1)×macro_len` base steps/decision (vmapped). The coupling
       reveals only as the window grows (smoke test measured `sum_i D_i/G` climbing
       `+0.04→+0.30→+0.53→+0.75` at macro_len `1→5→15→30` for one state; the
       saturated `~coupling` ratio needs a *tight* coalition state). It is a
@@ -785,6 +804,109 @@ normally uncheckable, since most envs cannot rewind.
         model=mlp trial_id=0 env.n_envs=32
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_wdr \
         model=mlp trial_id=0 env.n_envs=32
+    ```
+  - **Staggered starts (async-onset study).** `SyncMacroMJX(stagger_starts=True,
+    max_start_delay=D)` makes each agent come online at a random **low-level** step
+    in `[0, D]` (sampled per episode) and thereafter re-decide on its **own phase**
+    — every `macro_len` steps counted from *its* onset. Because onsets are not
+    multiples of `macro_len`, the agents' decision phases stay decoupled the whole
+    episode (persistent asynchrony), unlike the lockstep options view; the design
+    question it probes is whether a setup that records **one transition per global
+    macro window** copes with agents deciding out of phase. Mechanism: the policy is
+    still queried once per window (`proposed` off the window-start obs), but inside
+    `_step_staggered`'s low-level scan each agent adopts `proposed[i]` only at *its*
+    boundary (`t >= onset & (t-onset)%macro_len==0`) and flies its previous
+    `skill_idx` until then — so `skill_idx` must persist across the window boundary
+    (state is a registered `StaggeredMacroState(env_state, skill_idx, onset)`; the
+    absolute low-level step is read from `env_state.t`). Since period == window ==
+    `macro_len`, each online agent hits exactly one boundary per window, so the
+    trainer still stores one transition per agent per window. Before its onset an
+    agent is **offline**: `online` is threaded as the base env's per-step `active`
+    mask (null force + dropped from the coupling count), and it is masked out of the
+    PPO loss. That masking is a new `Transition.active_mask` `(n_envs, n_agents)`
+    field — `SyncMacroMJX` emits `info["active"]` (who decided this window; the
+    final truncated window can be `<` the onset schedule), the trainer defaults it
+    to **all-ones** for every other env, and `ppo_update` applies it as a masked
+    mean to the actor policy/entropy loss (+ the per-agent critic head). All-ones
+    reduces the masked mean to a plain mean, so **every non-stagger run is
+    byte-identical**. Config `conf/env/macro_mjx_16a_4o_stagger.yaml` (dense;
+    `max_start_delay: 50` low-level steps). Verified: onset→active-mask schedule,
+    decoupled phases, vmap, `tree.map` auto-reset, and train (collect→update→eval).
+    Launch:
+    ```
+    uv run python train.py algorithm=mappo_jax env=macro_mjx_16a_4o_stagger \
+        model=mlp trial_id=0 env.n_envs=32
+    ```
+  - **Difference rewards under asynchrony (global-window baseline).** Stagger now
+    also supports `reward_mode="windowed_difference_rewards"`: the per-agent reward
+    is `D_i = G(window) - G_{-i}(window)` over the **global** recording window
+    `[W, W+macro_len)`, computed by `SyncMacroMJX._step_staggered_windowed`. The
+    scan is refactored into `_staggered_window(mstate, proposed, drop_agent,
+    replay_actions)` — the factual run (`drop_agent=-1`, which records the per-step
+    `(macro_len, A, 2)` action sequence) plus an `A`-way `vmap` of counterfactual
+    runs each nulling one agent for the whole window (its `active` mask is `online &
+    (arange != drop_agent)`, like the oracle's `override_agent`). As in the sync
+    path, the teammates **replay their factual low-level forces** (`replay_actions`)
+    open-loop instead of reacting to the counterfactual state, so only the dropped
+    agent's contribution changes (the difference-reward requirement). **Forking
+    `StaggeredMacroState` resumes teammates' in-flight commitments automatically**
+    — carrying `skill_idx` + `onset` continues the scan from every partial
+    commitment; the replayed forces then flow open-loop, nothing else to restore.
+    Exact (recorded forces + deterministic MJX, common random numbers).
+    Cross-validated: with `onset` all-zero and a macro-boundary-aligned start state
+    the D is **bit-identical** to the independent sync `_step_windowed` path (0.0
+    gap); a never-online agent gets `D_i=0`/`active_i=0`. Still raises for the base
+    single-step `"difference_rewards"` (its counterfactual ignores the outer online
+    mask). Config `conf/env/macro_mjx_16a_4o_stagger_wdr.yaml`; verified train +
+    checkpoint resume. **Known limitation (the baseline's whole point):** agent i's
+    own decision window `[φ_i, φ_i+L)` (φ_i = `onset_i % L`, its fixed phase) is
+    phase-**offset** from `[W, W+L)`, so removing i over the global window blends
+    the tail of i's *previous* commitment with the head of its *new* one and pays
+    that D to the transition labelled with the new action (~φ/L of the window
+    misattributed) — mirroring the dense reward's own phase smear. The
+    **decision-aligned** variant (below / trainer-level) corrects it; the gap
+    between the two measures the misattribution cost. Launch:
+    ```
+    uv run python train.py algorithm=mappo_jax env=macro_mjx_16a_4o_stagger_wdr \
+        model=mlp trial_id=0 env.n_envs=32
+    ```
+  - **Decision-aligned difference rewards under asynchrony (the phase-corrected
+    arm).** `reward_mode="aligned_windowed_difference_rewards"` credits each agent
+    over **its own** decision window `[W+φ_i, W+φ_i+L)` instead of the global
+    `[W, W+L)`, so `D_i` pairs with the action i chose at `W+φ_i` and the `[W,
+    W+φ_i)` tail (i still flying its *previous* skill) lands on i's previous
+    transition — fixing the global-window baseline's ~φ/L phase misattribution.
+    The core primitive is `SyncMacroMJX.decision_aligned_D(mstate, proposed,
+    proposed_next)`: per agent (vmapped) it rolls `2L` steps from the window start,
+    factual and with i nulled **only during its own window**, and diffs the team
+    reward over `[W+φ_i, W+φ_i+L)`; the factual roll is shared, teammates **replay**
+    the recorded factual forces open-loop, and boundaries in the overshoot
+    `[W+L, W+φ_i+L)` adopt `proposed_next`. Because that window spills into the next
+    global window (whose proposals are unknown during collection), it is computed
+    **post-collect in the trainer** (`mappo_jax/trainer.py:_apply_aligned_rewards`):
+    `_env_step` logs a compact per-window `snapshot` (qpos/qvel + EnvState scalars +
+    skill_idx/onset — `SyncMacroMJX.snapshot`, reconstructed via
+    `state_from_snapshot` + `mjx.forward`; D is exact w.r.t. the reconstruction
+    since both branches share it), `truncated`, and the pre-reset `next_value`; the
+    post-collect pass `vmap`s `decision_aligned_D` over (window, env) with
+    `proposed_next = action` shifted by one (last window reuses its own action, a
+    boundary approximation), then re-applies the truncation bootstrap
+    `reward = D + γ·truncated·next_value`. In-collect the env returns the
+    global-window D as a **placeholder** (overwritten post-collect). Gated by a
+    static `aligned` flag in `make_train`, so **every non-aligned run is
+    unchanged**; the aligned mode requires `stagger_starts` and a dense base env.
+    Verified: **phase-0 parity** — with all onsets at phase 0 (decision window ==
+    global window) `decision_aligned_D` is bit-identical to
+    `_step_staggered_windowed` (0.0 gap) and independent of `proposed_next`; at
+    nonzero phase D genuinely **depends on `proposed_next`** (the credit reaches
+    into the next window); and train + checkpoint resume end-to-end. Config
+    `conf/env/macro_mjx_16a_4o_stagger_wdr_aligned.yaml`. Costs ~2× the
+    global-window arm (a shared factual + `A` replayed counterfactuals of `2L` each
+    per window). Compare its learning curve against the global-window arm — the gap
+    is the cost of the phase misattribution. Launch:
+    ```
+    uv run python train.py algorithm=mappo_jax \
+        env=macro_mjx_16a_4o_stagger_wdr_aligned model=mlp trial_id=0 env.n_envs=32
     ```
 - **`algorithms/difference_rewards/oracle.py`** — exact `D_i` by **forking the
   simulator** (`MultiBoxPushMJX` is pure, so a state can be replayed under a
@@ -809,4 +931,33 @@ normally uncheckable, since most envs cannot rewind.
   ```
   MUJOCO_GL=egl uv run python -m algorithms.difference_rewards.bias_study \
       --n-states 24 --horizon 60
+  ```
+- **`algorithms/difference_rewards/reward_magnitude_study.py`** — one-plot
+  diagnostic (no training) for *why* the `macro_mjx_16a_4o` DR arms (`_dr`,
+  `_wdr`) learn worse than the dense baseline: it compares the **magnitude of the
+  reward actually stored per transition** in each arm (what the critic/actor learn
+  from). It rolls out the **dense-trained** policies (`macro_mjx_16a_4o/mlp/
+  <trial>`, argmax skills) and at each macro decision reads all three stored
+  rewards off the *same* pre-step state / skills: dense team scalar `G`, the
+  `_dr` per-agent `D_i` (sum of the base env's single-step `D_i` over the window),
+  and the `_wdr` per-agent `D_i` (`_step_windowed`) — these are literally
+  `Transition.reward` in each arm. Exact/fair because base physics is independent
+  of `reward_mode` (only the read-out changes), so one canonical trajectory feeds
+  all three; all share `macro_len=20`. Uses three `SyncMacroMJX` views (dense
+  driver, `difference_rewards` base, windowed) and vmaps over rollouts × the
+  per-agent counterfactual forks; `--chunk` caps peak GPU memory (windowed forks
+  `chunk * n_agents` concurrent MJX sims — 32 rollouts unchunked OOMs a 16 GB
+  GPU). Caches the pooled arrays to `<out>.data.pkl`; `--from-cache` re-plots
+  without recomputing. **Finding** (11 trials, signed means): the per-agent DR
+  signal stored per transition is far weaker than the dense team reward each agent
+  learns from — dense `G ≈ 6.8`, timestep `D_i ≈ 0.095` (**~72x smaller**),
+  windowed `D_i ≈ 0.80` (**~8.5x smaller**). (Note: the earlier ~1.1 single-step
+  `sum_i D_i/G` ratio quoted elsewhere came from a hand-crafted tight-coalition
+  9a/3o *state*; averaged over the learned 16a/4o policy most of the 16 agents are
+  redundant per step, so single-step credit is even weaker.) Writes one bar chart
+  `algorithms/difference_rewards/reward_magnitude.png`.
+  ```
+  MUJOCO_GL=egl uv run python -u -m \
+      algorithms.difference_rewards.reward_magnitude_study \
+      --n-rollouts 5 --chunk 8
   ```

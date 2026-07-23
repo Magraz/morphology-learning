@@ -228,10 +228,14 @@ class ObservationManager:
         return (dist <= radius).astype(np.float32)
 
     def _calculate_nearest_box_vectors(self):
-        """Relative (dx, dy) from each agent to its nearest object.
+        """Relative (dx, dy) from each agent to its nearest *undelivered* object.
 
         Per-axis normalized by world_width so values land in ~[-1, 1]. Returns a
-        zero vector for every agent when the env has no objects.
+        zero vector for every agent when the env has no objects, or when every
+        object has already been delivered (no remaining target to point at).
+        Objects the env has marked delivered (``env.delivered_objects``) are
+        dropped from the search, so an agent stops being drawn to a box parked
+        in the goal band — mirrors the MJX env's nearest_box_vec masking.
         """
         n_agents = self.env.n_agents
         if self._object_pos_cache.shape[0] == 0:
@@ -243,6 +247,14 @@ class ObservationManager:
             - self._agent_pos_cache[:, np.newaxis, :]
         )  # (A, O, 2)
         dist = np.linalg.norm(rel, axis=-1)  # (A, O)
+
+        delivered = getattr(self.env, "delivered_objects", None)
+        if delivered:
+            idx = np.array([o for o in delivered if o < dist.shape[1]], dtype=int)
+            if idx.size == dist.shape[1]:  # nothing left to point at
+                return np.zeros((n_agents, 2), dtype=np.float32)
+            dist[:, idx] = np.inf
+
         nearest = np.argmin(dist, axis=1)  # (A,)
         nearest_vec = rel[np.arange(n_agents), nearest]  # (A, 2)
         return (nearest_vec / float(self.env.world_width)).astype(np.float32)

@@ -430,8 +430,13 @@ class MultiBoxPushMJX:
 
     # ------------------------------------------------------------------ obs
 
-    def _get_obs(self, data) -> jnp.ndarray:
-        """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder."""
+    def _get_obs(self, data, delivered=None) -> jnp.ndarray:
+        """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder.
+
+        ``delivered`` (O,) bool excludes already-delivered boxes from
+        ``nearest_box_vec`` so agents stop being drawn to a box parked in the
+        goal band; ``None`` senses every box (the pre-delivery / no-mask case).
+        """
         box_pos, box_yaw = self._box_pose(data)
         return self.obs_builder.build(
             data,
@@ -442,6 +447,7 @@ class MultiBoxPushMJX:
             box_half=self._box_half,
             goal_coord=self.target_y,  # band spans the top wall: goal axis is y
             goal_axis="y",
+            delivered=delivered,
         )
 
     # ------------------------------------------------------------------ API
@@ -488,7 +494,7 @@ class MultiBoxPushMJX:
             prev_box_goal_dist=self.target_y - box_y,
             delivered=jnp.zeros(self.n_objects, dtype=bool),
         )
-        return self._get_obs(data), state
+        return self._get_obs(data, state.delivered), state
 
     def _advance(
         self, state: EnvState, actions: jnp.ndarray, active: jnp.ndarray | None = None
@@ -589,7 +595,7 @@ class MultiBoxPushMJX:
         t = state.t + 1
         truncated = t >= self.max_steps
 
-        obs = self._get_obs(data)
+        obs = self._get_obs(data, delivered)
         new_state = EnvState(
             data=data, t=t, prev_box_goal_dist=dist, delivered=delivered
         )
