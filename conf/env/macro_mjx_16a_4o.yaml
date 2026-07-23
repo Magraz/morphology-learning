@@ -1,4 +1,22 @@
 # @package _global_
+# Rollout length, overriding the mappo_jax default of 1024. One step here is one
+# macro DECISION (macro_len low-level physics steps), and the macro horizon is
+# only ceil(1024 / macro_len) = 52 decisions, so the inherited 1024 made a single
+# rollout span ~20 episodes per env stream — vs exactly 1 for the base
+# multi_box_push_mjx env, where a step is one physics step. 256 brings that to ~5
+# episodes with a per-update batch of 256*32 = 8192 decisions.
+# NOTE this does NOT change the compute budget: num_updates = n_total_steps //
+# (n_steps * n_envs), so total collected steps is n_total_steps either way. Only
+# n_total_steps moves wall-clock. Keep identical across the macro arms.
+params:
+  n_steps: 256
+  # Compute budget, overriding the mappo_jax default of 1e8. n_total_steps counts
+  # macro DECISIONS here, each of which is macro_len low-level physics steps, so
+  # the inherited 1e8 meant 2e9 physics steps against multi_box_push_mjx's 1e8 —
+  # a 20x wall-clock gap for the same nominal config. 5e6 = 1e8 / macro_len
+  # equalizes the physics budget with mjx_16a_4o, giving 5e6 // 8192 = 610
+  # updates. If you change macro_len, rescale this by the same factor.
+  n_total_steps: 5000000.0
 env:
   # Hierarchical macro-action layer over multi_box_push_mjx: the policy selects
   # among the 4 scripted skills (discrete) and each choice runs macro_len

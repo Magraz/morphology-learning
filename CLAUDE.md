@@ -40,16 +40,62 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   Run: `uv run python train.py env=multi_box_push_9a_3o model=hgnn_mix trial_id=0`;
   sweep: `uv run python train.py -m model=mlp_shared,gnn_critic trial_id=0,1,2`
   (add `hydra/launcher=joblib_auto` for local parallelism).
+- **Hardware must not change the optimization trajectory.** Governing invariant:
+  the machine decides *how fast* data is gathered, never *what* the optimizer
+  sees. Two rules enforce it.
+  1. **The batch is config, not hardware.** For the torch stacks
+     (`mappo`, `mappo_vanilla`) the per-update batch is an explicit
+     `params.batch_size` in **total env-steps** (`conf/algorithm/{mappo,
+     mappo_vanilla}.yaml`, default `32768`), read straight through by
+     `run.py` → `VecMAPPOTrainer.train`. It used to be derived as
+     `n_steps * env.n_envs`, which made the **core count** set the batch and
+     hence `num_updates` — the same nominal run optimized differently on a
+     4-core and a 32-core node. `RolloutCollector.collect` already loops on a
+     *total* step count (`while total_step_count <= max_steps`), so it gathers
+     `batch_size` steps however many envs run in parallel; `n_envs` is now purely
+     a speed knob there. (`params.n_steps` no longer exists for these two
+     stacks.) `mappo_jax` keeps `params.n_steps` — it is the static length of the
+     jitted collect scan and must stay per-env — but its `n_envs` is a literal,
+     so its batch is likewise fixed by config alone.
+  2. **`n_envs` lives in the env group, never in `_self_`.** `conf/config.yaml`
+     deliberately does **not** set `env.n_envs`; being last in the defaults list
+     it would override every group. Each `conf/env/*.yaml` declares its own, and
+     the right value depends on what `n_envs` *means* for that env:
+     - **Subprocess envs** (box2d `multi_box_push`, `hrl_skill`, `smaclite`):
+       `n_envs: ${envs_per_job:${n_jobs}}` — a genuine hardware knob (one OS
+       process per env), safe to autoscale now that the batch is decoupled.
+     - **MJX envs** (`macro_mjx`, `multi_box_push_mjx`): a **literal** `n_envs:
+       32` — this is a vmap width on one device, not a core budget, and it *is*
+       a hyperparameter (batch = `n_steps * n_envs` → `num_updates`). Keep it
+       identical across arms being compared; lower it only for GPU memory, and
+       then for every arm at once.
+  The collector can only move in whole **rows** of `n_envs` steps (the vector env
+  steps every env together; GAE stacks per-env trajectories and needs a uniform
+  length, so cuts must land on a row boundary). Its loop condition is therefore
+  `while total_step_count < max_steps` — with `<=` it took one extra full row
+  even when `max_steps` was hit exactly, making the batch a function of `n_envs`
+  (32800 at `n_envs=32` vs 32776 at 8). With `<`, a batch that `n_envs` divides
+  is collected **exactly**: verified identical `[1024, 2048, 3072]` step grids at
+  `n_envs` ∈ {2, 4, 8, 32}. This matters for analysis, not optimization —
+  `plotting/plot_training_stats.ipynb` averages seeds with
+  `groupby(["plot_group", "total_steps"])`, an exact-value match, so trials whose
+  grids differ stop aggregating (`n_runs` → 1, SEM band becomes one run).
+  Residuals (accepted, not fixed): (1) when `n_envs` does **not** divide
+  `batch_size` a rollout still overshoots by up to `n_envs - 1` — measured
+  `[1032, 2064, 3072]` at `n_envs=12`, i.e. intermediate x points shift though
+  the final total self-corrects (`steps_to_collect = min(batch_size, remaining)`
+  shrinks the last request). Prefer power-of-2 `n_envs`. (2) equal-batch runs at
+  different `n_envs` are not *bit*-identical — advantage normalization is
+  per-env-stream, so 32×128 and 8×512 partition the same transitions
+  differently. Hyperparameters and batch size are invariant; the exact gradient
+  sequence is not.
 - **Parallelism autoscaling (two nested layers).** Layer 1 is the sweep: with
   the joblib launcher each cross-product job runs in its own loky worker. Layer 2
   is per-job rollout collection: `make_vec_env` forks `env.n_envs` box2d
   subprocesses. The two multiply, so the budget is `n_jobs × n_envs ≲ cores`.
-  A single top-level knob `n_jobs` (in `conf/config.yaml`, default `1`) drives
-  both: `conf/config.yaml`'s `_self_` block sets `env.n_envs:
-  ${envs_per_job:${n_jobs}}` → `usable_cores // n_jobs` **centrally** for every
-  env group (it wins over the selected `conf/env/*` because `_self_` is last;
-  pin a fixed count on the CLI with `env.n_envs=<N>`), and the
-  `hydra/launcher=joblib_auto` group
+  The top-level knob `n_jobs` (in `conf/config.yaml`, default `1`) drives both:
+  subprocess env groups set `n_envs: ${envs_per_job:${n_jobs}}` →
+  `usable_cores // n_jobs`, and the `hydra/launcher=joblib_auto` group
   (`conf/hydra/launcher/joblib_auto.yaml`, wraps the plugin's `joblib` and sets
   `n_jobs: ${n_jobs}`) makes joblib run that many at once. Resolvers `cores` /
   `envs_per_job` are registered at `train.py` import; `_usable_cores()` reads the
@@ -332,8 +378,9 @@ drop-in comparable:
 
 - **Same per-iteration cadence** (`run.py` ≙ `VecMAPPOTrainer.train`): jitted
   `collect_fn` (≙ `RolloutCollector.collect` — resets all envs at the top of
-  every rollout, scans `params.n_steps` (the per-update batch is `n_steps *
-  n_envs` env-steps in both stacks, scaling with parallelism), restarts envs that
+  every rollout, scans `params.n_steps` (per-update batch = `n_steps * n_envs`
+  env-steps here; the vanilla stack reaches the same total via an explicit
+  `params.batch_size` — see the hardware-invariance rules above), restarts envs that
   finish mid-rollout since MJX has no auto-reset, bootstraps the final value) →
   jitted `update_fn` (≙ `MAPPOAgent.update`) → jitted deterministic `eval_fn`
   (≙ `PolicyEvaluator`, 5 parallel episodes → the `reward` stat). Deviation:
@@ -433,14 +480,14 @@ drop-in comparable:
   `mappo_vanilla`), `conf/env/multi_box_push_mjx_9a_3o.yaml` (dense team reward)
   and `conf/env/multi_box_push_mjx_9a_3o_dr.yaml` (difference rewards), model
   group `mlp` (plain `hidden_dim`; `mlp_shared` carries full-MAPPO keys like
-  `critic_type` that `Model_Params` rejects). The central `env.n_envs` autoscale
-  targets subprocess envs — for vmapped MJX pin it on the CLI:
+  `critic_type` that `Model_Params` rejects). Every MJX env group carries a
+  literal `n_envs: 32`, so no CLI pin is needed (override only to experiment):
   ```
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o \
-      model=mlp trial_id=0 env.n_envs=32
+      model=mlp trial_id=0
   # difference-rewards arm (same command, _dr env group):
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o_dr \
-      model=mlp trial_id=0 env.n_envs=32
+      model=mlp trial_id=0
   ```
 
 ## Coordination-graph novelty exploration (gnn critic)
@@ -794,16 +841,34 @@ normally uncheckable, since most envs cannot rewind.
       fine-control (small `macro_len`) vs coalition-credit (window ≥ ~30) tension
       is real; the `_wdr` group picks `macro_len=30` for the credit signal.
 
+    **Budget scaling: every `macro_mjx_*` group must divide `params.n_total_steps`
+    and `params.n_steps` by `macro_len`.** Both are counted in *env steps*, and one
+    env step of `SyncMacroMJX` is one macro **decision** = `macro_len` low-level
+    `mjx.step`s (plus a 4-skill `all_skill_actions` evaluation each), so inheriting
+    the `mappo_jax` defaults (`n_total_steps: 1e8`, `n_steps: 1024`) silently made
+    the macro arms cost `macro_len`× the base env for the same nominal config — at
+    `macro_len=20` that was 2e9 low-level steps vs `mjx_16a_4o`'s 1e8, i.e. ~20×
+    the wall-clock, plus rollouts spanning ~20 episodes per stream (the macro
+    horizon is only `ceil(1024/20) = 52`) against exactly 1 for the base env. The
+    `macro_mjx_16a_4o*` groups therefore pin `n_total_steps: 5e6` (= 1e8/20, so the
+    **low-level physics budget matches `mjx_16a_4o` exactly**) and `n_steps: 256`
+    (~5 episodes/stream, batch 8192 decisions, 610 updates). Note `n_steps` alone
+    is *not* a wall-clock knob — `num_updates = n_total_steps // (n_steps*n_envs)`,
+    so lowering it only trades batch size for update count; only `n_total_steps`
+    moves total compute. Rescale both if you change `macro_len`, and keep them
+    identical across arms being compared. The `_wdr`/`_stagger_wdr*` counterfactual
+    forks are *extra* compute on top of that factual budget.
+
     All three arms verified end-to-end (train + resume + evaluate); the `_dr`/
     `_wdr` critic heads are `n_agents`-wide, the actor a 4-way categorical. Launch:
     ```
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o \
-        model=mlp trial_id=0 env.n_envs=32
+        model=mlp trial_id=0
     # single-step difference-rewards arm (_dr) / windowed arm (_wdr):
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_dr \
-        model=mlp trial_id=0 env.n_envs=32
+        model=mlp trial_id=0
     uv run python train.py algorithm=mappo_jax env=macro_mjx_9a_3o_wdr \
-        model=mlp trial_id=0 env.n_envs=32
+        model=mlp trial_id=0
     ```
   - **Staggered starts (async-onset study).** `SyncMacroMJX(stagger_starts=True,
     max_start_delay=D)` makes each agent come online at a random **low-level** step
@@ -835,7 +900,7 @@ normally uncheckable, since most envs cannot rewind.
     Launch:
     ```
     uv run python train.py algorithm=mappo_jax env=macro_mjx_16a_4o_stagger \
-        model=mlp trial_id=0 env.n_envs=32
+        model=mlp trial_id=0
     ```
   - **Difference rewards under asynchrony (global-window baseline).** Stagger now
     also supports `reward_mode="windowed_difference_rewards"`: the per-agent reward
@@ -868,7 +933,7 @@ normally uncheckable, since most envs cannot rewind.
     between the two measures the misattribution cost. Launch:
     ```
     uv run python train.py algorithm=mappo_jax env=macro_mjx_16a_4o_stagger_wdr \
-        model=mlp trial_id=0 env.n_envs=32
+        model=mlp trial_id=0
     ```
   - **Decision-aligned difference rewards under asynchrony (the phase-corrected
     arm).** `reward_mode="aligned_windowed_difference_rewards"` credits each agent
@@ -906,7 +971,7 @@ normally uncheckable, since most envs cannot rewind.
     is the cost of the phase misattribution. Launch:
     ```
     uv run python train.py algorithm=mappo_jax \
-        env=macro_mjx_16a_4o_stagger_wdr_aligned model=mlp trial_id=0 env.n_envs=32
+        env=macro_mjx_16a_4o_stagger_wdr_aligned model=mlp trial_id=0
     ```
 - **`algorithms/difference_rewards/oracle.py`** — exact `D_i` by **forking the
   simulator** (`MultiBoxPushMJX` is pure, so a state can be replayed under a

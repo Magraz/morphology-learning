@@ -1,4 +1,12 @@
 # @package _global_
+# See macro_mjx_16a_4o.yaml: one step is one macro DECISION, so the mappo_jax
+# default of 1024 spans ~20 episodes per stream (horizon is 52). Held identical
+# across every macro arm so the arms stay comparable.
+params:
+  n_steps: 256
+  # 1e8 / macro_len: equalizes the low-level physics budget with mjx_16a_4o (see
+  # macro_mjx_16a_4o.yaml). Rescale if macro_len changes.
+  n_total_steps: 5000000.0
 env:
   # Staggered-starts ASYNCHRONY study over the hierarchical macro env. Same as
   # macro_mjx_16a_4o (dense team reward, SyncMacroMJX, one transition per macro
