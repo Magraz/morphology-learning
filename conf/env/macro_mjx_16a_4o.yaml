@@ -16,7 +16,7 @@ params:
   # a 20x wall-clock gap for the same nominal config. 5e6 = 1e8 / macro_len
   # equalizes the physics budget with mjx_16a_4o, giving 5e6 // 8192 = 610
   # updates. If you change macro_len, rescale this by the same factor.
-  n_total_steps: 5000000.0
+  n_total_steps: 10000000.0
 env:
   # Hierarchical macro-action layer over multi_box_push_mjx: the policy selects
   # among the 4 scripted skills (discrete) and each choice runs macro_len
