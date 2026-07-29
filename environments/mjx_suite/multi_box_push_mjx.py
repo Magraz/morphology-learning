@@ -353,8 +353,10 @@ class MultiBoxPushMJX:
             raise ValueError("spawn region too small for n_agents")
         xs = np.linspace(x_lo, x_hi, n_cols)
         ys = np.linspace(y_lo, y_hi, n_rows)
-        gap = min(xs[1] - xs[0] if n_cols > 1 else np.inf,
-                  ys[1] - ys[0] if n_rows > 1 else np.inf)
+        gap = min(
+            xs[1] - xs[0] if n_cols > 1 else np.inf,
+            ys[1] - ys[0] if n_rows > 1 else np.inf,
+        )
         self._agent_spawn_jitter = max(0.0, (gap - min_dist) / 2)
         gx, gy = np.meshgrid(xs, ys)
         return jnp.asarray(
@@ -521,7 +523,13 @@ class MultiBoxPushMJX:
 
         # boundary termination: any agent touching a wall plane
         lo = self.boundary_thickness + _AGENT_RADIUS + _WALL_EPS
-        boundary_hit = jnp.any((agent_pos < lo) | (agent_pos > self.world_width - lo))
+        top_right_boundary_hit = jnp.hstack(
+            [
+                (agent_pos[:, 0] > self.world_width - lo)[:, jnp.newaxis],
+                (agent_pos[:, 1] > self.world_height - lo)[:, jnp.newaxis],
+            ]
+        )
+        boundary_hit = jnp.any((agent_pos < lo) | top_right_boundary_hit)
 
         # reward: shaping toward the band + one-time delivery bonus
         dist = self.target_y - box_pos[:, 1]  # (O,) signed, matches Box2D
@@ -570,7 +578,9 @@ class MultiBoxPushMJX:
 
         return g_factual - jax.vmap(counterfactual)(agent_ids)
 
-    def step(self, state: EnvState, actions: jnp.ndarray, active: jnp.ndarray | None = None):
+    def step(
+        self, state: EnvState, actions: jnp.ndarray, active: jnp.ndarray | None = None
+    ):
         """actions: (n_agents, 2) in [-1, 1]. Returns
         (obs, state, reward, terminated, truncated, info).
 
@@ -647,12 +657,18 @@ if __name__ == "__main__":
     parser.add_argument("--n-objects", type=int, default=3)
     parser.add_argument("--n-envs", type=int, default=32, help="vmap batch size")
     parser.add_argument("--steps", type=int, default=200)
+    parser.add_argument("--debug", type=bool, default=True)
     args = parser.parse_args()
 
+    if args.debug:
+        jax.config.update("jax_disable_jit", True)
+
     env = MultiBoxPushMJX(n_agents=args.n_agents, n_objects=args.n_objects)
-    print(f"world {env.world_width}x{env.world_height}, "
-          f"coupling {list(env.objects_push_coupling_list)}, "
-          f"box half-extents {list(env.box_half_extents)}")
+    print(
+        f"world {env.world_width}x{env.world_height}, "
+        f"coupling {list(env.objects_push_coupling_list)}, "
+        f"box half-extents {list(env.box_half_extents)}"
+    )
 
     reset = jax.jit(env.reset)
     step = jax.jit(env.step)
@@ -671,9 +687,11 @@ if __name__ == "__main__":
         if bool(term) or bool(trunc):
             done_at = i + 1
             break
-    print(f"scripted rollout: return {total:.1f}, "
-          f"delivered {np.asarray(info['delivered'])}, "
-          f"ended at step {done_at} ({time.time() - t0:.1f}s incl. compile)")
+    print(
+        f"scripted rollout: return {total:.1f}, "
+        f"delivered {np.asarray(info['delivered'])}, "
+        f"ended at step {done_at} ({time.time() - t0:.1f}s incl. compile)"
+    )
 
     # --- vmapped random-action throughput ---
     v_reset = jax.jit(jax.vmap(env.reset))
@@ -696,5 +714,7 @@ if __name__ == "__main__":
     jax.block_until_ready(o)
     dt = time.time() - t0
     sps = (args.steps - 1) * args.n_envs / dt
-    print(f"vmapped throughput: {sps:,.0f} env-steps/s "
-          f"({args.n_envs} envs, {dt:.2f}s for {args.steps - 1} steps)")
+    print(
+        f"vmapped throughput: {sps:,.0f} env-steps/s "
+        f"({args.n_envs} envs, {dt:.2f}s for {args.steps - 1} steps)"
+    )

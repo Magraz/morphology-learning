@@ -42,12 +42,10 @@ class MAPPO_JAX_Runner:
         trials_dir: Path,
         trial_id: str,
         checkpoint: bool,
-        debug: bool,
         exp_config: Experiment,
         env_config: dict,
     ):
-        if debug:
-            jax.config.update("jax_disable_jit", True)
+
         # Directory setup (same layout as Runner, without the torch import)
         self.device = device
         self.trial_id = trial_id
@@ -105,9 +103,8 @@ class MAPPO_JAX_Runner:
             # env and passes through the wrapper's accumulation.
             base_reward_mode = (
                 "dense"
-                if reward_mode in (
-                    WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS
-                )
+                if reward_mode
+                in (WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS)
                 else reward_mode
             )
             base_env = MultiBoxPushMJX(
@@ -434,9 +431,7 @@ class MAPPO_JAX_Runner:
         # at each macro boundary off the base obs there, exactly as SyncMacroMJX
         # does internally.
         base_step_fn = jax.jit(render_env.step) if is_macro else None
-        skill_actions_fn = (
-            jax.jit(self.env._skill_actions) if is_macro else None
-        )
+        skill_actions_fn = jax.jit(self.env._skill_actions) if is_macro else None
 
         print("\nTesting trained agents...")
         for episode in range(10):
@@ -497,9 +492,7 @@ class MAPPO_JAX_Runner:
 
             if native_frames:
                 native_path = self.dirs["logs"] / f"episode_{episode}_native.mp4"
-                imageio.mimwrite(
-                    native_path, native_frames, fps=30, macro_block_size=1
-                )
+                imageio.mimwrite(native_path, native_frames, fps=30, macro_block_size=1)
                 print(f"Native video saved to {native_path}")
 
     def evaluate(self):

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from algorithms.types import AlgorithmEnum
+import jax
 
 
 def _dispatch(
@@ -82,10 +83,11 @@ def _dispatch(
                 results_dir,
                 trial_id,
                 checkpoint,
-                debug,
                 exp_config,
                 env_config,
             )
+            if debug:
+                jax.config.update("jax_disable_jit", True)
 
         case AlgorithmEnum.DCG:
             from algorithms.dcg.run import DCG_Runner
