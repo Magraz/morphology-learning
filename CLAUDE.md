@@ -368,6 +368,114 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   `mappo_jax` stack (below) via `EnvironmentEnum.MULTI_BOX_MJX =
   "multi_box_push_mjx"`.
 
+#### Box drift / "decay" (`box_drift_speed`, off by default)
+
+Every box whose coupling requirement is **not currently met** sinks toward the
+bottom wall at a constant speed, so progress decays on any box the team is not
+working on. Added because `mappo_jax` fully solves `mjx_16a_4o`: a 16-agent
+swarm can deliver boxes one at a time, so no coalition structure has to be
+discovered. With the drift a sequential schedule arithmetically cannot reach its
+last box. Env groups `conf/env/mjx_16a_4o_drift.yaml` (drift, `box_drift_speed:
+0.5`) and `conf/env/mjx_16a_4o_trunc.yaml` (the termination-semantics control —
+see below; the drift arm changes two things at once, so this arm is what makes
+the comparison attributable).
+
+- **Mechanism**: a generalized force on each box's world-y slide DOF via
+  `data.qfrc_applied`, set in `_advance`. The y slide axis is world-fixed
+  regardless of box yaw (mjx rotates a joint axis by the quat accumulated from
+  *preceding* joints only, and the box joint order is slide-x, slide-y,
+  hinge-yaw). Since `_model_for` sets `dof_damping[box y] = _BOX_LIN_DAMPING *
+  mass`, sizing the force as `F = -v_d * _BOX_LIN_DAMPING * mass` puts the fixed
+  point at exactly `-v_d` **independent of box mass**, with a mass-independent
+  time constant `tau = 1 / _BOX_LIN_DAMPING = 0.2 s` (12 steps). Verified:
+  terminal `v_y = -0.79995` for `v_d = 0.8`, `|v_x|`/`|v_yaw| < 1e-4`, identical
+  across masses 180–627 kg, and the transient at 12 steps is 0.617 == `1 - rho^12`
+  with `rho = 1/(1 + k*dt)`.
+- **Gate**: `~met & ~delivered & (box_y > box_drift_floor)`. `met` comes from the
+  new `_coupling_met`, extracted from `_model_for` so the mass override and the
+  drift share one notion of "working together" — and so the drift is masked by
+  `active` and is therefore automatically part of every difference-reward
+  counterfactual.
+- **Floor** (`box_drift_floor`, default `boundary_thickness + 2 *
+  box_half_extent` = 3.7 at 16a/4o): a box resting on the bottom wall is
+  **unrecoverable** — to push it up an agent centre must reach `box_bottom -
+  radius` = 0.1, but boundary termination fires at `bt + radius + eps` = 0.91.
+  One box-width of clearance is the smallest floor that keeps the geometry
+  feasible (verified: a box spawned exactly at the floor is pushed out and
+  delivered by a *minimum* coalition in 275 steps). It costs the mechanic
+  nothing — a passive box needs ~20 s to reach it versus a 17 s episode.
+  Implemented as a force gate, **not** an mjx joint limit: a limit is static
+  model structure (an extra constraint row on every step of every arm, so the
+  drift-off graph would change), MJX limits are soft, and it would obstruct
+  legitimate downward pushing. Known property: the floor guarantees the geometry
+  for a minimum coalition, not that any crowd survives — piling the whole team
+  under a floored box can still shove one of them into the wall.
+- **`boundary_truncates`** (independent flag; defaults to `box_drift_speed > 0`):
+  reports a boundary hit as `truncated` rather than `terminated`. Necessary
+  because the drift makes shaping negative on every step an uncoupled box exists,
+  which turns the boundary-hit *termination* into an escape from the bleeding (it
+  pays 0 and ends the episode) — worth **+5.3 discounted** at gamma=0.99, ~15% of
+  the discounted value of solving the task, and reachable in ~6 steps from spawn
+  by any one of 16 agents. `mappo_jax/trainer.py:143-147` already adds
+  `gamma * V(s_next)` on truncation (computed pre-reset, so it values the real
+  successor), so reclassifying prices a wall hit at the cost of continuing — no
+  magic constant, no gamma knowledge in the env, and it propagates to the macro
+  arms for free. **Residual risk to watch:** truncation is now agent-*controllable*,
+  so until the critic learns that drifting states are worth < 0 the suicide bias
+  survives; if mean episode length collapses in the first ~10 updates, ramp
+  `box_drift_speed` from 0 over the first 10% of training.
+- **`box_drift_speed=0` is a strict no-op**: every branch is a Python-level `if`,
+  so the graph and the numbers are unchanged. Verified **bit-identical** qpos /
+  qvel / obs / reward over a fixed-seed 200-step rollout against the pre-change
+  code.
+- **Calibration** (16a/4o, 4 seeds, scripted swarm vs balanced partition). Mean y
+  of the boxes the swarm ignores / boxes delivered by the partition:
+
+  | `v_d`        | 0.0  | 0.2  | 0.3  | 0.5  | 0.8  |
+  |--------------|------|------|------|------|------|
+  | ignored-box y| 22.8 | 19.5 | 17.7 | 14.3 | 12.3 |
+  | partition box| 3.75 | 3.50 | 3.50 | 3.50 | 3.25 |
+
+  Decay pressure is monotone in `v_d`; `0.5` is the knee — near-maximal decay
+  without extra degradation of a *correct* strategy. At `0.8` the 819 N force
+  exceeds a full 4-agent coalition's 400 N of thrust, so exactly-coupling
+  coalitions become fragile *while forming* and even the scripted partition
+  starts dropping boxes.
+- **Measured, and contrary to the design prediction:** the partition-over-swarm
+  return *gap* does **not** widen with drift (16a/4o, 4 seeds: +318 at `v_d=0` vs
+  +284 at 0.8; it stays roughly flat). With a scripted oracle both arms pay drift
+  cost. What is robust is that the partition still wins at every `v_d` (the
+  mechanic never inverts the preference) and that the swarm's ignored boxes decay
+  monotonically. Whether it changes what a *learned* policy does is a training
+  question, not a scripted-probe one.
+- **Difference rewards are structurally blind to this pressure.** An unattended
+  box's drift cost does not depend on agent *i*, so it appears identically in `G`
+  and `G_-i` and cancels exactly. Measured: pivotal `D_i` (exactly `coupling`
+  agents touching) rises only ~7% (1.33e-2 -> 1.43e-2), and the pile-on case
+  (`2*coupling` touching) is unchanged to 4 significant figures. **Use the drift
+  arms in the dense/team-reward study, not as a fix for the DR magnitude gap.**
+- **Config plumbing**: `algorithms/mappo_jax/run.py` used to `.get()` a hard-coded
+  key list at each of its two `MultiBoxPushMJX` construction sites (bare, and as
+  the macro wrapper's base), so an `env:` yaml key that only one site forwarded
+  was silently ignored — which is why `coupling_def` / `max_steps` /
+  `comm_radius` were unreachable from Hydra. Both sites now go through
+  `_base_env_kwargs(env_config)` (`_BASE_ENV_KEYS` / `_RUNNER_ENV_KEYS`), which
+  also **warns** on unrecognized `env:` keys. Nothing else validates the `env:`
+  block — no dataclass guards it (`environments/types.py:EnvironmentParams` is
+  never instantiated).
+- **`scripted_push_action` now takes a per-agent assignment** (`box_idx` scalar,
+  or `(A,)` e.g. `jnp.arange(A) % O` for a balanced partition) and gives agents
+  sharing a box **distinct slots** along its bottom face. With the old single
+  shared staging point they collided and only ~2 ever reached the surface, so a
+  coalition of exactly `coupling` agents could never satisfy the requirement —
+  the swarm demo only worked because 9 agents crowding one box got 3 in contact
+  by accident. Surplus agents clamp to the face edges and crowd in as before.
+- Assertion suite (10 checks: no-op, terminal velocity/axis purity/mass
+  independence/transient, floor settling, coupling gate, reward semantics,
+  truncation, recoverability, efficacy, vmapped stability, DR structure):
+  `uv run python -m environments.mjx_suite.multi_box_push_mjx --check-drift
+  [--n-agents 16 --n-objects 4]` (needs jit, so it ignores `--debug`).
+
 ## JAX MAPPO (`algorithms/mappo_jax/`)
 
 `algorithm=mappo_jax` (`AlgorithmEnum.MAPPO_JAX`) is a fully-jitted MAPPO that

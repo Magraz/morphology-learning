@@ -1,0 +1,20 @@
+# @package _global_
+#
+# Ablation control for `mjx_16a_4o_drift`: no drift, but the SAME termination
+# semantics — a boundary hit is reported as `truncated` instead of `terminated`,
+# so the trainer bootstraps `gamma * V(s_next)` through a wall hit instead of
+# treating it as a value-0 terminal.
+#
+# The drift arm changes two things at once (the physics and this reclassification),
+# so this arm is what makes the comparison attributable. Expect it to be close to
+# `mjx_16a_4o`: without drift there is no negative reward stream to escape from,
+# and a wall hit is already near-worthless. A large gap here would mean the
+# baseline was quietly being taught that wall states are worth 0.
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 16
+  n_objects: 4
+  reward_mode: dense
+
+  variant: trunc

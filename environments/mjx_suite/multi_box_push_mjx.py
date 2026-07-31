@@ -228,7 +228,7 @@ class MultiBoxPushMJX:
         # directly — the two agree except where the 1.5 minimum box size binds,
         # and there the raw coupling form would under-provide clearance.
         drift_floor = self.boundary_thickness + 2 * self.box_half_extents
-        self.box_drift_floor = np.full_like(
+        self.box_drift_floor = np.array(
             self.boundary_thickness + 2 * self.box_half_extents
         )  # (O,) numpy, for logging/tests
         self._drift_floor = jnp.asarray(drift_floor, dtype=jnp.float32)
@@ -239,9 +239,8 @@ class MultiBoxPushMJX:
         # so the ablation can isolate the termination-semantics change.
         self.boundary_truncates = (
             True
-            if _VARIANT_MAP[variant]
-            == VARIANTS.DRIFT | _VARIANT_MAP[variant]
-            == VARIANTS.TRUNC
+            if (_VARIANT_MAP[variant] == VARIANTS.DRIFT)
+            | (_VARIANT_MAP[variant] == VARIANTS.TRUNC)
             else False
         )
 
