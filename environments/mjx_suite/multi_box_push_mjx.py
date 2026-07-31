@@ -78,6 +78,13 @@ the agents have to partition into simultaneous coalitions.
 - ``box_drift_speed=0`` (the default) is a strict no-op: every branch is a
   Python-level ``if``, so the compiled graph and the numbers are unchanged
   (verified bit-identical over a 200-step rollout).
+- The Hydra config surface is the ``variant`` **preset** (``env.variant`` in
+  ``conf/env/*.yaml``), since a yaml only needs the named arms: ``"drift"`` ->
+  ``box_drift_speed=_DEFAULT_DRIFT_SPEED`` + ``boundary_truncates=True``,
+  ``"trunc"`` -> truncation only, ``None`` (default) -> both off. It only
+  supplies *defaults*; passing ``box_drift_speed`` / ``box_drift_floor`` /
+  ``boundary_truncates`` explicitly overrides it, which is how the assertion
+  suite and the calibration sweep dial values without a variant name per value.
 
 Differences from Box2D worth knowing:
 - Spawns use shuffled jittered grids instead of rejection sampling (jit needs
@@ -93,7 +100,7 @@ Run the built-in demo / sanity check (no display needed):
 
 import dataclasses
 import math
-from enum import Enum
+from enum import StrEnum
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -119,12 +126,29 @@ _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
 
-_VARIANT_MAP = {"trunc": 1, "drift": 2}
+
+class VARIANTS(StrEnum):
+    """Preset bundles of the drift / termination-semantics knobs.
+
+    A `StrEnum` (the repo idiom, cf. `EnvironmentEnum`) so `VARIANTS("drift")`
+    parses a config string straight into a member. The previous
+    `{"trunc": 1, "drift": 2}` side table handed back a raw `int`, and
+    `2 == VARIANTS.DRIFT` is silently `False` for a plain `Enum` — so every
+    branch below evaluated to "off" and the drift never applied a force.
+    """
+
+    TRUNC = "trunc"  # boundary hits truncate rather than terminate; no drift
+    DRIFT = "drift"  # the above + uncoupled boxes decay toward the bottom wall
 
 
-class VARIANTS(Enum):
-    TRUNC = 1
-    DRIFT = 2
+# Drift speed the `"drift"` variant selects. Deliberately *past* the calibrated
+# knee: the scripted-probe sweep put the knee at 0.5 (near-maximal decay without
+# degrading a correct partition), and already at 0.8 the drift force exceeds a
+# full coalition's thrust, so exactly-coupling coalitions get fragile *while
+# forming*. Once coupling is met the drift is off entirely (`_drift_force`), so
+# this never fights a formed coalition — it only shortens the window agents have
+# to converge on a sinking box. Not re-swept at this value.
+_DEFAULT_DRIFT_SPEED = 1.0
 
 
 @jax.tree_util.register_dataclass
@@ -145,11 +169,23 @@ class MultiBoxPushMJX:
         max_steps: int = 1024,
         reward_mode: str = "dense",
         variant: str = None,
+        box_drift_speed: float = None,
+        box_drift_floor=None,
+        boundary_truncates: bool = None,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
                 f"reward_mode must be dense|sparse|difference_rewards, got {reward_mode}"
             )
+        if variant is not None:
+            try:
+                variant = VARIANTS(variant)
+            except ValueError:
+                raise ValueError(
+                    f"unknown variant: {variant!r}; expected one of "
+                    f"{[v.value for v in VARIANTS]} or None"
+                ) from None
+        self.variant = variant
         self.n_agents = n_agents
         self.n_objects = n_objects
         self.max_steps = max_steps
@@ -211,7 +247,12 @@ class MultiBoxPushMJX:
         )
 
         # --- box drift ("decay"); see the module docstring ---
-        self.box_drift_speed = 0.5 if _VARIANT_MAP[variant] == VARIANTS.DRIFT else 0.0
+        # `variant` is only a preset: it supplies the defaults and any explicit
+        # kwarg wins, so the assertion suite and the calibration sweep can dial
+        # speed/floor directly without inventing a variant name per value.
+        if box_drift_speed is None:
+            box_drift_speed = _DEFAULT_DRIFT_SPEED if variant is VARIANTS.DRIFT else 0.0
+        self.box_drift_speed = float(box_drift_speed)
         self._drift_on = self.box_drift_speed > 0.0
         # F = -v_d * k * m has fixed point v = F / (k*m) = -v_d, so the terminal
         # speed is mass-independent. The gate is `~met`, so the force only ever
@@ -227,22 +268,22 @@ class MultiBoxPushMJX:
         # Keyed off the half-extent rather than `coupling * _AGENT_RADIUS`
         # directly — the two agree except where the 1.5 minimum box size binds,
         # and there the raw coupling form would under-provide clearance.
-        drift_floor = self.boundary_thickness + 2 * self.box_half_extents
-        self.box_drift_floor = np.array(
-            self.boundary_thickness + 2 * self.box_half_extents
-        )  # (O,) numpy, for logging/tests
+        if box_drift_floor is None:
+            drift_floor = self.boundary_thickness + 2 * self.box_half_extents
+        else:  # scalar or (O,) override; broadcast so the gate stays per-box
+            drift_floor = np.broadcast_to(
+                np.asarray(box_drift_floor, dtype=float), (n_objects,)
+            )
+        self.box_drift_floor = np.array(drift_floor)  # (O,) numpy, for logging/tests
         self._drift_floor = jnp.asarray(drift_floor, dtype=jnp.float32)
         # Drift makes shaping negative while any box is uncoupled, which turns
         # boundary-hit *termination* into an escape from the bleeding (pays 0,
         # ends the episode). Truncating instead lets the trainers' truncation
         # bootstrap price a wall hit at the cost of continuing. Independent knob
         # so the ablation can isolate the termination-semantics change.
-        self.boundary_truncates = (
-            True
-            if (_VARIANT_MAP[variant] == VARIANTS.DRIFT)
-            | (_VARIANT_MAP[variant] == VARIANTS.TRUNC)
-            else False
-        )
+        if boundary_truncates is None:
+            boundary_truncates = self._drift_on or variant is VARIANTS.TRUNC
+        self.boundary_truncates = bool(boundary_truncates)
 
         # --- build & compile the planar MuJoCo model ---
         self._heavy_mass_np = heavy_mass  # kept for the visual model rebuild

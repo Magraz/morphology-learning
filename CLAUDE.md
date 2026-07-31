@@ -375,10 +375,34 @@ bottom wall at a constant speed, so progress decays on any box the team is not
 working on. Added because `mappo_jax` fully solves `mjx_16a_4o`: a 16-agent
 swarm can deliver boxes one at a time, so no coalition structure has to be
 discovered. With the drift a sequential schedule arithmetically cannot reach its
-last box. Env groups `conf/env/mjx_16a_4o_drift.yaml` (drift, `box_drift_speed:
-0.5`) and `conf/env/mjx_16a_4o_trunc.yaml` (the termination-semantics control —
-see below; the drift arm changes two things at once, so this arm is what makes
-the comparison attributable).
+last box. Env groups `conf/env/mjx_16a_4o_drift.yaml` (`variant: drift`) and
+`conf/env/mjx_16a_4o_trunc.yaml` (`variant: trunc`, the termination-semantics
+control — see below; the drift arm changes two things at once, so this arm is
+what makes the comparison attributable).
+
+- **Config surface is `env.variant`, a preset** — the yamls select a named arm,
+  not raw numbers: `"drift"` → `box_drift_speed=_DEFAULT_DRIFT_SPEED` (1.0,
+  past the 0.5 knee of the calibration table below; not re-swept there) +
+  `boundary_truncates=True`; `"trunc"` → truncation only; absent/`None`
+  (baseline `mjx_16a_4o`, every `macro_mjx_*`, `multi_box_push_mjx_*`) → both
+  off. `run.py` forwards it to `MultiBoxPushMJX` at both construction sites
+  (bare and macro-wrapped). The preset only supplies *defaults*: passing
+  `box_drift_speed` / `box_drift_floor` / `boundary_truncates` explicitly wins,
+  which is how `--check-drift` and the calibration sweep dial values without
+  needing a variant name per value.
+  - **Regression to know about (fixed 2026-07-31, was live in 32cf60d and
+    7db37b3):** `VARIANTS` was a plain `Enum` read through a side table
+    `_VARIANT_MAP = {"trunc": 1, "drift": 2}`, so the guards compared a raw
+    `int` to an enum member — `2 == VARIANTS.DRIFT` is silently `False`. Drift
+    and `boundary_truncates` were therefore **off in every run**, and
+    `variant=None` raised `KeyError: None`, breaking the baseline/macro groups
+    outright. `VARIANTS` is now a `StrEnum` (the repo idiom, cf.
+    `EnvironmentEnum`) parsed via `VARIANTS(variant)`, which also rejects an
+    unknown name instead of failing open. **Any `mjx_16a_4o_drift` /
+    `mjx_16a_4o_trunc` result produced before this fix is really a baseline
+    run and must be rediscarded/retrained.** The `--check-drift` suite did not
+    catch it because the same commit dropped the `box_drift_speed` kwarg the
+    suite constructs with, so the suite could not run at all.
 
 - **Mechanism**: a generalized force on each box's world-y slide DOF via
   `data.qfrc_applied`, set in `_advance`. The y slide axis is world-fixed
