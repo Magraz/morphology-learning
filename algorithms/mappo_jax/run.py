@@ -86,8 +86,9 @@ class MAPPO_JAX_Runner:
         if environment == EnvironmentEnum.MULTI_BOX_MJX:
             self.env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
-                n_objects=env_config.get("n_objects", 3),
+                n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
+                variant=env_config.get("variant"),
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -109,8 +110,9 @@ class MAPPO_JAX_Runner:
             )
             base_env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
-                n_objects=env_config.get("n_objects", 3),
+                n_objects=env_config.get("n_objects"),
                 reward_mode=base_reward_mode,
+                variant=env_config.get("variant"),
             )
             self.env = SyncMacroMJX(
                 base_env,

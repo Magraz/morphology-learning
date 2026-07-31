@@ -30,14 +30,59 @@ Parity with the Box2D env (same layout as ``observation.py``'s OBS_DIM = 40):
   ``coupling`` agents touch it, then drops to the light coupled mass. Done by
   overriding ``body_mass``/``body_inertia``/``dof_damping`` on the mjx.Model
   pytree each step (the model is a step argument, so this is jit-safe).
+  ``_coupling_met`` owns the "enough agents working together" predicate; the
+  mass override and the box drift (below) both read it, so they cannot diverge.
 - physics constants: dt = 1/60, agent mass 1 / radius 0.4 / damping 10, box 2D
   density 20 (0.05 * coupling when coupled), box linear/angular damping 5/8.
   Box2D's body damping is emulated with joint damping = coeff * mass (inertia
   for the hinge), which has the same steady state (v_terminal = F / (m * d)).
 
+Box drift ("decay"), off by default — ``box_drift_speed > 0``:
+
+Every *uncoupled* box sinks toward the bottom wall at a constant speed, so
+progress decays on any box the team is not currently working on. The point is to
+break the sequential strategy (swarm all agents onto one box, deliver, repeat)
+that makes the dense task easy: the boxes the swarm is not on lose ground the
+whole time, so a sequential schedule arithmetically cannot reach its last box and
+the agents have to partition into simultaneous coalitions.
+
+- Applied as a generalized force on each box's world-y slide DOF
+  (``data.qfrc_applied``). The y slide axis is world-fixed regardless of box yaw:
+  ``mjx`` rotates a joint's axis by the quaternion accumulated from *preceding*
+  joints only, and the box joint order is slide-x, slide-y, hinge-yaw, so both
+  slides resolve while that quat is still identity.
+- Since ``_model_for`` sets ``dof_damping[box y] = _BOX_LIN_DAMPING * mass``, a
+  constant force has fixed point ``v* = F / (k * m)``. Sizing the force as
+  ``F = -box_drift_speed * _BOX_LIN_DAMPING * mass`` therefore gives a terminal
+  speed of exactly ``box_drift_speed`` **independent of box mass**, and the time
+  constant ``tau = m / (k * m) = 1 / k = 0.2 s`` (12 steps) is mass-independent
+  too — negligible against a 1024-step episode.
+- Gated on ``~met & ~delivered & (box_y > box_drift_floor)``. ``met`` comes from
+  the same ``_coupling_met`` as the mass override and is masked by ``active``, so
+  the drift is automatically part of every difference-reward counterfactual: drop
+  a *pivotal* agent and its box starts sinking in the counterfactual branch.
+- The floor keeps a sunk box **recoverable**. To push a box up an agent must get
+  under it, but an agent within ``boundary_thickness + _AGENT_RADIUS`` of the
+  wall ends the episode, so a box resting on the bottom wall can never be pushed
+  out. Default floor ``boundary_thickness + 2 * box_half_extent`` (one box-width
+  of clearance, i.e. ``2 * coupling * _AGENT_RADIUS`` wherever the minimum box
+  size does not bind) is the smallest that keeps the geometry feasible. It is
+  insurance, not a cap on the pressure: a passive box needs ~20 s to reach it
+  versus a 17 s episode.
+- Drift makes the shaping term negative on every step an uncoupled box exists,
+  which turns the boundary-hit *termination* into an escape from the bleeding
+  (it pays 0 and ends the episode). ``boundary_truncates`` — on by default
+  whenever the drift is on — reclassifies a boundary hit as ``truncated`` rather
+  than ``terminated``, so the trainers' truncation bootstrap adds
+  ``gamma * V(s_next)`` and prices a wall hit at the cost of continuing.
+- ``box_drift_speed=0`` (the default) is a strict no-op: every branch is a
+  Python-level ``if``, so the compiled graph and the numbers are unchanged
+  (verified bit-identical over a 200-step rollout).
+
 Differences from Box2D worth knowing:
 - Spawns use shuffled jittered grids instead of rejection sampling (jit needs
   static shapes); same regions and min separations.
+- The box drift and ``boundary_truncates`` have no Box2D counterpart.
 - Reward shaping is live from the first step (Box2D pays 0 shaping on step 1).
 - Box sizes are fixed per instance (they already were in Box2D — derived from
   the coupling list at __init__).
@@ -48,7 +93,7 @@ Run the built-in demo / sanity check (no display needed):
 
 import dataclasses
 import math
-
+from enum import Enum
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -74,6 +119,13 @@ _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
 
+_VARIANT_MAP = {"trunc": 1, "drift": 2}
+
+
+class VARIANTS(Enum):
+    TRUNC = 1
+    DRIFT = 2
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +144,7 @@ class MultiBoxPushMJX:
         coupling_def: str = "even",
         max_steps: int = 1024,
         reward_mode: str = "dense",
-        comm_radius: float | None = None,
+        variant: str = None,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
@@ -120,9 +172,7 @@ class MultiBoxPushMJX:
         self.neighbor_detection_range = 3.0
         self.sector_sensor_radius = self.world_width / 3.0
         self.lidar_range = self.sector_sensor_radius
-        self.comm_radius = (
-            self.world_width / 3.0 if comm_radius is None else float(comm_radius)
-        )
+        self.comm_radius = self.world_width / 3.0
         self.force_multiplier = _FORCE_MULTIPLIER
 
         # --- target band spanning the top wall ---
@@ -160,6 +210,41 @@ class MultiBoxPushMJX:
             _COUPLED_DENSITY_PER_AGENT * coupling * (2 * self.box_half_extents) ** 2
         )
 
+        # --- box drift ("decay"); see the module docstring ---
+        self.box_drift_speed = 0.5 if _VARIANT_MAP[variant] == VARIANTS.DRIFT else 0.0
+        self._drift_on = self.box_drift_speed > 0.0
+        # F = -v_d * k * m has fixed point v = F / (k*m) = -v_d, so the terminal
+        # speed is mass-independent. The gate is `~met`, so the force only ever
+        # acts on a *heavy* box — no need for the light-mass variant.
+        self._drift_force_heavy = jnp.asarray(
+            -self.box_drift_speed * _BOX_LIN_DAMPING * heavy_mass, dtype=jnp.float32
+        )  # (O,)
+        # Floor: an agent must get *under* a box to push it up, but an agent
+        # within `boundary_thickness + _AGENT_RADIUS` of the wall ends the
+        # episode — so a box resting on the bottom wall is unrecoverable. One
+        # box-width of clearance is the smallest floor that keeps it feasible
+        # (holds even at 45 deg box yaw, where the box reaches sqrt(2)*half down).
+        # Keyed off the half-extent rather than `coupling * _AGENT_RADIUS`
+        # directly — the two agree except where the 1.5 minimum box size binds,
+        # and there the raw coupling form would under-provide clearance.
+        drift_floor = self.boundary_thickness + 2 * self.box_half_extents
+        self.box_drift_floor = np.full_like(
+            self.boundary_thickness + 2 * self.box_half_extents
+        )  # (O,) numpy, for logging/tests
+        self._drift_floor = jnp.asarray(drift_floor, dtype=jnp.float32)
+        # Drift makes shaping negative while any box is uncoupled, which turns
+        # boundary-hit *termination* into an escape from the bleeding (pays 0,
+        # ends the episode). Truncating instead lets the trainers' truncation
+        # bootstrap price a wall hit at the cost of continuing. Independent knob
+        # so the ablation can isolate the termination-semantics change.
+        self.boundary_truncates = (
+            True
+            if _VARIANT_MAP[variant]
+            == VARIANTS.DRIFT | _VARIANT_MAP[variant]
+            == VARIANTS.TRUNC
+            else False
+        )
+
         # --- build & compile the planar MuJoCo model ---
         self._heavy_mass_np = heavy_mass  # kept for the visual model rebuild
         self._mj_model = mujoco.MjModel.from_xml_string(self._build_xml(heavy_mass))
@@ -192,6 +277,7 @@ class MultiBoxPushMJX:
         box_dadr = np.array([[dadr(b), dadr(b) + 1, dadr(b) + 2] for b in box_bodies])
         self._box_dof_lin = jnp.asarray(box_dadr[:, :2].ravel())  # (2O,)
         self._box_dof_ang = jnp.asarray(box_dadr[:, 2])  # (O,)
+        self._box_dof_y = jnp.asarray(box_dadr[:, 1])  # (O,) world-y slide, drift axis
 
         # heavy/light overrides for the coupling mechanic
         self._coupling = jnp.asarray(coupling, dtype=jnp.int32)
@@ -393,27 +479,55 @@ class MultiBoxPushMJX:
             agent_pos, box_pos, box_yaw, self._box_half
         )
 
-    def _model_for(self, data, active: jnp.ndarray | None = None) -> mjx.Model:
-        """Per-step model with the coupling mechanic applied.
-
-        A box whose coupling requirement is met (enough agents touching) gets
-        the light mass; otherwise the heavy base mass. Inertia and the
-        Box2D-style damping (coeff * mass / inertia) scale along with it.
+    def _coupling_met(self, data, active: jnp.ndarray | None = None) -> jnp.ndarray:
+        """(O,) bool — is each box's coupling requirement currently satisfied?
 
         `active` is an optional (A,) bool mask (traced) of agents that count as
         *cooperating*. Masked-out agents are excluded from the touch count, so a
         counterfactual agent does not prop up a box it is no longer pushing. The
         coupling requirement abstracts "enough agents working together", and an
         agent applying zero force is not working — see `_difference_rewards`.
+
+        Shared by the mass override (`_model_for`) and the box drift
+        (`_drift_force`) so the two cannot disagree about who is cooperating,
+        and so the drift is counterfactual under `active` for free.
         """
         agent_pos = self._agent_pos(data)
         box_pos, box_yaw = self._box_pose(data)
         touch = self._touch_matrix(agent_pos, box_pos, box_yaw)  # (A, O)
         if active is not None:
             touch = touch & active[:, None]
-        n_touch = touch.sum(axis=0)
-        met = n_touch >= self._coupling  # (O,)
+        return touch.sum(axis=0) >= self._coupling  # (O,)
 
+    def _drift_force(self, data, met, delivered) -> jnp.ndarray:
+        """(O,) <= 0 generalized force on each box's world-y slide DOF.
+
+        Sized for a mass-independent terminal speed (see the module docstring):
+        `F = -box_drift_speed * _BOX_LIN_DAMPING * mass` against
+        `dof_damping = _BOX_LIN_DAMPING * mass`. Off where the coupling is met,
+        where the box is delivered, and below `box_drift_floor` — a box parked on
+        the bottom wall could never be pushed out again.
+
+        A force gate rather than an mjx joint limit on purpose: a limit is static
+        model structure (an extra constraint row on every step of *every* arm, so
+        the drift-off graph would change), MJX limits are soft so the box would
+        sink through and could be crushed against it, and it would also obstruct
+        legitimate downward pushing. The gate cannot chatter either: below the
+        floor there is no restoring force, so the implicit damping bleeds off the
+        residual velocity and the box settles ~`v_d * tau` units low and stays.
+        """
+        box_y = data.qpos[self._box_qadr[:, 1]]  # (O,)
+        drifting = ~met & ~delivered & (box_y > self._drift_floor)
+        return jnp.where(drifting, self._drift_force_heavy, 0.0)
+
+    def _model_for(self, met: jnp.ndarray) -> mjx.Model:
+        """Per-step model with the coupling mechanic applied.
+
+        A box whose coupling requirement is met (enough agents touching, per
+        `_coupling_met`) gets the light mass; otherwise the heavy base mass.
+        Inertia and the Box2D-style damping (coeff * mass / inertia) scale along
+        with it.
+        """
         mass = jnp.where(met, self._light_mass, self._heavy_mass)  # (O,)
         scale = mass / self._heavy_mass
         inertia = self._heavy_inertia * scale[:, None]  # (O, 3)
@@ -507,8 +621,19 @@ class MultiBoxPushMJX:
         if active is not None:
             ctrl = ctrl * active[:, None]
         # mass update from pre-step positions, then physics (Box2D ordering)
-        model_t = self._model_for(state.data, active)
+        met = self._coupling_met(state.data, active)
+        model_t = self._model_for(met)
         data = state.data.replace(ctrl=ctrl.reshape(-1))
+        if self._drift_on:  # Python-level: drift-off arms compile unchanged
+            # Rebuilt from zeros rather than accumulated, which keeps
+            # qfrc_applied a pure function of (qpos, met, delivered). That is
+            # what lets SyncMacroMJX.state_from_snapshot stay exact: it restores
+            # only qpos/qvel, and the next _advance recomputes this force.
+            data = data.replace(
+                qfrc_applied=jnp.zeros_like(state.data.qfrc_applied)
+                .at[self._box_dof_y]
+                .set(self._drift_force(state.data, met, state.delivered))
+            )
         return mjx.step(model_t, data)
 
     def _task_reward(self, state: EnvState, data):
@@ -601,9 +726,19 @@ class MultiBoxPushMJX:
         delivered = jnp.where(
             boundary_hit, state.delivered, state.delivered | newly_delivered
         )
-        terminated = boundary_hit | jnp.all(delivered)
         t = state.t + 1
-        truncated = t >= self.max_steps
+        all_delivered = jnp.all(delivered)
+        if self.boundary_truncates:
+            # A wall hit is an artificial cut-off, not an absorbing failure — the
+            # same category as the time limit. Filing it as truncation lets the
+            # trainers bootstrap `gamma * V(s_next)` through it, which is what
+            # stops "run into a wall" from being an escape from negative drift
+            # reward (see the module docstring).
+            terminated = all_delivered
+            truncated = (t >= self.max_steps) | boundary_hit
+        else:
+            terminated = boundary_hit | all_delivered
+            truncated = t >= self.max_steps
 
         obs = self._get_obs(data, delivered)
         new_state = EnvState(
@@ -632,20 +767,412 @@ class MultiBoxPushMJX:
         return obs, new_state, reward, terminated, truncated, info
 
 
-def scripted_push_action(env: MultiBoxPushMJX, state: EnvState, box_idx: int = 0):
-    """Hand-written cooperative controller: everyone converges on a staging
-    point just below ``box_idx`` and then pushes straight up. Delivers the box
-    through the coupling mechanic — used by the module demos and the renderer
+def scripted_push_action(env: MultiBoxPushMJX, state: EnvState, box_idx=0):
+    """Hand-written cooperative controller: each agent converges on a staging
+    point just below its assigned box and then pushes straight up. Delivers the
+    box through the coupling mechanic — used by the module demos and the renderer
     demo as a non-random rollout.
+
+    ``box_idx`` is a scalar (the whole team swarms one box) or an ``(A,)`` array
+    assigning a box per agent, e.g. ``jnp.arange(A) % O`` for a balanced
+    partition — the two arms of the swarm-vs-partition comparison.
+
+    Agents sharing a box get *distinct* slots spread along its bottom face. With
+    a single shared staging point they collide with each other and only ~2 ever
+    reach the surface, so a coalition of exactly ``coupling`` agents could never
+    satisfy the coupling requirement. Surplus agents clamp to the face edges and
+    crowd in as before.
     """
     agent_pos = env._agent_pos(state.data)
-    box = state.data.qpos[env._box_qadr[box_idx, :2]]
-    stage_pt = box + jnp.array([0.0, -(env.box_half_extents[box_idx] + 0.6)])
+    idx = jnp.broadcast_to(jnp.asarray(box_idx), (env.n_agents,))
+    box = state.data.qpos[env._box_qadr[idx, :2]]  # (A, 2)
+    # env._box_half, not the numpy box_half_extents: idx may be traced.
+    half = env._box_half[idx]  # (A,)
+    # Rank within the group sharing this box, and that group's size.
+    same = idx[:, None] == idx[None, :]
+    order = jnp.arange(env.n_agents)
+    rank = (same & (order[None, :] < order[:, None])).sum(axis=-1)
+    group = same.sum(axis=-1)
+    slot = (rank - (group - 1) / 2) * (2 * _AGENT_RADIUS + 0.1)
+    lateral = jnp.clip(slot, -half, half)
+    stage_pt = box + jnp.stack([lateral, -(half + 0.6)], axis=-1)
     to_stage = stage_pt - agent_pos
     close = jnp.linalg.norm(to_stage, axis=1, keepdims=True) < 0.7
     approach = to_stage / (jnp.linalg.norm(to_stage, axis=1, keepdims=True) + 1e-6)
     push = jnp.broadcast_to(jnp.array([0.0, 1.0]), approach.shape)
     return jnp.where(close, push, approach)
+
+
+def _pose(env: MultiBoxPushMJX, state: EnvState, agent_pos=None, box_pos=None):
+    """Hand-place agents/boxes in an existing state (test helper).
+
+    Rebuilds qpos and re-runs `mjx.forward` so contacts/positions are consistent,
+    and re-bases `prev_box_goal_dist` so the first step's shaping is not a jump.
+    """
+    qpos = state.data.qpos
+    if agent_pos is not None:
+        qpos = qpos.at[env._agent_qadr].set(jnp.asarray(agent_pos))
+    if box_pos is not None:
+        box_pos = jnp.asarray(box_pos)
+        qpos = qpos.at[env._box_qadr[:, 0]].set(box_pos[:, 0])
+        qpos = qpos.at[env._box_qadr[:, 1]].set(box_pos[:, 1])
+    at_rest = state.data.replace(qpos=qpos, qvel=jnp.zeros_like(state.data.qvel))
+    data = mjx.forward(env._model, at_rest)
+    box_y = data.qpos[env._box_qadr[:, 1]]
+    return dataclasses.replace(
+        state, data=data, prev_box_goal_dist=env.target_y - box_y
+    )
+
+
+def _face_positions(box_xy, half: float, n: int) -> np.ndarray:
+    """`n` agent positions touching a box, spread over its four faces.
+
+    Two slots per face at +-half/2 along it, offset `half + _AGENT_RADIUS - 0.05`
+    along the face normal — inside the touch threshold with room to spare, and
+    with the slots far enough apart not to overlap each other.
+    """
+    normals = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+    out = []
+    for slot in range(n):
+        nx, ny = normals[slot % 4]
+        along = (-1.0 if slot // 4 == 0 else 1.0) * half / 2
+        d = half + _AGENT_RADIUS - 0.05
+        out.append(
+            (
+                box_xy[0] + nx * d + (0.0 if nx else along),
+                box_xy[1] + ny * d + (0.0 if ny else along),
+            )
+        )
+    return np.asarray(out)
+
+
+def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
+    """Assertion suite for the box drift mechanic (see the module docstring)."""
+    import time
+
+    v_d = 0.8
+    k = _BOX_LIN_DAMPING
+    rho = 1.0 / (1.0 + k * _TIME_STEP)  # per-step velocity decay factor
+
+    def make(**kw):
+        return MultiBoxPushMJX(n_agents=n_agents, n_objects=n_objects, **kw)
+
+    off, on = make(), make(box_drift_speed=v_d)
+    coupling = np.asarray(off.objects_push_coupling_list)
+    print(
+        f"drift checks @ {n_agents}a/{n_objects}o | world {on.world_width} | "
+        f"coupling {list(coupling)} | half {list(on.box_half_extents)} | "
+        f"floor {list(np.round(on.box_drift_floor, 2))} | "
+        f"force {list(np.round(np.asarray(on._drift_force_heavy), 1))} N"
+    )
+
+    # --- 1. drift off is inert -------------------------------------------------
+    assert off._drift_on is False and off.boundary_truncates is False
+    assert on._drift_on is True and on.boundary_truncates is True
+    _, s_off = jax.jit(off.reset)(jax.random.PRNGKey(0))
+    _, s_off, *_ = jax.jit(off.step)(s_off, jnp.zeros((n_agents, 2)))
+    assert float(jnp.abs(s_off.data.qfrc_applied).max()) == 0.0
+    print("  [1] drift off: no applied force, boundary still terminates   OK")
+
+    # --- 2. terminal velocity, axis purity, mass independence, transient ------
+    # Agents parked in the top corners so nothing touches the drifting boxes.
+    def clear_state(env, key=0):
+        _, st = jax.jit(env.reset)(jax.random.PRNGKey(key))
+        top = env.world_height - 3.0
+        pos = np.stack(
+            [
+                np.linspace(3.0, env.world_width - 3.0, env.n_agents),
+                np.full(env.n_agents, top),
+            ],
+            axis=1,
+        )
+        return _pose(env, st, agent_pos=pos)
+
+    state = clear_state(on)
+    step_on = jax.jit(on.step)
+    zero = jnp.zeros((n_agents, 2))
+    vy_at = {}
+    for i in range(120):
+        _, state, r, term, trunc, _ = step_on(state, zero)
+        vy_at[i + 1] = np.asarray(state.data.qvel[on._box_dof_y])
+        assert not bool(term), f"unexpected termination at step {i + 1}"
+    vy = vy_at[120]
+    assert np.allclose(vy, -v_d, atol=1e-3), vy
+    vx = np.asarray(state.data.qvel[on._box_dof_lin])[0::2]
+    vyaw = np.asarray(state.data.qvel[on._box_dof_ang])
+    assert np.abs(vx).max() < 1e-4 and np.abs(vyaw).max() < 1e-4, (vx, vyaw)
+    frac = float(np.mean(vy_at[12] / -v_d))
+    assert abs(frac - (1 - rho**12)) < 0.03, (frac, 1 - rho**12)
+    print(
+        f"  [2] terminal v_y={vy.mean():+.5f} (want {-v_d}); |v_x|,|v_yaw| < 1e-4; "
+        f"transient at tau: {frac:.3f} vs 1-rho^12 = {1 - rho**12:.3f}   OK"
+    )
+
+    # mass independence: uneven couplings -> different box sizes/masses
+    rnd = MultiBoxPushMJX(
+        n_agents=n_agents,
+        n_objects=n_objects,
+        coupling_def="random",
+        box_drift_speed=v_d,
+    )
+    st_r = clear_state(rnd)
+    step_r = jax.jit(rnd.step)
+    for _ in range(120):
+        _, st_r, *_ = step_r(st_r, zero)
+    vy_r = np.asarray(st_r.data.qvel[rnd._box_dof_y])
+    assert np.allclose(vy_r, -v_d, atol=1e-3), (rnd.objects_push_coupling_list, vy_r)
+    print(
+        f"  [2b] mass independence: couplings {list(rnd.objects_push_coupling_list)} "
+        f"masses {list(np.round(np.asarray(rnd._heavy_mass), 1))} all reach "
+        f"{vy_r.mean():+.5f}   OK"
+    )
+
+    # --- 3. floor: the box stops and stays stopped ----------------------------
+    # Floor just under the lowest spawned box, so every box has to reach it,
+    # and enough steps for the *highest* box to arrive and settle.
+    spawn_y = np.asarray(clear_state(on).data.qpos[on._box_qadr[:, 1]])
+    floor = float(spawn_y.min() - 1.0)
+    n_settle = int((spawn_y.max() - floor) / v_d * 60) + 150
+    fl = make(box_drift_speed=v_d, box_drift_floor=floor)
+    st_f = clear_state(fl)
+    box_start = np.asarray(st_f.data.qpos[fl._box_qadr[:, 1]])
+    step_f = jax.jit(fl.step)
+    for _ in range(n_settle):
+        _, st_f, *_ = step_f(st_f, zero)
+    box_end = np.asarray(st_f.data.qpos[fl._box_qadr[:, 1]])
+    assert (box_start > floor).all(), (box_start, floor)
+    assert (box_end >= floor - 0.3).all(), (box_end, floor)
+    assert np.abs(np.asarray(st_f.data.qvel[fl._box_dof_y])).max() < 1e-3
+    print(
+        f"  [3] floor {floor:.2f} after {n_settle} steps: y {np.round(box_start, 2)} "
+        f"-> {np.round(box_end, 2)}, settled (no chatter)   OK"
+    )
+
+    # --- 4. coupling gate: met -> that box's force is off, others keep theirs --
+    st_c = clear_state(on)
+    box_xy = np.asarray(st_c.data.qpos[on._box_qadr[:, :2]])
+    touchers = _face_positions(
+        box_xy[0], float(on.box_half_extents[0]), int(coupling[0])
+    )
+    rest = np.stack(
+        [
+            np.linspace(3.0, on.world_width - 3.0, n_agents - len(touchers)),
+            np.full(n_agents - len(touchers), on.world_height - 3.0),
+        ],
+        axis=1,
+    )
+    st_c = _pose(on, st_c, agent_pos=np.concatenate([touchers, rest]))
+    met = on._coupling_met(st_c.data)
+    force = np.asarray(on._drift_force(st_c.data, met, st_c.delivered))
+    assert bool(met[0]) and not bool(met[1:].any()), np.asarray(met)
+    assert force[0] == 0.0, force
+    assert np.allclose(force[1:], np.asarray(on._drift_force_heavy)[1:]), force
+    print(
+        f"  [4] coupling gate: met {np.asarray(met)} -> "
+        f"force {np.round(force, 1)}   OK"
+    )
+
+    # --- 5. reward semantics: shaping == negated box displacement -------------
+    st_r0 = clear_state(on)
+    y0 = np.asarray(st_r0.data.qpos[on._box_qadr[:, 1]])
+    cum, st = 0.0, st_r0
+    for _ in range(200):
+        _, st, r, term, trunc, _ = step_on(st, zero)
+        assert float(r) < 0.0, r
+        cum += float(r)
+    dy = float((y0 - np.asarray(st.data.qpos[on._box_qadr[:, 1]])).sum())
+    assert abs(cum + dy) < 2e-3, (cum, -dy)
+    assert abs(float(r) + v_d * n_objects / 60.0) < 2e-3, r
+    st_o, cum_off = clear_state(off), 0.0
+    step_off = jax.jit(off.step)
+    for _ in range(200):
+        _, st_o, r_o, *_ = step_off(st_o, zero)
+        cum_off += float(r_o)
+    assert abs(cum_off) < 1e-3, cum_off
+    print(
+        f"  [5] reward: 200 idle steps -> {cum:.4f} (== -sum box dy {-dy:.4f}); "
+        f"per-step {float(r):+.5f} vs -v_d*O/60 = {-v_d * n_objects / 60:+.5f}; "
+        f"drift off -> {cum_off:.1e}   OK"
+    )
+
+    # --- 6. boundary hit: truncated (drift) vs terminated (baseline) ----------
+    def wall_dive(env):
+        _, st = jax.jit(env.reset)(jax.random.PRNGKey(0))
+        pos = np.array(st.data.qpos[env._agent_qadr])
+        pos[0] = (env.world_width / 2, env.boundary_thickness + _AGENT_RADIUS + 0.4)
+        st = _pose(env, st, agent_pos=pos)
+        down = jnp.zeros((n_agents, 2)).at[0, 1].set(-1.0)
+        f = jax.jit(env.step)
+        for _ in range(30):
+            _, st, _, term, trunc, _ = f(st, down)
+            if bool(term) or bool(trunc):
+                return bool(term), bool(trunc)
+        raise AssertionError("agent never reached the wall")
+
+    assert wall_dive(on) == (False, True)
+    assert wall_dive(off) == (True, False)
+    print("  [6] wall hit: drift arm -> truncated, baseline -> terminated   OK")
+
+    # --- 7. recoverability: a box sitting *at* the floor is still deliverable --
+    # Tested with a *minimum* coalition (the balanced partition, `coupling` agents
+    # per box), which is what the floor is sized for. Piling the whole team under
+    # a floored box can still shove one of them into the wall — the floor
+    # guarantees the geometry, not that any crowd survives it.
+    swarm = 0
+    partition = jnp.arange(n_agents) % n_objects
+    _, st_g = jax.jit(on.reset)(jax.random.PRNGKey(3))
+    # Box 0 down at its floor with a clear column above it; its coalition staged
+    # just under it; everyone else parked at the top of the arena and idle. The
+    # other boxes are moved to the side walls: left where they are, a drifting
+    # *heavy* box lands on the rising one and the pair sinks together at
+    # (819 - 400) / 1074 ~ 0.4 u/s — correct physics, but not what this checks.
+    crew = np.asarray(partition) == 0
+    boxes = np.array(st_g.data.qpos[on._box_qadr[:, :2]])
+    boxes[0] = (on.world_width / 2, float(on.box_drift_floor[0]))
+    for j in range(1, n_objects):
+        side = 2.5 + on.box_half_extents[j]
+        boxes[j] = (
+            side if j % 2 else on.world_width - side,
+            on.world_center_y + 2.0 * j,
+        )
+    half0 = float(on.box_half_extents[0])
+    agents = np.stack(
+        [
+            np.linspace(3.0, on.world_width - 3.0, n_agents),
+            np.full(n_agents, on.world_height - 3.0),
+        ],
+        axis=1,
+    )
+    n_crew = int(crew.sum())
+    agents[crew] = np.stack(
+        [
+            boxes[0, 0] + np.linspace(-half0, half0, n_crew),
+            np.full(n_crew, boxes[0, 1] - half0 - 1.0),
+        ],
+        axis=1,
+    )
+    st_g = _pose(on, st_g, agent_pos=agents, box_pos=boxes)
+    assert not bool(st_g.delivered.any())
+    idle = jnp.asarray(crew)[:, None]
+    ended_early, delivered0 = False, False
+    for _ in range(on.max_steps):
+        act = jnp.where(idle, scripted_push_action(on, st_g, partition), 0.0)
+        _, st_g, _, term, trunc, info = step_on(st_g, act)
+        delivered0 = bool(np.asarray(info["delivered"])[0])
+        if delivered0:
+            break
+        if bool(term) or bool(trunc):
+            ended_early = True
+            break
+    assert delivered0 and not ended_early, (delivered0, ended_early, int(st_g.t))
+    print(
+        f"  [7] recoverability: box starting *at* the floor "
+        f"({float(on.box_drift_floor[0]):.2f}) pushed out and delivered by a "
+        f"minimum coalition of {n_crew} in {int(st_g.t)} steps, no wall hit   OK"
+    )
+
+    # --- 8. efficacy: the sequential swarm loses the boxes it ignores ---------
+    # Averaged over seeds: single scripted rollouts are noisy at this scale (MJX
+    # is not bit-reproducible across processes and the returns are chaotic in it).
+    #
+    # What is asserted is what is *robust*: (i) the balanced partition still beats
+    # the swarm under drift — the mechanic must not invert the preference — and
+    # (ii) the swarm's ignored boxes end the episode markedly lower with drift
+    # than without, which is the mechanic doing its job. The partition-over-swarm
+    # *return gap* does NOT reliably widen (measured roughly flat, 16a/4o 4 seeds:
+    # +318 at v_d 0 vs +284 at 0.8) — with a scripted oracle both arms pay drift
+    # cost, so the interesting question is what a *learned* policy does, which
+    # only a training run answers.
+    def scripted_return(env, assign, seeds=(7, 23)):
+        rets, boxes, undelivered_y = [], [], []
+        f = jax.jit(env.step)
+        for seed in seeds:
+            _, st = jax.jit(env.reset)(jax.random.PRNGKey(seed))
+            total = 0.0
+            for _ in range(env.max_steps):
+                _, st, r, term, trunc, info = f(
+                    st, scripted_push_action(env, st, assign)
+                )
+                total += float(r)
+                if bool(term) or bool(trunc):
+                    break
+            done = np.asarray(info["delivered"])
+            rets.append(total)
+            boxes.append(int(done.sum()))
+            box_y = np.asarray(st.data.qpos[env._box_qadr[:, 1]])
+            undelivered_y.append(box_y[~done].mean() if (~done).any() else np.nan)
+        return (
+            float(np.mean(rets)),
+            float(np.mean(boxes)),
+            float(np.nanmean(undelivered_y)),
+        )
+
+    r_off_s, d_off_s, y_off_s = scripted_return(off, swarm)
+    r_off_p, d_off_p, _ = scripted_return(off, partition)
+    r_on_s, d_on_s, y_on_s = scripted_return(on, swarm)
+    r_on_p, d_on_p, _ = scripted_return(on, partition)
+    assert r_on_p > r_on_s, (r_on_p, r_on_s)
+    assert y_on_s < y_off_s - 2.0, (y_on_s, y_off_s)
+    print(
+        f"  [8] efficacy: swarm {r_off_s:.0f} ({d_off_s:.1f} boxes) -> partition "
+        f"{r_off_p:.0f} ({d_off_p:.1f}) with drift off; {r_on_s:.0f} ({d_on_s:.1f}) "
+        f"-> {r_on_p:.0f} ({d_on_p:.1f}) with drift on. Swarm's ignored boxes end "
+        f"at y {y_off_s:.1f} -> {y_on_s:.1f} (they decay)   OK"
+    )
+
+    # --- 9. stability + throughput under vmapped random actions ---------------
+    def vmapped(env, steps=256):
+        v_reset, v_step = jax.jit(jax.vmap(env.reset)), jax.jit(jax.vmap(env.step))
+        vst = v_reset(jax.random.split(jax.random.PRNGKey(1), n_envs))[1]
+        acts = jax.random.uniform(
+            jax.random.PRNGKey(2), (steps, n_envs, n_agents, 2), minval=-1, maxval=1
+        )
+        vst = v_step(vst, acts[0])[1]  # compile
+        jax.block_until_ready(vst.data.qpos)
+        t0 = time.time()
+        for i in range(1, steps):
+            o, vst, *_ = v_step(vst, acts[i])
+        jax.block_until_ready(o)
+        dt = time.time() - t0
+        assert jnp.isfinite(vst.data.qpos).all() and jnp.isfinite(vst.data.qvel).all()
+        assert jnp.isfinite(o).all() and float(jnp.abs(o).max()) < 1e3, o.max()
+        return (steps - 1) * n_envs / dt
+
+    sps_off, sps_on = vmapped(off), vmapped(on)
+    assert sps_on > 0.7 * sps_off, (sps_on, sps_off)
+    print(
+        f"  [9] stability: {n_envs} envs x 256 random steps all finite; "
+        f"throughput {sps_on:,.0f} vs {sps_off:,.0f} steps/s "
+        f"({100 * sps_on / sps_off:.0f}% of drift-off)   OK"
+    )
+
+    # --- 10. difference rewards: pivotal gains, pile-on unchanged -------------
+    dr_off = make(reward_mode="difference_rewards")
+    dr_on = make(reward_mode="difference_rewards", box_drift_speed=v_d)
+    up = jnp.zeros((n_agents, 2)).at[:, 1].set(1.0)
+
+    def d_for(env, n_touch):
+        st = clear_state(env, key=5)
+        bxy = np.asarray(st.data.qpos[env._box_qadr[:, :2]])
+        pos = np.array(st.data.qpos[env._agent_qadr])
+        pos[:n_touch] = _face_positions(bxy[0], float(env.box_half_extents[0]), n_touch)
+        st = _pose(env, st, agent_pos=pos)
+        assert bool(env._coupling_met(st.data)[0])
+        return np.asarray(jax.jit(env.step)(st, up)[2])[:n_touch]
+
+    c0 = int(coupling[0])
+    piv_off, piv_on = d_for(dr_off, c0), d_for(dr_on, c0)
+    pile_off, pile_on = d_for(dr_off, 2 * c0), d_for(dr_on, 2 * c0)
+    assert piv_on.mean() > piv_off.mean(), (piv_on, piv_off)
+    assert np.allclose(pile_on, pile_off, atol=1e-4), (pile_on, pile_off)
+    print(
+        f"  [10] difference rewards: pivotal ({c0} touching) D_i "
+        f"{piv_off.mean():.3e} -> {piv_on.mean():.3e} (drift helps); "
+        f"pile-on ({2 * c0} touching) {pile_off.mean():.3e} -> "
+        f"{pile_on.mean():.3e} (unchanged: the drift cancels in G - G_-i)   OK"
+    )
+
+    print("drift checks passed.")
 
 
 if __name__ == "__main__":
@@ -658,7 +1185,17 @@ if __name__ == "__main__":
     parser.add_argument("--n-envs", type=int, default=32, help="vmap batch size")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--debug", type=bool, default=True)
+    parser.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="run the box-drift assertion suite instead of the demo rollout "
+        "(needs jit, so it ignores --debug)",
+    )
     args = parser.parse_args()
+
+    if args.check_drift:
+        _check_drift(args.n_agents, args.n_objects, args.n_envs)
+        raise SystemExit(0)
 
     if args.debug:
         jax.config.update("jax_disable_jit", True)
