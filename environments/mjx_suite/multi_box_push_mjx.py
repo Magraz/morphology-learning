@@ -1,100 +1,76 @@
 """MuJoCo-MJX port of the Box2D ``MultiBoxPushEnv`` (multi_box_push.py).
 
-The physics is constrained to 2D by construction: every body only owns planar
-DOFs (agents: slide-x + slide-y; boxes: slide-x + slide-y + hinge-yaw), gravity
-is zero, and the arena walls are four inward-facing planes. There is no z DOF
-anywhere, so MJX literally cannot compute out-of-plane motion — no springs,
-no clamping, no wasted 3D dynamics.
+2D by construction: bodies own only planar DOFs (agents slide-x/y; boxes
+slide-x/y + hinge-yaw), gravity is zero, walls are four inward-facing planes —
+with no z DOF anywhere, MJX cannot compute out-of-plane motion at all.
 
-Functional JAX API (gymnax-style), fully ``jit``/``vmap``-able::
+Functional JAX API (gymnax-style), fully ``jit``/``vmap``-able; no auto-reset
+(on ``terminated | truncated`` the caller resets)::
 
     env = MultiBoxPushMJX(n_agents=9, n_objects=3)
     obs, state = jax.jit(env.reset)(key)                       # obs (A, 40)
     obs, state, reward, terminated, truncated, info = jax.jit(env.step)(state, actions)
 
-No auto-reset: when ``terminated | truncated`` the caller resets (or wraps with
-its own auto-reset logic before ``vmap``).
+Parity with the Box2D env:
 
-Parity with the Box2D env (same layout as ``observation.py``'s OBS_DIM = 40):
+- obs: the shared 40-dim ``OBS_DIM`` layout from ``mjx_suite/observation.py``
+  (``MJXObservationBuilder``); this env supplies only the qpos layout
+  (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal band.
+- reward: shaping toward the top target band + one-time +100 per delivered box
+  (``"sparse"`` drops the shaping); terminate on all-delivered or a wall touch.
+- coupling: a box keeps its heavy base mass until ``coupling`` agents touch it,
+  then drops to the light coupled mass — a per-step override of ``body_mass`` /
+  ``body_inertia`` / ``dof_damping`` on the mjx.Model pytree (jit-safe: the
+  model is a step argument). ``_coupling_met`` owns the "enough agents working
+  together" predicate, shared by the mass override and the drift below so the
+  two cannot diverge.
+- constants: dt=1/60, agent mass 1 / radius 0.4 / damping 10, box 2D density 20
+  (0.05*coupling when coupled), box lin/ang damping 5/8. Box2D body damping is
+  emulated as joint damping = coeff*mass (inertia for the hinge) — same steady
+  state ``v_terminal = F / (m*d)``.
 
-- observation: own_velocity(2) + density_sensors(16) + is_touching_object(1)
-  + neighbor_fraction(1) + contact_force(1) + nearest_box_vec(2)
-  + goal_distance(1) + lidar(16), identical normalizations. The sensor math
-  lives in the suite-shared ``mjx_suite/observation.py``
-  (``MJXObservationBuilder``) — this env only supplies the qpos layout
-  (``_agent_pos`` / ``_agent_vel`` / ``_box_pose``) and its goal band.
-- reward: per-step shaping toward the top target band + one-time +100 per
-  delivered box (``reward_mode="dense"`` keeps shaping, ``"sparse"`` doesn't);
-  terminate when all boxes delivered or any agent touches a wall.
-- coupling mechanic: a box keeps its heavy base mass until at least
-  ``coupling`` agents touch it, then drops to the light coupled mass. Done by
-  overriding ``body_mass``/``body_inertia``/``dof_damping`` on the mjx.Model
-  pytree each step (the model is a step argument, so this is jit-safe).
-  ``_coupling_met`` owns the "enough agents working together" predicate; the
-  mass override and the box drift (below) both read it, so they cannot diverge.
-- physics constants: dt = 1/60, agent mass 1 / radius 0.4 / damping 10, box 2D
-  density 20 (0.05 * coupling when coupled), box linear/angular damping 5/8.
-  Box2D's body damping is emulated with joint damping = coeff * mass (inertia
-  for the hinge), which has the same steady state (v_terminal = F / (m * d)).
+Box drift ("decay"), off unless ``box_drift_speed > 0``: every *uncoupled* box
+sinks toward the bottom wall, so progress decays on any box the team is not
+working on. This breaks the sequential swarm-one-box-at-a-time strategy that
+makes the dense task easy — such a schedule arithmetically cannot reach its last
+box, forcing the agents into simultaneous coalitions.
 
-Box drift ("decay"), off by default — ``box_drift_speed > 0``:
-
-Every *uncoupled* box sinks toward the bottom wall at a constant speed, so
-progress decays on any box the team is not currently working on. The point is to
-break the sequential strategy (swarm all agents onto one box, deliver, repeat)
-that makes the dense task easy: the boxes the swarm is not on lose ground the
-whole time, so a sequential schedule arithmetically cannot reach its last box and
-the agents have to partition into simultaneous coalitions.
-
-- Applied as a generalized force on each box's world-y slide DOF
-  (``data.qfrc_applied``). The y slide axis is world-fixed regardless of box yaw:
-  ``mjx`` rotates a joint's axis by the quaternion accumulated from *preceding*
-  joints only, and the box joint order is slide-x, slide-y, hinge-yaw, so both
-  slides resolve while that quat is still identity.
-- Since ``_model_for`` sets ``dof_damping[box y] = _BOX_LIN_DAMPING * mass``, a
-  constant force has fixed point ``v* = F / (k * m)``. Sizing the force as
-  ``F = -box_drift_speed * _BOX_LIN_DAMPING * mass`` therefore gives a terminal
-  speed of exactly ``box_drift_speed`` **independent of box mass**, and the time
-  constant ``tau = m / (k * m) = 1 / k = 0.2 s`` (12 steps) is mass-independent
-  too — negligible against a 1024-step episode.
-- Gated on ``~met & ~delivered & (box_y > box_drift_floor)``. ``met`` comes from
-  the same ``_coupling_met`` as the mass override and is masked by ``active``, so
-  the drift is automatically part of every difference-reward counterfactual: drop
-  a *pivotal* agent and its box starts sinking in the counterfactual branch.
-- The floor keeps a sunk box **recoverable**. To push a box up an agent must get
+- A generalized force on each box's world-y slide DOF (``qfrc_applied``). That
+  axis is world-fixed regardless of box yaw: mjx rotates a joint axis only by
+  the quat accumulated from *preceding* joints, and the order is slide-x,
+  slide-y, hinge-yaw.
+- ``F = -box_drift_speed * _BOX_LIN_DAMPING * mass`` against
+  ``dof_damping = _BOX_LIN_DAMPING * mass`` puts the terminal speed at exactly
+  ``box_drift_speed`` with ``tau = 1/k = 0.2 s`` (12 steps) — both
+  mass-independent, and negligible against a 1024-step episode.
+- Gate: ``~met & ~delivered & (box_y > box_drift_floor)``. ``met`` is masked by
+  ``active``, so the drift joins every difference-reward counterfactual for
+  free: drop a *pivotal* agent and its box starts sinking in that branch.
+- The floor keeps a sunk box **recoverable** — pushing a box up means getting
   under it, but an agent within ``boundary_thickness + _AGENT_RADIUS`` of the
-  wall ends the episode, so a box resting on the bottom wall can never be pushed
-  out. Default floor ``boundary_thickness + 2 * box_half_extent`` (one box-width
-  of clearance, i.e. ``2 * coupling * _AGENT_RADIUS`` wherever the minimum box
-  size does not bind) is the smallest that keeps the geometry feasible. It is
-  insurance, not a cap on the pressure: a passive box needs ~20 s to reach it
-  versus a 17 s episode.
-- Drift makes the shaping term negative on every step an uncoupled box exists,
-  which turns the boundary-hit *termination* into an escape from the bleeding
-  (it pays 0 and ends the episode). ``boundary_truncates`` — on by default
-  whenever the drift is on — reclassifies a boundary hit as ``truncated`` rather
-  than ``terminated``, so the trainers' truncation bootstrap adds
-  ``gamma * V(s_next)`` and prices a wall hit at the cost of continuing.
-- ``box_drift_speed=0`` (the default) is a strict no-op: every branch is a
-  Python-level ``if``, so the compiled graph and the numbers are unchanged
-  (verified bit-identical over a 200-step rollout).
-- The Hydra config surface is the ``variant`` **preset** (``env.variant`` in
-  ``conf/env/*.yaml``), since a yaml only needs the named arms: ``"drift"`` ->
-  ``box_drift_speed=_DEFAULT_DRIFT_SPEED`` + ``boundary_truncates=True``,
-  ``"trunc"`` -> truncation only, ``None`` (default) -> both off. It only
-  supplies *defaults*; passing ``box_drift_speed`` / ``box_drift_floor`` /
-  ``boundary_truncates`` explicitly overrides it, which is how the assertion
-  suite and the calibration sweep dial values without a variant name per value.
+  wall ends the episode, so a box on the bottom wall would be stuck forever.
+  Default ``boundary_thickness + 2*box_half_extent`` is the smallest clearance
+  that keeps the geometry feasible. Insurance, not a cap on the pressure: a
+  passive box needs ~20 s to reach it versus a 17 s episode.
+- Drift makes shaping negative while any box is uncoupled, which turns a
+  boundary-hit *termination* into an escape from the bleeding (pays 0, ends the
+  episode). ``boundary_truncates`` — on by default whenever drift is — reports
+  ``truncated`` instead, so the trainers' bootstrap adds ``gamma * V(s_next)``
+  and prices a wall hit at the cost of continuing.
+- ``box_drift_speed=0`` is a strict no-op: every branch is a Python-level
+  ``if``, so the graph and the numbers are unchanged (verified bit-identical).
+- Config surface is the ``variant`` preset (``env.variant`` in ``conf/env/``):
+  ``"drift"`` -> drift + truncation, ``"trunc"`` -> truncation only, ``None``
+  -> both off. Presets supply only *defaults*; explicit ``box_drift_speed`` /
+  ``box_drift_floor`` / ``boundary_truncates`` override them, which is how the
+  assertion suite and the calibration sweep dial values.
 
-Differences from Box2D worth knowing:
-- Spawns use shuffled jittered grids instead of rejection sampling (jit needs
-  static shapes); same regions and min separations.
-- The box drift and ``boundary_truncates`` have no Box2D counterpart.
-- Reward shaping is live from the first step (Box2D pays 0 shaping on step 1).
-- Box sizes are fixed per instance (they already were in Box2D — derived from
-  the coupling list at __init__).
+Differences from Box2D: spawns use shuffled jittered grids rather than rejection
+sampling (jit needs static shapes), same regions and min separations; drift and
+``boundary_truncates`` have no counterpart; shaping is live from step 1 (Box2D
+pays 0 on its first step); box sizes are fixed per instance (already true there).
 
-Run the built-in demo / sanity check (no display needed):
+Demo / sanity check (no display needed):
     uv run python -m environments.mjx_suite.multi_box_push_mjx
 """
 
@@ -125,6 +101,7 @@ _BOX_HALF_HEIGHT = 0.4  # z half-extent; cosmetic (no z DOF), keeps contacts pla
 _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
+_DEFAULT_DRIFT_SPEED = 3.0
 
 
 class VARIANTS(StrEnum):
@@ -139,16 +116,6 @@ class VARIANTS(StrEnum):
 
     TRUNC = "trunc"  # boundary hits truncate rather than terminate; no drift
     DRIFT = "drift"  # the above + uncoupled boxes decay toward the bottom wall
-
-
-# Drift speed the `"drift"` variant selects. Deliberately *past* the calibrated
-# knee: the scripted-probe sweep put the knee at 0.5 (near-maximal decay without
-# degrading a correct partition), and already at 0.8 the drift force exceeds a
-# full coalition's thrust, so exactly-coupling coalitions get fragile *while
-# forming*. Once coupling is met the drift is off entirely (`_drift_force`), so
-# this never fights a formed coalition — it only shortens the window agents have
-# to converge on a sinking box. Not re-swept at this value.
-_DEFAULT_DRIFT_SPEED = 1.0
 
 
 @jax.tree_util.register_dataclass
@@ -169,9 +136,6 @@ class MultiBoxPushMJX:
         max_steps: int = 1024,
         reward_mode: str = "dense",
         variant: str = None,
-        box_drift_speed: float = None,
-        box_drift_floor=None,
-        boundary_truncates: bool = None,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
@@ -250,8 +214,7 @@ class MultiBoxPushMJX:
         # `variant` is only a preset: it supplies the defaults and any explicit
         # kwarg wins, so the assertion suite and the calibration sweep can dial
         # speed/floor directly without inventing a variant name per value.
-        if box_drift_speed is None:
-            box_drift_speed = _DEFAULT_DRIFT_SPEED if variant is VARIANTS.DRIFT else 0.0
+        box_drift_speed = _DEFAULT_DRIFT_SPEED if variant is VARIANTS.DRIFT else 0.0
         self.box_drift_speed = float(box_drift_speed)
         self._drift_on = self.box_drift_speed > 0.0
         # F = -v_d * k * m has fixed point v = F / (k*m) = -v_d, so the terminal
@@ -268,12 +231,8 @@ class MultiBoxPushMJX:
         # Keyed off the half-extent rather than `coupling * _AGENT_RADIUS`
         # directly — the two agree except where the 1.5 minimum box size binds,
         # and there the raw coupling form would under-provide clearance.
-        if box_drift_floor is None:
-            drift_floor = self.boundary_thickness + 2 * self.box_half_extents
-        else:  # scalar or (O,) override; broadcast so the gate stays per-box
-            drift_floor = np.broadcast_to(
-                np.asarray(box_drift_floor, dtype=float), (n_objects,)
-            )
+        drift_floor = 5 * self.boundary_thickness + 2 * self.box_half_extents
+
         self.box_drift_floor = np.array(drift_floor)  # (O,) numpy, for logging/tests
         self._drift_floor = jnp.asarray(drift_floor, dtype=jnp.float32)
         # Drift makes shaping negative while any box is uncoupled, which turns
@@ -281,8 +240,7 @@ class MultiBoxPushMJX:
         # ends the episode). Truncating instead lets the trainers' truncation
         # bootstrap price a wall hit at the cost of continuing. Independent knob
         # so the ablation can isolate the termination-semantics change.
-        if boundary_truncates is None:
-            boundary_truncates = self._drift_on or variant is VARIANTS.TRUNC
+        boundary_truncates = self._drift_on or variant is VARIANTS.TRUNC
         self.boundary_truncates = bool(boundary_truncates)
 
         # --- build & compile the planar MuJoCo model ---

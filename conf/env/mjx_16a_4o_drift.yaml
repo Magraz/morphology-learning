@@ -15,11 +15,12 @@
 # D_i = G - G_-i. Use this arm in the dense/team-reward study.
 env:
   environment: multi_box_push_mjx
-  # n_envs is a vmap width on one device here, not a core budget, and it *is* a
-  # hyperparameter (batch = params.n_steps * n_envs). Keep it equal across arms.
   n_envs: 32
   n_agents: 16
   n_objects: 4
   reward_mode: dense
 
   variant: drift
+
+params:
+  n_steps: 512

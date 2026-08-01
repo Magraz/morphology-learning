@@ -475,7 +475,14 @@ class MAPPO_JAX_Runner:
                         break
             rewards = np.asarray(rewards)
 
-            print(f"REWARD: {rewards[-1]:.4f}")
+            # Episode *return* (sum), not the final step's reward — the delivery
+            # bonuses are paid on the steps the boxes land, so `rewards[-1]`
+            # reported ~0 for any episode that did not happen to end on a
+            # delivery. Matches what `evaluate()` and the `reward` stat report.
+            print(
+                f"RETURN: {rewards.sum():.4f}  "
+                f"(final step {rewards[-1]:+.4f}, {len(rewards)} steps)"
+            )
 
             fig, ax = plt.subplots(figsize=(10, 3))
             ax.plot(np.arange(len(rewards)), rewards)
