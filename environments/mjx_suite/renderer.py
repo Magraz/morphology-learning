@@ -44,6 +44,12 @@ For a vmapped batch, render one env with
 Demo (headless, writes multi_box_push_mjx.mp4 + a sample png; add
 ``--native iso`` or ``--native top`` for the MuJoCo renderer):
     MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run python -m environments.mjx_suite.renderer
+
+Keyboard control (``manual_control``) — needs a real display, so do NOT set
+SDL_VIDEODRIVER; arrows move, [G] co-drives everyone in the sensing radius.
+No MUJOCO_GL needed: this path is pygame, and MJX itself is pure compute.
+    uv run python -m environments.mjx_suite.renderer --manual \
+        [--n-agents 16 --n-objects 4 --variant drift]
 """
 
 from types import SimpleNamespace
@@ -75,6 +81,7 @@ _LIDAR_SLICE = slice(BASE_OBS_DIM, OBS_DIM)
 
 _AGENT_COLOR = (200, 50, 50)  # Box2D Agent.render_circle "closed" color
 _COUPLED_OUTLINE = (0, 170, 0)
+_GROUP_COLOR = (255, 140, 0)  # ring on agents co-driven in manual group control
 
 
 class MJXRenderer(Renderer):
@@ -109,6 +116,7 @@ class MJXRenderer(Renderer):
         state: EnvState,
         obs: np.ndarray | None = None,
         focus_agent: int | None = 0,
+        highlight=(),
     ) -> np.ndarray | None:
         """Draw one frame from an ``EnvState``.
 
@@ -117,6 +125,8 @@ class MJXRenderer(Renderer):
             obs: optional (n_agents, OBS_DIM) observation for the sensor
                 overlay of ``focus_agent``; overlay is skipped when None.
             focus_agent: whose observation to overlay (None disables it).
+            highlight: agent indices to ring in ``_GROUP_COLOR`` — used by
+                ``manual_control`` to show which agents a keypress drives.
 
         Returns:
             (H, W, 3) uint8 frame in ``rgb_array`` mode, else None.
@@ -130,6 +140,7 @@ class MJXRenderer(Renderer):
         self._draw_boxes(snap)
         self._draw_box_coupling(snap)
         self._draw_agents(snap)
+        self._draw_highlight(snap, highlight)
         if obs is not None and focus_agent is not None:
             self._draw_obs_overlay(snap, np.asarray(obs), focus_agent)
 
@@ -232,6 +243,17 @@ class MJXRenderer(Renderer):
                 self.screen.blit(outline, rect.move(offset))
             self.screen.blit(surface, rect)
 
+    def _draw_highlight(self, snap, highlight):
+        """Ring the given agents. Drawn after `_draw_agents` so it sits on top,
+        and before the sensor overlay so the focus agent's own marker still wins.
+        """
+        radius = int(_AGENT_RADIUS * self.scale) + 3
+        for i in highlight:
+            pygame.draw.circle(
+                self.screen, _GROUP_COLOR, self._to_screen(*snap["agent_pos"][i]),
+                radius, 3,
+            )
+
     def _draw_obs_overlay(self, snap, obs, focus_agent):
         """Sensor overlay for one agent, fed by its actual observation vector.
 
@@ -265,6 +287,134 @@ class MJXRenderer(Renderer):
             self.screen, (0, 0, 0), center, int(_AGENT_RADIUS * self.scale) + 3, 2
         )
         self._draw_sensor_hud(idx, readout)  # inherited
+
+
+def manual_control(
+    env: MultiBoxPushMJX,
+    seed: int = 0,
+    fps: int = 30,
+    screen_size: tuple[int, int] = (700, 700),
+):
+    """Drive the env from the keyboard — the MJX counterpart of the box2d suite's
+    per-env debuggers (``multi_box_push.py`` / ``push_box.py`` ``manual_debug``),
+    with the same control scheme so muscle memory carries over.
+
+        [ARROWS] move the controlled agent      [SPACE] switch controlled agent
+        [G]      toggle group control           [R]     reset the episode
+        [TAB]    cycle the sensor overlay       [ESC]   quit
+
+    Group control drives every agent within the controlled agent's **sensing
+    radius** (``env.sector_sensor_radius``) with the same force. Membership is
+    recomputed every step from live positions, so agents join and leave the group
+    as they move — which is the point: it is the same neighbourhood the density
+    sensors and ``comm_radius`` adjacency see, and the sensor overlay already
+    draws that circle, so the ring around each grouped agent should always sit
+    inside it.
+
+    Useful because ``coupling`` agents must touch a box *simultaneously* to move
+    it: single-agent control cannot exercise the coupling mechanic at all, and
+    group control is the cheapest way to hand-drive a real coalition.
+    """
+    import jax
+
+    renderer = MJXRenderer(env, mode="human", screen_size=screen_size, fps=fps)
+    reset, step = jax.jit(env.reset), jax.jit(env.step)
+    n = env.n_agents
+    radius = env.sector_sensor_radius
+
+    print(
+        f"\n{'=' * 62}\n MULTI BOX PUSH MJX — MANUAL CONTROL\n{'=' * 62}\n"
+        f" {n} agents, {env.n_objects} objects, coupling "
+        f"{list(env.objects_push_coupling_list)}\n"
+        f" variant={env.variant} drift={env.box_drift_speed} "
+        f"walls_end_episode={env.boundary_ends_episode}\n"
+        f" sensing radius {radius:.1f} (group control range)\n"
+        f"{'-' * 62}\n"
+        "  [ARROWS] move        [SPACE] switch agent   [G] group toggle\n"
+        "  [R]      reset       [TAB]   overlay agent  [ESC] quit\n"
+        f"{'=' * 62}\n"
+        " compiling env.step (a few seconds on first frame)...\n"
+    )
+
+    obs, state = reset(jax.random.PRNGKey(seed))
+    agent, group_on, overlay, episode = 0, False, 0, 0
+    total, running = 0.0, True
+
+    # Draw the reset state BEFORE entering the loop. MJXRenderer creates its
+    # screen lazily inside render(), and pygame.event.get()/key.get_pressed()
+    # raise "video system not initialized" until pygame.init() has run — which
+    # would happen only at the *end* of the first iteration. This also puts the
+    # start state on screen while env.step compiles, instead of a blank window.
+    renderer.render(state, obs=obs, focus_agent=overlay)
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    agent = (agent + 1) % n
+                    overlay = agent
+                    print(f">>> controlling agent {agent}")
+                elif event.key == pygame.K_g:
+                    group_on = not group_on
+                    print(
+                        f">>> group control {'ON' if group_on else 'OFF'} "
+                        f"(sensing radius {radius:.1f})"
+                    )
+                elif event.key == pygame.K_TAB:
+                    overlay = (overlay + 1) % n
+                    print(f">>> sensor overlay on agent {overlay}")
+                elif event.key == pygame.K_r:
+                    obs, state = reset(jax.random.PRNGKey(seed + episode + 1))
+                    episode, total = episode + 1, 0.0
+                    print(f">>> reset (episode {episode})")
+
+        keys = pygame.key.get_pressed()
+        force = np.array(
+            [
+                float(keys[pygame.K_RIGHT]) - float(keys[pygame.K_LEFT]),
+                float(keys[pygame.K_UP]) - float(keys[pygame.K_DOWN]),
+            ],
+            dtype=np.float32,
+        )
+
+        # Who this keypress drives. Recomputed per step from live positions so
+        # the group tracks the sensing neighbourhood rather than freezing at the
+        # moment G was pressed.
+        driven = [agent]
+        if group_on:
+            pos = np.asarray(env._agent_pos(state.data))
+            within = np.linalg.norm(pos - pos[agent], axis=1) <= radius
+            driven = np.flatnonzero(within).tolist()
+
+        actions = np.zeros((n, 2), dtype=np.float32)
+        actions[driven] = force
+
+        obs, state, reward, term, trunc, info = step(state, actions)
+        total += float(np.sum(np.asarray(reward)))  # scalar, or per-agent under DR
+
+        pygame.display.set_caption(
+            f"MJX manual | ep {episode} t {int(state.t)} | return {total:+.1f} | "
+            f"agent {agent}{f' +{len(driven) - 1}' if len(driven) > 1 else ''}"
+            f"{' [GROUP]' if group_on else ''} | "
+            f"delivered {int(np.asarray(info['delivered']).sum())}/{env.n_objects}"
+        )
+        renderer.render(state, obs=obs, focus_agent=overlay, highlight=driven)
+
+        if bool(term) or bool(trunc):
+            print(
+                f">>> episode {episode} ended at t={int(state.t)} "
+                f"({'terminated' if bool(term) else 'truncated'}), "
+                f"return {total:+.1f}, delivered "
+                f"{int(np.asarray(info['delivered']).sum())}/{env.n_objects}"
+            )
+            obs, state = reset(jax.random.PRNGKey(seed + episode + 1))
+            episode, total = episode + 1, 0.0
+
+    renderer.close()
 
 
 class MuJoCoNativeRenderer:
@@ -381,9 +531,21 @@ if __name__ == "__main__":
     parser.add_argument("--native", choices=["iso", "top"], default=None,
                         help="render with the native MuJoCo (OpenGL) renderer "
                              "instead of pygame; needs MUJOCO_GL=egl headless")
+    parser.add_argument("--manual", action="store_true",
+                        help="drive the env from the keyboard in a live pygame "
+                             "window instead of recording a scripted rollout "
+                             "(needs a real display: do NOT set SDL_VIDEODRIVER)")
+    parser.add_argument("--variant", choices=["drift", "trunc"], default=None,
+                        help="env variant preset (default: baseline)")
     args = parser.parse_args()
 
-    env = MultiBoxPushMJX(n_agents=args.n_agents, n_objects=args.n_objects)
+    env = MultiBoxPushMJX(
+        n_agents=args.n_agents, n_objects=args.n_objects, variant=args.variant
+    )
+    if args.manual:
+        manual_control(env, seed=args.seed)
+        raise SystemExit(0)
+
     if args.native:
         renderer = MuJoCoNativeRenderer(env, camera=args.native)
         draw = lambda state, obs: renderer.render(state)  # noqa: E731
