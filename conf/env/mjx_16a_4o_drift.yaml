@@ -7,8 +7,22 @@
 # a sequential schedule arithmetically cannot reach its last box.
 #
 # Ablate against `mjx_16a_4o` (baseline) AND `mjx_16a_4o_trunc` (which carries
-# only the boundary_truncates change): this arm differs from the baseline in two
-# ways, so without the middle arm the result is not attributable.
+# only the inert-wall change): this arm differs from the baseline in two ways,
+# so without the middle arm the result is not attributable.
+#
+# Wall contact is inert here (it never ends the episode). Under drift, shaping is
+# negative while any box is uncoupled, so an episode-ending wall hit is an escape
+# from the bleeding — and `boundary_hit` is `any()` over 16 agents, so it is a
+# unilateral one. Reporting it as `truncated` and bootstrapping through it was
+# tried and is NOT sufficient (policies still learned to crash); the escape is
+# removed instead. See the `multi_box_push_mjx` module docstring.
+#
+# CHECK `_DEFAULT_DRIFT_SPEED` BEFORE TRUSTING A RESULT FROM THIS ARM. At the
+# current 3.0 the drift force (3072 N) far exceeds a 4-agent coalition's ~400 N,
+# and `--check-drift` [8] fails: a *scripted balanced partition* — the strategy
+# the mechanic exists to reward — delivers 0.5 of 4 boxes with drift on vs 4.0
+# with it off, and loses to the swarm. The task is close to infeasible there, so
+# a flat learning curve would say nothing about coalition discovery.
 #
 # NOTE: difference rewards are structurally BLIND to this pressure — an
 # unattended box's drift cost does not depend on agent i, so it cancels in

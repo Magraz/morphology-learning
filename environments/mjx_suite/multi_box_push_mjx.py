@@ -46,28 +46,44 @@ box, forcing the agents into simultaneous coalitions.
 - Gate: ``~met & ~delivered & (box_y > box_drift_floor)``. ``met`` is masked by
   ``active``, so the drift joins every difference-reward counterfactual for
   free: drop a *pivotal* agent and its box starts sinking in that branch.
-- The floor keeps a sunk box **recoverable** — pushing a box up means getting
-  under it, but an agent within ``boundary_thickness + _AGENT_RADIUS`` of the
-  wall ends the episode, so a box on the bottom wall would be stuck forever.
-  Default ``boundary_thickness + 2*box_half_extent`` is the smallest clearance
-  that keeps the geometry feasible. Insurance, not a cap on the pressure: a
-  passive box needs ~20 s to reach it versus a 17 s episode.
-- Drift makes shaping negative while any box is uncoupled, which turns a
-  boundary-hit *termination* into an escape from the bleeding (pays 0, ends the
-  episode). ``boundary_truncates`` — on by default whenever drift is — reports
-  ``truncated`` instead, so the trainers' bootstrap adds ``gamma * V(s_next)``
-  and prices a wall hit at the cost of continuing.
-- ``box_drift_speed=0`` is a strict no-op: every branch is a Python-level
-  ``if``, so the graph and the numbers are unchanged (verified bit-identical).
-- Config surface is the ``variant`` preset (``env.variant`` in ``conf/env/``):
-  ``"drift"`` -> drift + truncation, ``"trunc"`` -> truncation only, ``None``
-  -> both off. Presets supply only *defaults*; explicit ``box_drift_speed`` /
-  ``box_drift_floor`` / ``boundary_truncates`` override them, which is how the
-  assertion suite and the calibration sweep dial values.
+- The floor keeps a sunk box **recoverable**: pushing a box up means getting
+  under it, and the default ``5*boundary_thickness + 2*box_half_extent`` is the
+  smallest clearance that keeps that geometry feasible. Insurance, not a cap on
+  the pressure: a passive box needs ~20 s to reach it versus a 17 s episode.
+- **Wall contact is inert in both drift arms** (``boundary_ends_episode`` is
+  True only for the baseline). Drift makes shaping negative while any box is
+  uncoupled, so an episode-ending wall hit is an *escape* from the bleeding —
+  and a unilateral one, since ``boundary_hit`` is ``any()`` over agents, so one
+  of 16 ends it for the team from ~6 steps out of spawn.
+
+  The earlier fix reported the hit as ``truncated`` so the trainers' bootstrap
+  would add ``gamma * V(s_next)`` and price the escape at the cost of
+  continuing. That is not enough, and the arms trained under it learned to
+  crash on purpose. Two reasons. (a) The stored return for crashing is
+  ``0 + gamma*V̂(s_wall)`` against ``r_t + gamma*V̂(s_t+1)`` for continuing, so
+  crashing wins by ``-r_t`` plus the critic's own error — with ``V̂ ~ 0`` early
+  that is exactly the per-step drift bleed. (b) It is self-sealing: once the
+  policy crashes at step k, no data past k is ever collected, so ``V̂`` at the
+  bootstrapped states is trained only against other bootstrap targets, which is
+  self-consistent with *any* value. The critic never learns that drifting
+  states are worth ``< 0``, so the bias never corrects.
+
+  So the escape is removed rather than priced. The walls are real inward-facing
+  planes and agents cannot leave regardless; boundary *termination* was Box2D
+  parity. With it gone, "end the episode" is not in the action space and the
+  whole failure mode is unreachable. Both arms share this, so the ablation
+  ladder still isolates one change per step: baseline (wall ends it) ->
+  ``trunc`` (wall inert) -> ``drift`` (wall inert + decay).
+- ``variant=None`` is a strict no-op: every branch is a Python-level ``if``, so
+  the baseline graph and numbers are unchanged (verified bit-identical).
+- Config surface is the ``variant`` preset (``env.variant`` in ``conf/env/``),
+  and it is the *whole* surface — every knob is a constant of the preset, so an
+  arm is fully identified by its name: ``"drift"`` -> decay + inert walls,
+  ``"trunc"`` -> inert walls only, ``None`` -> stock Box2D-parity behavior.
 
 Differences from Box2D: spawns use shuffled jittered grids rather than rejection
 sampling (jit needs static shapes), same regions and min separations; drift and
-``boundary_truncates`` have no counterpart; shaping is live from step 1 (Box2D
+the inert-wall variants have no counterpart; shaping is live from step 1 (Box2D
 pays 0 on its first step); box sizes are fixed per instance (already true there).
 
 Demo / sanity check (no display needed):
@@ -114,7 +130,7 @@ class VARIANTS(StrEnum):
     branch below evaluated to "off" and the drift never applied a force.
     """
 
-    TRUNC = "trunc"  # boundary hits truncate rather than terminate; no drift
+    TRUNC = "trunc"  # boundary hits are inert (never end the episode); no drift
     DRIFT = "drift"  # the above + uncoupled boxes decay toward the bottom wall
 
 
@@ -211,9 +227,8 @@ class MultiBoxPushMJX:
         )
 
         # --- box drift ("decay"); see the module docstring ---
-        # `variant` is only a preset: it supplies the defaults and any explicit
-        # kwarg wins, so the assertion suite and the calibration sweep can dial
-        # speed/floor directly without inventing a variant name per value.
+        # `variant` is the whole config surface: every knob below is a constant
+        # of the preset, so an arm is fully identified by its name.
         box_drift_speed = _DEFAULT_DRIFT_SPEED if variant is VARIANTS.DRIFT else 0.0
         self.box_drift_speed = float(box_drift_speed)
         self._drift_on = self.box_drift_speed > 0.0
@@ -235,13 +250,13 @@ class MultiBoxPushMJX:
 
         self.box_drift_floor = np.array(drift_floor)  # (O,) numpy, for logging/tests
         self._drift_floor = jnp.asarray(drift_floor, dtype=jnp.float32)
-        # Drift makes shaping negative while any box is uncoupled, which turns
-        # boundary-hit *termination* into an escape from the bleeding (pays 0,
-        # ends the episode). Truncating instead lets the trainers' truncation
-        # bootstrap price a wall hit at the cost of continuing. Independent knob
-        # so the ablation can isolate the termination-semantics change.
-        boundary_truncates = self._drift_on or variant is VARIANTS.TRUNC
-        self.boundary_truncates = bool(boundary_truncates)
+        # Drift makes shaping negative while any box is uncoupled, which turns a
+        # boundary hit into an *escape* from the bleeding. Both drift arms
+        # therefore make wall contact inert: it neither ends the episode nor
+        # alters the bookkeeping, so "quit early" leaves the action space
+        # entirely. See the module docstring for why pricing the escape (the
+        # previous `boundary_truncates` approach) cannot work.
+        self.boundary_ends_episode = variant is None
 
         # --- build & compile the planar MuJoCo model ---
         self._heavy_mass_np = heavy_mass  # kept for the visual model rebuild
@@ -664,9 +679,16 @@ class MultiBoxPushMJX:
         completion = 100.0 * newly_delivered.sum()
         task_reward = completion + (shaping if self._dense else 0.0)
 
-        # Box2D skips reward/delivery bookkeeping on a boundary hit
-        reward = jnp.where(boundary_hit, 0.0, task_reward)
-        return reward, newly_delivered, boundary_hit, dist
+        # Box2D skips reward/delivery bookkeeping on a boundary hit — but only
+        # because the hit *is* the episode's terminal failure there. Where wall
+        # contact is inert (the drift arms) the step physically happened like any
+        # other and must pay its real reward: zeroing it would hand back exactly
+        # the negative drift shaping the agent would otherwise eat, i.e. a
+        # standing bonus for touching a wall. Python-level `if`, so the baseline
+        # graph and numbers are untouched.
+        if self.boundary_ends_episode:
+            task_reward = jnp.where(boundary_hit, 0.0, task_reward)
+        return task_reward, newly_delivered, boundary_hit, dist
 
     def _difference_rewards(
         self, state: EnvState, actions: jnp.ndarray, g_factual: jnp.ndarray
@@ -721,21 +743,23 @@ class MultiBoxPushMJX:
         data = self._advance(state, actions, active)
         reward, newly_delivered, boundary_hit, dist = self._task_reward(state, data)
 
-        delivered = jnp.where(
-            boundary_hit, state.delivered, state.delivered | newly_delivered
-        )
+        if self.boundary_ends_episode:
+            delivered = jnp.where(
+                boundary_hit, state.delivered, state.delivered | newly_delivered
+            )
+        else:
+            delivered = state.delivered | newly_delivered
         t = state.t + 1
         all_delivered = jnp.all(delivered)
-        if self.boundary_truncates:
-            # A wall hit is an artificial cut-off, not an absorbing failure — the
-            # same category as the time limit. Filing it as truncation lets the
-            # trainers bootstrap `gamma * V(s_next)` through it, which is what
-            # stops "run into a wall" from being an escape from negative drift
-            # reward (see the module docstring).
-            terminated = all_delivered
-            truncated = (t >= self.max_steps) | boundary_hit
-        else:
+        if self.boundary_ends_episode:
             terminated = boundary_hit | all_delivered
+            truncated = t >= self.max_steps
+        else:
+            # Wall contact is inert. The walls are real inward-facing planes, so
+            # agents are already physically confined — ending the episode on
+            # contact was Box2D parity, not a physical necessity, and under drift
+            # it was the cheapest way out of a negative reward stream.
+            terminated = all_delivered
             truncated = t >= self.max_steps
 
         obs = self._get_obs(data, delivered)
@@ -848,14 +872,16 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
     """Assertion suite for the box drift mechanic (see the module docstring)."""
     import time
 
-    v_d = 0.8
+    # The arms are named presets with no tunable knobs, so the suite checks the
+    # `drift` arm exactly as training runs it.
+    v_d = _DEFAULT_DRIFT_SPEED
     k = _BOX_LIN_DAMPING
     rho = 1.0 / (1.0 + k * _TIME_STEP)  # per-step velocity decay factor
 
     def make(**kw):
         return MultiBoxPushMJX(n_agents=n_agents, n_objects=n_objects, **kw)
 
-    off, on = make(), make(box_drift_speed=v_d)
+    off, on = make(), make(variant="drift")
     coupling = np.asarray(off.objects_push_coupling_list)
     print(
         f"drift checks @ {n_agents}a/{n_objects}o | world {on.world_width} | "
@@ -865,8 +891,10 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
     )
 
     # --- 1. drift off is inert -------------------------------------------------
-    assert off._drift_on is False and off.boundary_truncates is False
-    assert on._drift_on is True and on.boundary_truncates is True
+    assert off._drift_on is False and off.boundary_ends_episode is True
+    assert on._drift_on is True and on.boundary_ends_episode is False
+    assert make(variant="trunc")._drift_on is False
+    assert make(variant="trunc").boundary_ends_episode is False
     _, s_off = jax.jit(off.reset)(jax.random.PRNGKey(0))
     _, s_off, *_ = jax.jit(off.step)(s_off, jnp.zeros((n_agents, 2)))
     assert float(jnp.abs(s_off.data.qfrc_applied).max()) == 0.0
@@ -911,7 +939,7 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
         n_agents=n_agents,
         n_objects=n_objects,
         coupling_def="random",
-        box_drift_speed=v_d,
+        variant="drift",
     )
     st_r = clear_state(rnd)
     step_r = jax.jit(rnd.step)
@@ -926,24 +954,30 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
     )
 
     # --- 3. floor: the box stops and stays stopped ----------------------------
-    # Floor just under the lowest spawned box, so every box has to reach it,
-    # and enough steps for the *highest* box to arrive and settle.
-    spawn_y = np.asarray(clear_state(on).data.qpos[on._box_qadr[:, 1]])
-    floor = float(spawn_y.min() - 1.0)
-    n_settle = int((spawn_y.max() - floor) / v_d * 60) + 150
-    fl = make(box_drift_speed=v_d, box_drift_floor=floor)
+    # The arm's own floor (no override knob), so this is the floor training sees.
+    # Enough steps for the *highest* box to fall to it and settle.
+    fl = on
+    floor = np.asarray(fl.box_drift_floor)  # (O,)
     st_f = clear_state(fl)
     box_start = np.asarray(st_f.data.qpos[fl._box_qadr[:, 1]])
+    n_settle = int((box_start - floor).max() / v_d * 60) + 150
     step_f = jax.jit(fl.step)
     for _ in range(n_settle):
         _, st_f, *_ = step_f(st_f, zero)
     box_end = np.asarray(st_f.data.qpos[fl._box_qadr[:, 1]])
+    # The floor is a force *gate*, not a hard limit, so a box coasts past it by
+    # its stopping distance v_d*tau = v_d/k before the damping kills the carried
+    # velocity. That is real resting clearance the floor does not provide —
+    # significant at the current v_d (0.6 of the 5.7 floor), so keep the tolerance
+    # tied to the physics rather than a constant that silently absorbs it.
+    coast = v_d / k
     assert (box_start > floor).all(), (box_start, floor)
-    assert (box_end >= floor - 0.3).all(), (box_end, floor)
+    assert (box_end >= floor - coast - 0.1).all(), (box_end, floor, coast)
     assert np.abs(np.asarray(st_f.data.qvel[fl._box_dof_y])).max() < 1e-3
     print(
-        f"  [3] floor {floor:.2f} after {n_settle} steps: y {np.round(box_start, 2)} "
-        f"-> {np.round(box_end, 2)}, settled (no chatter)   OK"
+        f"  [3] floor {np.round(floor, 2)} after {n_settle} steps: "
+        f"y {np.round(box_start, 2)} -> {np.round(box_end, 2)} "
+        f"(coast {coast:.2f}), settled (no chatter)   OK"
     )
 
     # --- 4. coupling gate: met -> that box's force is off, others keep theirs --
@@ -993,23 +1027,38 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
         f"drift off -> {cum_off:.1e}   OK"
     )
 
-    # --- 6. boundary hit: truncated (drift) vs terminated (baseline) ----------
-    def wall_dive(env):
+    # --- 6. wall contact: inert in the drift arms, terminal in the baseline ---
+    # The failure this guards: under drift, an episode-ending wall hit is an
+    # escape from the negative shaping, and the crash step used to be paid 0
+    # (Box2D parity) — handing back exactly the bleed it escaped.
+    def wall_dive(env, n=30):
         _, st = jax.jit(env.reset)(jax.random.PRNGKey(0))
         pos = np.array(st.data.qpos[env._agent_qadr])
         pos[0] = (env.world_width / 2, env.boundary_thickness + _AGENT_RADIUS + 0.4)
         st = _pose(env, st, agent_pos=pos)
         down = jnp.zeros((n_agents, 2)).at[0, 1].set(-1.0)
         f = jax.jit(env.step)
-        for _ in range(30):
-            _, st, _, term, trunc, _ = f(st, down)
+        lo = env.boundary_thickness + _AGENT_RADIUS + _WALL_EPS
+        contact = []  # rewards on the steps where agent 0 is against the wall
+        for _ in range(n):
+            _, st, r, term, trunc, _ = f(st, down)
+            if float(st.data.qpos[env._agent_qadr][0, 1]) < lo:
+                contact.append(float(r))
             if bool(term) or bool(trunc):
-                return bool(term), bool(trunc)
-        raise AssertionError("agent never reached the wall")
+                return bool(term), bool(trunc), contact
+        return False, False, contact
 
-    assert wall_dive(on) == (False, True)
-    assert wall_dive(off) == (True, False)
-    print("  [6] wall hit: drift arm -> truncated, baseline -> terminated   OK")
+    assert wall_dive(off)[:2] == (True, False), "baseline must still terminate"
+    term_on, trunc_on, contact = wall_dive(on)
+    assert (term_on, trunc_on) == (False, False), "wall contact must not end it"
+    assert contact, "agent never reached the wall"
+    assert all(r != 0.0 for r in contact), contact  # not the old zeroed reward
+    assert np.mean(contact) < 0.0, contact  # it eats the drift bleed like any step
+    print(
+        f"  [6] wall contact: baseline -> terminated; drift arm -> episode "
+        f"continues, {len(contact)} contact steps pay real reward "
+        f"(mean {np.mean(contact):+.4f}, never 0)   OK"
+    )
 
     # --- 7. recoverability: a box sitting *at* the floor is still deliverable --
     # Tested with a *minimum* coalition (the balanced partition, `coupling` agents
@@ -1109,14 +1158,28 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
     r_off_p, d_off_p, _ = scripted_return(off, partition)
     r_on_s, d_on_s, y_on_s = scripted_return(on, swarm)
     r_on_p, d_on_p, _ = scripted_return(on, partition)
-    assert r_on_p > r_on_s, (r_on_p, r_on_s)
-    assert y_on_s < y_off_s - 2.0, (y_on_s, y_off_s)
+    # Reported before asserting: when this check fails it is usually diagnosing
+    # the *drift speed*, not a code defect, and the numbers are what tell you so.
     print(
         f"  [8] efficacy: swarm {r_off_s:.0f} ({d_off_s:.1f} boxes) -> partition "
         f"{r_off_p:.0f} ({d_off_p:.1f}) with drift off; {r_on_s:.0f} ({d_on_s:.1f}) "
         f"-> {r_on_p:.0f} ({d_on_p:.1f}) with drift on. Swarm's ignored boxes end "
-        f"at y {y_off_s:.1f} -> {y_on_s:.1f} (they decay)   OK"
+        f"at y {y_off_s:.1f} -> {y_on_s:.1f} (they decay)"
     )
+    assert y_on_s < y_off_s - 2.0, (y_on_s, y_off_s)
+    # The mechanic must not invert the preference it exists to create. If the
+    # partition stops winning, `box_drift_speed` is too high for the coalition to
+    # survive: the drift force (v_d * k * mass) is racing `coupling` agents'
+    # combined thrust, so past some v_d even a perfectly scripted partition loses
+    # its boxes and the "correct" strategy is punished. Compare `d_on_p` against
+    # `d_off_p` — a collapse there means the task itself became infeasible.
+    assert r_on_p > r_on_s, (
+        f"drift INVERTED the strategy preference: partition {r_on_p:.0f} "
+        f"({d_on_p:.1f} boxes) <= swarm {r_on_s:.0f} ({d_on_s:.1f}); the partition "
+        f"delivers {d_off_p:.1f} boxes with drift off vs {d_on_p:.1f} on. "
+        f"box_drift_speed={v_d} is too high."
+    )
+    print("       partition still beats the swarm under drift   OK")
 
     # --- 9. stability + throughput under vmapped random actions ---------------
     def vmapped(env, steps=256):
@@ -1146,7 +1209,7 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
 
     # --- 10. difference rewards: pivotal gains, pile-on unchanged -------------
     dr_off = make(reward_mode="difference_rewards")
-    dr_on = make(reward_mode="difference_rewards", box_drift_speed=v_d)
+    dr_on = make(reward_mode="difference_rewards", variant="drift")
     up = jnp.zeros((n_agents, 2)).at[:, 1].set(1.0)
 
     def d_for(env, n_touch):
