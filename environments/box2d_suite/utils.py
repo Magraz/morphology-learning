@@ -107,6 +107,31 @@ class ObjectTargetArea:
         return in_x and in_y
 
 
+class CircularTargetArea:
+    """Disc-shaped drop zone — the radial counterpart of `ObjectTargetArea`.
+
+    Used by the circular-arena envs, whose goal is a region concentric with the
+    boundary rather than a band along one wall. Exposes the same duck-typed
+    surface the renderer consumes (`x`, `y`, `radius`, `color`,
+    `contains_object`) minus `width`/`height`, which is what
+    `Renderer._draw_target_areas` keys off to pick the disc branch.
+    """
+
+    def __init__(self, x, y, radius, color=(50, 200, 50, 128)):
+        self.x = x
+        self.y = y
+        self.radius = radius
+        self.color = color
+        self.reward_scale = 1.0
+        # Needed for compatibility with agent logic
+        self.coupling_requirement = 0
+
+    def contains_object(self, body):
+        """True when the body's center lies inside the disc."""
+        pos = body.position
+        return np.hypot(pos.x - self.x, pos.y - self.y) <= self.radius
+
+
 def update_object_mass_from_contacts(env, coupled_density_per_agent=0.05):
     """Lighten each object once its coupling requirement is met.
 

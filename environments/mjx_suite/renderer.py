@@ -50,6 +50,11 @@ SDL_VIDEODRIVER; arrows move, [G] co-drives everyone in the sensing radius.
 No MUJOCO_GL needed: this path is pygame, and MJX itself is pure compute.
     uv run python -m environments.mjx_suite.renderer --manual \
         [--n-agents 16 --n-objects 4 --variant drift]
+
+``--env circular`` swaps ``MultiBoxPushMJX`` for the circular-arena
+``MultiBoxMultiGoalPushMJX`` in every CLI mode (scripted recording, ``--native``,
+``--manual``); both renderers and ``manual_control`` are env-agnostic:
+    uv run python -m environments.mjx_suite.renderer --env circular --manual
 """
 
 from types import SimpleNamespace
@@ -290,7 +295,7 @@ class MJXRenderer(Renderer):
 
 
 def manual_control(
-    env: MultiBoxPushMJX,
+    env,
     seed: int = 0,
     fps: int = 30,
     screen_size: tuple[int, int] = (700, 700),
@@ -298,6 +303,11 @@ def manual_control(
     """Drive the env from the keyboard — the MJX counterpart of the box2d suite's
     per-env debuggers (``multi_box_push.py`` / ``push_box.py`` ``manual_debug``),
     with the same control scheme so muscle memory carries over.
+
+    Works with any MJX push env that ``MJXRenderer`` can draw — the square-arena
+    ``MultiBoxPushMJX`` and the circular-arena ``MultiBoxMultiGoalPushMJX``; the
+    square env's ``variant``/drift attributes are read with ``getattr`` so the
+    circular env, which has no such presets, needs no special case.
 
         [ARROWS] move the controlled agent      [SPACE] switch controlled agent
         [G]      toggle group control           [R]     reset the episode
@@ -323,11 +333,12 @@ def manual_control(
     radius = env.sector_sensor_radius
 
     print(
-        f"\n{'=' * 62}\n MULTI BOX PUSH MJX — MANUAL CONTROL\n{'=' * 62}\n"
+        f"\n{'=' * 62}\n {type(env).__name__} — MANUAL CONTROL\n{'=' * 62}\n"
         f" {n} agents, {env.n_objects} objects, coupling "
         f"{list(env.objects_push_coupling_list)}\n"
-        f" variant={env.variant} drift={env.box_drift_speed} "
-        f"walls_end_episode={env.boundary_ends_episode}\n"
+        f" variant={getattr(env, 'variant', None)} "
+        f"drift={getattr(env, 'box_drift_speed', 0.0)} "
+        f"walls_end_episode={getattr(env, 'boundary_ends_episode', True)}\n"
         f" sensing radius {radius:.1f} (group control range)\n"
         f"{'-' * 62}\n"
         "  [ARROWS] move        [SPACE] switch agent   [G] group toggle\n"
@@ -517,9 +528,11 @@ if __name__ == "__main__":
 
     import jax
 
-    from environments.mjx_suite.multi_box_push_mjx import scripted_push_action
-
     parser = argparse.ArgumentParser()
+    parser.add_argument("--env", choices=["square", "circular"], default="square",
+                        help="square: MultiBoxPushMJX (square arena, goal band); "
+                             "circular: MultiBoxMultiGoalPushMJX (disc arena, "
+                             "concentric goal disc)")
     parser.add_argument("--n-agents", type=int, default=9)
     parser.add_argument("--n-objects", type=int, default=3)
     parser.add_argument("--steps", type=int, default=400)
@@ -536,12 +549,29 @@ if __name__ == "__main__":
                              "window instead of recording a scripted rollout "
                              "(needs a real display: do NOT set SDL_VIDEODRIVER)")
     parser.add_argument("--variant", choices=["drift", "trunc"], default=None,
-                        help="env variant preset (default: baseline)")
+                        help="env variant preset (square env only; "
+                             "default: baseline)")
     args = parser.parse_args()
 
-    env = MultiBoxPushMJX(
-        n_agents=args.n_agents, n_objects=args.n_objects, variant=args.variant
-    )
+    if args.env == "circular":
+        # The circular env carries no drift/variant presets (see its module
+        # docstring) — a wall touch always ends the episode there.
+        if args.variant is not None:
+            parser.error("--variant is only supported by --env square")
+        from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
+            MultiBoxMultiGoalPushMJX,
+            scripted_push_action,
+        )
+
+        env = MultiBoxMultiGoalPushMJX(
+            n_agents=args.n_agents, n_objects=args.n_objects
+        )
+    else:
+        from environments.mjx_suite.multi_box_push_mjx import scripted_push_action
+
+        env = MultiBoxPushMJX(
+            n_agents=args.n_agents, n_objects=args.n_objects, variant=args.variant
+        )
     if args.manual:
         manual_control(env, seed=args.seed)
         raise SystemExit(0)

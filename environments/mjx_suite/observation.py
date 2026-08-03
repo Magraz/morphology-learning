@@ -21,6 +21,9 @@ It covers the whole suite, not just multi_box_push:
   ``env.objects`` is empty.
 - **No goal region** (``goal_coord=None``, e.g. contact / scatter /
   rendezvouz): ``goal_distance`` is zero, as when ``env.target_areas`` is empty.
+- **Concentric goal** (``goal_axis="radial"``, circular arenas): ``goal_coord``
+  is the goal center ``(2,)`` and the feature is the radial distance to it,
+  offset by ``goal_radius`` so it crosses zero on the goal boundary.
 - **Per-episode goal wall** (push_box): ``goal_axis`` accepts a *traced* axis
   index (0 = x, 1 = y) as well as the static ``"x"``/``"y"`` strings, so a goal
   side sampled at ``reset`` stays jit-compatible.
@@ -218,17 +221,29 @@ class MJXObservationBuilder:
             vec = jnp.where(jnp.all(delivered), 0.0, vec)
         return vec
 
-    def goal_distances(self, agent_pos, goal_coord=None, goal_axis="y"):
+    def goal_distances(self, agent_pos, goal_coord=None, goal_axis="y",
+                       goal_radius=0.0):
         """(A,) signed distance to the goal center along the goal axis.
 
         ``goal_coord`` is the target center's coordinate *on that axis*; ``None``
         means the env has no target region and the feature is zero. ``goal_axis``
         is ``"y"``/``"x"`` when the axis is fixed, or a traced index (0 = x,
         1 = y) for envs that sample the goal wall per episode (push_box).
+
+        ``goal_axis="radial"`` is the concentric-goal case (circular arenas):
+        ``goal_coord`` is then the goal *center* ``(2,)`` and the feature is the
+        distance from the agent to that center less ``goal_radius``, so it
+        crosses zero exactly on the goal boundary — the radial analogue of the
+        axis form, which crosses zero on the band center. Same
+        ``world_width`` normalization, so the scale matches the other envs.
         """
         if goal_coord is None:
             return jnp.zeros(self.n_agents)
         if isinstance(goal_axis, str):
+            if goal_axis == "radial":
+                center = jnp.asarray(goal_coord)  # (2,)
+                dist = jnp.linalg.norm(agent_pos - center, axis=1)
+                return (dist - goal_radius) / self.world_width
             if goal_axis == "x":
                 return (goal_coord - agent_pos[:, 0]) / self.world_width
             return (goal_coord - agent_pos[:, 1]) / self.world_height
@@ -295,12 +310,14 @@ class MJXObservationBuilder:
         box_half=None,
         goal_coord=None,
         goal_axis="y",
+        goal_radius=0.0,
         delivered=None,
     ):
         """(A, obs_dim) float32 observation in the shared Box2D-suite layout.
 
         ``box_*`` may be omitted when the env has no objects. ``goal_coord`` /
-        ``goal_axis`` locate the target band (see ``goal_distances``).
+        ``goal_axis`` / ``goal_radius`` locate the target region (see
+        ``goal_distances``).
         ``delivered`` is an optional (O,) bool mask of already-delivered boxes,
         excluded from ``nearest_box_vec`` (see ``nearest_box_vectors``).
         """
@@ -318,7 +335,9 @@ class MJXObservationBuilder:
                 self.neighbor_fractions(agent_pos)[:, None],
                 (self.contact_forces(data) / self.force_multiplier)[:, None],
                 self.nearest_box_vectors(agent_pos, box_pos, delivered),
-                self.goal_distances(agent_pos, goal_coord, goal_axis)[:, None],
+                self.goal_distances(agent_pos, goal_coord, goal_axis, goal_radius)[
+                    :, None
+                ],
                 self.lidar(data, agent_pos),
             ],
             axis=1,

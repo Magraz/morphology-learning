@@ -91,9 +91,23 @@ class Renderer:
             agent.render_box(self.screen, self.screen_size, self.scale, color)
 
     def _draw_boundary_walls(self):
-        """Draw boundary walls flush with screen edges."""
+        """Draw boundary walls flush with screen edges.
+
+        Circular arenas (`env.arena_radius`, e.g. the concentric-goal MJX env)
+        get a ring instead: the physical wall is the circle of that radius about
+        the world center, drawn `boundary_thickness` thick outward from it.
+        """
         sw, sh = self.screen_size
         t = max(1, int(self.env.boundary_thickness * self.scale))
+
+        arena_radius = getattr(self.env, "arena_radius", None)
+        if arena_radius is not None:
+            center = self._to_screen(
+                self.env.world_width / 2, self.env.world_height / 2
+            )
+            radius = int((arena_radius + self.env.boundary_thickness / 2) * self.scale)
+            pygame.draw.circle(self.screen, (0, 0, 0), center, radius, t)
+            return
 
         # Bottom wall
         pygame.draw.rect(self.screen, (0, 0, 0), pygame.Rect(0, sh - t, sw, t))
@@ -294,8 +308,13 @@ class Renderer:
             return
 
         target = target_areas[0]
-        # Match the observation: the distance is measured along one axis only.
-        if getattr(self.env, "goal_axis", "y") == "x":
+        goal_axis = getattr(self.env, "goal_axis", "y")
+        # Match the observation: the distance is measured along one axis only,
+        # or radially for a concentric goal (then the segment points at its
+        # center, the direction the obs measures along).
+        if goal_axis == "radial":
+            tip = self._to_screen(target.x, target.y)
+        elif goal_axis == "x":
             tip = self._to_screen(target.x, origin[1])
         else:
             tip = self._to_screen(origin[0], target.y)
@@ -370,6 +389,16 @@ class Renderer:
                     pygame.Rect(left, top, px_w, px_h),
                     2,
                 )
+
+            # Disc drop zone (CircularTargetArea — concentric-goal arenas):
+            # no width/height, so it falls through to the radius branch.
+            elif hasattr(area, "radius"):
+                center = self._to_screen(area.x, area.y)
+                r = int(area.radius * self.scale)
+                disc = pygame.Surface((2 * r, 2 * r), pygame.SRCALPHA)
+                pygame.draw.circle(disc, area.color, (r, r), r)
+                self.screen.blit(disc, (center[0] - r, center[1] - r))
+                pygame.draw.circle(self.screen, (0, 100, 0), center, r, 2)
 
             # Draw label (Optional)
             if hasattr(area, "contains_object"):
