@@ -21,9 +21,9 @@ import jax
 import numpy as np
 from flax.serialization import from_bytes, to_bytes
 
-from algorithms.mappo_jax.mappo import create_train_state
-from algorithms.mappo_jax.trainer import RunnerState, make_train
-from algorithms.mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
+from algorithms.feudal_mappo_jax.mappo import create_train_state
+from algorithms.feudal_mappo_jax.trainer import RunnerState, make_train
+from algorithms.feudal_mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
 from environments.mjx_suite.multi_box_push_mjx import MultiBoxPushMJX
 from environments.types import EnvironmentEnum
 
@@ -32,43 +32,6 @@ def set_seeds(seed: int):
     """Set Python and NumPy seeds. JAX uses explicit PRNG keys."""
     random.seed(seed)
     np.random.seed(seed)
-
-
-# `env:` yaml keys forwarded to MultiBoxPushMJX, vs. those consumed by the runner
-# and the macro wrapper. Kept as one list rather than a `.get()` per construction
-# site: the base env is built in two places (bare, and as the macro wrapper's
-# base), and a key that only one site forwarded would be silently ignored by the
-# other. Everything under `env:` is otherwise unvalidated — no dataclass guards
-# it — so unknown keys are warned about instead of vanishing.
-_BASE_ENV_KEYS = (
-    "n_agents",
-    "n_objects",
-    "coupling_def",
-    "max_steps",
-    "comm_radius",
-    "box_drift_speed",
-    "box_drift_floor",
-    "boundary_truncates",
-)
-_RUNNER_ENV_KEYS = frozenset(
-    {
-        "environment",
-        "n_envs",
-        "reward_mode",
-        "macro_len",
-        "stagger_starts",
-        "max_start_delay",
-    }
-)
-
-
-def _base_env_kwargs(env_config: dict) -> dict:
-    kwargs = {k: env_config[k] for k in _BASE_ENV_KEYS if k in env_config}
-    kwargs.setdefault("n_objects", 3)
-    unknown = set(env_config) - set(_BASE_ENV_KEYS) - _RUNNER_ENV_KEYS
-    if unknown:
-        print(f"WARNING: ignoring unknown env config keys: {sorted(unknown)}")
-    return kwargs
 
 
 class MAPPO_JAX_Runner:
@@ -125,6 +88,7 @@ class MAPPO_JAX_Runner:
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
+                variant=env_config.get("variant"),
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -148,6 +112,7 @@ class MAPPO_JAX_Runner:
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
                 reward_mode=base_reward_mode,
+                variant=env_config.get("variant"),
             )
             self.env = SyncMacroMJX(
                 base_env,
@@ -161,7 +126,7 @@ class MAPPO_JAX_Runner:
             )
         else:
             raise ValueError(
-                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' and "
+                f"feudal_mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' and "
                 f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
                 f"got {environment!r}"
             )
@@ -425,7 +390,7 @@ class MAPPO_JAX_Runner:
         import imageio
         import matplotlib.pyplot as plt
 
-        from algorithms.mappo_jax.network import sample_action
+        from algorithms.feudal_mappo_jax.network import sample_action
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
@@ -510,7 +475,14 @@ class MAPPO_JAX_Runner:
                         break
             rewards = np.asarray(rewards)
 
-            print(f"REWARD: {rewards[-1]:.4f}")
+            # Episode *return* (sum), not the final step's reward — the delivery
+            # bonuses are paid on the steps the boxes land, so `rewards[-1]`
+            # reported ~0 for any episode that did not happen to end on a
+            # delivery. Matches what `evaluate()` and the `reward` stat report.
+            print(
+                f"RETURN: {rewards.sum():.4f}  "
+                f"(final step {rewards[-1]:+.4f}, {len(rewards)} steps)"
+            )
 
             fig, ax = plt.subplots(figsize=(10, 3))
             ax.plot(np.arange(len(rewards)), rewards)

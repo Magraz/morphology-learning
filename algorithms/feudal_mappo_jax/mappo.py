@@ -26,8 +26,8 @@ import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
 
-from algorithms.mappo_jax.types import MAPPOConfig, Transition
-from algorithms.mappo_jax.network import (
+from algorithms.feudal_mappo_jax.types import MAPPOConfig, Transition
+from algorithms.feudal_mappo_jax.network import (
     MAPPOActor,
     MAPPOCritic,
     evaluate_action,

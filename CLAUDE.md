@@ -358,6 +358,41 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   `MUJOCO_GL=egl` headless. Demo (writes mp4 + png, scripted delivery via the
   shared `scripted_push_action`): `MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run
   python -m environments.mjx_suite.renderer [--native iso|top]`.
+- **Keyboard control** (`renderer.manual_control(env)`, `--manual`) — the MJX
+  counterpart of the box2d suite's per-env `manual_debug`, same control scheme:
+  `[ARROWS]` move the controlled agent, `[SPACE]` switches it, `[G]` toggles
+  group control, `[R]` resets, `[TAB]` moves the sensor overlay, `[ESC]` quits.
+  **Group control drives every agent within the controlled agent's sensing
+  radius** (`env.sector_sensor_radius`, = `world_width/3`) with the same force,
+  recomputed from live positions each step so membership tracks the
+  neighbourhood rather than freezing when `G` was pressed. It exists because
+  `coupling` agents must touch a box *simultaneously* to move it — single-agent
+  control cannot exercise the coupling mechanic at all. Grouped agents get an
+  orange ring (`MJXRenderer.render(..., highlight=[...])`, a general hook; empty
+  `highlight` is a no-op, so recorded rollouts are unchanged), and since the
+  sensor overlay already draws the sector-radius circle, every ring should sit
+  inside it. The window caption carries step / return / group size / delivered.
+  Needs a **real display** — do not set `SDL_VIDEODRIVER=dummy`. No `MUJOCO_GL`
+  needed (that is only for `MuJoCoNativeRenderer`; this path is pygame and MJX
+  is pure compute). `manual_control` draws the reset state **before** entering
+  the loop: `MJXRenderer` creates its screen lazily inside `render()`, and
+  `pygame.event.get()` / `key.get_pressed()` raise `video system not
+  initialized` until `pygame.init()` has run.
+  ```
+  uv run python -m environments.mjx_suite.renderer --manual \
+      [--n-agents 16 --n-objects 4 --variant drift|trunc --seed N]
+  ```
+  **`--env {square,circular}`** picks which env the whole CLI drives (scripted
+  recording, `--native`, and `--manual` alike): `square` = `MultiBoxPushMJX`
+  (default), `circular` = `MultiBoxMultiGoalPushMJX`. It also selects that
+  module's `scripted_push_action`. `manual_control` itself is env-agnostic —
+  the square-only `variant` / `box_drift_speed` / `boundary_ends_episode` in
+  its banner are read via `getattr`, and `--variant` errors on `--env circular`
+  (that env has no presets) rather than being silently ignored.
+  A `.vscode/launch.json` entry must use `"module":
+  "environments.mjx_suite.renderer"` + `"cwd": "${workspaceFolder}"` — the
+  module uses absolute imports, so `"program": ".../renderer.py"` fails with
+  `ModuleNotFoundError: No module named 'environments'`.
 - Demo/sanity check (scripted delivery rollout + vmapped throughput):
   `uv run python -m environments.mjx_suite.multi_box_push_mjx`. Step-matched
   wall-clock shootout vs Box2D (`profile_multi_box_push.py`, Box2D on all
@@ -376,25 +411,26 @@ working on. Added because `mappo_jax` fully solves `mjx_16a_4o`: a 16-agent
 swarm can deliver boxes one at a time, so no coalition structure has to be
 discovered. With the drift a sequential schedule arithmetically cannot reach its
 last box. Env groups `conf/env/mjx_16a_4o_drift.yaml` (`variant: drift`) and
-`conf/env/mjx_16a_4o_trunc.yaml` (`variant: trunc`, the termination-semantics
+`conf/env/mjx_16a_4o_trunc.yaml` (`variant: trunc`, the boundary-semantics
 control — see below; the drift arm changes two things at once, so this arm is
 what makes the comparison attributable).
 
-- **Config surface is `env.variant`, a preset** — the yamls select a named arm,
-  not raw numbers: `"drift"` → `box_drift_speed=_DEFAULT_DRIFT_SPEED` (1.0,
-  past the 0.5 knee of the calibration table below; not re-swept there) +
-  `boundary_truncates=True`; `"trunc"` → truncation only; absent/`None`
-  (baseline `mjx_16a_4o`, every `macro_mjx_*`, `multi_box_push_mjx_*`) → both
-  off. `run.py` forwards it to `MultiBoxPushMJX` at both construction sites
-  (bare and macro-wrapped). The preset only supplies *defaults*: passing
-  `box_drift_speed` / `box_drift_floor` / `boundary_truncates` explicitly wins,
-  which is how `--check-drift` and the calibration sweep dial values without
-  needing a variant name per value.
+- **Config surface is `env.variant`, a preset, and it is the WHOLE surface** —
+  every knob is a constant of the preset, so an arm is fully identified by its
+  name and there are no `box_drift_speed` / `box_drift_floor` kwargs to pass:
+  `"drift"` → `box_drift_speed=_DEFAULT_DRIFT_SPEED` (read the constant — it is
+  being tuned, and is set well past the 0.5 knee of the calibration table below,
+  which has not been re-swept there) + inert walls; `"trunc"` → inert walls
+  only; absent/`None` (baseline `mjx_16a_4o`, every `macro_mjx_*`,
+  `multi_box_push_mjx_*`) → neither, i.e. stock Box2D-parity behavior, verified
+  **bit-identical** (obs/reward/qpos/qvel over a fixed-seed 200-step rollout, in
+  both `dense` and `difference_rewards`). `run.py` forwards `variant` to
+  `MultiBoxPushMJX` at both construction sites (bare and macro-wrapped).
   - **Regression to know about (fixed 2026-07-31, was live in 32cf60d and
     7db37b3):** `VARIANTS` was a plain `Enum` read through a side table
     `_VARIANT_MAP = {"trunc": 1, "drift": 2}`, so the guards compared a raw
     `int` to an enum member — `2 == VARIANTS.DRIFT` is silently `False`. Drift
-    and `boundary_truncates` were therefore **off in every run**, and
+    and the boundary flag were therefore **off in every run**, and
     `variant=None` raised `KeyError: None`, breaking the baseline/macro groups
     outright. `VARIANTS` is now a `StrEnum` (the repo idiom, cf.
     `EnvironmentEnum`) parsed via `VARIANTS(variant)`, which also rejects an
@@ -402,7 +438,29 @@ what makes the comparison attributable).
     `mjx_16a_4o_trunc` result produced before this fix is really a baseline
     run and must be rediscarded/retrained.** The `--check-drift` suite did not
     catch it because the same commit dropped the `box_drift_speed` kwarg the
-    suite constructs with, so the suite could not run at all.
+    suite constructs with, so the suite could not run at all — it now
+    constructs via `variant=` and needs no kwargs, so it cannot desync again.
+
+- **Wall contact is inert in both drift arms** (`boundary_ends_episode` is True
+  only for the baseline), and the crash step pays its **real** reward rather
+  than the Box2D-parity 0. This replaces the earlier `boundary_truncates`
+  approach, which **did not work** — policies trained on `_drift` learned to
+  crash into a wall on purpose to end the episode. Why bootstrapping cannot fix
+  it: the stored return for crashing is `0 + γ·V̂(s_wall)` against
+  `r_t + γ·V̂(s_{t+1})` for continuing, so crashing wins by `−r_t` plus the
+  critic's own error — with `V̂ ≈ 0` early that is exactly the per-step drift
+  bleed, and the old `reward = where(boundary_hit, 0, task_reward)` handed back
+  that same bleed *unconditionally*, independent of any critic. Worse, it is
+  self-sealing: once the policy crashes at step k no data past k is collected,
+  so `V̂` at the bootstrapped states is trained only against other bootstrap
+  targets — self-consistent with **any** value — and never learns that drifting
+  states are worth `< 0`. Compounding it, `boundary_hit` is `jnp.any()` over
+  agents, so one of 16 ends the episode for the team from ~6 steps out of spawn.
+  The escape is therefore **removed, not priced**: the walls are real
+  inward-facing planes and agents cannot leave regardless, so boundary
+  *termination* was parity, not physics. Both arms share the change, so the
+  ladder still isolates one thing per step: baseline (wall ends it) → `trunc`
+  (wall inert) → `drift` (wall inert + decay).
 
 - **Mechanism**: a generalized force on each box's world-y slide DOF via
   `data.qfrc_applied`, set in `_advance`. The y slide axis is world-fixed
@@ -420,38 +478,26 @@ what makes the comparison attributable).
   drift share one notion of "working together" — and so the drift is masked by
   `active` and is therefore automatically part of every difference-reward
   counterfactual.
-- **Floor** (`box_drift_floor`, default `boundary_thickness + 2 *
-  box_half_extent` = 3.7 at 16a/4o): a box resting on the bottom wall is
-  **unrecoverable** — to push it up an agent centre must reach `box_bottom -
-  radius` = 0.1, but boundary termination fires at `bt + radius + eps` = 0.91.
-  One box-width of clearance is the smallest floor that keeps the geometry
-  feasible (verified: a box spawned exactly at the floor is pushed out and
-  delivered by a *minimum* coalition in 275 steps). It costs the mechanic
-  nothing — a passive box needs ~20 s to reach it versus a 17 s episode.
-  Implemented as a force gate, **not** an mjx joint limit: a limit is static
-  model structure (an extra constraint row on every step of every arm, so the
-  drift-off graph would change), MJX limits are soft, and it would obstruct
-  legitimate downward pushing. Known property: the floor guarantees the geometry
-  for a minimum coalition, not that any crowd survives — piling the whole team
-  under a floored box can still shove one of them into the wall.
-- **`boundary_truncates`** (independent flag; defaults to `box_drift_speed > 0`):
-  reports a boundary hit as `truncated` rather than `terminated`. Necessary
-  because the drift makes shaping negative on every step an uncoupled box exists,
-  which turns the boundary-hit *termination* into an escape from the bleeding (it
-  pays 0 and ends the episode) — worth **+5.3 discounted** at gamma=0.99, ~15% of
-  the discounted value of solving the task, and reachable in ~6 steps from spawn
-  by any one of 16 agents. `mappo_jax/trainer.py:143-147` already adds
-  `gamma * V(s_next)` on truncation (computed pre-reset, so it values the real
-  successor), so reclassifying prices a wall hit at the cost of continuing — no
-  magic constant, no gamma knowledge in the env, and it propagates to the macro
-  arms for free. **Residual risk to watch:** truncation is now agent-*controllable*,
-  so until the critic learns that drifting states are worth < 0 the suicide bias
-  survives; if mean episode length collapses in the first ~10 updates, ramp
-  `box_drift_speed` from 0 over the first 10% of training.
-- **`box_drift_speed=0` is a strict no-op**: every branch is a Python-level `if`,
-  so the graph and the numbers are unchanged. Verified **bit-identical** qpos /
+- **Floor** (`5 * boundary_thickness + 2 * box_half_extent` = 5.7 at 16a/4o): a
+  box resting on the bottom wall is hard to recover — to push it up an agent
+  centre must get under it. The clearance keeps that geometry feasible (verified:
+  a box spawned exactly at the floor is pushed out and delivered by a *minimum*
+  coalition in 260 steps). It costs the mechanic nothing — a passive box needs
+  ~20 s to reach it versus a 17 s episode. Implemented as a force gate, **not**
+  an mjx joint limit: a limit is static model structure (an extra constraint row
+  on every step of every arm, so the drift-off graph would change), MJX limits
+  are soft, and it would obstruct legitimate downward pushing. Two known
+  properties: the floor guarantees the geometry for a minimum coalition, not
+  that any crowd survives; and because it is a *gate*, a box coasts past it by
+  its stopping distance `v_d * tau = v_d / k` before the damping kills the
+  carried velocity — **0.6 of the 5.7 floor at the current `v_d = 3.0`**
+  (measured resting y ≈ 5.06), so the effective clearance is smaller than the
+  nominal floor. `--check-drift` [3] ties its tolerance to that formula rather
+  than a constant, so raising `v_d` cannot silently eat the margin.
+- **`variant=None` is a strict no-op**: every branch is a Python-level `if`, so
+  the graph and the numbers are unchanged. Verified **bit-identical** qpos /
   qvel / obs / reward over a fixed-seed 200-step rollout against the pre-change
-  code.
+  code, in both `dense` and `difference_rewards`.
 - **Calibration** (16a/4o, 4 seeds, scripted swarm vs balanced partition). Mean y
   of the boxes the swarm ignores / boxes delivered by the partition:
 
@@ -468,10 +514,24 @@ what makes the comparison attributable).
 - **Measured, and contrary to the design prediction:** the partition-over-swarm
   return *gap* does **not** widen with drift (16a/4o, 4 seeds: +318 at `v_d=0` vs
   +284 at 0.8; it stays roughly flat). With a scripted oracle both arms pay drift
-  cost. What is robust is that the partition still wins at every `v_d` (the
-  mechanic never inverts the preference) and that the swarm's ignored boxes decay
-  monotonically. Whether it changes what a *learned* policy does is a training
-  question, not a scripted-probe one.
+  cost. What was robust *within the swept range* is that the partition still wins
+  at every `v_d` (the mechanic never inverts the preference) and that the swarm's
+  ignored boxes decay monotonically. Whether it changes what a *learned* policy
+  does is a training question, not a scripted-probe one.
+- **⚠ `_DEFAULT_DRIFT_SPEED = 3.0` is outside the calibrated range and breaks the
+  mechanic.** The sweep above stops at 0.8, already the point where the drift
+  force exceeds a full coalition's thrust; at 3.0 it is 3072 N against ~400 N.
+  `--check-drift` [8] **fails** there (16a/4o, seeds 7/23): the scripted balanced
+  partition — the strategy the mechanic exists to reward — delivers **0.5 of 4
+  boxes** with drift on vs **4.0** with it off, and its return *loses* to the
+  swarm (21 vs 60), i.e. the drift **inverts** the preference. The task is close
+  to infeasible at this speed, so a flat learning curve on `_drift` says nothing
+  about coalition discovery. Re-sweep and pick from the table (0.5 was the knee)
+  before running the arm; the check is the canary. Note the inversion is mostly
+  the speed, not the inert-wall change: measured partition − swarm at `v_d=3.0`
+  is **+8** under the old episode-ending walls and **−39** under inert walls
+  (against **+345** with no drift), because the swarm no longer has its episode
+  cut short at ~615 steps by an incidental wall hit and finishes its one box.
 - **Difference rewards are structurally blind to this pressure.** An unattended
   box's drift cost does not depend on agent *i*, so it appears identically in `G`
   and `G_-i` and cancels exactly. Measured: pivotal `D_i` (exactly `coupling`
@@ -496,9 +556,165 @@ what makes the comparison attributable).
   by accident. Surplus agents clamp to the face edges and crowd in as before.
 - Assertion suite (10 checks: no-op, terminal velocity/axis purity/mass
   independence/transient, floor settling, coupling gate, reward semantics,
-  truncation, recoverability, efficacy, vmapped stability, DR structure):
+  inert walls, recoverability, efficacy, vmapped stability, DR structure):
   `uv run python -m environments.mjx_suite.multi_box_push_mjx --check-drift
-  [--n-agents 16 --n-objects 4]` (needs jit, so it ignores `--debug`).
+  [--n-agents 16 --n-objects 4]` (needs jit, so it ignores `--debug`). It
+  constructs via `variant="drift"`, so it exercises the arm training actually
+  runs and cannot desync from the shipped constants. **Checks 1–7 and 9–10 pass;
+  [8] currently fails** — see the `_DEFAULT_DRIFT_SPEED` warning above. [8] is a
+  config canary, not a code defect: it prints its numbers before asserting, and
+  the message names the speed.
+
+### MJX circular arena / per-box concentric goal rings (`multi_box_multi_goal_push_mjx.py`)
+
+`MultiBoxMultiGoalPushMJX` is a copy of `MultiBoxPushMJX` with the **geometry**
+changed and nothing else: same physics constants, coupling mechanic, 40-dim
+`OBS_DIM` layout, reward structure (`dense`/`sparse`/`difference_rewards`),
+`EnvState`, and functional API. Not wired into `create_env` / `run.py` / `conf/`
+yet — construct it directly. The box-drift mechanic and the `variant`
+(`drift`/`trunc`) presets are deliberately **not** carried over; a wall touch
+ends the episode as in the square-arena baseline.
+
+- **Arena is a disc** of `arena_radius = world_width/2 - boundary_thickness`
+  about the world center (now the *geometric* center, `W/2` not `W//2`). MuJoCo
+  has no concave primitive, so the wall is `_N_WALL_SEGMENTS` (32)
+  **inward-facing planes tangent to that circle** — the free region is the
+  intersection of their half-spaces, a regular N-gon with apothem
+  `arena_radius`, whose corners stick out by `1/cos(pi/N) - 1` = 0.5% at 32.
+  Same construction as the square arena's four wall planes, just more of them;
+  measured **no throughput cost** (32 envs, 9a/3o: 20.2k vs 13.9k steps/s for
+  the square env — i.e. within run-to-run noise, not slower). `N` is the one
+  fidelity/cost knob (it multiplies candidate collision pairs and lidar ray
+  tests).
+- **Goal is one concentric ring per box.** The `[0, goal_outer_radius]` disc is
+  cut into `n_objects` rings of equal width and **box j belongs in ring j
+  counted from the center out** — box 0 in the central disc, box 1 in the
+  annulus around it, and so on — so the boxes are not interchangeable: each has
+  its own stopping radius, and the outer ones must be left in place while the
+  inner ones are pushed past them. Boxes and rings are **color-coded to match**
+  (`env.box_colors`, the `COLORS_LIST[n_agents + j]` scheme, now the single
+  source of truth for the box geoms, the `CircularTargetArea`s, the native
+  discs, and `MJXRenderer._draw_boxes`), and each ring is labelled `BOX j`.
+  - Ring width is the box's **side** (`2*max(box_half_extents)`) where the arena
+    affords it, so a box square-on fits its ring; `_max_goal_radius` caps the
+    whole structure at the largest rim that still leaves a usable agent spawn
+    annulus and the rings shrink uniformly if that binds. At the shipped configs
+    it does not bind: 9a/3o -> 3 rings of 3.00 (rim 9.0), 16a/4o -> 4 of 3.20
+    (rim 12.8). The goal block therefore sits *below* the coupling/box-size
+    block in `__init__` (it needs `box_half_extents`).
+  - `_BOX_RING_FRAC` is **0.25**, not the 0.40 the single-goal version used:
+    the goal structure now grows with `n_objects`, and pulling the box spawn
+    ring inward is what buys the radial room for full-width rings (at 0.40 the
+    cap bit and 9a/3o rings came out 2.23 wide against a 3.0 box). Boxes end up
+    at nearly the same radius either way, since the rim they are measured from
+    moved out by about as much as their offset shrank. The spawn-layout
+    constants live at module level precisely because `_max_goal_radius` inverts
+    `_agent_annulus_inner` to derive that cap — one copy, so the cap cannot
+    drift from the layout it protects.
+  Everything keyed to the goal axis becomes radial **and per-box**:
+  - delivery is `ring_inner[j] <= |box j - center| <= ring_outer[j]`; a box
+    parked in someone else's ring is *not* delivered and keeps bleeding shaping;
+  - shaping is the reduction in `_goal_dist`, now indexed **by box** — entry j
+    is box j's distance to ring j (`clip(| |box-center| - ring_mid[j] | -
+    half_width, 0)`), 0 inside its ring and growing on **both** sides, so
+    approaching from either side pays and burrowing past pays nothing. Ring 0 is
+    a disc and the same formula degenerates correctly for it (`|r - w/2| - w/2
+    <= 0` for all `r <= w`). `in_goal` is literally `dist <= 0`, one source of
+    truth for the two;
+  - the `goal_distance` obs is a **per-agent** offset from the centerline of the
+    ring belonging to the box that agent is sensing — the same nearest
+    undelivered box `nearest_box_vec` points at, so the two features describe
+    one box. A single global goal radius would say nothing about where *this*
+    box has to go. The lookup uses the new shared
+    `MJXObservationBuilder.nearest_box_indices` (factored out of
+    `nearest_box_vectors`, same search, one copy); `goal_radius` accepts a
+    per-agent `(A,)` array and just broadcasts;
+  - boundary contact is `|agent - center| >= arena_radius - agent_radius` —
+    measured on the circle, so in the N-gon's corner directions it trips ~0.5% of
+    R early (conservative).
+  Helpers `_radius` / `_outward` / `_goal_dist` own the polar math. **Delivery
+  still latches** (`delivered | newly_delivered`), so a box shoved out of its
+  ring stays delivered — matching the square env's semantics rather than
+  re-paying/revoking the +100.
+- **Spawn layout keeps the square env's ordering** (agents behind the boxes,
+  boxes between agents and goal) mapped onto the radius: goal rings in the
+  middle -> boxes on a ring `_BOX_RING_FRAC` (0.25) of the way from the
+  outermost goal ring's rim to the wall (shuffled *angular* slots + radial
+  jitter), so every box spawns outside *every* goal ring and none starts in
+  another's target -> agents on concentric rings of cells in the outer annulus,
+  whose inner radius clears the outermost box surface. Same
+  jitter-safety rule as the square grid (jitter <= half the smallest cell gap).
+- **`scripted_push_action` needed two fixes** that are easy to re-break:
+  1. **It orbits, it does not beeline.** Agents spawn at *every* bearing here,
+     so a straight line to the staging point runs through the arena middle and
+     into the box's **inner** face — an agent arriving that way pushes the box
+     *outward*. Measured before the fix: the swarm shoved its box from r=10 to
+     r=14.5 and into the wall. Agents now circle at the docking radius toward
+     the staging bearing and only close in once they are outside the box and
+     roughly behind it. That bearing tolerance must include the box's **own**
+     angular half-width (`20 deg + asin(half / box_r)`), which grows as the box
+     nears the center: under a fixed cone the outer lateral slots fall outside
+     it once the box is close in (at 16a/4o a slot 1.35 off-axis subtends
+     19 deg at r=4), so those agents orbit forever and the coalition stalls one
+     agent short of `coupling` — measured as `touch` pinned at 3/4 for hundreds
+     of steps while the box crawled.
+  2. **Stand-off must be `half + 0.6`** (= agent radius + touch eps), so an
+     agent that reaches its staging point is *already touching*. Standing off
+     far enough to clear a rotated box's `sqrt(2)*half` corner reach makes the
+     agent hover: it pushes in, fails the `close` test, and is pulled back out,
+     so a minimum coalition never gets all `coupling` members on the box (16a/4o
+     partition: 0 boxes delivered vs 3 after the fix).
+  3. **Agents go limp once their box is delivered** (`state.delivered[idx]` ->
+     zero action). With a ring, pushing does not stop being right *and then
+     wrong* — keep pushing and the box exits through the inner edge into the
+     next box's ring. Delivery triggers at the ring's *outer* edge and the box
+     then coasts ~1.4 units before the damping kills its speed, which lands it
+     about the centerline of a box-wide ring. Chasing the centerline explicitly
+     instead overshoots by that same coast and drops the box a ring too far in
+     (measured: box 1 parked at r=2.80 against a `[3.00, 6.00]` ring). Delivery
+     latches, so this cannot oscillate.
+  Sanity numbers, balanced partition (`arange(A) % O`), 1024 steps: 9a/3o
+  delivers **3/3** by step ~355 (return ~316), each box parked inside its own
+  ring (r = 2.98 / 5.01 / 8.96 for rings `[0,3] / [3,6] / [6,9]`); 16a/4o
+  delivers 3/4 (return ~330) — the innermost box has the longest trip and ends
+  a few tenths short of its ring at the step limit. 3/4 at 16a/4o is this
+  controller's standing result, not a regression from the per-box goals.
+- **Shared code extended, not copied** (all changes inert for existing envs):
+  `CircularTargetArea` in `box2d_suite/utils.py` (disc/annulus drop zone, no
+  `width`/`height` — that is what the renderer keys off — with an optional
+  `inner_radius`, default 0 = plain disc, validated `0 <= inner < radius`, plus
+  `color` and a `label`); `MJXObservationBuilder.goal_distances(...,
+  goal_axis="radial", goal_radius=)`, where `goal_coord` is the center `(2,)`
+  and the feature is `(|agent - center| - goal_radius) / world_width` —
+  **unchanged**, per-box rings are expressed purely by passing a per-agent
+  `goal_radius`; `MJXObservationBuilder.nearest_box_indices` (the
+  nearest-undelivered-box search, factored out of `nearest_box_vectors` so an
+  env with a per-box goal can look up *which* box an agent senses); and four
+  branches in the shared box2d `Renderer` — a ring for `_draw_boundary_walls`
+  when `env.arena_radius` exists, a disc/annulus branch in `_draw_target_areas`
+  (the hole is punched by drawing it `(0,0,0,0)` on the SRCALPHA surface —
+  pygame *replaces* pixels rather than blending — with an outline and label
+  darkened from the zone's own color, and concentric zones labelled at the
+  middle of their own band rather than all stacked on the shared center), and a
+  `goal_axis == "radial"` case in `_draw_goal_distance` (segment points at the
+  goal center). `MJXRenderer._draw_boxes` prefers `env.box_colors` when present
+  and washes delivered boxes only 30% toward white (was 65%) — in this env the
+  hue is what ties a box to its ring, so washing it out hid the assignment.
+- Both renderers work unchanged otherwise: `MJXRenderer(env)` (pygame, verified
+  by rendering a delivery rollout) and `MuJoCoNativeRenderer(env)` — the visual
+  twin builds the wall as a ring of tangential slabs (half-length
+  `R*tan(pi/N)`, so they meet corner-to-corner) and the goal rings as nested
+  cosmetic cylinders in the boxes' colors, outermost lowest, each inner one
+  stacked just above and covering the previous one's middle (MuJoCo has no
+  annulus primitive). They must be **opaque** — translucent discs blend with the
+  ones below instead of covering them, turning every ring into a mix of the
+  colors outside it — and the whole stack has to stay between the floor
+  (z=-0.41) and the bottom of the boxes (z=-0.4), hence the `0.008/n_objects`
+  z-step, or the discs cut through the boxes.
+  Keyboard control works too, via the shared CLI's env switch (verified: reset
+  draw + step loop + auto-reset on truncation):
+  `uv run python -m environments.mjx_suite.renderer --env circular --manual`.
+- Demo: `uv run python -m environments.mjx_suite.multi_box_multi_goal_push_mjx`.
 
 ## JAX MAPPO (`algorithms/mappo_jax/`)
 
@@ -621,6 +837,46 @@ drop-in comparable:
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o_dr \
       model=mlp trial_id=0
   ```
+
+## Feudal MAPPO (`algorithms/feudal_mappo_jax/`) — WORK IN PROGRESS
+
+A FeUdal-Networks-style (Vezhnevets et al. 2017) hierarchy being built on top of
+a **copy** of `mappo_jax`: a manager emits a latent goal vector, a goal-conditioned
+worker emits the primitive action. Not wired into `algorithms/types.py` /
+`_dispatch` / `conf/` yet — nothing launches it.
+
+- **The copy is now self-contained.** `trainer.py`, `run.py` and `mappo.py`
+  originally imported `Transition`/`MAPPOConfig`/`sample_action`/
+  `create_train_state`/`make_train` `from algorithms.mappo_jax...`, which left
+  the local `network.py`/`mappo.py`/`types.py` inert — edits to them changed
+  nothing. All 8 import sites now point at `algorithms.feudal_mappo_jax`, so the
+  package no longer reads any `mappo_jax` code and diverging it is safe.
+  Behavior-preserving: the only diffs against `algorithms/mappo_jax/*` are those
+  import lines plus two error strings that named the wrong package (the files
+  are otherwise byte-identical, and nothing outside the package imports it yet).
+  The runner class is still called `MAPPO_JAX_Runner` — rename when it is wired
+  into `_dispatch`.
+- **`worker.py` — `FeudalWorker`** (done). Goal-conditioned low-level policy:
+  `__call__(obs, goal)` concatenates the goal onto the obs and runs the flat
+  `MAPPOActor` body **reused verbatim** (same 2-layer Tanh MLP, orthogonal init,
+  and return contract), so `sample_action`/`evaluate_action` work on it
+  unmodified via the `bind_goal(apply_fn, goal)` closure — no forked sampling
+  path. The goal broadcasts over the obs's leading axes, so a team goal
+  `(n_envs, goal_dim)` and a per-agent goal `(n_envs, n_agents, goal_dim)` both
+  pair with `(n_envs, n_agents, obs_dim)`. Optional `goal_embed_dim` puts the
+  goal through a **bias-free** Dense first (FuN's `phi`). `init_worker(...)`
+  returns `(module, params)`. Verified: shapes/log-prob agreement between sample
+  and evaluate, goal-sensitivity, jit + vmap, both action-space types.
+  - **Design caveat to revisit:** with concat fusion the worker *can* learn to
+    ignore the goal (zero the goal columns of layer 1) — the degeneracy FuN
+    avoids with a bilinear `logits = U(obs) @ phi(g)` and no bias, so a zero
+    goal expresses no preference. If the manager's goals turn out not to steer
+    the worker, swap the fusion; the module interface stays the same.
+- **`manager.py` — empty, next.** Open decisions it forces: goal dimension and
+  whether goals are per-team or per-agent; the state-embedding `f_percept` the
+  goal lives in (FuN's cosine intrinsic reward needs one); goal horizon `c`;
+  whether the worker's critic is goal-conditioned (its return depends on `g`, so
+  the flat `MAPPOCritic` on the global state alone is not sufficient).
 
 ## Coordination-graph novelty exploration (gnn critic)
 

@@ -21,9 +21,9 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from algorithms.mappo_jax.types import MAPPOConfig, Transition
-from algorithms.mappo_jax.network import sample_action
-from algorithms.mappo_jax.mappo import (
+from algorithms.feudal_mappo_jax.types import MAPPOConfig, Transition
+from algorithms.feudal_mappo_jax.network import sample_action
+from algorithms.feudal_mappo_jax.mappo import (
     ActorCriticTrainState,
     create_train_state,
     ppo_update,
@@ -64,7 +64,7 @@ def make_train(config: MAPPOConfig, env):
 
     if not config.parameter_sharing:
         raise NotImplementedError(
-            "mappo_jax implements the shared-actor path only "
+            "feudal_mappo_jax implements the shared-actor path only "
             "(parameter_sharing=true); use mappo_vanilla for independent actors"
         )
 

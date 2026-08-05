@@ -191,10 +191,20 @@ class MJXRenderer(Renderer):
 
     def _draw_boxes(self, snap):
         env = self.env
+        # `env.box_colors` is the source of truth where an env has one (the
+        # concentric-goal env colors each box to match its goal ring); the
+        # expression below is the same default the model XML uses otherwise.
+        palette = getattr(env, "box_colors", None)
         for j in range(env.n_objects):
-            color = COLORS_LIST[(env.n_agents + j) % len(COLORS_LIST)]
-            if snap["delivered"][j]:  # wash out delivered boxes
-                color = tuple(int(c + (255 - c) * 0.65) for c in color)
+            color = (
+                palette[j]
+                if palette is not None
+                else COLORS_LIST[(env.n_agents + j) % len(COLORS_LIST)]
+            )
+            if snap["delivered"][j]:  # pale, but still recognizably its color:
+                # in the per-box-goal env the hue is what ties a box to its goal
+                # ring, so washing it out entirely would hide the assignment.
+                color = tuple(int(c + (255 - c) * 0.3) for c in color)
 
             h = env.box_half_extents[j]
             cx, cy = snap["box_pos"][j]

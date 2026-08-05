@@ -390,27 +390,58 @@ class Renderer:
                     2,
                 )
 
-            # Disc drop zone (CircularTargetArea — concentric-goal arenas):
-            # no width/height, so it falls through to the radius branch.
+            # Disc / band drop zone (CircularTargetArea — concentric-goal
+            # arenas): no width/height, so it falls through to the radius
+            # branch. `inner_radius > 0` makes it an annulus — the hole is
+            # punched by drawing it fully transparent on the SRCALPHA surface
+            # (draw *replaces* pixels, so the fill is cleared rather than
+            # blended), and gets its own outline.
             elif hasattr(area, "radius"):
                 center = self._to_screen(area.x, area.y)
                 r = int(area.radius * self.scale)
+                r_in = int(getattr(area, "inner_radius", 0.0) * self.scale)
                 disc = pygame.Surface((2 * r, 2 * r), pygame.SRCALPHA)
                 pygame.draw.circle(disc, area.color, (r, r), r)
+                if r_in > 0:
+                    pygame.draw.circle(disc, (0, 0, 0, 0), (r, r), r_in)
                 self.screen.blit(disc, (center[0] - r, center[1] - r))
-                pygame.draw.circle(self.screen, (0, 100, 0), center, r, 2)
+                outline = self._darken(area.color)
+                pygame.draw.circle(self.screen, outline, center, r, 2)
+                if r_in > 0:
+                    pygame.draw.circle(self.screen, outline, center, r_in, 2)
+                # Concentric zones all share a center, so labelling them there
+                # would stack every label on one spot. Put each at the middle of
+                # its own band, straight up from the center.
+                mid = (area.radius + getattr(area, "inner_radius", 0.0)) / 2
+                self._draw_target_label(
+                    area, self._to_screen(area.x, area.y + mid), outline
+                )
+                continue
 
             # Draw label (Optional)
             if hasattr(area, "contains_object"):
-                text = "DROP ZONE"
-                text_surface = self._target_font.render(text, True, (0, 0, 0))
-                text_rect = text_surface.get_rect(
-                    center=(
+                self._draw_target_label(
+                    area,
+                    (
                         area.x * self.scale,
                         self.screen_size[1] - area.y * self.scale,
-                    )
+                    ),
+                    (0, 0, 0),
                 )
-                self.screen.blit(text_surface, text_rect)
+
+    def _draw_target_label(self, area, center, color):
+        """Name a drop zone at `center` (screen px)."""
+        text = getattr(area, "label", "DROP ZONE")
+        if not text:
+            return
+        surface = self._target_font.render(text, True, color)
+        self.screen.blit(surface, surface.get_rect(center=center))
+
+    @staticmethod
+    def _darken(color, factor=0.55):
+        """Opaque, darker version of an (r, g, b[, a]) fill — used for outlines
+        and labels so they read against the zone's own translucent color."""
+        return tuple(int(c * factor) for c in color[:3])
 
     def _draw_agent_indices(self):
         """Render the index of each agent on top of them for easy identification."""

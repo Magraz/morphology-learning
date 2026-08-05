@@ -198,6 +198,24 @@ class MJXObservationBuilder:
         """(A, A) euclidean distance between every agent pair; zero on the diagonal."""
         return jnp.linalg.norm(agent_pos[:, None, :] - agent_pos[None, :, :], axis=-1)
 
+    def nearest_box_indices(self, agent_pos, box_pos, delivered=None):
+        """(A,) index of the nearest *undelivered* box for each agent.
+
+        ``delivered`` is an optional (O,) bool mask; delivered boxes are dropped
+        from the search (their distance is set to +inf). With every box
+        delivered the argmin is meaningless and returns 0 — callers must handle
+        that case (``nearest_box_vectors`` zeroes its output).
+
+        Exposed because envs with a *per-box* goal need to know which box an
+        agent is sensing in order to describe that box's target; it is the same
+        search ``nearest_box_vectors`` runs, kept in one place.
+        """
+        rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
+        dist = jnp.linalg.norm(rel, axis=-1)  # (A, O)
+        if delivered is not None:
+            dist = jnp.where(delivered[None, :], jnp.inf, dist)
+        return jnp.argmin(dist, axis=1)  # (A,)
+
     def nearest_box_vectors(self, agent_pos, box_pos, delivered=None):
         """(A, 2) relative vector to the nearest *undelivered* box, normalized by
         world_width.
@@ -211,10 +229,7 @@ class MJXObservationBuilder:
         if self.n_objects == 0:
             return jnp.zeros((self.n_agents, 2))
         rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
-        dist = jnp.linalg.norm(rel, axis=-1)  # (A, O)
-        if delivered is not None:
-            dist = jnp.where(delivered[None, :], jnp.inf, dist)
-        nearest = jnp.argmin(dist, axis=1)  # (A,)
+        nearest = self.nearest_box_indices(agent_pos, box_pos, delivered)  # (A,)
         vec = rel[jnp.arange(self.n_agents), nearest] / self.world_width
         if delivered is not None:
             # all boxes delivered -> argmin over +inf is meaningless; zero it out
@@ -236,6 +251,9 @@ class MJXObservationBuilder:
         crosses zero exactly on the goal boundary — the radial analogue of the
         axis form, which crosses zero on the band center. Same
         ``world_width`` normalization, so the scale matches the other envs.
+        ``goal_radius`` may be a scalar or a per-agent ``(A,)`` array (it just
+        broadcasts), which is what an env with a *different* target ring per box
+        passes: each agent measures against the ring of the box it is sensing.
         """
         if goal_coord is None:
             return jnp.zeros(self.n_agents)

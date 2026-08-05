@@ -10,16 +10,29 @@ Same physics, coupling mechanic, observation layout and reward structure as
   has no concave primitive, so a polygon of half-spaces is the way to confine
   bodies *inside* a curved boundary — the same construction as the four walls of
   the square arena, just with more of them.
-- the goal is a **disc concentric with the arena** (radius ``goal_radius``)
-  rather than a band along the top wall, so the task is radial: push every box
-  inward to the middle, from whatever direction it happens to lie.
+- the goal is **one concentric ring per box**: the ``[0, goal_outer_radius]``
+  disc is cut into ``n_objects`` rings of equal width, and **box j belongs in
+  ring j counted from the center out** — box 0 in the central disc, box 1 in the
+  annulus around it, and so on. So the task is radial *and* per-box: push every
+  box inward from whatever bearing it lies, each to a *different* stopping
+  radius, leaving the outer ones in place while the inner ones are pushed past
+  them. Boxes and rings are color-coded to match (``box_colors``), so a frame
+  shows the assignment directly.
+  Ring width is the box's side (``2*max(box_half_extents)``) where the arena
+  affords it; ``_max_goal_radius`` caps the whole structure at the largest
+  radius that still leaves a usable agent spawn annulus, and the rings shrink
+  uniformly if that binds.
 
-Everything that referenced the goal axis becomes radial: delivery is
-``|box - center| <= goal_radius``, the shaping term is the box's inward radial
-displacement, the ``goal_distance`` observation is the agent's distance to the
-goal center (offset by ``goal_radius``, so it crosses zero on the goal edge —
-the shared builder's ``goal_axis="radial"`` mode), and the boundary-contact test
-is ``|agent - center| >= arena_radius - agent_radius``.
+Everything that referenced the goal axis becomes radial *and* per-box: delivery
+is ``ring_inner[j] <= |box j - center| <= ring_outer[j]``, the shaping term is
+box j's reduction in ``_goal_dist`` (distance to *its* ring, zero inside it,
+growing on *both* sides — so approaching from either side pays and burrowing
+past it does not), the ``goal_distance`` observation is the agent's radial
+offset from the centerline of the ring belonging to the box it is sensing (via
+the shared builder's ``goal_axis="radial"`` mode with a per-agent
+``goal_radius``: negative inside that ring, positive outside it, ~0 on it), and
+the boundary-contact test is
+``|agent - center| >= arena_radius - agent_radius``.
 
 The square-arena env's box-drift mechanic and its ``variant`` presets
 (``drift`` / ``trunc``) are deliberately **not** carried over: this env is the
@@ -40,8 +53,8 @@ Inherited from the Box2D env / its square-arena MJX port:
 
 - obs: the shared 40-dim ``OBS_DIM`` layout from ``mjx_suite/observation.py``
   (``MJXObservationBuilder``); this env supplies only the qpos layout
-  (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal disc.
-- reward: shaping toward the goal disc + one-time +100 per delivered box
+  (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal band.
+- reward: shaping toward the goal band + one-time +100 per delivered box
   (``"sparse"`` drops the shaping); terminate on all-delivered or a wall touch.
 - coupling: a box keeps its heavy base mass until ``coupling`` agents touch it,
   then drops to the light coupled mass — a per-step override of ``body_mass`` /
@@ -54,8 +67,9 @@ Inherited from the Box2D env / its square-arena MJX port:
   state ``v_terminal = F / (m*d)``.
 
 Spawn layout follows the square-arena env's *ordering* (agents behind the boxes,
-boxes between the agents and the goal) mapped onto the radius: the goal disc in
-the middle, boxes on a ring around it, agents in the outer annulus. Spawns use
+boxes between the agents and the goal) mapped onto the radius: the goal rings in
+the middle, boxes on a ring outside *all* of them (so no box starts in anyone's
+target), agents in the outer annulus beyond that. Spawns use
 shuffled jittered grids rather than rejection sampling (jit needs static
 shapes); shaping is live from step 1; box sizes are fixed per instance.
 
@@ -97,13 +111,29 @@ _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
 # lidar beam, so it is the one knob trading fidelity for step cost.
 _N_WALL_SEGMENTS = 32
 
+# Spawn layout, radially outward: goal rings -> box ring -> agent annulus -> wall.
+# Module-level because `_max_goal_radius` solves them for the largest goal
+# structure that still leaves agents somewhere to spawn; keeping one copy is what
+# stops that cap from drifting away from the layout it is supposed to protect.
+_SPAWN_MARGIN = 2.0  # agent cells stay this far inside the wall
+_SPAWN_MIN_DIST = 2.0  # min separation between agent spawn cells
+# 0.25 rather than the 0.40 the single-goal version used: the goal structure now
+# grows with `n_objects`, and pulling the box spawn ring inward is what buys the
+# radial room for every ring to be a full box wide at the shipped configs (at
+# 0.40 the cap bit and 9a/3o rings came out 2.23 wide against a 3.0 box). The
+# boxes end up at almost the same radius either way, since the goal rim they are
+# measured from moved out by about as much as their offset shrank.
+_BOX_RING_FRAC = 0.25  # box ring, as a fraction of goal-rim -> wall
+_BOX_RING_JITTER_FRAC = 0.10  # +- radial jitter, same units
+_MIN_AGENT_ANNULUS = 1.0  # radial width the agent spawn annulus must keep
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class EnvState:
     data: mjx.Data
     t: jax.Array  # () int32 — steps taken this episode
-    prev_box_goal_dist: jax.Array  # (O,) radial distance box -> goal center
+    prev_box_goal_dist: jax.Array  # (O,) distance box -> goal band (0 inside)
     delivered: jax.Array  # (O,) bool
 
 
@@ -136,7 +166,7 @@ class MultiBoxMultiGoalPushMJX:
         # arena is the inscribed disc. The center is the *geometric* center
         # (W/2, not W//2) so the circle sits symmetrically in that box.
         total_entities = n_agents + n_objects
-        self.world_width = int(30 * max(1.0, total_entities / 8) ** 0.5)
+        self.world_width = int(30 * max(1.0, total_entities / 8) ** 0.75)
         self.world_height = self.world_width
         self.world_center_x = self.world_width / 2
         self.world_center_y = self.world_height / 2
@@ -153,21 +183,6 @@ class MultiBoxMultiGoalPushMJX:
         self.comm_radius = self.world_width / 3.0
         self.force_multiplier = _FORCE_MULTIPLIER
 
-        # --- goal disc, concentric with the arena ---
-        # Radius carried over from the band's thickness, so the goal is the same
-        # size relative to the world as the band was thick.
-        self.goal_radius = max(5.0, 5.0 * self.world_height / 30.0)
-        self.target_x = self.world_center_x
-        self.target_y = self.world_center_y
-        # Read by the shared Renderer (`_draw_goal_distance`) and mirrored by the
-        # observation builder's `goal_axis="radial"` mode.
-        self.goal_axis = "radial"
-        # Box2D-suite target object (numpy-only, never touched by jitted code):
-        # lets the shared Renderer machinery draw the goal disc.
-        self.target_areas = [
-            CircularTargetArea(self.target_x, self.target_y, self.goal_radius)
-        ]
-
         # --- coupling requirements and box sizes (fixed per instance) ---
         if coupling_def == "random":
             coupling = np.random.default_rng(42).integers(
@@ -179,6 +194,68 @@ class MultiBoxMultiGoalPushMJX:
             raise ValueError(f"unknown coupling_def: {coupling_def}")
         self.objects_push_coupling_list = coupling
         self.box_half_extents = np.maximum(1.5, coupling * _AGENT_RADIUS)
+
+        # --- one concentric goal ring per box ---
+        # The goal is not a single region: the [0, goal_outer_radius] disc is cut
+        # into `n_objects` concentric rings of equal width, and **box j must be
+        # delivered to ring j counted from the center out** — box 0 to the
+        # central disc, box 1 to the annulus around it, and so on. So the boxes
+        # cannot be treated interchangeably: each has its own stopping radius,
+        # and the outer ones must be left in place while the inner ones are
+        # pushed past them.
+        #
+        # Ring width is the box's side (`2*half`) where the arena affords it, so
+        # a box square-on fits inside its ring; `_max_goal_radius` caps the whole
+        # structure at the largest radius that still leaves a usable agent spawn
+        # annulus, and the rings shrink uniformly if that binds.
+        # `box_half_extents` must be known first — hence this block sits below
+        # the coupling/size block.
+        self.n_goal_rings = n_objects
+        preferred = n_objects * 3.0 * float(self.box_half_extents.max())
+        cap = self._max_goal_radius()
+        if cap <= 0.0:
+            raise ValueError(
+                f"no room for {n_objects} goal rings in an arena of radius "
+                f"{self.arena_radius}"
+            )
+        self.goal_outer_radius = min(preferred, cap)
+        self.goal_ring_width = self.goal_outer_radius / n_objects
+        rings = np.arange(n_objects)
+        self.goal_ring_inner = rings * self.goal_ring_width  # (O,)
+        self.goal_ring_outer = (rings + 1) * self.goal_ring_width  # (O,)
+        # Centerline of each ring: the radius its box should come to rest at, and
+        # the offset the `goal_distance` observation is measured against. Ring 0
+        # is a disc, and the |r - mid| <= half_width test degenerates correctly
+        # for it (every r in [0, width] passes), so one formula covers both.
+        self.goal_ring_mid = (rings + 0.5) * self.goal_ring_width  # (O,)
+        self._ring_mid = jnp.asarray(self.goal_ring_mid, dtype=jnp.float32)
+        self._ring_half_width = 0.5 * self.goal_ring_width
+        self.target_x = self.world_center_x
+        self.target_y = self.world_center_y
+        # Read by the shared Renderer (`_draw_goal_distance`) and mirrored by the
+        # observation builder's `goal_axis="radial"` mode.
+        self.goal_axis = "radial"
+        # Each ring carries its box's color (and index), so the renderers can
+        # show at a glance which box belongs in which ring. Colors follow the
+        # Box2D scheme — COLORS_LIST offset by n_agents — and this attribute is
+        # the single source of truth for the box geoms, the rings, and the
+        # renderer's box fill.
+        self.box_colors = [
+            COLORS_LIST[(n_agents + j) % len(COLORS_LIST)] for j in range(n_objects)
+        ]
+        # Box2D-suite target objects (numpy-only, never touched by jitted code):
+        # let the shared Renderer machinery draw the rings.
+        self.target_areas = [
+            CircularTargetArea(
+                self.target_x,
+                self.target_y,
+                float(self.goal_ring_outer[j]),
+                inner_radius=float(self.goal_ring_inner[j]),
+                color=(*self.box_colors[j], 110),
+                label=f"BOX {j}",
+            )
+            for j in range(n_objects)
+        ]
 
         heavy_mass = _BOX_BASE_DENSITY_2D * (2 * self.box_half_extents) ** 2
         light_mass = (
@@ -268,12 +345,11 @@ class MultiBoxMultiGoalPushMJX:
         cx, cy = self.world_center_x, self.world_center_y
         R = self.arena_radius
         wall_angles = 2 * np.pi * np.arange(_N_WALL_SEGMENTS) / _N_WALL_SEGMENTS
-        # Box colors follow the Box2D scheme: COLORS_LIST offset by n_agents.
+        # One color per box (see `self.box_colors`); its goal ring gets the same
+        # one, so the pairing is readable straight off a frame.
         box_rgba = [
-            "{:.3f} {:.3f} {:.3f} 1".format(
-                *(c / 255 for c in COLORS_LIST[(self.n_agents + j) % len(COLORS_LIST)])
-            )
-            for j in range(self.n_objects)
+            "{:.3f} {:.3f} {:.3f} 1".format(*(c / 255 for c in color))
+            for color in self.box_colors
         ]
         agent_rgba = "0.78 0.2 0.2 1"  # Box2D agent disc red
 
@@ -317,13 +393,30 @@ class MultiBoxMultiGoalPushMJX:
                 'dir="0.1 0.15 -1" diffuse="0.85 0.85 0.85" castshadow="true"/>',
                 f'    <geom name="floor" type="plane" pos="{cx} {cy} -0.41" '
                 f'size="{cx} {cy} 0.1" material="floor_mat" {cosmetic}/>',
-                f'    <geom name="goal_disc" type="cylinder" '
-                f'pos="{self.target_x} {self.target_y} -0.385" '
-                f'size="{self.goal_radius} 0.02" '
-                f'rgba="0.2 0.78 0.2 0.45" {cosmetic}/>',
             ]
+            # Goal rings: MuJoCo has no annulus primitive, so paint them as
+            # nested discs — outermost first at the lowest z, each inner ring
+            # stacked just above it (no z-fighting) and covering the previous
+            # one's middle. What remains visible of ring j is exactly its
+            # annulus, in box j's color. They must be **opaque**: translucent
+            # discs blend with the ones below instead of covering them, which
+            # turns every ring into a mix of the colors outside it. The whole
+            # stack also has to stay between the floor (z=-0.41) and the bottom
+            # of the boxes (z=-0.4), or the discs cut through them.
+            z_step = 0.008 / self.n_objects
+            for j in reversed(range(self.n_objects)):
+                r, g, b = (c / 255 for c in self.box_colors[j])
+                z = -0.409 + z_step * (self.n_objects - 1 - j)
+                parts.append(
+                    f'    <geom name="goal_ring_{j}" type="cylinder" '
+                    f'pos="{self.target_x} {self.target_y} {z}" '
+                    f'size="{self.goal_ring_outer[j]} 0.002" '
+                    f'rgba="{r:.3f} {g:.3f} {b:.3f} 1" {cosmetic}/>'
+                )
             for k, a in enumerate(wall_angles):
-                px, py = cx + (R + bt / 2) * math.cos(a), cy + (R + bt / 2) * math.sin(a)
+                px, py = cx + (R + bt / 2) * math.cos(a), cy + (R + bt / 2) * math.sin(
+                    a
+                )
                 parts.append(
                     f'    <geom name="wall_{k}" type="box" pos="{px} {py} {wall_z}" '
                     f'euler="0 0 {math.degrees(a)}" '
@@ -378,18 +471,52 @@ class MultiBoxMultiGoalPushMJX:
 
     # ------------------------------------------------------------------ spawns
 
+    def _agent_annulus_inner(self, goal_outer_radius: float) -> float:
+        """Inner radius of the agent spawn annulus for a given goal rim.
+
+        Everything outward of the goal is laid out from that rim: the box ring
+        sits `_BOX_RING_FRAC` of the way to the wall (plus jitter), and agents
+        start beyond the outermost box's surface so one can never spawn inside a
+        box. Written as a function of the rim so `_max_goal_radius` can invert
+        it instead of restating the chain.
+        """
+        span = self.arena_radius - goal_outer_radius
+        return (
+            goal_outer_radius
+            + (_BOX_RING_FRAC + _BOX_RING_JITTER_FRAC) * span
+            + float(self.box_half_extents.max())
+            + _AGENT_RADIUS
+            + 0.5
+        )
+
+    def _max_goal_radius(self) -> float:
+        """Largest goal rim that still leaves a usable agent spawn annulus.
+
+        Solves `arena_radius - _SPAWN_MARGIN - _agent_annulus_inner(G) >=
+        _MIN_AGENT_ANNULUS` for G. With one ring per box the goal structure grows
+        with `n_objects`, and past this radius it would push the agents' spawn
+        region out through the wall — so the rings are capped here and shrink
+        uniformly rather than the layout silently failing.
+        """
+        f = _BOX_RING_FRAC + _BOX_RING_JITTER_FRAC
+        clearance = float(self.box_half_extents.max()) + _AGENT_RADIUS + 0.5
+        return (
+            (1 - f) * self.arena_radius - _SPAWN_MARGIN - clearance - _MIN_AGENT_ANNULUS
+        ) / (1 - f)
+
     def _make_box_ring(self) -> None:
         """Radius (and jitter) of the ring the boxes spawn on.
 
         The square arena spawned boxes in a central band with the goal beyond it
-        and the agents behind them; radially that ordering becomes goal disc ->
-        box ring -> agent annulus. The ring sits 40% of the way from the goal
-        edge to the wall, leaving room for a coalition to work its way around a
-        box on any side.
+        and the agents behind them; radially that ordering becomes goal rings ->
+        box ring -> agent annulus. The ring sits `_BOX_RING_FRAC` of the way from
+        the outermost goal ring's rim to the wall, leaving room for a coalition
+        to work its way around a box on any side. Every box spawns outside
+        *every* goal ring, so no box starts in another's target.
         """
-        span = self.arena_radius - self.goal_radius
-        self._box_ring_r = self.goal_radius + 0.40 * span
-        self._box_ring_jitter = 0.10 * span
+        span = self.arena_radius - self.goal_outer_radius
+        self._box_ring_r = self.goal_outer_radius + _BOX_RING_FRAC * span
+        self._box_ring_jitter = _BOX_RING_JITTER_FRAC * span
 
     def _make_spawn_grid(self) -> jnp.ndarray:
         """Candidate agent spawn cells: the outer annulus, jitter-safe >=2 apart.
@@ -398,16 +525,10 @@ class MultiBoxMultiGoalPushMJX:
         square arena's meshgrid over the bottom third. The inner radius clears
         the outermost box surface so an agent can never spawn inside a box.
         """
-        margin, min_dist = 2.0, 2.0
+        min_dist = _SPAWN_MIN_DIST
         spacing = min_dist + 0.5
-        r_lo = (
-            self._box_ring_r
-            + self._box_ring_jitter
-            + float(self.box_half_extents.max())
-            + _AGENT_RADIUS
-            + 0.5
-        )
-        r_hi = self.arena_radius - margin
+        r_lo = self._agent_annulus_inner(self.goal_outer_radius)
+        r_hi = self.arena_radius - _SPAWN_MARGIN
         if r_hi <= r_lo:
             raise ValueError("agent spawn annulus is empty; arena too small")
         n_rings = int((r_hi - r_lo) // spacing) + 1
@@ -466,6 +587,24 @@ class MultiBoxMultiGoalPushMJX:
     def _radius(self, pos: jnp.ndarray) -> jnp.ndarray:
         """(N,) distance of each (N, 2) position from the goal/arena center."""
         return jnp.linalg.norm(pos - self._center, axis=-1)
+
+    def _goal_dist(self, box_pos: jnp.ndarray) -> jnp.ndarray:
+        """(O,) distance from each box to **its own** goal ring.
+
+        Indexed by box: entry j measures box j against ring j, so this is where
+        the per-box goal assignment actually lives. Zero everywhere inside the
+        ring and growing on **both** sides of it — outward toward the wall and
+        inward toward the middle — so the shaping term it feeds pays for
+        approaching the ring from either side and pays nothing for burrowing
+        past it. (A plain distance-to-center would keep rewarding inward motion
+        all the way to the middle, i.e. reward overshooting every ring but the
+        innermost.) Ring 0 is a disc, and this degenerates correctly for it:
+        `|r - w/2| - w/2 <= 0` for every `r` in `[0, w]`.
+        """
+        return jnp.clip(
+            jnp.abs(self._radius(box_pos) - self._ring_mid) - self._ring_half_width,
+            0.0,
+        )
 
     def _outward(self, pos: jnp.ndarray) -> jnp.ndarray:
         """(N, 2) unit vector from the center toward each position.
@@ -529,20 +668,30 @@ class MultiBoxMultiGoalPushMJX:
         """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder.
 
         ``delivered`` (O,) bool excludes already-delivered boxes from
-        ``nearest_box_vec`` so agents stop being drawn to a box parked in the
-        goal band; ``None`` senses every box (the pre-delivery / no-mask case).
+        ``nearest_box_vec`` so agents stop being drawn to a box parked in its
+        goal ring; ``None`` senses every box (the pre-delivery / no-mask case).
         """
+        agent_pos = self._agent_pos(data)
         box_pos, box_yaw = self._box_pose(data)
+        # Each box has a *different* target ring, so a single global goal radius
+        # would tell an agent nothing about where its box has to go. The feature
+        # is therefore measured against the ring of the box that agent is
+        # sensing — the same nearest-undelivered-box the `nearest_box_vec`
+        # component points at, so the two features describe one box.
+        nearest = self.obs_builder.nearest_box_indices(agent_pos, box_pos, delivered)
         return self.obs_builder.build(
             data,
-            agent_pos=self._agent_pos(data),
+            agent_pos=agent_pos,
             agent_vel=self._agent_vel(data),
             box_pos=box_pos,
             box_yaw=box_yaw,
             box_half=self._box_half,
             goal_coord=self._center,  # concentric goal: distance is radial
             goal_axis="radial",
-            goal_radius=self.goal_radius,
+            # Offset by that ring's centerline, so the feature is the agent's
+            # signed radial offset from where its box should end up: negative
+            # inside the ring, positive outside it, ~0 on it.
+            goal_radius=self._ring_mid[nearest],  # (A,)
             delivered=delivered,
         )
 
@@ -588,7 +737,7 @@ class MultiBoxMultiGoalPushMJX:
         state = EnvState(
             data=data,
             t=jnp.zeros((), dtype=jnp.int32),
-            prev_box_goal_dist=self._radius(box_xy),
+            prev_box_goal_dist=self._goal_dist(box_xy),
             delivered=jnp.zeros(self.n_objects, dtype=bool),
         )
         return self._get_obs(data, state.delivered), state
@@ -625,10 +774,14 @@ class MultiBoxMultiGoalPushMJX:
             self._radius(agent_pos) >= self.arena_radius - _AGENT_RADIUS - _WALL_EPS
         )
 
-        # reward: shaping toward the goal disc + one-time delivery bonus
-        dist = self._radius(box_pos)  # (O,) distance to the goal center
+        # reward: shaping toward each box's own goal ring + delivery bonus
+        dist = self._goal_dist(box_pos)  # (O,) distance to box j's ring j
         shaping = jnp.sum((state.prev_box_goal_dist - dist) * (~state.delivered))
-        in_goal = dist <= self.goal_radius
+        # `_goal_dist` is clipped at 0, so "distance 0" *is* "inside my ring"
+        # (ring_inner[j] <= |box j - center| <= ring_outer[j]) — one source of
+        # truth for the two. A box parked in someone else's ring is not
+        # delivered, and keeps bleeding shaping until it reaches its own.
+        in_goal = dist <= 0.0
         newly_delivered = in_goal & ~state.delivered
         completion = 100.0 * newly_delivered.sum()
         task_reward = completion + (shaping if self._dense else 0.0)
@@ -800,13 +953,29 @@ def scripted_push_action(env: MultiBoxMultiGoalPushMJX, state: EnvState, box_idx
     )
     orbit = orbit / (jnp.linalg.norm(orbit, axis=1, keepdims=True) + 1e-6)
 
-    # Behind the box (within ~20 deg of the staging bearing) and already out at
-    # the docking radius -> stop orbiting and close in.
-    behind = ((u_agent * u_stage).sum(axis=1) > jnp.cos(jnp.radians(20.0))) & (
+    # Behind the box and already out at the docking radius -> stop orbiting and
+    # close in. The bearing tolerance has to include the box's *own* angular
+    # half-width, which grows as it nears the center: with a fixed cone the
+    # agents in the outer lateral slots fall outside it once the box is close in
+    # (at 16a/4o a slot 1.35 off-axis subtends 19 deg at r=4), so they orbit
+    # forever and the coalition stalls one agent short of `coupling`.
+    box_r = jnp.maximum(env._radius(box), half)
+    ang_tol = jnp.radians(20.0) + jnp.arcsin(jnp.clip(half / box_r, 0.0, 1.0))
+    behind = ((u_agent * u_stage).sum(axis=1) > jnp.cos(ang_tol)) & (
         env._radius(agent_pos) >= dock_r - 0.5
     )
     move = jnp.where(behind[:, None], approach, orbit)
-    return jnp.where(stage_dist < 0.7, -outward, move)
+    action = jnp.where(stage_dist < 0.7, -outward, move)
+    # Each goal is a *ring*, so pushing does not stop being wrong once the box is
+    # in it: keep going and the box leaves through the inner edge into some other
+    # box's ring. Agents whose box is delivered go limp, and the ~1.4 units the
+    # box coasts before the damping kills its speed carry it from the ring's
+    # outer edge (where delivery triggers) to about the centerline of a
+    # box-wide ring — so it parks *inside* its ring rather than straddling the
+    # edge. Chasing the centerline explicitly instead overshoots by that same
+    # coast and drops the box into the next ring in. Delivery latches in
+    # `EnvState`, so this never oscillates.
+    return jnp.where(state.delivered[idx][:, None], 0.0, action)
 
 
 if __name__ == "__main__":
@@ -826,10 +995,17 @@ if __name__ == "__main__":
 
     env = MultiBoxMultiGoalPushMJX(n_agents=args.n_agents, n_objects=args.n_objects)
     print(
-        f"world {env.world_width}x{env.world_height}, "
+        f"world {env.world_width}x{env.world_height}, arena r={env.arena_radius}, "
         f"coupling {list(env.objects_push_coupling_list)}, "
         f"box half-extents {list(env.box_half_extents)}"
     )
+    print(f"goal rings (width {env.goal_ring_width:.2f}, box j -> ring j):")
+    for j in range(env.n_objects):
+        print(
+            f"  box {j}: r in [{env.goal_ring_inner[j]:.2f}, "
+            f"{env.goal_ring_outer[j]:.2f}]  color {env.box_colors[j]}"
+        )
+    print(f"boxes spawn at r ~ {env._box_ring_r:.2f} +- {env._box_ring_jitter:.2f}")
 
     reset = jax.jit(env.reset)
     step = jax.jit(env.step)
@@ -839,19 +1015,32 @@ if __name__ == "__main__":
     assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
     print(f"obs shape OK: {obs.shape}")
 
-    # --- scripted sanity rollout: everyone pushes box 0 into the band ---
+    # --- scripted sanity rollout: a balanced partition, each box to its ring ---
+    # (Not the swarm: with one ring per box, delivering them all is the task.)
+    assign = jnp.arange(args.n_agents) % args.n_objects
     total, done_at = 0.0, None
     t0 = time.time()
     for i in range(1024):
-        obs, state, r, term, trunc, info = step(state, scripted_push_action(env, state))
+        obs, state, r, term, trunc, info = step(
+            state, scripted_push_action(env, state, assign)
+        )
         total += float(r)
         if bool(term) or bool(trunc):
             done_at = i + 1
             break
+    box_r = np.asarray(env._radius(env._box_pose(state.data)[0]))
     print(
         f"scripted rollout: return {total:.1f}, "
         f"delivered {np.asarray(info['delivered'])}, "
         f"ended at step {done_at} ({time.time() - t0:.1f}s incl. compile)"
+    )
+    print(
+        "  final box radii vs their rings: "
+        + ", ".join(
+            f"box {j} r={box_r[j]:.2f} in [{env.goal_ring_inner[j]:.2f}, "
+            f"{env.goal_ring_outer[j]:.2f}]"
+            for j in range(env.n_objects)
+        )
     )
 
     # --- vmapped random-action throughput ---

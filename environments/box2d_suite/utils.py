@@ -108,28 +108,52 @@ class ObjectTargetArea:
 
 
 class CircularTargetArea:
-    """Disc-shaped drop zone — the radial counterpart of `ObjectTargetArea`.
+    """Disc- or annulus-shaped drop zone — the radial counterpart of
+    `ObjectTargetArea`.
 
     Used by the circular-arena envs, whose goal is a region concentric with the
     boundary rather than a band along one wall. Exposes the same duck-typed
-    surface the renderer consumes (`x`, `y`, `radius`, `color`,
+    surface the renderer consumes (`x`, `y`, `radius`, `inner_radius`, `color`,
     `contains_object`) minus `width`/`height`, which is what
     `Renderer._draw_target_areas` keys off to pick the disc branch.
+
+    `inner_radius > 0` makes the zone a **circular band**: the annulus between
+    the two concentric circles, so the middle is *outside* the goal. The default
+    0 is the plain disc.
+
+    `label` names the zone in the renderer (default "DROP ZONE"). Envs with one
+    target region per object use it to say *which* object belongs here, and give
+    each region that object's color.
     """
 
-    def __init__(self, x, y, radius, color=(50, 200, 50, 128)):
+    def __init__(
+        self,
+        x,
+        y,
+        radius,
+        inner_radius=0.0,
+        color=(50, 200, 50, 128),
+        label="DROP ZONE",
+    ):
+        if not 0.0 <= inner_radius < radius:
+            raise ValueError(
+                f"inner_radius must be in [0, radius); got {inner_radius} vs {radius}"
+            )
         self.x = x
         self.y = y
         self.radius = radius
+        self.inner_radius = inner_radius
         self.color = color
+        self.label = label
         self.reward_scale = 1.0
         # Needed for compatibility with agent logic
         self.coupling_requirement = 0
 
     def contains_object(self, body):
-        """True when the body's center lies inside the disc."""
+        """True when the body's center lies inside the disc / band."""
         pos = body.position
-        return np.hypot(pos.x - self.x, pos.y - self.y) <= self.radius
+        dist = np.hypot(pos.x - self.x, pos.y - self.y)
+        return self.inner_radius <= dist <= self.radius
 
 
 def update_object_mass_from_contacts(env, coupled_density_per_agent=0.05):
