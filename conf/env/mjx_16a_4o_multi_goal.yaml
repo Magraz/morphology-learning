@@ -1,34 +1,36 @@
 # @package _global_
 #
-# mjx_16a_4o + the box drift ("decay") mechanic: every box whose coupling
-# requirement is NOT currently met sinks toward the bottom wall, so progress
-# decays on any box the team is not working on. Kills the sequential
-# swarm-one-box-at-a-time strategy that makes the dense arm easy for MAPPO —
-# a sequential schedule arithmetically cannot reach its last box.
+# mjx_16a_4o on a circular arena with one concentric goal ring per box
+# (`MultiBoxMultiGoalPushMJX`). The [0, goal_outer_radius] disc is cut into
+# `n_objects` rings of equal width and **box j must be delivered to ring j
+# counted from the center out** — box 0 to the central disc, box 1 to the
+# annulus around it, and so on. At 16a/4o that is 4 rings of width 3.20:
+# [0, 3.2], [3.2, 6.4], [6.4, 9.6], [9.6, 12.8], inside an arena of radius 23.
 #
-# Ablate against `mjx_16a_4o` (baseline) AND `mjx_16a_4o_trunc` (which carries
-# only the inert-wall change): this arm differs from the baseline in two ways,
-# so without the middle arm the result is not attributable.
+# Ablate against `mjx_16a_4o` (the square arena, single goal band at the top
+# wall). Two things change at once — the arena shape and the per-box goals — so
+# a difference between the two arms is not attributable to either alone; the
+# point of this arm is the *task*, not a controlled geometry ablation.
 #
-# Wall contact is inert here (it never ends the episode). Under drift, shaping is
-# negative while any box is uncoupled, so an episode-ending wall hit is an escape
-# from the bleeding — and `boundary_hit` is `any()` over 16 agents, so it is a
-# unilateral one. Reporting it as `truncated` and bootstrapping through it was
-# tried and is NOT sufficient (policies still learned to crash); the escape is
-# removed instead. See the `multi_box_push_mjx` module docstring.
+# What makes it harder than a shared goal: the boxes stop being
+# interchangeable. Delivering all four requires a partition of the team (the
+# coupling requirement is 4 = 16/4, so exactly one minimum coalition per box),
+# *and* the coalitions must respect the assignment — a box parked in another
+# box's ring counts for nothing and keeps bleeding shaping. The inner boxes must
+# also be pushed past the outer rings without dislodging what is already parked
+# there.
 #
-# CHECK `_DEFAULT_DRIFT_SPEED` BEFORE TRUSTING A RESULT FROM THIS ARM. At the
-# current 3.0 the drift force (3072 N) far exceeds a 4-agent coalition's ~400 N,
-# and `--check-drift` [8] fails: a *scripted balanced partition* — the strategy
-# the mechanic exists to reward — delivers 0.5 of 4 boxes with drift on vs 4.0
-# with it off, and loses to the swarm. The task is close to infeasible there, so
-# a flat learning curve would say nothing about coalition discovery.
+# The observation layout is unchanged (the shared 40-dim OBS_DIM), so the `mlp`
+# model group and every downstream stat/plot apply as-is. `goal_distance` is now
+# per-agent: the radial offset from the centerline of the ring belonging to the
+# box that agent is sensing.
 #
-# NOTE: difference rewards are structurally BLIND to this pressure — an
-# unattended box's drift cost does not depend on agent i, so it cancels in
-# D_i = G - G_-i. Use this arm in the dense/team-reward study.
+# The square arena's box-drift mechanic and its `variant` presets
+# (`drift`/`trunc`) do not exist here — do not set `env.variant`.
 env:
   environment: multi_box_multi_goal_push_mjx
+  # vmap width on one device, not a core budget — keep identical across arms
+  # being compared (the per-update batch is params.n_steps * n_envs).
   n_envs: 32
   n_agents: 16
   n_objects: 4

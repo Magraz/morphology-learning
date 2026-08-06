@@ -24,6 +24,9 @@ from flax.serialization import from_bytes, to_bytes
 from algorithms.mappo_jax.mappo import create_train_state
 from algorithms.mappo_jax.trainer import RunnerState, make_train
 from algorithms.mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
+from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
+    MultiBoxMultiGoalPushMJX,
+)
 from environments.mjx_suite.multi_box_push_mjx import MultiBoxPushMJX
 from environments.types import EnvironmentEnum
 
@@ -76,8 +79,12 @@ class MAPPO_JAX_Runner:
         set_seeds(random_seed)
         self.rng_seed = random_seed
 
-        # Create the functional MJX environment. Two supported env groups:
-        #   MULTI_BOX_MJX — continuous force control (the base env)
+        # Create the functional MJX environment. Three supported env groups:
+        #   MULTI_BOX_MJX            — continuous force control (the base env)
+        #   MULTI_BOX_MULTI_GOAL_MJX — the same task on a circular arena with one
+        #                   concentric goal ring per box (box j -> ring j from the
+        #                   center out); same 40-dim obs, action space and reward
+        #                   modes, so nothing downstream changes
         #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
         #                   one decision per macro_len low-level steps), which
         #                   wraps a base MultiBoxPushMJX.
@@ -89,6 +96,14 @@ class MAPPO_JAX_Runner:
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
+            )
+        elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
+            # No `variant` here: the drift / inert-wall presets are specific to
+            # the square arena and are deliberately not carried over.
+            self.env = MultiBoxMultiGoalPushMJX(
+                n_agents=env_config.get("n_agents"),
+                n_objects=env_config.get("n_objects"),
+                reward_mode=reward_mode,
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -126,7 +141,8 @@ class MAPPO_JAX_Runner:
             )
         else:
             raise ValueError(
-                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' and "
+                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
+                f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}' and "
                 f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
                 f"got {environment!r}"
             )

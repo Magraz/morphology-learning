@@ -570,10 +570,15 @@ what makes the comparison attributable).
 `MultiBoxMultiGoalPushMJX` is a copy of `MultiBoxPushMJX` with the **geometry**
 changed and nothing else: same physics constants, coupling mechanic, 40-dim
 `OBS_DIM` layout, reward structure (`dense`/`sparse`/`difference_rewards`),
-`EnvState`, and functional API. Not wired into `create_env` / `run.py` / `conf/`
-yet — construct it directly. The box-drift mechanic and the `variant`
-(`drift`/`trunc`) presets are deliberately **not** carried over; a wall touch
-ends the episode as in the square-arena baseline.
+`EnvState`, and functional API. **Trainable with `mappo_jax`**
+(`EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX = "multi_box_multi_goal_push_mjx"`,
+its own branch in `mappo_jax/run.py`, env group
+`conf/env/mjx_16a_4o_multi_goal.yaml`); not wired into `create_env` (the torch
+stacks) — everything downstream of `run.py` is duck-typed on the functional API,
+so the trainer, `view()` and `evaluate()` needed no changes. The box-drift
+mechanic and the `variant` (`drift`/`trunc`) presets are deliberately **not**
+carried over — do not set `env.variant` on this group; a wall touch ends the
+episode as in the square-arena baseline.
 
 - **Arena is a disc** of `arena_radius = world_width/2 - boundary_thickness`
   about the world center (now the *geometric* center, `W/2` not `W//2`). MuJoCo
@@ -714,6 +719,22 @@ ends the episode as in the square-arena baseline.
   Keyboard control works too, via the shared CLI's env switch (verified: reset
   draw + step loop + auto-reset on truncation):
   `uv run python -m environments.mjx_suite.renderer --env circular --manual`.
+- **Training** (verified end-to-end: train writes the usual
+  `training_stats_*.pkl` / `models_*.msgpack` under
+  `experiments/results/mjx_16a_4o_multi_goal/mlp/<trial>/`, and `evaluate=true`
+  reloads them):
+  ```
+  uv run python train.py algorithm=mappo_jax env=mjx_16a_4o_multi_goal \
+      model=mlp trial_id=0
+  ```
+  ⚠ The group ships `params.n_steps: 512` against the env's `max_steps: 1024`.
+  `collect_fn` **resets every env at the top of every rollout** and then scans
+  exactly `n_steps`, so at 512 training never sees the second half of *any*
+  episode — and in this task deliveries land late (the scripted oracle needs
+  ~350–900 steps), so the +100 bonuses would be almost entirely outside the
+  training distribution. Use `n_steps: 1024` to cover a full episode, which also
+  makes the per-update batch (1024 x 32) identical to the `mjx_16a_4o` baseline
+  arm it is meant to be compared against.
 - Demo: `uv run python -m environments.mjx_suite.multi_box_multi_goal_push_mjx`.
 
 ## JAX MAPPO (`algorithms/mappo_jax/`)
@@ -836,7 +857,15 @@ drop-in comparable:
   # difference-rewards arm (same command, _dr env group):
   uv run python train.py algorithm=mappo_jax env=multi_box_push_mjx_9a_3o_dr \
       model=mlp trial_id=0
+  # circular arena, one concentric goal ring per box:
+  uv run python train.py algorithm=mappo_jax env=mjx_16a_4o_multi_goal \
+      model=mlp trial_id=0
   ```
+  `run.py` has one `elif` per supported env group
+  (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX`), each passing its
+  constructor arguments explicitly — deliberately not a shared kwargs helper.
+  Note this means an `env:` key is only reachable where a branch names it:
+  `coupling_def` and `max_steps` are currently forwarded by no branch.
 
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`) — WORK IN PROGRESS
 

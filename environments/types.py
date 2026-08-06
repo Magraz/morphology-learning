@@ -19,6 +19,9 @@ class EnvironmentEnum(StrEnum):
     MULTI_BOX = "multi_box_push"
     # MuJoCo-MJX port of multi_box_push (functional JAX API, mappo_jax only)
     MULTI_BOX_MJX = "multi_box_push_mjx"
+    # Same, on a circular arena with one concentric goal ring per box: box j
+    # must be delivered to ring j counted from the center out (mappo_jax only)
+    MULTI_BOX_MULTI_GOAL_MJX = "multi_box_multi_goal_push_mjx"
     # Hierarchical macro-action layer over MULTI_BOX_MJX: the policy selects
     # among frozen scripted skills (discrete), one decision per macro_len
     # low-level steps (SyncMacroMJX; mappo_jax only)
