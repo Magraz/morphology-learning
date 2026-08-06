@@ -27,10 +27,10 @@ Everything that referenced the goal axis becomes radial *and* per-box: delivery
 is ``ring_inner[j] <= |box j - center| <= ring_outer[j]``, the shaping term is
 box j's reduction in ``_goal_dist`` (distance to *its* ring, zero inside it,
 growing on *both* sides — so approaching from either side pays and burrowing
-past it does not), the ``goal_distance`` observation is the agent's radial
-offset from the centerline of the ring belonging to the box it is sensing (via
-the shared builder's ``goal_axis="radial"`` mode with a per-agent
-``goal_radius``: negative inside that ring, positive outside it, ~0 on it), and
+past it does not), the ``goal_distance`` observation is the radial offset of the
+box an agent is sensing from the centerline of *that box's* ring (via the shared
+builder's ``goal_axis="radial"`` mode with a per-agent ``goal_radius`` and
+``goal_from_pos``: negative inside that ring, positive outside it, ~0 on it), and
 the boundary-contact test is
 ``|agent - center| >= arena_radius - agent_radius``.
 
@@ -675,9 +675,9 @@ class MultiBoxMultiGoalPushMJX:
         box_pos, box_yaw = self._box_pose(data)
         # Each box has a *different* target ring, so a single global goal radius
         # would tell an agent nothing about where its box has to go. The feature
-        # is therefore measured against the ring of the box that agent is
-        # sensing — the same nearest-undelivered-box the `nearest_box_vec`
-        # component points at, so the two features describe one box.
+        # is therefore keyed to the box that agent is sensing — the same
+        # nearest-undelivered-box the `nearest_box_vec` component points at, so
+        # the two features describe one box.
         nearest = self.obs_builder.nearest_box_indices(agent_pos, box_pos, delivered)
         return self.obs_builder.build(
             data,
@@ -688,10 +688,14 @@ class MultiBoxMultiGoalPushMJX:
             box_half=self._box_half,
             goal_coord=self._center,  # concentric goal: distance is radial
             goal_axis="radial",
-            # Offset by that ring's centerline, so the feature is the agent's
-            # signed radial offset from where its box should end up: negative
-            # inside the ring, positive outside it, ~0 on it.
+            # Offset by that ring's centerline, and measured from the *box*
+            # rather than the agent: the quantity that has to be driven to zero
+            # is how far the sensed box still is from its own ring — negative
+            # inside it, positive outside it, ~0 on its centerline. (The agent's
+            # own radial offset said nothing about the box's remaining work, and
+            # went to zero when the agent stood on the ring itself.)
             goal_radius=self._ring_mid[nearest],  # (A,)
+            goal_from_pos=box_pos[nearest],  # (A, 2)
             delivered=delivered,
         )
 

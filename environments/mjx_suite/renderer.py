@@ -269,6 +269,25 @@ class MJXRenderer(Renderer):
                 radius, 3,
             )
 
+    def _goal_measure(self, snap, idx):
+        """``(from_pos, goal_radius)`` for the focus agent's goal_distance obs.
+
+        ``(None, None)`` — measure from the agent, as the shared layout does —
+        unless the env has a *per-box* goal ring, in which case the observation
+        is the sensed box's offset from its own ring and the overlay has to be
+        drawn from that box (see the env's ``_get_obs``). The sensed box is the
+        nearest undelivered one, the same search the observation runs.
+        """
+        ring_mid = getattr(self.env, "goal_ring_mid", None)
+        if ring_mid is None or not len(snap["box_pos"]):
+            return None, None
+        dist = np.linalg.norm(snap["box_pos"] - snap["agent_pos"][idx], axis=1)
+        dist = np.where(snap["delivered"], np.inf, dist)
+        if not np.isfinite(dist).any():  # everything delivered
+            return None, None
+        nearest = int(np.argmin(dist))
+        return snap["box_pos"][nearest], float(ring_mid[nearest])
+
     def _draw_obs_overlay(self, snap, obs, focus_agent):
         """Sensor overlay for one agent, fed by its actual observation vector.
 
@@ -296,7 +315,7 @@ class MJXRenderer(Renderer):
 
         self._draw_lidar(origin, center, readout)  # inherited
         self._draw_density_sectors(center, readout)  # inherited
-        self._draw_goal_distance(origin, center)  # inherited
+        self._draw_goal_distance(origin, center, *self._goal_measure(snap, idx))
         self._draw_nearest_box_vec(origin, center, readout)  # inherited
         pygame.draw.circle(
             self.screen, (0, 0, 0), center, int(_AGENT_RADIUS * self.scale) + 3, 2
