@@ -901,11 +901,111 @@ worker emits the primitive action. Not wired into `algorithms/types.py` /
     avoids with a bilinear `logits = U(obs) @ phi(g)` and no bias, so a zero
     goal expresses no preference. If the manager's goals turn out not to steer
     the worker, swap the fusion; the module interface stays the same.
-- **`manager.py` — empty, next.** Open decisions it forces: goal dimension and
-  whether goals are per-team or per-agent; the state-embedding `f_percept` the
-  goal lives in (FuN's cosine intrinsic reward needs one); goal horizon `c`;
-  whether the worker's critic is goal-conditioned (its return depends on `g`, so
-  the flat `MAPPOCritic` on the global state alone is not sufficient).
+- **`manager.py` — `FeudalManager`** (done, network only; nothing calls it).
+  Centralized manager emitting **one unit-norm goal per agent**. `s` (the latent
+  state space) and `g` share a space — in FuN a goal is a *direction in the state
+  embedding*, not a separate code — so `goal_dim` is the only width knob:
+  ```
+  global_state (E, N*obs_dim)      # trainer.py: obs.reshape(n_envs, -1)
+    -> f_percept 2-layer Tanh MLP   -> z    (E, hidden_dim)   team embedding
+    -> f_Mspace  Dense(N*goal_dim)  -> s    (E, N, goal_dim)
+    -> f_Mrnn (dilated LSTM | MLP)  -> y    (E, hidden_dim)   consumes s
+    -> goal head Dense(N*goal_dim)  -> ghat (E, N, goal_dim)
+                   per-agent L2     -> g    (E, N, goal_dim)
+  ```
+  **`s` is a bottleneck, not a side head** — the core consumes `s`, matching the
+  paper's `h^M_t, ghat_t = f^Mrnn(s_t, h^M_{t-1})`. This is load-bearing, not
+  cosmetic: see the detach rule below. It also means `goal_dim` is the manager's
+  entire information channel, so shrinking it throttles the goal RNN too.
+  Layers are explicitly named (`f_percept_0/1`, `f_Mspace`, `core`, `goal_head`)
+  so gradient-routing assertions don't depend on flax's `Dense_N` ordering.
+  `__call__(carry, global_state) -> (carry, goal, s)`; `init_manager(...)` returns
+  `(module, params, carry)`. Goals are per-agent (not per-team) so the manager can
+  assign a **division of labour**; `g` drops straight into `FeudalWorker`
+  (`_broadcast_goal` is a no-op on an already-per-agent goal). Recurrence is
+  **team-level** — one LSTM over `z`, expanded to agents only at the goal head —
+  so the carry has no agent axis.
+  - **`DilatedLSTM`** (FuN §3): state is a pool of `radius` sub-states
+    `(..., r, features)`; at step `t` only group `t % r` is read and written, so a
+    group's gradient path spans `r`× more real time. Gate params are **shared
+    across groups** (one `nn.LSTMCell`, reused for the gate math — the repo's only
+    other recurrence is torch). Group selection is a one-hot gather + masked
+    write-back, **not** a dynamic index, so `t` may be a tracer and the module is
+    `jit`/`scan`-safe. `r` defaults to the goal horizon `c`. Carry is
+    `DilatedLSTMState(cell=(c_pool, h_pool), t)`, built by the module-level
+    `dilated_lstm_carry(...)` — *not* inside `initialize_carry`, because flax wraps
+    every public module method in its scope machinery and an unbound module cannot
+    construct submodules there (this raises a bare `AssertionError` if reintroduced).
+  - **`core="mlp"`** is the stateless alternative: carry is `None` and passes
+    through, same signature and output shapes. It exists because **nothing in the
+    JAX stack is recurrent** — `trainer.py`'s rollout scan carry is
+    `(train_state, env_state, obs, rng)` — so the MLP core can be wired in without
+    touching the scan, and the dilated LSTM added after.
+  - **Deliberate deviations from the paper**, both documented in-file: `f_Mspace`
+    uses the repo's 2-layer Tanh body rather than FuN's `Dense + ReLU` (bounded
+    latents are better conditioned for a cosine objective); and the goal head uses
+    `orthogonal(1.0)`, not the actor head's `0.01` — a near-zero `ghat` normalizes
+    to a direction set entirely by init noise. FuN also shares one `f_percept`
+    between manager and worker; here the worker eats the raw local obs, so
+    `f_Mspace` is manager-only.
+  - **Goal-semantics helpers** (pure, jittable, static shapes, all in the same
+    module): `pool_goals(goals, c)` = `sum_{i=t-c+1..t} g_i`, what the worker is
+    actually conditioned on so directives persist over the horizon;
+    `transition_cosine(states, goals, c) -> (cos, valid)` = `d_cos(s_{t+c}-s_t,
+    g_t)`, the manager's transition policy gradient objective (multiply by the
+    manager advantage); `worker_intrinsic_reward(states, goals, c)` = `1/c *
+    sum_{i=1..c} d_cos(s_t-s_{t-i}, g_{t-i})`. All three take an **optional `done`
+    mask** that severs any pair straddling an episode boundary (a `cumsum`
+    comparison) — FuN's env never terminated, ours do, and omitting it silently
+    mixes latents from different episodes. `_unit` is zero-safe (`+ eps`), the same
+    convention as `environments/mjx_suite/macro_skills.py:_unit`.
+  - **Latent collapse and the detach rule (the reason for the topology).**
+    `d_cos` is scale-invariant, so the risk is **directional**, not about the
+    magnitude of `s` (an earlier version of this note said "shrinking `s`" — that
+    is a no-op). If `f_Mspace` collapses to rank 1 (`s_t = phi(x_t) * u`), every
+    `s_t - s_{t-i}` is parallel to `u`, the goal head emits `g = u`, and the
+    cosine pins at ±1 for **every** state and action: the intrinsic reward becomes
+    a constant, which advantage centering annihilates. The mechanism goes inert
+    while the losses look healthy — self-sealing, since the metric that would
+    expose it is the one that collapsed (same trap as the `boundary_truncates`
+    bug above). The manager is pushed there because it owns *both* arguments of
+    the cosine: it picks the measuring stick (`s`) *and* the target (`g`), and
+    rotating the yardstick is far cheaper than learning what the worker can
+    achieve. The guard is FuN's own and is **explicit in the paper**: *"the
+    dependence of `s` on θ is ignored when computing ∇_θ d_cos — this avoids
+    trivial solutions."* Implemented as `transition_cosine(..., detach_states=True)`
+    (default; `False` reproduces the failure deliberately) plus an unconditional
+    detach in `worker_intrinsic_reward` — a reward is data, and leaving it
+    attached would also backprop the worker's objective into the manager, which
+    FuN rules out because it *"would deprive Manager's goals `g` of any semantic
+    meaning, making them just internal latent variables."*
+    **Why the core must consume `s`:** the detach hits only the *target* arm;
+    `g_t(θ)` still depends on θ **through `s`**, so `f_Mspace` keeps a learning
+    signal via the *goal* arm. Wire the core to `z` instead (as the first draft
+    did) and the detach starves `f_Mspace` to its random init — measured
+    `|dL/df_Mspace| = 0.0` exactly under the old wiring vs `45.2` now, which is
+    what check [8] asserts.
+    **Unguarded residual, per-agent-specific:** `s` and `g` are each one `Dense`
+    reshaped to `(N, goal_dim)`, so nothing structurally forces the `N` rows to
+    differ — under uniformity pressure per-agent goals silently degrade to one
+    team goal and every shape/assertion still passes. Log the mean pairwise cosine
+    between agents' goals, the effective rank of `s`, and `Var_t[d_cos]`; a high
+    **flat** intrinsic reward is the pathology, so its mean alone reads as success.
+  - **Still open, for whoever wires it up** (also in the module docstring):
+    manager value `V^M` should **reuse `MAPPOCritic` on the global state with
+    `n_outputs=n_agents`** — do not add another critic; `create_train_state`
+    returns a 2-field `ActorCriticTrainState` and needs a third manager
+    `TrainState` (plus the two checkpoint-restore sites in `run.py`);
+    `trainer._actor_forward` flattens obs to `(b*n_agents, obs_dim)` for the fused
+    shared-actor pass, so the goal must be flattened the same way *there*
+    (`worker._broadcast_goal` handles the un-flattened layout only).
+  - Self-check (8 groups: shapes/unit-norm, dilation writes group `t%r` only and
+    covers all `r`, `jit`+`lax.scan` carry threading, `vmap`, mlp core is
+    stateless + an unknown core raises, goal-semantics incl. done-masking, a
+    manager→worker handshake through `bind_goal`+`sample_action` for both action
+    spaces, and gradient routing under the detach rule — target arm zeroed, goal
+    arm live, `r^I` fully detached, `f_Mspace` still trained). All pass:
+    `uv run python -m algorithms.feudal_mappo_jax.manager`
 
 ## Coordination-graph novelty exploration (gnn critic)
 

@@ -301,26 +301,43 @@ class Renderer:
         pygame.draw.line(self.screen, self.BOX_VEC_COLOR, center, tip, 3)
         self._draw_arrow_head(center, tip, self.BOX_VEC_COLOR)
 
-    def _draw_goal_distance(self, origin, center):
-        """Segment from the agent to the target band, along the env's goal axis."""
+    def _draw_goal_distance(self, origin, center, from_pos=None, goal_radius=None):
+        """Segment from the agent to the target band, along the env's goal axis.
+
+        ``from_pos`` overrides the point the distance is measured from — an env
+        whose target is per-object measures from the object the agent senses,
+        not from the agent (see ``goal_distances``); the segment then starts
+        there. ``goal_radius`` likewise names the concentric goal's radius when
+        it differs per object, so the segment ends on *that* ring rather than at
+        the goal center.
+        """
         target_areas = getattr(self.env, "target_areas", None)
         if not target_areas:  # no goal region — the obs is 0
             return
 
         target = target_areas[0]
         goal_axis = getattr(self.env, "goal_axis", "y")
+        pos = origin if from_pos is None else from_pos
+        start = center if from_pos is None else self._to_screen(*pos)
         # Match the observation: the distance is measured along one axis only,
         # or radially for a concentric goal (then the segment points at its
-        # center, the direction the obs measures along).
+        # center, the direction the obs measures along — or at the ring itself
+        # when a `goal_radius` is given).
         if goal_axis == "radial":
-            tip = self._to_screen(target.x, target.y)
+            if goal_radius is None:
+                tip = self._to_screen(target.x, target.y)
+            else:
+                dx, dy = pos[0] - target.x, pos[1] - target.y
+                r = math.hypot(dx, dy)
+                scale = goal_radius / r if r > 1e-6 else 0.0
+                tip = self._to_screen(target.x + dx * scale, target.y + dy * scale)
         elif goal_axis == "x":
-            tip = self._to_screen(target.x, origin[1])
+            tip = self._to_screen(target.x, pos[1])
         else:
-            tip = self._to_screen(origin[0], target.y)
+            tip = self._to_screen(pos[0], target.y)
 
-        pygame.draw.line(self.screen, self.GOAL_COLOR, center, tip, 3)
-        self._draw_arrow_head(center, tip, self.GOAL_COLOR)
+        pygame.draw.line(self.screen, self.GOAL_COLOR, start, tip, 3)
+        self._draw_arrow_head(start, tip, self.GOAL_COLOR)
 
     def _draw_arrow_head(self, start, end, color, size=9):
         """Filled triangle at `end`, pointing away from `start`."""
