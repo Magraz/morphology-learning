@@ -1,10 +1,12 @@
 #!/bin/bash
-ENVIRONMENT=multi_box_push
-BATCH_NAME=${ENVIRONMENT}_test
-EXPERIMENT_NAMES=("mlp_shared" "hgnn_shared" "hgnn_shared_entropy")
-ALGORITHM=mappo
+#ENVIRONMENT=hrl_skill
+#BATCH_NAME=${ENVIRONMENT}_team_9a
+BATCH_NAME=mjx_16a_4o_drift
+# EXPERIMENT_NAMES=("cg_agent_novelty" "cg_team_novelty" "gnn_critic" "mlp_shared" "cg_agent_novelty_dir_adj" "cg_team_novelty_dir_adj" "cg_agent_novelty_node_emb" "cg_team_novelty_node_emb")
+EXPERIMENT_NAMES=("mlp")
+ALGORITHM=mappo_jax
 TRIAL_START=0
-TRIAL_END=9
+TRIAL_END=4
 SBATCH_SCRIPT="run_trial_gpu.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

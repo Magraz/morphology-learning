@@ -24,7 +24,7 @@ sbatch <<EOT
 #SBATCH -c 1                                                                 # number of cores/threads per task (default 1)
 #SBATCH --cpu-freq=high
 #SBATCH --mem=4G                                                            # request gigabytes memory (per node, default depends on node)
-#SBATCH --time=72:00:00                                                      # time needed for job (1 day)
+#SBATCH --time=96:00:00                                                      # time needed for job (1 day)
 #SBATCH --nodes=1
 #SBATCH --requeue
 

@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval-minutes",
         type=float,
-        default=30.0,
+        default=10.0,
         help="Minutes between watchdog cycles (default: 30).",
     )
     parser.add_argument(
