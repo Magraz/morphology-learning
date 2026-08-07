@@ -1091,10 +1091,38 @@ existing `append_agent_stats` path with **no stats-plumbing change**:
 latent collapse**, the mechanism inert while losses look healthy),
 `goal_pairwise_cos` / `state_pairwise_cos` (**≳0.9 ⇒ per-agent goals degenerated
 to one team goal** — the residual `manager.py` flags as structurally unguarded),
-`d_cos_var` (**≲1e-3 ⇒ the cosine is constant**, annihilated by advantage
+`goal_direction_count` + `goal_pairwise_cos_abs` (the sign-blind companions to
+that signed mean — see below), `d_cos_var` (**≲1e-3 ⇒ the cosine is constant**,
+annihilated by advantage
 centering — never read `d_cos_mean` alone, a high *flat* value reads as success),
 `valid_fraction`, `manager_pg_loss`, `manager_value_loss`,
 `manager_explained_variance`.
+
+**Goal collapse: read `goal_direction_count`, not `goal_pairwise_cos` alone.**
+The headline "are the manager's goals unique per agent?" series is
+`goal_direction_count` — the effective number of *distinct* goal directions
+emitted at a single (timestep, env), averaged over the batch, in
+`[1, min(n_agents, goal_dim)]`. **1.0 ⇒ one shared team goal; n_agents ⇒
+mutually orthogonal per-agent directives.** It exists because the signed mean
+cosine cannot distinguish genuine diversity from a collapse onto a single
+**line**: goals splitting into `+u` / `-u` clusters average to ≈0 and read as
+perfectly healthy while carrying one bit of information. `goal_pairwise_cos_abs`
+(mean `|cos|`; ≳0.9 ⇒ collinear) is the cheap cross-check that says which of the
+two a `goal_pairwise_cos` ≈ 0 is. All three are computed off one shared
+`_agent_gram` (`mappo.py`); the count is the participation ratio
+`(Σλ)²/Σλ² = N²/‖G‖_F²` of that Gram — unit-norm rows make the numerator exact,
+so it costs a Frobenius norm, not an eigendecomposition, over the (T, E, N, N)
+stack. Pinned by `test_goal_direction_count_reads_the_collapse_cases`.
+
+⚠ **The healthy value is not `n_agents`** — compare against the random-direction
+baseline `N² / (N + N(N−1)/goal_dim)`, since `N` unit vectors in `goal_dim`
+dimensions are only near-orthogonal when `goal_dim >> N`. At `mjx_16a_4o`
+(`n_agents=16`, `goal_dim=16`) that baseline is **8.26**, and a 65k-step run
+measures 8.25 (with `goal_pairwise_cos` ≈ −0.02, `|cos|` ≈ 0.204 ≈ the random
+`sqrt(2/(pi*goal_dim))`) — i.e. maximally diverse for this width, *not* half
+collapsed. Read the series as a **trend**: a drift downward toward 1 is the
+collapse. Because the ceiling is set by `goal_dim`, the count is only comparable
+across runs that share it.
 
 Measured at 131k steps on `mjx_16a_4o` (`goal_dim=16`, `c=10`): erank 14.5 → 11.8,
 `goal_pairwise_cos` ≈ ±0.02, `d_cos_var` ≈ 0.063, `valid_fraction` 0.88 → 0.76 —

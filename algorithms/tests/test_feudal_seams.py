@@ -334,10 +334,15 @@ def test_update_moves_both_learners(rollout):
         "total_loss", "policy_loss", "value_loss", "entropy_loss",
         "manager_pg_loss", "manager_value_loss", "manager_explained_variance",
         "d_cos_mean", "d_cos_var", "valid_fraction",
-        "goal_pairwise_cos", "state_pairwise_cos", "state_latent_erank",
+        "goal_pairwise_cos", "goal_pairwise_cos_abs", "goal_direction_count",
+        "state_pairwise_cos", "state_latent_erank",
     ):
         assert key in losses, f"missing metric {key}"
         assert np.isfinite(float(losses[key])), (key, losses[key])
+
+    n_agents = traj.goal.shape[-2]
+    count = float(losses["goal_direction_count"])
+    assert 1.0 - 1e-4 <= count <= n_agents + 1e-4, count
 
     for name in ("actor_ts", "critic_ts", "manager_ts", "manager_critic_ts"):
         before = jax.tree.leaves(getattr(new_rs.train_state, name).params)
@@ -345,6 +350,30 @@ def test_update_moves_both_learners(rollout):
         assert any(
             not jnp.array_equal(a, b) for a, b in zip(before, after)
         ), f"{name} did not move"
+
+
+def test_goal_direction_count_reads_the_collapse_cases():
+    """1 for one shared goal (or one shared LINE), N for orthogonal goals."""
+    from algorithms.feudal_mappo_jax.mappo import (
+        _agent_direction_count,
+        _agent_gram,
+        _mean_pairwise_cosine,
+    )
+
+    n, d = 4, 8
+    key = jax.random.PRNGKey(0)
+    shared = jnp.broadcast_to(jax.random.normal(key, (1, d)), (n, d))
+    orthogonal = jnp.eye(n, d)
+    # Antipodal clusters: signed cosine averages to ~0 and reads as "diverse",
+    # but every goal lies on one line — this is the case the count exists for.
+    antipodal = shared * jnp.array([1.0, 1.0, -1.0, -1.0])[:, None]
+
+    assert np.isclose(float(_agent_direction_count(_agent_gram(shared))), 1.0, atol=1e-3)
+    assert np.isclose(float(_agent_direction_count(_agent_gram(orthogonal))), n, atol=1e-3)
+    assert np.isclose(
+        float(_agent_direction_count(_agent_gram(antipodal))), 1.0, atol=1e-3
+    )
+    assert abs(float(_mean_pairwise_cosine(_agent_gram(antipodal)))) < 0.4
 
 
 def test_manager_metrics_are_scalars(rollout):

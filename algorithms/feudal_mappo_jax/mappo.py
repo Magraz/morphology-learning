@@ -473,24 +473,58 @@ def _effective_rank(s: jnp.ndarray) -> jnp.ndarray:
     return jnp.exp(entropy)
 
 
-def _mean_pairwise_cosine(v: jnp.ndarray) -> jnp.ndarray:
-    """Mean cosine between the agent-axis rows of ``v`` (..., n_agents, d).
+def _agent_gram(v: jnp.ndarray) -> jnp.ndarray:
+    """Pairwise cosines between the agent-axis rows of ``v`` (..., n_agents, d).
+
+    The three agent-diversity diagnostics below are all functions of this one
+    (..., N, N) matrix, so it is computed once per quantity rather than per
+    metric.
+    """
+    u = v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-6)
+    return jnp.einsum("...id,...jd->...ij", u, u)
+
+
+def _mean_pairwise_cosine(gram: jnp.ndarray) -> jnp.ndarray:
+    """Mean off-diagonal entry of ``gram``, averaged over the leading axes.
 
     Detects the residual `manager.py` flags as unguarded: `s` and `g` are each
     one Dense reshaped to (N, goal_dim), so nothing *structurally* forces the N
     rows to differ. Under uniformity pressure per-agent goals silently degrade to
     a single team goal — every shape and assertion still passes — and this is the
     only thing that would say so.
+
+    Read it together with `_agent_direction_count`: the SIGNED mean cannot tell
+    "diverse" from "two antipodal clusters", which averages to ~0 while every
+    goal lies on a single line.
     """
-    n = v.shape[-2]
+    n = gram.shape[-1]
     if n < 2:
         return jnp.float32(0.0)
-    u = v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-6)
-    gram = jnp.einsum("...id,...jd->...ij", u, u)
-    off_diag_sum = gram.sum(axis=(-2, -1)) - jnp.trace(
-        gram, axis1=-2, axis2=-1
-    )
+    off_diag_sum = gram.sum(axis=(-2, -1)) - jnp.trace(gram, axis1=-2, axis2=-1)
     return (off_diag_sum / (n * (n - 1))).mean()
+
+
+def _agent_direction_count(gram: jnp.ndarray) -> jnp.ndarray:
+    """Effective number of DISTINCT agent directions, in [1, min(N, d)].
+
+    The headline "are the goals collapsing?" metric: computed per (timestep,
+    env) across the agent axis and then averaged, so it answers "how many
+    different directives does the manager issue at a single moment" — 1.0 means
+    one shared team goal, N means N mutually orthogonal ones. Unlike the mean
+    pairwise cosine it is sign-blind, so it also catches a collapse onto a
+    single *line* (goals split into +u / -u clusters, whose signed cosines
+    cancel to ~0 and read as healthy diversity).
+
+    This is the participation ratio of the Gram's eigenvalues,
+    ``(sum lambda)^2 / sum lambda^2``. The rows are unit-norm, so ``trace = N``
+    and the numerator is exactly ``N^2`` — no eigendecomposition needed, only
+    the Frobenius norm, which matters because this runs on a (T, E, N, N) stack.
+    """
+    n = gram.shape[-1]
+    if n < 2:
+        return jnp.float32(1.0)
+    frob_sq = jnp.sum(gram**2, axis=(-2, -1))
+    return (n**2 / (frob_sq + 1e-12)).mean()
 
 
 def manager_update(
@@ -654,9 +688,10 @@ def manager_update(
         )(manager_ts.params)
         manager_ts = manager_ts.apply_gradients(grads=m_grads)
 
-        # --- collapse diagnostics (see the two helpers above) ---
+        # --- collapse diagnostics (see the helpers above) ---
         cos_mean = _masked_mean(cos, mask)
         cos_var = _masked_mean((cos - cos_mean) ** 2, mask)
+        goal_gram = _agent_gram(goal)
         metrics = {
             "manager_pg_loss": pg_loss,
             "manager_adv_std": m_adv.std(),
@@ -666,8 +701,12 @@ def manager_update(
             # read d_cos_var next to d_cos_mean, never the mean alone.
             "d_cos_var": cos_var,
             "valid_fraction": valid.mean(),
-            "goal_pairwise_cos": _mean_pairwise_cosine(goal),
-            "state_pairwise_cos": _mean_pairwise_cosine(s),
+            "goal_pairwise_cos": _mean_pairwise_cosine(goal_gram),
+            # Sign-blind companions to the signed mean: goals collapsed onto one
+            # LINE give cos ~ 0 but |cos| ~ 1 and a direction count ~ 1.
+            "goal_pairwise_cos_abs": _mean_pairwise_cosine(jnp.abs(goal_gram)),
+            "goal_direction_count": _agent_direction_count(goal_gram),
+            "state_pairwise_cos": _mean_pairwise_cosine(_agent_gram(s)),
             "state_latent_erank": _effective_rank(s),
         }
         return manager_ts, metrics
