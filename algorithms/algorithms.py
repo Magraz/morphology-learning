@@ -89,6 +89,26 @@ def _dispatch(
             if debug:
                 jax.config.update("jax_disable_jit", True)
 
+        case AlgorithmEnum.FEUDAL_MAPPO_JAX:
+            # FeUdal Networks hierarchy over the same functional MJX envs as
+            # mappo_jax: a centralized manager emits one latent goal per agent,
+            # a goal-conditioned worker emits the primitive action.
+            from algorithms.feudal_mappo_jax.run import Feudal_MAPPO_JAX_Runner
+            from algorithms.feudal_mappo_jax.types import Experiment
+
+            exp_config = Experiment(**exp_dict)
+            runner = Feudal_MAPPO_JAX_Runner(
+                exp_config.device,
+                batch_dir,
+                results_dir,
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+            if debug:
+                jax.config.update("jax_disable_jit", True)
+
         case AlgorithmEnum.DCG:
             from algorithms.dcg.run import DCG_Runner
             from algorithms.dcg.types import Experiment

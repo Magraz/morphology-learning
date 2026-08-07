@@ -1,0 +1,9 @@
+# @package _global_
+# FeUdal intrinsic-reward ablation, alpha = 0.1. See conf/model/feudal_a0.yaml
+# for why the ablation axis is a model group rather than a bare param override.
+defaults:
+  - feudal
+  - _self_
+
+params:
+  intrinsic_coef: 0.1

@@ -1,0 +1,90 @@
+# @package _global_
+# FeUdal MAPPO (algorithms/feudal_mappo_jax): a FeUdal-Networks hierarchy over
+# the same functional MJX envs as mappo_jax — a centralized manager emits one
+# unit-norm latent goal per agent, a goal-conditioned worker emits the primitive
+# action. The worker's PPO surface is identical to mappo_jax so the two are
+# drop-in comparable; the feudal-only knobs live below and in conf/model/feudal.
+#
+# NOTE: always pair this with `model=feudal`, never `model=mlp`. The results path
+# is experiments/results/<env>/<model>/ and does NOT include the algorithm, so
+# `model=mlp` would write into the mappo_jax baseline's directory (and a
+# `checkpoint=true` resume would try to load a 2-state mappo_jax checkpoint into
+# the 4-state feudal train state).
+algorithm: feudal_mappo_jax
+params:
+  n_epochs: 6
+  n_total_steps: 100000000.0     # float on purpose; env groups override when different
+  n_minibatches: 8
+  # Rollout length per env stream. Unlike the torch stacks this must stay
+  # per-env: it is the static length of the jitted collect scan. The batch is
+  # n_steps * env.n_envs, and n_envs is a literal in each MJX env group (a vmap
+  # width, never core-derived), so the batch is still fixed by config alone.
+  n_steps: 1024
+  parameter_sharing: true       # shared-worker path only, as in mappo_jax
+  lr: 0.0003
+  gamma: 0.99
+  lmbda: 0.95
+  eps_clip: 0.2
+  ent_coef: 0.01
+  grad_clip: 0.5
+
+  # ---- FeUdal ----
+  # Goal horizon c: the lag at which the manager's directive is scored
+  # (d_cos(s_{t+c} - s_t, g_t)), the number of goals the worker's conditioning
+  # pools over, and the dilation radius of the LSTM core. Note c interacts with
+  # episode length: horizons that straddle an episode boundary are masked out of
+  # the manager loss, so on a short-episode env a large c starves the manager
+  # (watch `valid_fraction`).
+  goal_horizon: 10
+  # alpha: weight of the worker's intrinsic reward. 0.0 leaves the intrinsic path
+  # inert — goals still condition the worker, but nothing rewards following them.
+  #
+  # CALIBRATED VALUE IS 0.5; the default is deliberately left OFF because the
+  # ablation that would justify flipping it needs a full-length run. Launch with
+  # `params.intrinsic_coef=0.5` to turn it on.
+  #
+  # How 0.5 was derived (mjx_16a_4o, measured — do NOT re-derive from a short
+  # run): |r^I| is ~0.152/step and near-constant, but the ENV reward at smoke
+  # budget is 6.2e-07/step, so the ratio is a division by zero and alpha cannot
+  # be scaled from a short run. The usable denominator comes from the converged
+  # mappo_jax baseline instead: eval return ~398-470 over max_steps=1024, i.e.
+  # ~0.39-0.46/step. alpha=0.5 puts 0.5*0.152 = 0.076 at ~17-19% of that, inside
+  # the intended 10-30% band.
+  #
+  # ⚠ Known consequence, by construction: early in training the extrinsic reward
+  # really is ~0, so at alpha=0.5 the intrinsic term dominates the worker's
+  # objective by ~5 orders of magnitude until the policy starts moving boxes.
+  # That is FuN's intended exploration behaviour, not a bug — but it means the
+  # early learning curve is driven almost entirely by goal-following, and a
+  # sensible ablation is 0 / 0.1 / 0.5 rather than a single arm.
+  intrinsic_coef: 0.0
+  manager_lr: 0.0003
+  manager_val_coef: 0.5
+  # The manager operates on a longer timescale than the worker, so this may
+  # exceed `gamma`.
+  manager_gamma: 0.99
+  # Gradient passes per update over the FULL batch. The transition PG has no
+  # importance-sampling correction, so >1 is uncorrected off-policy for the
+  # policy arm; V^M's regression has no such constraint (fixed targets) and is
+  # given its own count below.
+  n_manager_epochs: 1
+  # V^M regresses fixed targets, so extra passes are ordinary supervised
+  # optimization. Kept separate because the worker critic gets
+  # n_epochs * n_minibatches (48 at the defaults) gradient steps per update; at 1
+  # the manager critic would be ~50x undertrained by comparison and
+  # `manager_explained_variance` stays negative.
+  n_manager_critic_epochs: 8
+model_params:
+  hidden_dim: 168
+  # Width of the manager's latent state `s` AND of the goal `g` (in FuN a goal is
+  # a direction in the state embedding, so they share a space). Also the
+  # manager's whole information bottleneck — the core consumes `s`.
+  goal_dim: 16
+  manager_hidden_dim: 256
+  # "mlp" (stateless) or "dilated_lstm" (FuN's dilated recurrence). mlp is the
+  # default so goal-mechanism effects stay attributable separately from
+  # recurrence effects.
+  manager_core: mlp
+  # Optional bias-free Dense on the goal before it meets the obs (FuN's `phi`).
+  # null = raw concat fusion.
+  goal_embed_dim: null

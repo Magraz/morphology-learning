@@ -1,0 +1,15 @@
+# @package _global_
+# FeUdal intrinsic-reward ablation, alpha = 0.0 (intrinsic path inert; goals
+# still condition the worker, but nothing rewards following them).
+#
+# The ablation axis is a MODEL GROUP, not a bare `params.intrinsic_coef=...`
+# override, because the results path is experiments/results/<env>/<model>/<trial>
+# and does NOT include arbitrary overrides — a `-m params.intrinsic_coef=0,0.1,0.5`
+# sweep would write all three arms into one directory. See conf/model/feudal.yaml.
+# (plans/sweep_tagged_results_paths.md would replace this idiom with a `tag=` key.)
+defaults:
+  - feudal
+  - _self_
+
+params:
+  intrinsic_coef: 0.0

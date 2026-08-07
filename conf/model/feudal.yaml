@@ -1,0 +1,10 @@
+# @package _global_
+# FeUdal model group: goal-conditioned MLP worker + centralized manager.
+#
+# This group exists as much for the RESULTS PATH as for the knobs. `train.py`
+# builds experiments/results/<env-choice>/<model-choice>/ and the algorithm is
+# NOT part of that path, so running feudal with `model=mlp` would write into the
+# mappo_jax baseline's directory. Always run `algorithm=feudal_mappo_jax
+# model=feudal`.
+model_params:
+  hidden_dim: 168

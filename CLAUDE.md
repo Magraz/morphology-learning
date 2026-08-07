@@ -867,24 +867,43 @@ drop-in comparable:
   Note this means an `env:` key is only reachable where a branch names it:
   `coupling_def` and `max_steps` are currently forwarded by no branch.
 
-## Feudal MAPPO (`algorithms/feudal_mappo_jax/`) — WORK IN PROGRESS
+## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 
-A FeUdal-Networks-style (Vezhnevets et al. 2017) hierarchy being built on top of
-a **copy** of `mappo_jax`: a manager emits a latent goal vector, a goal-conditioned
-worker emits the primitive action. Not wired into `algorithms/types.py` /
-`_dispatch` / `conf/` yet — nothing launches it.
+A FeUdal-Networks (Vezhnevets et al. 2017) hierarchy on top of a **copy** of
+`mappo_jax`: a centralized manager emits one unit-norm latent goal per agent, a
+goal-conditioned worker emits the primitive action. **Wired end-to-end and
+runnable** (`algorithm=feudal_mappo_jax`); the manager's transition policy
+gradient trains, the intrinsic-reward path is implemented but ships **off**
+(`intrinsic_coef: 0.0`).
 
-- **The copy is now self-contained.** `trainer.py`, `run.py` and `mappo.py`
-  originally imported `Transition`/`MAPPOConfig`/`sample_action`/
-  `create_train_state`/`make_train` `from algorithms.mappo_jax...`, which left
-  the local `network.py`/`mappo.py`/`types.py` inert — edits to them changed
-  nothing. All 8 import sites now point at `algorithms.feudal_mappo_jax`, so the
-  package no longer reads any `mappo_jax` code and diverging it is safe.
-  Behavior-preserving: the only diffs against `algorithms/mappo_jax/*` are those
-  import lines plus two error strings that named the wrong package (the files
-  are otherwise byte-identical, and nothing outside the package imports it yet).
-  The runner class is still called `MAPPO_JAX_Runner` — rename when it is wired
-  into `_dispatch`.
+```
+uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o \
+    model=feudal trial_id=0
+```
+
+- **⚠ Always pair with `model=feudal`, never `model=mlp`.** `train.py` builds
+  `experiments/results/<env>/<model>/` and the **algorithm is not in that path**,
+  so `model=mlp` writes into the `mappo_jax` baseline's directory — and a
+  `checkpoint=true` resume would try to load a 2-state mappo_jax checkpoint into
+  the 4-state feudal train state. `conf/model/feudal.yaml` exists as much for
+  that separation as for its knobs.
+- **The flat baseline is `algorithm=mappo_jax`, not `intrinsic_coef=0`.** The
+  feudal worker critic is **always per-agent** (the intrinsic reward is
+  inherently `(T,E,N)`), so even with alpha=0 the arm differs from flat MAPPO by
+  the critic head width and the goal conditioning.
+- **Registration** is the usual three points: `AlgorithmEnum.FEUDAL_MAPPO_JAX`,
+  a `_dispatch` case mirroring `MAPPO_JAX`, and
+  `conf/algorithm/feudal_mappo_jax.yaml`. The runner is
+  `Feudal_MAPPO_JAX_Runner`; `run.py` was re-synced with the
+  `MULTI_BOX_MULTI_GOAL_MJX` branch it had drifted behind (commit 617cb62), so
+  its only diffs vs `algorithms/mappo_jax/run.py` are imports, the class name and
+  one error string. **`algorithms/mappo_jax/` is untouched.**
+- **Equivalence cannot be checked by comparing training stats.** MJX rollouts are
+  not reproducible across processes (CLAUDE.md documents this above), and it
+  shows at the top level: two runs of *unmodified* `mappo_jax` at the same seed
+  gave 953 vs 897 episodes. Verify structural equivalence instead by
+  constructing both packages' train states **in one process** and diffing the
+  parameter leaves (max abs diff 0.0 across 13 leaves).
 - **`worker.py` — `FeudalWorker`** (done). Goal-conditioned low-level policy:
   `__call__(obs, goal)` concatenates the goal onto the obs and runs the flat
   `MAPPOActor` body **reused verbatim** (same 2-layer Tanh MLP, orthogonal init,
@@ -991,14 +1010,203 @@ worker emits the primitive action. Not wired into `algorithms/types.py` /
     team goal and every shape/assertion still passes. Log the mean pairwise cosine
     between agents' goals, the effective rank of `s`, and `Var_t[d_cos]`; a high
     **flat** intrinsic reward is the pathology, so its mean alone reads as success.
-  - **Still open, for whoever wires it up** (also in the module docstring):
-    manager value `V^M` should **reuse `MAPPOCritic` on the global state with
-    `n_outputs=n_agents`** — do not add another critic; `create_train_state`
-    returns a 2-field `ActorCriticTrainState` and needs a third manager
-    `TrainState` (plus the two checkpoint-restore sites in `run.py`);
-    `trainer._actor_forward` flattens obs to `(b*n_agents, obs_dim)` for the fused
-    shared-actor pass, so the goal must be flattened the same way *there*
-    (`worker._broadcast_goal` handles the un-flattened layout only).
+  - **Two shape bugs fixed when the helpers met real trainer data** (both were
+    invisible to the 1-D self-check): `pool_goals` multiplied an unaligned `(T,)`
+    `in_range` against `_same_episode`'s `(T,E,N)` before aligning either, so it
+    **raised** for any `goals.ndim > 2` with a `done` mask; and
+    `transition_cosine` returned `valid` of shape **`(T,T,E)`** — silently, no
+    exception — when handed the trainer's actual `(T, n_envs)` `done`, because
+    `(T,1,1) * (T,E)` right-aligns. `done` must now be pre-broadcast to the full
+    leading shape of the cosine `(T, n_envs, n_agents)`; `_check_done` enforces it
+    (Python-level, so jit-free) and rejects `(T,E,1)` too — that one broadcasts
+    *correctly* but makes a masked-mean denominator `n_agents` times too small.
+    `transition_cosine` now also returns `valid` at the full shape of `cos` for
+    the same reason. Self-check group **[9]** pins the batched path against the
+    1-D one per `(env, agent)` slice and asserts the bad masks raise.
+
+### Wiring (what the hierarchy adds to the flat stack)
+
+- **Four train states**, not two: `FeudalTrainState(actor_ts, critic_ts,
+  manager_ts, manager_critic_ts)`. `V^M` **reuses `MAPPOCritic`** (writing a
+  second critic *class* is what `manager.py` rules out) but keeps its **own
+  params and Adam**: the worker critic predicts the intrinsic-augmented return
+  under `gamma`, `V^M` the extrinsic one under `manager_gamma`. Its head width
+  follows the env (`n_agents` under difference rewards, else 1) so it never
+  regresses N copies of one target. All **four msgpack sites** in `run.py`
+  (`save_params`, `_save_train_checkpoint`, and both `from_bytes` targets) must
+  move in lockstep — `from_bytes` needs an exactly-shaped target tree.
+- **The goal ring is the training path; `pool_goals` is only the oracle.** The
+  worker acts on `w_t` = sum of the last `c` goals, but `pool_goals` is a
+  whole-trajectory function that cannot be called inside the scan, so the scan
+  carries a `(c, E, N, D)` ring written with a one-hot slot (`t % c`, not a
+  dynamic index, so `t` may be a tracer). The pooled goal **must be stored**, not
+  recomputed: the PPO ratio is only valid if `evaluate_action` sees exactly the
+  vector `sample_action` saw. Scan carry is now
+  `(train_state, env_state, obs, rng, m_carry, goal_hist)` with `xs=arange(n_steps)`.
+  - The ring lives in `manager.py` as `goal_ring_write` / `goal_ring_pool` /
+    `goal_ring_reset` and is **shared by all three consumers** — the training
+    scan, the eval scan, and `run.py:view()`. They are rank-agnostic, so the
+    batched `(c, E, N, D)` and unbatched `(c, N, D)` layouts are one code path.
+    This matters because a drifted copy of the convention (wrong slot index,
+    stale pool) **renders perfectly happily** — it just silently shows a
+    different policy than the one that trained. `view()` had its own copy until
+    that was consolidated; `test_ring_helpers_agree_across_batched_and_unbatched_layouts`
+    now pins the two layouts against each other across a full wrap-around.
+- **Two truncation bootstraps.** `Transition` gains a `manager_reward` field
+  because `_env_step`'s bootstrap uses the *worker* critic, which is the wrong
+  number for the manager stream. Also: a scalar env reward must be broadcast to
+  `(E, N)` **explicitly** before the worker bootstrap — `(E,) + (E,N)`
+  right-aligns `E` against `N` and *raises* at E=32/N=16.
+- **`manager_update` is a separate full-batch pass** (`mappo.py`), not a variant
+  of `ppo_update`: `transition_cosine` needs the time axis **in order**, which
+  the flatten to `(T*E, N, …)` plus `jax.random.permutation` destroys. It has no
+  importance ratio (FuN reinforces the observed state *transition*, not a goal
+  likelihood), so extra policy epochs are uncorrected off-policy —
+  `n_manager_epochs: 1`.
+  - **`n_manager_critic_epochs` is separate from it, and needs to be.** `V^M`
+    regresses **fixed** targets, so extra passes are ordinary supervised fitting.
+    Sharing the count gave `V^M` *one* gradient step per update against the
+    worker critic's `n_epochs * n_minibatches` (48 at the defaults). Measured at
+    131k steps: manager value loss 3.9e-3 → 1.1e-3 → 2.8e-4 at 1 / 8 / 48 epochs.
+    Default 8 — 48 costs 6x for a further 3.9x and the returns on EV are sharply
+    diminishing.
+- **Goal flattening must be agent-major in both places** — `_actor_forward`'s
+  `pooled_goal.reshape(b*n_agents, D)` and `ppo_update`'s
+  `pg_ts[mb_ids].reshape(n_flat, goal_dim)` — matching the obs reshape exactly,
+  or every agent silently trains on a neighbour's directive.
+- **`view()` runs the full hierarchy** (unbatched, Python-loop ring over the
+  shared `goal_ring_*` helpers). Rendering the worker without the manager would
+  drive it with a goal it never saw. Verified end-to-end on **both** cores —
+  10 episodes, pygame + native MuJoCo videos + reward plots:
+  ```
+  MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run python train.py \
+      algorithm=feudal_mappo_jax env=mjx_16a_4o model=feudal trial_id=0 view=true
+  ```
+
+### Diagnostics (load-bearing — both failure modes are self-sealing)
+
+`manager_update` returns these in its metrics dict, so they ride `run.py`'s
+existing `append_agent_stats` path with **no stats-plumbing change**:
+`state_latent_erank` (entropy-based effective rank of `cov(s)`; **≲1.5 ⇒ rank-1
+latent collapse**, the mechanism inert while losses look healthy),
+`goal_pairwise_cos` / `state_pairwise_cos` (**≳0.9 ⇒ per-agent goals degenerated
+to one team goal** — the residual `manager.py` flags as structurally unguarded),
+`d_cos_var` (**≲1e-3 ⇒ the cosine is constant**, annihilated by advantage
+centering — never read `d_cos_mean` alone, a high *flat* value reads as success),
+`valid_fraction`, `manager_pg_loss`, `manager_value_loss`,
+`manager_explained_variance`.
+
+Measured at 131k steps on `mjx_16a_4o` (`goal_dim=16`, `c=10`): erank 14.5 → 11.8,
+`goal_pairwise_cos` ≈ ±0.02, `d_cos_var` ≈ 0.063, `valid_fraction` 0.88 → 0.76 —
+all healthy. **`manager_explained_variance` is negative (≈ −3) and that is not
+yet diagnosable**: `m_ret - manager_value` is identically the advantage, so the
+metric is `1 - var(adv)/var(ret)`, and at this budget the task reward is ~0 (the
+env's own baseline needs 1e8 steps), leaving `var(ret)` tiny and the ratio noise.
+For calibration the flat `mappo_jax` baseline also starts at EV −1.34 and only
+reaches 0.97 after 1e8 steps. Judge `V^M` on a real-length run, not a smoke.
+
+`valid_fraction` interacts with episode length: horizons straddling a boundary
+are masked out, and `mjx_16a_4o` episodes are short (~43 steps, boundary contact
+terminates), so a large `c` starves the manager. Watch it when changing `c`.
+
+- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (11 tests, CPU stub
+  env, no MJX — fast and *deterministic*, unlike an MJX rollout). They pin the
+  joints where a mistake is silent: the in-scan ring equals the `pool_goals`
+  oracle including done-masking; the stored goals are reproducible by re-scanning
+  the manager over the stored global states (the property `manager_update` relies
+  on); agent-major flattening pairs each agent's obs with its own goal; and the
+  **PPO ratio is exactly 1** before any update. Run:
+  `uv run pytest algorithms/tests/test_feudal_seams.py -q`
+### Intrinsic reward (`intrinsic_coef`) — implemented, calibrated, shipped OFF
+
+The worker's FuN intrinsic reward `r^I` is wired (post-scan, following
+`_apply_aligned_rewards`' precedent) and runs end-to-end, but **`intrinsic_coef`
+defaults to 0.0**: the arm that would justify turning it on is a learning-curve
+ablation, which is not judgeable at smoke budget.
+
+- **alpha cannot be calibrated from a short run, and it is worth knowing why.**
+  `|r^I|` is measurable at any budget — ~0.152/step on `mjx_16a_4o`, tightly
+  ranged [0.141, 0.157], since it depends only on the `(s, g)` geometry. The
+  *extrinsic* reward is not: at 65k steps it is **6.2e-07/step**, so the
+  intrinsic/extrinsic ratio is a division by zero. The usable denominator comes
+  from the **already-converged `mappo_jax` baseline**: eval return 398–470 over
+  `max_steps=1024` ⇒ ~0.39–0.46/step. That puts **alpha = 0.5** at
+  `0.5*0.152 = 0.076` ≈ **17–19%** of converged extrinsic, inside the intended
+  10–30% band. Recorded in `conf/algorithm/feudal_mappo_jax.yaml`; launch with
+  `params.intrinsic_coef=0.5`.
+- **⚠ By construction the intrinsic term dominates early.** Since the extrinsic
+  reward really is ~0 until the policy moves boxes, at alpha=0.5 the worker's
+  objective is ~5 orders of magnitude intrinsic for the whole early phase. That
+  is FuN's intended exploration pressure, not a bug, but it means an ablation
+  should sweep `params.intrinsic_coef=0,0.1,0.5` rather than run one arm.
+- **Scale against `intrinsic_reward_abs`, never `intrinsic_reward`.** The signed
+  mean is ~-4e-4 — cosines cancel about zero — so it reads as "no intrinsic
+  signal" while the per-step term is 0.152. Both are logged; the raw (unscaled)
+  `r^I` is recorded, so the number is comparable across alphas.
+- **`worker_goal_column_ratio`** (in `ppo_update`'s metrics) is the per-input-dim
+  RMS of the goal columns of the worker's first Dense over the obs columns, ~1.0
+  at orthogonal init. `FeudalWorker` fuses by **concatenation**, so the worker
+  can disconnect the hierarchy simply by driving those columns to zero — the
+  degeneracy FuN avoids with a bias-free bilinear `U(obs) @ phi(g)`. Nothing else
+  logged would show it: goals stay unit-norm and diverse and the manager's own
+  loss keeps improving. A decay toward 0 is the trigger to set `goal_embed_dim`
+  or change the fusion. (0.9998 → 0.951 over 64 updates — far too short to read
+  anything into.)
+- Rollout-level series (`train_reward`, `intrinsic_reward`,
+  `intrinsic_reward_abs`) are appended to the same per-update stats dict as the
+  losses. Note `train_reward` is the **rollout** team reward; the `reward` series
+  remains the deterministic **eval** return.
+
+### Recurrent manager (`manager_core: dilated_lstm`) — works end-to-end
+
+```
+uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o model=feudal \
+    trial_id=0 model_params.manager_core=dilated_lstm
+```
+
+Verified at production scale (`n_steps=1024`, `n_envs=32`): trains, resumes from
+checkpoint, no OOM. `mlp` stays the default so goal-mechanism effects remain
+attributable separately from recurrence effects.
+
+- **The load-bearing requirement is that `manager_update`'s recompute reproduces
+  the rollout's carry exactly.** The PG needs `g_t(theta)` differentiable, so it
+  re-derives `(goal, s)` from the stored global states; with a stateless core
+  that is a pure function, but with the LSTM it is a `lax.scan` that must match
+  `trainer._env_step` on **both** conventions: start from the same
+  zero-initialized pools, and apply the per-env reset *after* emitting the
+  step's goal. Get either wrong and the manager is optimized for a policy that
+  never acted — silently, with healthy-looking losses.
+  `test_goals_are_reproducible_from_stored_states` is parametrized over both
+  cores and is what catches it.
+  - The two paths build their carries from **different rngs** and only agree
+    because `dilated_lstm_carry` zeroes the pools and ignores the key. That
+    implicit contract is pinned by `test_dilated_lstm_carry_is_deterministic`.
+  - `DilatedLSTMState.t` is a single shared counter with **no env axis**, so it
+    is deliberately not reset per env: a mid-rollout reset leaves that env at an
+    arbitrary dilation phase. Harmless (the phase is arbitrary anyway), but both
+    paths must do the same thing, and they do.
+- **No `jax.checkpoint`/remat, and that is a measured decision.** The plan
+  assumed the BPTT would need it (~738 MB of f32 residuals at `T=1024, E=32,
+  r=10, H=256`). Measured, that estimate is wrong: peak memory is dominated by
+  the scan's own `(T, E, N, goal_dim)` `goal`/`s` outputs, not the carry, and
+  XLA already avoids storing the latter naively. Over 5 grad calls at `T=1024,
+  E=32`:
+
+  | hidden | remat | no remat |
+  |---|---|---|
+  | 256  | 129.3 ms / 793.5 MiB  | 118.8 ms / 848.2 MiB |
+  | 1024 | 315.4 ms / 2783.9 MiB | 314.2 ms / 2789.3 MiB |
+
+  ~9% slower for ~6% memory at the shipped width, and a wash on both axes at 4x
+  the width. Re-measure before adding it back if `n_steps` or the carry grows a
+  lot.
+
+- **Still open**: no full-length run of any feudal arm has been done, so nothing
+  is known about whether the hierarchy *helps* — every number in this section is
+  a mechanism check, not a result. The `intrinsic_coef` ablation (0 / 0.1 / 0.5)
+  and any `mlp` vs `dilated_lstm` comparison both need full-length runs.
+  `view()`'s rendering path has not been exercised since the goal plumbing
+  landed.
   - Self-check (8 groups: shapes/unit-norm, dilation writes group `t%r` only and
     covers all `r`, `jit`+`lax.scan` carry threading, `vmap`, mlp core is
     stateless + an unknown core raises, goal-semantics incl. done-masking, a

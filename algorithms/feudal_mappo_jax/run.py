@@ -24,6 +24,9 @@ from flax.serialization import from_bytes, to_bytes
 from algorithms.feudal_mappo_jax.mappo import create_train_state
 from algorithms.feudal_mappo_jax.trainer import RunnerState, make_train
 from algorithms.feudal_mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
+from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
+    MultiBoxMultiGoalPushMJX,
+)
 from environments.mjx_suite.multi_box_push_mjx import MultiBoxPushMJX
 from environments.types import EnvironmentEnum
 
@@ -34,7 +37,7 @@ def set_seeds(seed: int):
     np.random.seed(seed)
 
 
-class MAPPO_JAX_Runner:
+class Feudal_MAPPO_JAX_Runner:
     def __init__(
         self,
         device: str,
@@ -76,8 +79,12 @@ class MAPPO_JAX_Runner:
         set_seeds(random_seed)
         self.rng_seed = random_seed
 
-        # Create the functional MJX environment. Two supported env groups:
-        #   MULTI_BOX_MJX — continuous force control (the base env)
+        # Create the functional MJX environment. Three supported env groups:
+        #   MULTI_BOX_MJX            — continuous force control (the base env)
+        #   MULTI_BOX_MULTI_GOAL_MJX — the same task on a circular arena with one
+        #                   concentric goal ring per box (box j -> ring j from the
+        #                   center out); same 40-dim obs, action space and reward
+        #                   modes, so nothing downstream changes
         #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
         #                   one decision per macro_len low-level steps), which
         #                   wraps a base MultiBoxPushMJX.
@@ -89,6 +96,14 @@ class MAPPO_JAX_Runner:
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
+            )
+        elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
+            # No `variant` here: the drift / inert-wall presets are specific to
+            # the square arena and are deliberately not carried over.
+            self.env = MultiBoxMultiGoalPushMJX(
+                n_agents=env_config.get("n_agents"),
+                n_objects=env_config.get("n_objects"),
+                reward_mode=reward_mode,
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -126,7 +141,8 @@ class MAPPO_JAX_Runner:
             )
         else:
             raise ValueError(
-                f"feudal_mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}' and "
+                f"feudal_mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
+                f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}' and "
                 f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
                 f"got {environment!r}"
             )
@@ -159,13 +175,31 @@ class MAPPO_JAX_Runner:
             parameter_sharing=self.params.parameter_sharing,
             hidden_dim=self.model_params.hidden_dim,
             per_agent_rewards=per_agent_rewards,
+            # ---- FeUdal ----
+            goal_dim=self.model_params.goal_dim,
+            goal_horizon=self.params.goal_horizon,
+            intrinsic_coef=self.params.intrinsic_coef,
+            manager_lr=self.params.manager_lr,
+            manager_val_coef=self.params.manager_val_coef,
+            manager_gamma=self.params.manager_gamma,
+            n_manager_epochs=self.params.n_manager_epochs,
+            n_manager_critic_epochs=self.params.n_manager_critic_epochs,
+            manager_hidden_dim=self.model_params.manager_hidden_dim,
+            manager_core=self.model_params.manager_core,
+            goal_embed_dim=self.model_params.goal_embed_dim,
         )
 
         print(
-            f"JAX MAPPO | env={environment} | n_envs={self.config.n_envs} | "
+            f"FeUdal MAPPO | env={environment} | n_envs={self.config.n_envs} | "
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
             f"reward_mode={self.env.reward_mode} | "
             f"backend={jax.default_backend()}"
+        )
+        print(
+            f"  manager: core={self.config.manager_core} "
+            f"goal_dim={self.config.goal_dim} c={self.config.goal_horizon} "
+            f"hidden={self.config.manager_hidden_dim} | "
+            f"alpha(intrinsic)={self.config.intrinsic_coef}"
         )
 
     def train(self):
@@ -248,8 +282,22 @@ class MAPPO_JAX_Runner:
             steps_completed += steps_per_update
             episodes_completed += int(rollout_stats["episode_count"])
 
+            # Rollout-level scalars ride the same per-update stats path as the
+            # losses (TrainingStatsTracker copies unknown keys through, so the
+            # plotting notebooks are unaffected). `episode_count` is excluded —
+            # it is already accumulated into `episodes_completed` above — and
+            # `mean_reward` is renamed so it cannot collide with the `reward`
+            # series, which is the deterministic EVAL return.
+            rollout_series = {
+                "train_reward": float(rollout_stats["mean_reward"]),
+                "intrinsic_reward": float(rollout_stats["intrinsic_reward"]),
+                "intrinsic_reward_abs": float(
+                    rollout_stats["intrinsic_reward_abs"]
+                ),
+            }
             stats_tracker.append_agent_stats(
                 {key: float(value) for key, value in losses.items()}
+                | rollout_series
             )
             elapsed_time = stats_tracker.record_iteration(
                 steps_completed=steps_completed,
@@ -307,11 +355,17 @@ class MAPPO_JAX_Runner:
 
     # ------------------------------------------------------------------ io
 
+    # NOTE: the four msgpack sites below must be kept in lockstep — `from_bytes`
+    # needs an exactly-shaped target tree, so adding a component to one save site
+    # without the matching restore site breaks resume loudly.
+
     def save_params(self, train_state, path):
-        """Save actor + critic params as flax msgpack."""
+        """Save worker + critic + manager + manager-critic params as msgpack."""
         params_dict = {
             "actor": train_state.actor_ts.params,
             "critic": train_state.critic_ts.params,
+            "manager": train_state.manager_ts.params,
+            "manager_critic": train_state.manager_critic_ts.params,
         }
         with open(path, "wb") as f:
             f.write(to_bytes(params_dict))
@@ -320,9 +374,12 @@ class MAPPO_JAX_Runner:
         """Full resumable training state: params + optimizer states + step
         counters (the TrainStates serialize as {step, params, opt_state}) and
         both RNG chains. Progress counters live in the stats checkpoint."""
+        ts = runner_state.train_state
         checkpoint = {
-            "actor_ts": runner_state.train_state.actor_ts,
-            "critic_ts": runner_state.train_state.critic_ts,
+            "actor_ts": ts.actor_ts,
+            "critic_ts": ts.critic_ts,
+            "manager_ts": ts.manager_ts,
+            "manager_critic_ts": ts.manager_critic_ts,
             "rng": runner_state.rng,
             "eval_rng": eval_rng,
         }
@@ -331,9 +388,12 @@ class MAPPO_JAX_Runner:
 
     def _load_train_checkpoint(self, runner_state, eval_rng, path):
         """Restore a _save_train_checkpoint file into a fresh RunnerState."""
+        ts = runner_state.train_state
         target = {
-            "actor_ts": runner_state.train_state.actor_ts,
-            "critic_ts": runner_state.train_state.critic_ts,
+            "actor_ts": ts.actor_ts,
+            "critic_ts": ts.critic_ts,
+            "manager_ts": ts.manager_ts,
+            "manager_critic_ts": ts.manager_critic_ts,
             "rng": runner_state.rng,
             "eval_rng": eval_rng,
         }
@@ -342,8 +402,11 @@ class MAPPO_JAX_Runner:
         print(f"Train state loaded from {path}")
         return (
             RunnerState(
-                train_state=runner_state.train_state._replace(
-                    actor_ts=loaded["actor_ts"], critic_ts=loaded["critic_ts"]
+                train_state=ts._replace(
+                    actor_ts=loaded["actor_ts"],
+                    critic_ts=loaded["critic_ts"],
+                    manager_ts=loaded["manager_ts"],
+                    manager_critic_ts=loaded["manager_critic_ts"],
                 ),
                 rng=loaded["rng"],
             ),
@@ -359,8 +422,12 @@ class MAPPO_JAX_Runner:
             self.env.observation_dim * self.env.n_agents,
             self.env.action_dim,
             discrete=getattr(self.env, "discrete", False),
-            # Must match training, or the restored critic params won't fit.
-            n_critic_outputs=(
+            n_agents=self.env.n_agents,
+            # Must match training, or the restored params won't fit. The worker
+            # critic is ALWAYS per-agent here (the intrinsic reward is per-agent);
+            # only V^M's width follows the env's reward mode.
+            n_critic_outputs=self.env.n_agents,
+            n_manager_outputs=(
                 self.env.n_agents if self.config.per_agent_rewards else 1
             ),
         )
@@ -370,6 +437,8 @@ class MAPPO_JAX_Runner:
         target = {
             "actor": train_state.actor_ts.params,
             "critic": train_state.critic_ts.params,
+            "manager": train_state.manager_ts.params,
+            "manager_critic": train_state.manager_critic_ts.params,
         }
         with open(path, "rb") as f:
             params_dict = from_bytes(target, f.read())
@@ -377,6 +446,12 @@ class MAPPO_JAX_Runner:
         return train_state._replace(
             actor_ts=train_state.actor_ts.replace(params=params_dict["actor"]),
             critic_ts=train_state.critic_ts.replace(params=params_dict["critic"]),
+            manager_ts=train_state.manager_ts.replace(
+                params=params_dict["manager"]
+            ),
+            manager_critic_ts=train_state.manager_critic_ts.replace(
+                params=params_dict["manager_critic"]
+            ),
         )
 
     def save_training_stats(self, stats_tracker, path):
@@ -390,7 +465,15 @@ class MAPPO_JAX_Runner:
         import imageio
         import matplotlib.pyplot as plt
 
+        import jax.numpy as jnp
+
+        from algorithms.feudal_mappo_jax.manager import (
+            goal_ring_pool,
+            goal_ring_write,
+        )
+        from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
+        from algorithms.feudal_mappo_jax.worker import bind_goal
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
@@ -408,17 +491,51 @@ class MAPPO_JAX_Runner:
         reset_fn = jax.jit(self.env.reset)
         step_fn = jax.jit(self.env.step)
 
+        # The full hierarchy has to run here too — the worker is goal-conditioned,
+        # so rendering it without the manager would drive it with a goal it never
+        # saw in training. Everything is UNBATCHED (obs is (n_agents, obs_dim)),
+        # and the Python loop maintains the goal ring the rollout scan carries.
+        manager = build_manager(self.config, self.env.n_agents)
+        horizon, goal_dim = self.config.goal_horizon, self.config.goal_dim
+
         @jax.jit
-        def policy_fn(obs):
+        def manager_fn(m_carry, obs):
+            return manager.apply(
+                train_state.manager_ts.params, m_carry, obs.reshape(-1)
+            )
+
+        @jax.jit
+        def policy_fn(obs, pooled_goal):
             actions, _ = sample_action(
                 jax.random.PRNGKey(0),
-                train_state.actor_ts.apply_fn,
+                bind_goal(train_state.actor_ts.apply_fn, pooled_goal),
                 train_state.actor_ts.params,
                 obs,
                 discrete=discrete,
                 deterministic=True,
             )
             return actions
+
+        def _fresh_goal_state():
+            """Per-episode manager memory: zeroed ring + zeroed core carry."""
+            return (
+                manager.initialize_carry(jax.random.PRNGKey(0), ()),
+                jnp.zeros((horizon, self.env.n_agents, goal_dim)),
+            )
+
+        def _advance_goal(m_carry, goal_hist, t, obs):
+            """One manager decision + ring write; returns the pooled goal w_t.
+
+            Uses the SAME `goal_ring_*` helpers as the training and eval scans —
+            not a copy of them — so the rendered policy provably conditions on
+            what the trained one did. (The helpers are rank-agnostic, so the
+            unbatched `(c, N, D)` ring here needs no special case.) A private
+            reimplementation would drift silently: a wrong slot index or a stale
+            pool renders perfectly happily, just as a different policy.
+            """
+            m_carry, goal, _ = manager_fn(m_carry, obs)
+            goal_hist = goal_ring_write(goal_hist, goal, t)
+            return m_carry, goal_hist, goal_ring_pool(goal_hist)
 
         def _draw(state, obs):
             """Append one rendered frame (+ native) for the given base state."""
@@ -445,11 +562,17 @@ class MAPPO_JAX_Runner:
             if is_macro:
                 state = self.env.base_state(state)
             rewards, frames, native_frames = [], [], []
+            m_carry, goal_hist = _fresh_goal_state()
 
             if is_macro:
                 done = False
-                for _ in range(self.env.max_steps):  # macro decisions
-                    skills = policy_fn(obs)
+                for t in range(self.env.max_steps):  # macro decisions
+                    # The manager decides on the macro boundary, alongside the
+                    # worker's skill choice.
+                    m_carry, goal_hist, pooled = _advance_goal(
+                        m_carry, goal_hist, t, obs
+                    )
+                    skills = policy_fn(obs, pooled)
                     for _ in range(self.env.macro_len):  # low-level steps
                         _draw(state, obs)
                         actions = skill_actions_fn(state, skills)
@@ -463,10 +586,13 @@ class MAPPO_JAX_Runner:
                     if done:
                         break
             else:
-                for _ in range(self.env.max_steps):
+                for t in range(self.env.max_steps):
                     _draw(state, obs)
+                    m_carry, goal_hist, pooled = _advance_goal(
+                        m_carry, goal_hist, t, obs
+                    )
                     obs, state, _, terminated, truncated, info = step_fn(
-                        state, policy_fn(obs)
+                        state, policy_fn(obs, pooled)
                     )
                     # Team reward: the env's `reward` is per-agent under
                     # difference_rewards, and the plot is of team performance.

@@ -7,6 +7,7 @@ class AlgorithmEnum(StrEnum):
     MAPPO = "mappo"
     MAPPO_VANILLA = "mappo_vanilla"
     MAPPO_JAX = "mappo_jax"
+    FEUDAL_MAPPO_JAX = "feudal_mappo_jax"
     DCG = "dcg"
     DCG_MACRO = "dcg_macro"
     TD3 = "td3"

@@ -327,6 +327,34 @@ def _align(mask, ref: jnp.ndarray):
     return mask
 
 
+def _check_done(done: Optional[jnp.ndarray], expected, fn_name: str):
+    """Reject a `done` mask whose shape is not the leading shape it must align to.
+
+    Load-bearing, because the failure it prevents is **silent**. These masks are
+    multiplied against tensors whose leading axes are ``(T, n_envs, n_agents)``.
+    The trainer's own ``Transition.done`` is ``(T, n_envs)`` — one axis short —
+    and numpy right-alignment turns ``(T,1,1) * (T,E)`` into ``(T,T,E)`` rather
+    than raising, so the manager loss would end up masked by a tensor that
+    measures nothing. Callers must pre-broadcast `done` to the full leading
+    shape (e.g. ``jnp.broadcast_to(done[..., None], states.shape[:-1])``).
+
+    Note ``(T, E, 1)`` is rejected too: it broadcasts *correctly* but makes a
+    masked-mean denominator ``mask.sum()`` a factor of ``n_agents`` too small.
+
+    Python-level (shapes are static under jit), so this costs nothing.
+    """
+    if done is None:
+        return
+    if tuple(done.shape) != tuple(expected):
+        raise ValueError(
+            f"{fn_name}: `done` must have shape {tuple(expected)} (the leading "
+            f"shape of the cosine), got {tuple(done.shape)}. A partially-shaped "
+            f"mask broadcasts silently into a wrong result instead of raising — "
+            f"pre-broadcast it, e.g. "
+            f"jnp.broadcast_to(done[..., None], {tuple(expected)})."
+        )
+
+
 def pool_goals(
     goals: jnp.ndarray, horizon: int, done: Optional[jnp.ndarray] = None
 ) -> jnp.ndarray:
@@ -339,23 +367,73 @@ def pool_goals(
     Args:
         goals: ``(T, ...)`` with the goal vector on the last axis.
         horizon: `c`.
-        done: optional ``(T, ...)`` terminal mask; goals from before an episode
-            boundary are dropped from the sum.
+        done: optional terminal mask, shaped exactly ``goals.shape[:-1]``; goals
+            from before an episode boundary are dropped from the sum.
 
     Returns:
         ``(T, ...)``, same shape as `goals`.
     """
+    _check_done(done, goals.shape[:-1], "pool_goals")
+
     T = goals.shape[0]
     steps = jnp.arange(T)
 
     def one_offset(i):
         src = jnp.maximum(steps - i, 0)
         g = jnp.take(goals, src, axis=0)
-        in_range = (steps >= i).astype(jnp.float32)
-        mask = in_range * _same_episode(done, src, steps, T)
-        return g * _align(mask, g)
+        # Both masks must be aligned to `g` SEPARATELY before being combined:
+        # `in_range` is (T,) while `_same_episode` is g.shape[:-1], so
+        # multiplying them first right-aligns (T,) against the agent axis and
+        # either raises or silently mis-broadcasts.
+        in_range = _align((steps >= i).astype(jnp.float32), g)
+        same = _align(_same_episode(done, src, steps, T), g)
+        return g * in_range * same
 
     return jnp.sum(jax.vmap(one_offset)(jnp.arange(horizon)), axis=0)
+
+
+def goal_ring_write(goal_hist: jnp.ndarray, goal: jnp.ndarray, t) -> jnp.ndarray:
+    """Write `goal` into ring slot ``t % horizon``; returns the updated ring.
+
+    The incremental, online form of :func:`pool_goals`. The pooled conditioning
+    `w_t` has to exist *at act time* — the worker's stored ``log_prob`` and the
+    update's ``evaluate_action`` must come from the same conditioned policy or
+    the PPO ratio is meaningless — but ``pool_goals`` reads the whole trajectory
+    and cannot be called inside a scan. So the rollout carries this ring instead,
+    and ``pool_goals`` serves as the offline oracle the ring is tested against.
+
+    Shared by **every** consumer of that convention — the training scan, the eval
+    scan, and ``run.py:view()`` — so the rendered policy provably conditions on
+    the same thing the trained one did. Rank-agnostic: the ring is
+    ``(horizon, *leading, goal_dim)`` and `goal` is ``(*leading, goal_dim)``, so
+    it serves the batched ``(c, E, N, D)`` and unbatched ``(c, N, D)`` layouts
+    alike.
+
+    Slot selection is a one-hot gather/write rather than a dynamic index, so `t`
+    may be a tracer. Slots not yet written hold zeros and contribute nothing to
+    the sum — exactly what ``pool_goals`` masks out for ``t < i``.
+    """
+    horizon = goal_hist.shape[0]
+    slot = jax.nn.one_hot(t % horizon, horizon).reshape(
+        (horizon,) + (1,) * (goal_hist.ndim - 1)
+    )
+    return goal_hist * (1.0 - slot) + goal[None] * slot
+
+
+def goal_ring_pool(goal_hist: jnp.ndarray) -> jnp.ndarray:
+    """FuN's `w_t`: the sum over the ring (zeros for never-written slots)."""
+    return goal_hist.sum(axis=0)
+
+
+def goal_ring_reset(goal_hist: jnp.ndarray, done) -> jnp.ndarray:
+    """Clear finished envs' rings, preserving ``pool_goals``' episode semantics.
+
+    Must be applied AFTER the step's `w_t` has been consumed: ``_same_episode``
+    counts dones in ``[src, t)``, so `g_src` still contributes to `w_t` on the
+    step where ``done[t]`` fires, and not afterwards.
+    """
+    mask = done.reshape((1,) + done.shape + (1,) * (goal_hist.ndim - done.ndim - 1))
+    return jnp.where(mask, 0.0, goal_hist)
 
 
 def transition_cosine(
@@ -394,6 +472,8 @@ def transition_cosine(
         flagged ``valid=False``. Steps whose horizon crosses an episode boundary
         are also invalid.
     """
+    _check_done(done, states.shape[:-1], "transition_cosine")
+
     T = states.shape[0]
     steps = jnp.arange(T)
     dst = jnp.minimum(steps + horizon, T - 1)
@@ -404,7 +484,12 @@ def transition_cosine(
 
     in_range = (steps + horizon <= T - 1).astype(jnp.float32)
     valid = _align(in_range, cos) * _same_episode(done, steps, dst, T)
-    return cos, valid
+    # Always hand back `valid` at the FULL shape of `cos`. Without this it is
+    # (T,1,1) whenever `done is None`, which multiplies correctly but makes the
+    # masked-mean denominator `valid.sum()` a factor of n_envs*n_agents too
+    # small — the same silent-denominator hazard `_check_done` rejects a
+    # (T,E,1) mask for. Broadcasting is free (no copy until written to).
+    return cos, jnp.broadcast_to(valid, cos.shape)
 
 
 def worker_intrinsic_reward(
@@ -428,6 +513,8 @@ def worker_intrinsic_reward(
 
     Shapes match :func:`transition_cosine`; returns ``(T, ...)``.
     """
+    _check_done(done, states.shape[:-1], "worker_intrinsic_reward")
+
     states = jax.lax.stop_gradient(states)
     goals = jax.lax.stop_gradient(goals)
 
@@ -671,5 +758,70 @@ if __name__ == "__main__":
         f"{float(jnp.linalg.norm(g_mspace)):.3f}, "
         f"|dL/dgoal_head| = {float(jnp.linalg.norm(g_goal)):.3f})   OK"
     )
+
+    # [9] the shapes the TRAINER actually passes -------------------------------
+    # Everything above exercises 1-D (T, d) sequences. The trainer's trajectory is
+    # (T, n_envs, n_agents, goal_dim) with a (T, n_envs) done, and both of those
+    # used to go wrong silently — see `_check_done`. This group pins the batched
+    # path against the 1-D path that groups [6]/[8] already validate.
+    Tb, Eb, Nb, Db, cb = 12, 3, 4, 5, 3
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(12), 3)
+    s_b = jax.random.normal(k1, (Tb, Eb, Nb, Db))
+    g_b = _unit(jax.random.normal(k2, (Tb, Eb, Nb, Db)))
+    # Random terminals, per (env, agent) — enough of them to straddle horizons.
+    done_b = (jax.random.uniform(k3, (Tb, Eb, Nb)) < 0.15).astype(jnp.float32)
+
+    cos_b, valid_b = transition_cosine(s_b, g_b, cb, done=done_b)
+    assert cos_b.shape == (Tb, Eb, Nb), cos_b.shape
+    assert valid_b.shape == (Tb, Eb, Nb), valid_b.shape  # was silently (T,T,E)
+    pooled_b = pool_goals(g_b, cb, done=done_b)
+    assert pooled_b.shape == g_b.shape, pooled_b.shape
+    ri_b = worker_intrinsic_reward(s_b, g_b, cb, done=done_b)
+    assert ri_b.shape == (Tb, Eb, Nb), ri_b.shape
+
+    # Every (env, agent) stream must equal the 1-D result on that slice.
+    for e in range(Eb):
+        for n in range(Nb):
+            cos_1d, valid_1d = transition_cosine(
+                s_b[:, e, n], g_b[:, e, n], cb, done=done_b[:, e, n]
+            )
+            assert jnp.allclose(cos_b[:, e, n], cos_1d, atol=1e-6), (e, n)
+            assert jnp.allclose(valid_b[:, e, n], valid_1d, atol=1e-6), (e, n)
+            assert jnp.allclose(
+                pooled_b[:, e, n],
+                pool_goals(g_b[:, e, n], cb, done=done_b[:, e, n]),
+                atol=1e-5,
+            ), (e, n)
+            assert jnp.allclose(
+                ri_b[:, e, n],
+                worker_intrinsic_reward(
+                    s_b[:, e, n], g_b[:, e, n], cb, done=done_b[:, e, n]
+                ),
+                atol=1e-6,
+            ), (e, n)
+
+    # An under-shaped mask must RAISE now, not broadcast into nonsense. (T, E) is
+    # exactly what `Transition.done` is, so this is the realistic mistake; (T,E,1)
+    # broadcasts correctly but would make masked-mean denominators N times small.
+    for bad in (done_b[:, :, 0], done_b[:, :, :1]):
+        for fn, args in (
+            (transition_cosine, (s_b, g_b, cb)),
+            (worker_intrinsic_reward, (s_b, g_b, cb)),
+            (pool_goals, (g_b, cb)),
+        ):
+            try:
+                fn(*args, done=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f"{fn.__name__} accepted a {bad.shape} done mask"
+                )
+
+    # done=None still works batched (the mask degenerates to the float 1.0).
+    assert transition_cosine(s_b, g_b, cb)[1].shape == (Tb, Eb, Nb)
+    assert pool_goals(g_b, cb).shape == g_b.shape
+    assert worker_intrinsic_reward(s_b, g_b, cb).shape == (Tb, Eb, Nb)
+    print("[9] trainer shapes (T,E,N,D) + guards  OK")
 
     print("\nall manager checks passed")

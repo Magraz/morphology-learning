@@ -1,0 +1,10 @@
+# @package _global_
+# FeUdal intrinsic-reward ablation, alpha = 0.5 — the CALIBRATED value (see the
+# derivation in conf/algorithm/feudal_mappo_jax.yaml). See conf/model/feudal_a0.yaml
+# for why the ablation axis is a model group rather than a bare param override.
+defaults:
+  - feudal
+  - _self_
+
+params:
+  intrinsic_coef: 0.5
