@@ -60,3 +60,6 @@ done
 cp "${JOB_LEDGER}" "${LATEST_LEDGER}"
 echo "job ledger written to: ${JOB_LEDGER}"
 echo "latest ledger updated: ${LATEST_LEDGER}"
+
+echo "submitting watchdog for batch: ${BATCH_NAME}"
+bash "${SCRIPT_DIR}/run_watchdog.sh" "${BATCH_NAME}"
