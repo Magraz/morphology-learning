@@ -79,6 +79,10 @@ from environments.mjx_suite.multi_box_push_mjx import (
 # Observation layout slices (see ObservationManager.get_observation):
 # [vel 0:2 | density 2:18 | touching 18 | neigh 19 | contact 20 |
 #  box_vec 21:23 | goal 23 | lidar 24:40]
+# All are absolute indices from the front of the SHARED layout, so an env that
+# appends task-specific extras after lidar (MultiBoxMultiGoalPushMJX ->
+# MULTI_GOAL_OBS_DIM = 41) renders unchanged. Keep it that way: extras append,
+# they never insert.
 _DENSITY_SLICE = slice(2, 18)
 _BOX_VEC_SLICE = slice(21, 23)
 _GOAL_IDX = 23

@@ -70,7 +70,11 @@ Inherited from the Box2D env / its square-arena MJX port:
 
 - obs: the shared 40-dim ``OBS_DIM`` layout from ``mjx_suite/observation.py``
   (``MJXObservationBuilder``); this env supplies only the qpos layout
-  (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal band.
+  (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal band — **plus a
+  1-scalar extras tail appended after lidar**, so ``observation_dim`` is
+  ``MULTI_GOAL_OBS_DIM = 41``. See ``_N_OBS_EXTRAS``. Appending keeps every index
+  into the shared 40 dims valid (renderer overlay, analysis scripts) and leaves
+  every other env untouched.
 - reward: shaping toward the goal band + one-time +100 per delivered box
   (``"sparse"`` drops the shaping); terminate on all-delivered or a wall touch.
 - coupling: a box keeps its heavy base mass until ``coupling`` agents touch it,
@@ -109,6 +113,24 @@ from environments.mjx_suite.observation import (
     MJXObservationBuilder,
     geom_index_maps,
 )
+
+# --- env-specific observation extras, APPENDED after the shared layout -------
+# This env's obs is the shared `OBS_DIM` (40) vector plus a tail of task-specific
+# scalars. Appending rather than inserting is deliberate: every index into the
+# shared layout (the renderer's `_DENSITY_SLICE` / `_BOX_VEC_SLICE` / `_GOAL_IDX`
+# / `_LIDAR_SLICE`, the sensor overlay, any analysis script) stays valid, and no
+# other MJX or Box2D env is touched — the extras are the only new width.
+#
+#   [40] coupling_fraction — the fraction of the *whole team* that must touch the
+#        agent's nearest undelivered box simultaneously before it turns light
+#        (`coupling[nearest] / n_agents`, in [0, 1]). Pairs with `nearest_box_vec`
+#        [21:23] and `goal_distance` [23], which describe the *same* box, so the
+#        three together say "that box is there, it must go this far, and it takes
+#        this share of the team to move it". 0 when every box is delivered or the
+#        env has no objects, matching `nearest_box_vec`'s convention.
+_N_OBS_EXTRAS = 1
+MULTI_GOAL_OBS_DIM = OBS_DIM + _N_OBS_EXTRAS
+_COUPLING_FRAC_IDX = OBS_DIM  # 40
 
 _AGENT_RADIUS = 0.4
 _AGENT_MASS = 1.0  # Box2D default-mass fallback for zero-density fixtures
@@ -345,8 +367,14 @@ class MultiBoxMultiGoalPushMJX:
         self._agent_spawn_grid = self._make_spawn_grid()
         self._box_spawn_angles = self._make_box_slots()
 
-        self.observation_dim = OBS_DIM
+        # Shared 40-dim layout + this env's extras tail (see _N_OBS_EXTRAS).
+        self.observation_dim = MULTI_GOAL_OBS_DIM
         self.action_dim = 2
+        # coupling[j] / n_agents, precomputed: the fraction of the team needed to
+        # move box j. Constant per instance, so it is a lookup at obs time.
+        self._coupling_fraction = jnp.asarray(
+            self.objects_push_coupling_list / n_agents, dtype=jnp.float32
+        )
 
     # ------------------------------------------------------------------ model
 
@@ -687,7 +715,8 @@ class MultiBoxMultiGoalPushMJX:
     # ------------------------------------------------------------------ obs
 
     def _get_obs(self, data, delivered=None) -> jnp.ndarray:
-        """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder.
+        """(A, MULTI_GOAL_OBS_DIM) — the shared Box2D-suite layout built by
+        obs_builder, plus this env's extras tail (see ``_N_OBS_EXTRAS``).
 
         ``delivered`` (O,) bool excludes already-delivered boxes from
         ``nearest_box_vec`` so agents stop being drawn to a box parked in its
@@ -701,7 +730,7 @@ class MultiBoxMultiGoalPushMJX:
         # nearest-undelivered-box the `nearest_box_vec` component points at, so
         # the two features describe one box.
         nearest = self.obs_builder.nearest_box_indices(agent_pos, box_pos, delivered)
-        return self.obs_builder.build(
+        base = self.obs_builder.build(
             data,
             agent_pos=agent_pos,
             agent_vel=self._agent_vel(data),
@@ -720,6 +749,28 @@ class MultiBoxMultiGoalPushMJX:
             goal_from_pos=box_pos[nearest],  # (A, 2)
             delivered=delivered,
         )
+        return jnp.concatenate(
+            [base, self._coupling_fractions(nearest, delivered)[:, None]], axis=1
+        )
+
+    def _coupling_fractions(self, nearest, delivered=None) -> jnp.ndarray:
+        """(A,) share of the whole team needed to move each agent's nearest box.
+
+        ``coupling[nearest] / n_agents`` in [0, 1] — how much of the team has to
+        be touching that box *simultaneously* before it drops to its light mass.
+        Keyed to the same nearest-undelivered box as ``nearest_box_vec`` and
+        ``goal_distance``, so the three features describe one box.
+
+        Zero when the env has no objects, and (like ``nearest_box_vectors``) when
+        every box is delivered — ``nearest`` is an argmin over +inf there, so the
+        index is meaningless and must not be read as a real requirement.
+        """
+        if self.n_objects == 0:
+            return jnp.zeros(self.n_agents)
+        frac = self._coupling_fraction[nearest]  # (A,)
+        if delivered is not None:
+            frac = jnp.where(jnp.all(delivered), 0.0, frac)
+        return frac
 
     # ------------------------------------------------------------------ API
 
@@ -1051,8 +1102,14 @@ if __name__ == "__main__":
 
     key = jax.random.PRNGKey(0)
     obs, state = reset(key)
-    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
-    print(f"obs shape OK: {obs.shape}")
+    assert obs.shape == (args.n_agents, MULTI_GOAL_OBS_DIM), obs.shape
+    assert obs.shape[1] == env.observation_dim
+    print(f"obs shape OK: {obs.shape} (shared {OBS_DIM} + {_N_OBS_EXTRAS} extras)")
+    frac = np.asarray(obs[:, _COUPLING_FRAC_IDX])
+    print(
+        f"  coupling_fraction [{_COUPLING_FRAC_IDX}]: {np.unique(frac.round(4))} "
+        f"(coupling {list(env.objects_push_coupling_list)} / {env.n_agents} agents)"
+    )
 
     # --- scripted sanity rollout: a balanced partition, each box to its ring ---
     # (Not the swarm: with one ring per box, delivering them all is the task.)

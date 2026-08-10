@@ -93,6 +93,13 @@ class Feudal_MAPPO_JAX_Runner:
         #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
         #                   one decision per macro_len low-level steps), which
         #                   wraps a base MultiBoxPushMJX.
+        # `coupling_def` is forwarded to every branch that builds a box-push env
+        # (bare, multi-goal, and the macro wrapper's base). Default "even" ==
+        # n_agents // n_objects for every box, i.e. exactly what each group got
+        # before this was reachable — so no existing arm changes. "random" draws
+        # per-box requirements in [2, n_agents//2] from a FIXED rng(42), which
+        # also resizes the boxes (`box_half_extents = max(1.5, coupling*0.4)`)
+        # and, in the multi-goal env, the goal rings derived from them.
         environment = env_config.get("environment")
         reward_mode = env_config.get("reward_mode", "dense")
         if environment == EnvironmentEnum.MULTI_BOX_MJX:
@@ -101,6 +108,7 @@ class Feudal_MAPPO_JAX_Runner:
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
+                coupling_def=env_config.get("coupling_def", "even"),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
             self.env = MultiBoxMultiGoalPushMJX(
@@ -108,6 +116,7 @@ class Feudal_MAPPO_JAX_Runner:
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
                 boundary_ends_episode=env_config.get("boundary_ends_episode", False),
+                coupling_def=env_config.get("coupling_def", "even"),
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -132,6 +141,7 @@ class Feudal_MAPPO_JAX_Runner:
                 n_objects=env_config.get("n_objects"),
                 reward_mode=base_reward_mode,
                 variant=env_config.get("variant"),
+                coupling_def=env_config.get("coupling_def", "even"),
             )
             self.env = SyncMacroMJX(
                 base_env,

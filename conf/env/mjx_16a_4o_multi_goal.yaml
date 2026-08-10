@@ -46,6 +46,19 @@ env:
   # Inert walls (the `trunc` treatment) — this is the default, stated
   # explicitly so the arm is fully identified by its config.
   boundary_ends_episode: false
+  # Per-box coupling requirement. `even` = n_agents // n_objects = 4 for all
+  # four boxes. NOTE this makes the `coupling_fraction` observation (obs[40])
+  # a CONSTANT 0.25 — it carries no information under `even`.
+  # `random` draws [2, n_agents//2] per box from a fixed rng(42): at 16a/4o that
+  # is [2, 7, 6, 5], so obs[40] becomes {0.125, 0.3125, 0.375, 0.4375}. Two
+  # consequences before switching:
+  #   - the couplings sum to 20 > 16 agents, so no *simultaneous* partition
+  #     exists; the team must deliver over-subscribed boxes sequentially;
+  #   - box sizes follow the coupling (`max(1.5, coupling*0.4)`) and the goal
+  #     rings are derived from the largest box, so the whole geometry shifts
+  #     (rings 4.80 -> 4.67 wide, rim 19.20 -> 18.69).
+  # The rng seed is fixed, so every trial_id sees the same coupling vector.
+  coupling_def: even
 
 params:
   n_steps: 1024
