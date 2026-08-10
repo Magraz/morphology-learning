@@ -73,9 +73,12 @@ At the end it prints a summary with:
 
 ## Watchdog action log
 
-Each run writes:
+All watchdog cycles append to:
 
-`scripts/hpc/job_tracking/watchdog_<YYYYMMDD_HHMMSS>.csv`
+`scripts/hpc/job_tracking/watchdog_actions.csv`
+
+Each row carries its own timestamp, so the full action history remains available
+without creating a new CSV for every watchdog cycle.
 
 Columns:
 

@@ -101,9 +101,10 @@ if ! command -v sacct >/dev/null 2>&1; then
 fi
 
 mkdir -p "${TRACKING_DIR}"
-CHECK_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-WATCHDOG_LOG="${TRACKING_DIR}/watchdog_${CHECK_TIMESTAMP}.csv"
-echo "timestamp,job_name,batch_name,experiment,trial_id,status,old_job_id,new_job_id" > "${WATCHDOG_LOG}"
+WATCHDOG_LOG="${TRACKING_DIR}/watchdog_actions.csv"
+if [[ ! -s "${WATCHDOG_LOG}" ]]; then
+    echo "timestamp,job_name,batch_name,experiment,trial_id,status,old_job_id,new_job_id" > "${WATCHDOG_LOG}"
+fi
 
 declare -A LEDGER_IDS
 declare -A COMPLETED_IDS
