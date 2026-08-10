@@ -12,16 +12,17 @@ SBATCH_SCRIPT="run_trial_gpu.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRACKING_DIR="${SCRIPT_DIR}/job_tracking"
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ID="${BATCH_NAME}_${RUN_TIMESTAMP}"
+BATCH_IDENTIFIER="${ALGORITHM}_${BATCH_NAME}"
+RUN_ID="${BATCH_IDENTIFIER}_${RUN_TIMESTAMP}"
 JOB_LEDGER="${TRACKING_DIR}/${RUN_ID}.csv"
-LATEST_LEDGER="${TRACKING_DIR}/${BATCH_NAME}_latest.csv"
+LATEST_LEDGER="${TRACKING_DIR}/${BATCH_IDENTIFIER}_latest.csv"
 
 mkdir -p "${TRACKING_DIR}"
 echo "timestamp,run_id,batch_name,environment,algorithm,experiment,trial_id,job_name,job_id,submission_ok" > "${JOB_LEDGER}"
 
 for EXPERIMENT in "${EXPERIMENT_NAMES[@]}"; do
     for TRIAL_ID in $(seq "${TRIAL_START}" "${TRIAL_END}"); do
-        JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${BATCH_NAME}"
+        JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${BATCH_IDENTIFIER}"
         TIMESTAMP="$(date +%Y-%m-%dT%H:%M:%S%z)"
 
         SUBMISSION_OUTPUT="$(
@@ -61,5 +62,5 @@ cp "${JOB_LEDGER}" "${LATEST_LEDGER}"
 echo "job ledger written to: ${JOB_LEDGER}"
 echo "latest ledger updated: ${LATEST_LEDGER}"
 
-echo "submitting watchdog for batch: ${BATCH_NAME}"
-bash "${SCRIPT_DIR}/run_watchdog.sh" "${BATCH_NAME}"
+echo "submitting watchdog for identifier: ${BATCH_IDENTIFIER}"
+bash "${SCRIPT_DIR}/run_watchdog.sh" "${BATCH_IDENTIFIER}"

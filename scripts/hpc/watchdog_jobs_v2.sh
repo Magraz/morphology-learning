@@ -8,21 +8,23 @@ TRACKING_DIR="${SCRIPT_DIR}/job_tracking"
 DEFAULT_RUN_SCRIPT="${SCRIPT_DIR}/run_trial_gpu.sh"
 
 LEDGER_PATH=""
-BATCH_NAME_FILTER=""
+BATCH_IDENTIFIER_FILTER=""
 RUN_SCRIPT="${DEFAULT_RUN_SCRIPT}"
 DRY_RUN=0
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [batch_name] [--dry-run] [--run-script PATH]
+Usage: $(basename "$0") [algorithm_batch_name] [--dry-run] [--run-script PATH]
 
 Checks each expected job in a ledger and resubmits any job that is not
 currently present in squeue for this user, unless the ledger job already
 finished with state COMPLETED in sacct.
 
 Options:
-  batch_name         Optional batch name. If provided, uses
-                     ${TRACKING_DIR}/<batch_name>_latest.csv.
+  algorithm_batch_name
+                     Optional identifier in the form <algorithm>_<batch_name>.
+                     If provided, uses
+                     ${TRACKING_DIR}/<algorithm>_<batch_name>_latest.csv.
                      If omitted, newest *_latest.csv in ${TRACKING_DIR} is used.
   --dry-run          Show what would be resubmitted without submitting.
   --run-script PATH  Submission script to call (default: ${DEFAULT_RUN_SCRIPT}).
@@ -50,12 +52,12 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            if [[ -n "${BATCH_NAME_FILTER}" ]]; then
+            if [[ -n "${BATCH_IDENTIFIER_FILTER}" ]]; then
                 echo "error: unexpected argument '$1'" >&2
                 usage
                 exit 1
             fi
-            BATCH_NAME_FILTER="$1"
+            BATCH_IDENTIFIER_FILTER="$1"
             shift
             ;;
     esac
@@ -66,7 +68,7 @@ if [[ ! -d "${TRACKING_DIR}" ]]; then
     exit 1
 fi
 
-if [[ -z "${BATCH_NAME_FILTER}" ]]; then
+if [[ -z "${BATCH_IDENTIFIER_FILTER}" ]]; then
     mapfile -t LATEST_LEDGERS < <(ls -1t "${TRACKING_DIR}"/*_latest.csv 2>/dev/null)
     if [[ ${#LATEST_LEDGERS[@]} -eq 0 ]]; then
         echo "error: no *_latest.csv found in ${TRACKING_DIR}" >&2
@@ -74,9 +76,9 @@ if [[ -z "${BATCH_NAME_FILTER}" ]]; then
     fi
     LEDGER_PATH="${LATEST_LEDGERS[0]}"
 else
-    LEDGER_PATH="${TRACKING_DIR}/${BATCH_NAME_FILTER}_latest.csv"
+    LEDGER_PATH="${TRACKING_DIR}/${BATCH_IDENTIFIER_FILTER}_latest.csv"
     if [[ ! -f "${LEDGER_PATH}" ]]; then
-        echo "error: no latest ledger found for batch '${BATCH_NAME_FILTER}': ${LEDGER_PATH}" >&2
+        echo "error: no latest ledger found for identifier '${BATCH_IDENTIFIER_FILTER}': ${LEDGER_PATH}" >&2
         exit 1
     fi
 fi
@@ -145,9 +147,9 @@ RESUBMITTED=0
 WOULD_RESUBMIT=0
 FAILED=0
 
-while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERIMENT TRIAL_ID JOB_NAME JOB_ID _SUBMISSION_OK; do
+while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERIMENT TRIAL_ID LEDGER_JOB_NAME JOB_ID _SUBMISSION_OK; do
     JOB_ID="${JOB_ID%$'\r'}"
-    JOB_NAME="${JOB_NAME%$'\r'}"
+    LEDGER_JOB_NAME="${LEDGER_JOB_NAME%$'\r'}"
     TRIAL_ID="${TRIAL_ID%$'\r'}"
     EXPERIMENT="${EXPERIMENT%$'\r'}"
     BATCH_NAME="${BATCH_NAME%$'\r'}"
@@ -159,9 +161,8 @@ while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERI
         continue
     fi
 
-    if [[ -z "${JOB_NAME}" ]]; then
-        JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${BATCH_NAME}"
-    fi
+    JOB_IDENTIFIER="${ALGORITHM}_${BATCH_NAME}"
+    JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${JOB_IDENTIFIER}"
 
     TOTAL=$((TOTAL + 1))
 
@@ -170,6 +171,11 @@ while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERI
         IS_ACTIVE=1
     fi
     if [[ ${IS_ACTIVE} -eq 0 && -n "${ACTIVE_NAMES[${JOB_NAME}]+x}" ]]; then
+        IS_ACTIVE=1
+    fi
+    # Avoid duplicating an in-flight job created before algorithm-prefixed names
+    # were introduced. New submissions always use JOB_NAME above.
+    if [[ ${IS_ACTIVE} -eq 0 && -n "${LEDGER_JOB_NAME}" && -n "${ACTIVE_NAMES[${LEDGER_JOB_NAME}]+x}" ]]; then
         IS_ACTIVE=1
     fi
 

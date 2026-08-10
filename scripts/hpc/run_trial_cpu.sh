@@ -10,7 +10,7 @@ EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/run_tri
 
 sbatch <<EOT
 #!/bin/bash
-#SBATCH -J ${TRIAL_ID}_${EXPERIMENT_NAME}_${BATCH_NAME}                      # name of job
+#SBATCH -J ${TRIAL_ID}_${EXPERIMENT_NAME}_${ALGORITHM}_${BATCH_NAME}         # name of job
 #SBATCH -A kt-lab	                                                         # name of my sponsored account, e.g. class or research group, NOT ONID!
 #SBATCH --partition=preempt                                                  # name of partition or queue
 #SBATCH -o ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.out           # name of output file for this submission script

@@ -12,7 +12,7 @@ EXPERIMENT_SCRIPT=/nfs/stak/users/agrazvam/hpc-share/morphology-learning/train.p
 
 sbatch <<EOT
 #!/bin/bash
-#SBATCH -J ${TRIAL_ID}_${EXPERIMENT_NAME}_${BATCH_NAME}
+#SBATCH -J ${TRIAL_ID}_${EXPERIMENT_NAME}_${ALGORITHM}_${BATCH_NAME}
 #SBATCH -A kt-lab
 #SBATCH --partition=preempt
 #SBATCH -o ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.out

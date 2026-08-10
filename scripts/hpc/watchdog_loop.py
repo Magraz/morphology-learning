@@ -35,14 +35,14 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Run watchdog_jobs_v2.sh repeatedly for the given batch names. "
+            "Run watchdog_jobs_v2.sh repeatedly for the given algorithm/batch identifiers. "
             "This is intended to run as a long-lived SLURM job."
         )
     )
     parser.add_argument(
         "batch_names",
         nargs="+",
-        help="One or more batch names. Example: multi_box_push_12a_6o",
+        help="One or more <algorithm>_<batch_name> identifiers. Example: mappo_jax_multi_box_push_12a_6o",
     )
     parser.add_argument(
         "--interval-minutes",
