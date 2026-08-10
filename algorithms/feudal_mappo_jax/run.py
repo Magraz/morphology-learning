@@ -23,7 +23,12 @@ from flax.serialization import from_bytes, to_bytes
 
 from algorithms.feudal_mappo_jax.mappo import create_train_state
 from algorithms.feudal_mappo_jax.trainer import RunnerState, make_train
-from algorithms.feudal_mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
+from algorithms.feudal_mappo_jax.types import (
+    Experiment,
+    MAPPOConfig,
+    Model_Params,
+    Params,
+)
 from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
     MultiBoxMultiGoalPushMJX,
 )
@@ -98,12 +103,11 @@ class Feudal_MAPPO_JAX_Runner:
                 variant=env_config.get("variant"),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
-            # No `variant` here: the drift / inert-wall presets are specific to
-            # the square arena and are deliberately not carried over.
             self.env = MultiBoxMultiGoalPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
+                boundary_ends_episode=env_config.get("boundary_ends_episode", False),
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (
@@ -291,13 +295,10 @@ class Feudal_MAPPO_JAX_Runner:
             rollout_series = {
                 "train_reward": float(rollout_stats["mean_reward"]),
                 "intrinsic_reward": float(rollout_stats["intrinsic_reward"]),
-                "intrinsic_reward_abs": float(
-                    rollout_stats["intrinsic_reward_abs"]
-                ),
+                "intrinsic_reward_abs": float(rollout_stats["intrinsic_reward_abs"]),
             }
             stats_tracker.append_agent_stats(
-                {key: float(value) for key, value in losses.items()}
-                | rollout_series
+                {key: float(value) for key, value in losses.items()} | rollout_series
             )
             elapsed_time = stats_tracker.record_iteration(
                 steps_completed=steps_completed,
@@ -446,9 +447,7 @@ class Feudal_MAPPO_JAX_Runner:
         return train_state._replace(
             actor_ts=train_state.actor_ts.replace(params=params_dict["actor"]),
             critic_ts=train_state.critic_ts.replace(params=params_dict["critic"]),
-            manager_ts=train_state.manager_ts.replace(
-                params=params_dict["manager"]
-            ),
+            manager_ts=train_state.manager_ts.replace(params=params_dict["manager"]),
             manager_critic_ts=train_state.manager_critic_ts.replace(
                 params=params_dict["manager_critic"]
             ),

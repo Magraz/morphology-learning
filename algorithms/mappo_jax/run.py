@@ -98,12 +98,11 @@ class MAPPO_JAX_Runner:
                 variant=env_config.get("variant"),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
-            # No `variant` here: the drift / inert-wall presets are specific to
-            # the square arena and are deliberately not carried over.
             self.env = MultiBoxMultiGoalPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
                 reward_mode=reward_mode,
+                boundary_ends_episode=env_config.get("boundary_ends_episode", False),
             )
         elif environment == EnvironmentEnum.MACRO_MJX:
             from environments.mjx_suite.macro_wrapper import (

@@ -37,4 +37,4 @@ env:
   variant: drift
 
 params:
-  n_steps: 512
+  n_steps: 1024

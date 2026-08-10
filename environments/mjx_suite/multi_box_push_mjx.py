@@ -117,7 +117,7 @@ _BOX_HALF_HEIGHT = 0.4  # z half-extent; cosmetic (no z DOF), keeps contacts pla
 _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
-_DEFAULT_DRIFT_SPEED = 3.0
+_DEFAULT_DRIFT_SPEED = 0.5
 
 
 class VARIANTS(StrEnum):

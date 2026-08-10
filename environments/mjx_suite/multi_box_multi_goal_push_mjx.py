@@ -35,8 +35,25 @@ the boundary-contact test is
 ``|agent - center| >= arena_radius - agent_radius``.
 
 The square-arena env's box-drift mechanic and its ``variant`` presets
-(``drift`` / ``trunc``) are deliberately **not** carried over: this env is the
-plain task on a disc, so a wall touch ends the episode as in the baseline.
+(``drift`` / ``trunc``) are deliberately **not** carried over — this env is the
+plain task on a disc. What it *does* adopt from the ``trunc`` arm is the
+**inert-wall** treatment, and it is the default here (``boundary_ends_episode``
+defaults to ``False``; pass ``True`` for the square baseline's semantics):
+
+- the wall segments are real inward-facing planes, so agents are already
+  physically confined — ending the episode on contact was Box2D parity, not a
+  physical necessity;
+- ``boundary_hit`` is ``any()`` over agents, so under the old semantics one of N
+  agents ended the episode for the whole team, and agents spawn in the *outer*
+  annulus here, i.e. right against the wall;
+- worse, the crash step paid ``0`` instead of its real reward. In this env the
+  shaping stream is negative whenever boxes drift away from their rings
+  (measured: ~1/3 of episodes), so ending the episode on purpose was a standing
+  bonus — the same escape hatch the square env's ``boundary_truncates`` attempt
+  hit, where policies learned to crash into a wall deliberately.
+
+Every branch is a Python-level ``if``, so ``boundary_ends_episode=True``
+reproduces the previous graph and numbers exactly.
 
 2D by construction: bodies own only planar DOFs (agents slide-x/y; boxes
 slide-x/y + hinge-yaw), gravity is zero, walls are inward-facing planes — with
@@ -145,6 +162,7 @@ class MultiBoxMultiGoalPushMJX:
         coupling_def: str = "even",
         max_steps: int = 1024,
         reward_mode: str = "dense",
+        boundary_ends_episode: bool = False,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
@@ -154,6 +172,10 @@ class MultiBoxMultiGoalPushMJX:
         self.n_objects = n_objects
         self.max_steps = max_steps
         self.reward_mode = reward_mode
+        # Inert walls by default (the `trunc` treatment) — see the module
+        # docstring. `True` restores the square baseline's semantics: a wall
+        # touch terminates and that step pays 0.
+        self.boundary_ends_episode = boundary_ends_episode
         # `difference_rewards` shapes the *team* reward exactly like "dense" and
         # then decomposes it per agent; a sparse base would leave D_i zero on every
         # step except a delivery, which is too thin to learn from.
@@ -790,9 +812,15 @@ class MultiBoxMultiGoalPushMJX:
         completion = 100.0 * newly_delivered.sum()
         task_reward = completion + (shaping if self._dense else 0.0)
 
-        # A boundary hit ends the episode in failure, and (Box2D parity) that
-        # step's reward/delivery bookkeeping is skipped.
-        task_reward = jnp.where(boundary_hit, 0.0, task_reward)
+        # Box2D skips reward/delivery bookkeeping on a boundary hit — but only
+        # because the hit *is* the episode's terminal failure there. With inert
+        # walls (the default) the step physically happened like any other and
+        # must pay its real reward: zeroing it would hand back exactly the
+        # negative shaping the agent would otherwise eat, i.e. a standing bonus
+        # for touching a wall. Python-level `if`, so the old graph and numbers
+        # are reproduced exactly under `boundary_ends_episode=True`.
+        if self.boundary_ends_episode:
+            task_reward = jnp.where(boundary_hit, 0.0, task_reward)
         return task_reward, newly_delivered, boundary_hit, dist
 
     def _difference_rewards(
@@ -848,11 +876,18 @@ class MultiBoxMultiGoalPushMJX:
         data = self._advance(state, actions, active)
         reward, newly_delivered, boundary_hit, dist = self._task_reward(state, data)
 
-        delivered = jnp.where(
-            boundary_hit, state.delivered, state.delivered | newly_delivered
-        )
+        if self.boundary_ends_episode:
+            delivered = jnp.where(
+                boundary_hit, state.delivered, state.delivered | newly_delivered
+            )
+        else:
+            # Wall contact is inert: the step counted, so a delivery that landed
+            # on it counts too.
+            delivered = state.delivered | newly_delivered
         t = state.t + 1
-        terminated = boundary_hit | jnp.all(delivered)
+        all_delivered = jnp.all(delivered)
+        terminated = (boundary_hit | all_delivered) if self.boundary_ends_episode \
+            else all_delivered
         truncated = t >= self.max_steps
 
         obs = self._get_obs(data, delivered)
