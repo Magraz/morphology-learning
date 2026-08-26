@@ -107,7 +107,11 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from environments.box2d_suite.utils import COLORS_LIST, CircularTargetArea
+from environments.box2d_suite.utils import (
+    COLORS_LIST,
+    CircularTargetArea,
+    resolve_coupling,
+)
 from environments.mjx_suite.observation import (
     OBS_DIM,
     MJXObservationBuilder,
@@ -228,14 +232,7 @@ class MultiBoxMultiGoalPushMJX:
         self.force_multiplier = _FORCE_MULTIPLIER
 
         # --- coupling requirements and box sizes (fixed per instance) ---
-        if coupling_def == "random":
-            coupling = np.random.default_rng(42).integers(
-                2, (n_agents // 2) + 1, n_objects
-            )
-        elif coupling_def == "even":
-            coupling = np.array([n_agents // n_objects] * n_objects)
-        else:
-            raise ValueError(f"unknown coupling_def: {coupling_def}")
+        coupling = resolve_coupling(coupling_def, n_agents, n_objects)
         self.objects_push_coupling_list = coupling
         self.box_half_extents = np.maximum(1.5, coupling * _AGENT_RADIUS)
 

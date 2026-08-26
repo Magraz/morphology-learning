@@ -10,14 +10,13 @@ base_path: "/home/magraz/morphology-learning/experiments/results"
 # batches: ["multi_box_push_9a_3o", "hrl_skill_agent_9a", "hrl_skill_team_9a"]
 # batches: ["dcg_smaclite_2s3z"]
 # batches: ["smaclite_3s_vs_5z"]
-batches: ["multi_box_push_mjx_20a_5o_dr", "multi_box_push_mjx_20a_5o"]
-
-
+# batches: ["macro_mjx_16a_4o","mjx_16a_4o", "macro_mjx_16a_4o_dr", "macro_mjx_16a_4o_wdr", "macro_mjx_16a_4o_stagger", "macro_mjx_16a_4o_stagger_wdr", "macro_mjx_16a_4o_stagger_wdr_aligned"]
+batches: ["mjx_16a_4o_drift"]
 
 
 # experiments: ["gcn", "gat", "graph_transformer", "gcn_full", "gat_full", "graph_transformer_full"]
 # experiments: ["hygma", "hgnn_shared", "learned_affinity", "mlp_shared"]
-experiments: ["mlp"]
+experiments: ["mlp", "feudal_a0", "feudal_a01", "feudal_a05"]
 custom_labels:
   hgnn_shared: Typed Hypergraph Critic + MAPPO
   hgnn_proximity: Typed Hypergraph Critic + MAPPO

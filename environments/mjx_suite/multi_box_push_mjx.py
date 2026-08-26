@@ -99,7 +99,11 @@ import mujoco
 import numpy as np
 from mujoco import mjx
 
-from environments.box2d_suite.utils import COLORS_LIST, ObjectTargetArea
+from environments.box2d_suite.utils import (
+    COLORS_LIST,
+    ObjectTargetArea,
+    resolve_coupling,
+)
 from environments.mjx_suite.observation import (
     OBS_DIM,
     MJXObservationBuilder,
@@ -210,14 +214,7 @@ class MultiBoxPushMJX:
         ]
 
         # --- coupling requirements and box sizes (fixed per instance) ---
-        if coupling_def == "random":
-            coupling = np.random.default_rng(42).integers(
-                2, (n_agents // 2) + 1, n_objects
-            )
-        elif coupling_def == "even":
-            coupling = np.array([n_agents // n_objects] * n_objects)
-        else:
-            raise ValueError(f"unknown coupling_def: {coupling_def}")
+        coupling = resolve_coupling(coupling_def, n_agents, n_objects)
         self.objects_push_coupling_list = coupling
         self.box_half_extents = np.maximum(1.5, coupling * _AGENT_RADIUS)
 
@@ -934,11 +931,15 @@ def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
         f"transient at tau: {frac:.3f} vs 1-rho^12 = {1 - rho**12:.3f}   OK"
     )
 
-    # mass independence: uneven couplings -> different box sizes/masses
+    # mass independence: uneven couplings -> different box sizes/masses.
+    # An explicit ascending list rather than a random draw: the point is only
+    # that the boxes differ in mass, and a fixed list keeps the check
+    # reproducible across `n_agents` / `n_objects`.
+    uneven = [min(2 + j, n_agents) for j in range(n_objects)]
     rnd = MultiBoxPushMJX(
         n_agents=n_agents,
         n_objects=n_objects,
-        coupling_def="random",
+        coupling_def=uneven,
         variant="drift",
     )
     st_r = clear_state(rnd)

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 from Box2D import b2ContactListener
 
@@ -154,6 +156,71 @@ class CircularTargetArea:
         pos = body.position
         dist = np.hypot(pos.x - self.x, pos.y - self.y)
         return self.inner_radius <= dist <= self.radius
+
+
+def resolve_coupling(coupling_def, n_agents, n_objects):
+    """Per-box coupling requirement: how many agents must touch a box at once.
+
+    Shared by every box-pushing env (box2d ``multi_box_push``, mjx
+    ``multi_box_push_mjx`` / ``multi_box_multi_goal_push_mjx``) so the four
+    copies of this parse cannot drift apart. Returns an ``(n_objects,)`` int
+    array.
+
+    ``coupling_def`` is either:
+
+    - ``"even"`` — ``n_agents // n_objects`` for every box (the default, and
+      what every existing arm uses);
+    - an explicit per-box sequence, e.g. ``[2, 3, 5, 6]``.
+
+    The explicit form exists to make the boxes **non-interchangeable**. Under
+    ``"even"`` every box needs an identical crew, so any agent is as good as any
+    other and there is no particular team-to-box assignment to discover — which
+    is exactly the structure a per-agent goal mechanism (e.g. the feudal
+    manager) is supposed to exploit. Unequal requirements force a *specific*
+    partition. A list summing to ``n_agents`` keeps a simultaneous partition
+    feasible (so the task is no harder, only more specific); a larger sum
+    over-subscribes the team and forces sequential delivery, which is a
+    difficulty change as well as a structural one — hence the warning.
+
+    Note the box's size follows its coupling in the callers
+    (``max(1.5, coupling * agent_radius)``), so unequal couplings also mean
+    unequal box sizes; in the multi-goal env that shifts the goal-ring geometry.
+    """
+    if isinstance(coupling_def, str):
+        if coupling_def != "even":
+            raise ValueError(
+                f"unknown coupling_def: {coupling_def!r}; expected 'even' or an "
+                f"explicit per-box list of {n_objects} ints, e.g. "
+                f"{[max(1, n_agents // n_objects)] * n_objects}"
+            )
+        return np.full(n_objects, n_agents // n_objects, dtype=int)
+
+    try:
+        coupling = [int(c) for c in coupling_def]
+    except TypeError:
+        raise ValueError(
+            f"coupling_def must be 'even' or a sequence of ints, got "
+            f"{type(coupling_def).__name__}: {coupling_def!r}"
+        ) from None
+
+    if len(coupling) != n_objects:
+        raise ValueError(
+            f"coupling_def has {len(coupling)} entries but n_objects={n_objects}"
+        )
+    bad = [c for c in coupling if not 1 <= c <= n_agents]
+    if bad:
+        raise ValueError(
+            f"coupling_def entries must be in [1, n_agents={n_agents}], got {bad}"
+        )
+    if sum(coupling) > n_agents:
+        warnings.warn(
+            f"coupling_def={coupling} sums to {sum(coupling)} > n_agents="
+            f"{n_agents}: no simultaneous partition exists, so boxes must be "
+            f"delivered sequentially. This changes task difficulty, not just "
+            f"the assignment structure.",
+            stacklevel=2,
+        )
+    return np.array(coupling, dtype=int)
 
 
 def update_object_mass_from_contacts(env, coupled_density_per_agent=0.05):

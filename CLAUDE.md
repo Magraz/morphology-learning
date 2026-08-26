@@ -418,9 +418,8 @@ what makes the comparison attributable).
 - **Config surface is `env.variant`, a preset, and it is the WHOLE surface** —
   every knob is a constant of the preset, so an arm is fully identified by its
   name and there are no `box_drift_speed` / `box_drift_floor` kwargs to pass:
-  `"drift"` → `box_drift_speed=_DEFAULT_DRIFT_SPEED` (read the constant — it is
-  being tuned, and is set well past the 0.5 knee of the calibration table below,
-  which has not been re-swept there) + inert walls; `"trunc"` → inert walls
+  `"drift"` → `box_drift_speed=_DEFAULT_DRIFT_SPEED` (currently `0.5`, the knee
+  of the calibration table below) + inert walls; `"trunc"` → inert walls
   only; absent/`None` (baseline `mjx_16a_4o`, every `macro_mjx_*`,
   `multi_box_push_mjx_*`) → neither, i.e. stock Box2D-parity behavior, verified
   **bit-identical** (obs/reward/qpos/qvel over a fixed-seed 200-step rollout, in
@@ -518,20 +517,33 @@ what makes the comparison attributable).
   at every `v_d` (the mechanic never inverts the preference) and that the swarm's
   ignored boxes decay monotonically. Whether it changes what a *learned* policy
   does is a training question, not a scripted-probe one.
-- **⚠ `_DEFAULT_DRIFT_SPEED = 3.0` is outside the calibrated range and breaks the
-  mechanic.** The sweep above stops at 0.8, already the point where the drift
-  force exceeds a full coalition's thrust; at 3.0 it is 3072 N against ~400 N.
-  `--check-drift` [8] **fails** there (16a/4o, seeds 7/23): the scripted balanced
-  partition — the strategy the mechanic exists to reward — delivers **0.5 of 4
-  boxes** with drift on vs **4.0** with it off, and its return *loses* to the
-  swarm (21 vs 60), i.e. the drift **inverts** the preference. The task is close
-  to infeasible at this speed, so a flat learning curve on `_drift` says nothing
-  about coalition discovery. Re-sweep and pick from the table (0.5 was the knee)
-  before running the arm; the check is the canary. Note the inversion is mostly
-  the speed, not the inert-wall change: measured partition − swarm at `v_d=3.0`
-  is **+8** under the old episode-ending walls and **−39** under inert walls
-  (against **+345** with no drift), because the swarm no longer has its episode
-  cut short at ~615 steps by an incidental wall hit and finishes its one box.
+- **`_DEFAULT_DRIFT_SPEED` is now `0.5`, the knee of the table above, and all 10
+  `--check-drift` checks pass** (re-verified 2026-08-13). An earlier value of
+  `3.0` was outside the calibrated range and broke the mechanic — it put 3072 N
+  against a full coalition's ~400 N, and check [8] failed there (the scripted
+  balanced partition delivered 0.5 of 4 boxes with drift on vs 4.0 with it off,
+  *losing* to the swarm, i.e. the drift inverted the preference it exists to
+  create). At 0.5, [8] reports swarm 91 (1.0 boxes) -> partition 461 (4.0) with
+  drift on, i.e. the partition still wins. Keep [8] as the canary if the speed
+  is ever changed again.
+- **⚠ But the mechanic does not do its job on a *learned* policy.** Measured on
+  the trained `mjx_16a_4o_drift` mlp arm (deterministic eval, 24 episodes/seed,
+  3 seeds): **3.92–4.00 of 4 boxes delivered**, against 3.42–4.00 on the
+  `mjx_16a_4o` baseline; final eval return 458.1 ± 1.4 vs 421.8 ± 8.3, and the
+  per-step reward rate is only ~7% lower. Drift was introduced to kill the
+  sequential swarm-one-box-at-a-time strategy; at `v_d = 0.5` MAPPO still
+  delivers everything. The coupling gate turns the drift off on whatever box the
+  team is working, and the floor keeps sunk boxes recoverable, so sequencing
+  pays only a bounded one-time cost. **Do not use this arm as the coalition-
+  pressure manipulation** — see `conf/env/mjx_16a_4o_partition.yaml` for the
+  structural alternative, and note a time budget (cutting `max_steps` below what
+  sequencing needs) is the untried knob that would actually forbid it.
+  ⚠ The comparison is also not attributable: `mjx_16a_4o_trunc`, the middle rung
+  that isolates the inert-wall change, is **stale** — its runs terminate well
+  before `max_steps` (episode lengths 12–2000), which is impossible with
+  `boundary_ends_episode: false`, so they predate the `97a7dfc` StrEnum fix and
+  are really baseline runs; its group also sets `n_steps: 512` against 1024
+  everywhere else. Re-run it before attributing anything to drift.
 - **Difference rewards are structurally blind to this pressure.** An unattended
   box's drift cost does not depend on agent *i*, so it appears identically in `G`
   and `G_-i` and cancels exactly. Measured: pivotal `D_i` (exactly `coupling`
@@ -560,10 +572,10 @@ what makes the comparison attributable).
   `uv run python -m environments.mjx_suite.multi_box_push_mjx --check-drift
   [--n-agents 16 --n-objects 4]` (needs jit, so it ignores `--debug`). It
   constructs via `variant="drift"`, so it exercises the arm training actually
-  runs and cannot desync from the shipped constants. **Checks 1–7 and 9–10 pass;
-  [8] currently fails** — see the `_DEFAULT_DRIFT_SPEED` warning above. [8] is a
-  config canary, not a code defect: it prints its numbers before asserting, and
-  the message names the speed.
+  runs and cannot desync from the shipped constants. **All 10 pass** at the
+  shipped `_DEFAULT_DRIFT_SPEED = 0.5` (re-verified 2026-08-13). [8] is a config
+  canary, not a code defect: it prints its numbers before asserting, and the
+  message names the speed — it is what catches an uncalibrated drift speed.
 
 ### MJX circular arena / per-box concentric goal rings (`multi_box_multi_goal_push_mjx.py`)
 
@@ -576,9 +588,33 @@ its own branch in `mappo_jax/run.py`, env group
 `conf/env/mjx_16a_4o_multi_goal.yaml`); not wired into `create_env` (the torch
 stacks) — everything downstream of `run.py` is duck-typed on the functional API,
 so the trainer, `view()` and `evaluate()` needed no changes. The box-drift
-mechanic and the `variant` (`drift`/`trunc`) presets are deliberately **not**
-carried over — do not set `env.variant` on this group; a wall touch ends the
-episode as in the square-arena baseline.
+mechanic and the `variant` preset are deliberately **not** carried over — do not
+set `env.variant` on this group.
+
+- **Walls are inert here, and that is the default** (`boundary_ends_episode:
+  false`, a plain bool kwarg rather than a `variant` preset — this env has no
+  preset surface). It adopts the square env's `trunc` treatment for the same
+  reason and then some: the wall segments are real inward-facing planes so
+  agents are already confined (terminating on contact was Box2D parity, not
+  physics); `boundary_hit` is `any()` over agents, so one of 16 ended the
+  episode for the team; and agents spawn in the **outer annulus** here, i.e.
+  right against the wall. Decisively, the crash step used to pay `0` instead of
+  its real reward while ~1/3 of episodes carry net-negative shaping — a standing
+  bonus for touching a wall, the same escape hatch the square env's
+  `boundary_truncates` attempt hit. Set `boundary_ends_episode: true` to restore
+  the old terminate-on-contact semantics (the ablation arm). Verified: physics
+  is untouched (qpos/qvel/obs bit-identical over a 200-step fixed-action
+  rollout, both settings); the scripted oracle is **unaffected** (977.9 steps /
+  return 279.6 / 2.5-of-4 delivered under both — a competent policy never
+  touches the wall before delivering); a random policy goes from ep_len 141 with
+  100% wall-termination to the full 1024 with 0%. Plumbed at both `run.py`
+  construction sites (`mappo_jax` and `feudal_mappo_jax`).
+  - ⚠ This is now a **third** uncontrolled difference from the `mjx_16a_4o`
+    baseline it is ablated against (after arena shape and per-box goals), which
+    already was not a controlled geometry ablation. Note the measured
+    wall-termination rate was *not* what separated the two arms — under trained
+    policies both sat at 0.22–0.31, and the square baseline reaches 400+ anyway.
+    This change removes a hazard, it does not explain the failure.
 
 - **Arena is a disc** of `arena_radius = world_width/2 - boundary_thickness`
   about the world center (now the *geometric* center, `W/2` not `W//2`). MuJoCo
@@ -604,9 +640,15 @@ episode as in the square-arena baseline.
     affords it, so a box square-on fits its ring; `_max_goal_radius` caps the
     whole structure at the largest rim that still leaves a usable agent spawn
     annulus and the rings shrink uniformly if that binds. At the shipped configs
-    it does not bind: 9a/3o -> 3 rings of 3.00 (rim 9.0), 16a/4o -> 4 of 3.20
-    (rim 12.8). The goal block therefore sits *below* the coupling/box-size
-    block in `__init__` (it needs `box_half_extents`).
+    it does not bind: **9a/3o -> 3 rings of 3.73 (rim 11.19), 16a/4o -> 4 of
+    4.80 (rim 19.2)** (measured; the 3.00/9.0 and 3.20/12.8 recorded here
+    earlier are stale). The goal block therefore sits *below* the
+    coupling/box-size block in `__init__` (it needs `box_half_extents`).
+    ⚠ The rim matters for difficulty: boxes spawn at r ~ 21.6 at 16a/4o, so with
+    the rim at 19.2 the **outermost box needs only 2.4 units of travel while box
+    0 needs 17.0** ([17.0, 12.1, 7.2, 2.4]). Deliveries by a trained policy track
+    that ordering exactly ([2, 2, 6, 10] over 80 episodes), i.e. essentially all
+    of the learnable signal is the outermost box.
   - `_BOX_RING_FRAC` is **0.25**, not the 0.40 the single-goal version used:
     the goal structure now grows with `n_objects`, and pulling the box spawn
     ring inward is what buys the radial room for full-width rings (at 0.40 the
@@ -634,6 +676,35 @@ episode as in the square-arena baseline.
     `MJXObservationBuilder.nearest_box_indices` (factored out of
     `nearest_box_vectors`, same search, one copy); `goal_radius` accepts a
     per-agent `(A,)` array and just broadcasts;
+  - **the obs is `MULTI_GOAL_OBS_DIM = OBS_DIM + 1 = 41`**, not the shared 40 —
+    this env appends a task-specific **extras tail** after lidar. Currently one
+    scalar, `[40] coupling_fraction` = `coupling[nearest] / n_agents` in [0, 1]:
+    the share of the whole team that must touch the agent's nearest undelivered
+    box *simultaneously* before it drops to its light mass. It is keyed to the
+    same nearest box as `nearest_box_vec` [21:23] and `goal_distance` [23], so
+    the three say "that box is there, it must go this far, it takes this share of
+    the team to move it"; it is 0 when every box is delivered or `n_objects == 0`,
+    matching `nearest_box_vec`'s convention.
+    - **Extras APPEND, they never insert.** Every index into the shared 40 dims
+      stays valid — in particular `mjx_suite/renderer.py`'s `_DENSITY_SLICE` /
+      `_BOX_VEC_SLICE` / `_GOAL_IDX` / `_LIDAR_SLICE = slice(BASE_OBS_DIM,
+      OBS_DIM)`, which the sensor overlay slices straight out of the policy
+      input. Inserting the scalar before lidar would silently shift that slice
+      and the overlay would render a different vector than the policy sees.
+      Verified: `_get_obs(...)[:, :40]` is bit-identical to the bare
+      `obs_builder.build(...)` (compare both **under jit** — `mjx.ray`'s reduction
+      order differs between compilations and a jitted-vs-eager diff shows a
+      spurious ~1.6e-4 in the lidar block).
+    - The **shared** `MJXObservationBuilder` is untouched, so no other MJX env,
+      no Box2D env and no existing checkpoint changes width. Everything
+      downstream reads `env.observation_dim` (`mappo_jax/trainer.py:54`,
+      `run.py:373`), so the network width follows automatically.
+    - ⚠ **At the shipped config the feature is a constant.** `coupling_def:
+      "even"` gives `coupling = [4,4,4,4]` at 16a/4o, so `coupling_fraction` is
+      0.25 for every agent, box and step — zero information, just a bias the
+      first layer absorbs. It only varies under an explicit unequal
+      `coupling_def` list (e.g. `[2, 3, 5, 6]`). See the `coupling_def` note
+      below for what switching costs.
   - boundary contact is `|agent - center| >= arena_radius - agent_radius` —
     measured on the circle, so in the N-gon's corner directions it trips ~0.5% of
     R early (conservative).
@@ -865,7 +936,42 @@ drop-in comparable:
   (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX`), each passing its
   constructor arguments explicitly — deliberately not a shared kwargs helper.
   Note this means an `env:` key is only reachable where a branch names it:
-  `coupling_def` and `max_steps` are currently forwarded by no branch.
+  **`max_steps` is still forwarded by no branch.**
+- **`env.coupling_def` is wired** (all three branches — bare `MultiBoxPushMJX`,
+  `MultiBoxMultiGoalPushMJX`, and the macro wrapper's base env — in **both**
+  `mappo_jax/run.py` and its `feudal_mappo_jax` copy, which must stay in sync).
+  It accepts `"even"` (== `n_agents // n_objects` per box, the default and what
+  every existing arm uses) **or an explicit per-box list** of ints, e.g.
+  `coupling_def: [2, 3, 5, 6]` at 16a/4o. Parsing lives in the single shared
+  helper `box2d_suite/utils.py:resolve_coupling`, called by all three envs
+  (box2d `multi_box_push` included) so the copies cannot drift; it validates
+  length and range, and **warns** when the list sums to more than `n_agents`
+  (no simultaneous partition exists, so boxes must be delivered sequentially —
+  a difficulty change, not just a structural one). Verified: `"even"` and an
+  explicit `[4,4,4,4]` are **bit-identical** (obs/reward/qpos over a fixed-seed
+  100-step rollout, both MJX envs), so **no existing arm changes**; an unknown
+  value raises (`ValueError: unknown coupling_def: 'bogus'`). A Hydra list
+  override needs the key to exist in the env group (struct mode) — declare it in
+  the group rather than passing `+env.coupling_def=...`.
+  - **The `"random"` branch was removed.** It drew from a fixed
+    `np.random.default_rng(42)`, so one arbitrary draw defined the arm, and at
+    16a/4o it changed three things at once (couplings `[2,7,6,5]` summing to
+    20 > 16, hence forced sequencing; box sizes, hence multi-goal ring geometry;
+    and no per-seed resampling). An explicit list expresses any of that
+    deliberately. The `--check-drift` mass-independence check [2b], its only
+    consumer, now constructs with an ascending list `[2+j ...]`.
+  - **Why the explicit form exists** — `conf/env/mjx_16a_4o_partition.yaml`
+    (`[2, 3, 5, 6]`, summing to exactly 16). Under `even` every box needs an
+    identical crew, so agents are interchangeable and there is no particular
+    assignment to discover; measured, the trained baseline just sequences the
+    boxes with a swarm. Unequal-but-summing-to-`n_agents` keeps a simultaneous
+    partition feasible while making the assignment *specific* — the structure a
+    per-agent goal mechanism (the feudal manager) is supposed to exploit. ⚠ Box
+    size follows coupling (`max(1.5, coupling*0.4)`), so that arm's boxes are
+    `[1.5, 1.5, 2.0, 2.4]` against the baseline's uniform 1.6: it changes the
+    assignment structure **and** the geometry, and the group's docstring says so.
+  - Under `even`, `coupling_fraction` (the multi-goal obs extra) is the constant
+    0.25; an explicit unequal list is now what makes it informative.
 
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 

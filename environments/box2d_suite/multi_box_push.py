@@ -29,6 +29,7 @@ from environments.box2d_suite.utils import (
     ObjectTargetArea,
     BoundaryContactListener,
     get_scatter_positions,
+    resolve_coupling,
     update_object_mass_from_contacts,
 )
 
@@ -109,14 +110,9 @@ class MultiBoxPushEnv(gym.Env):
         self._init_agents()
 
         # Create boxes coupling reqs
-        if coupling_def == "random":
-            self.objects_push_coupling_list = np.random.default_rng(42).integers(
-                2, (self.n_agents // 2) + 1, (self.n_objects)
-            )
-        elif coupling_def == "even":
-            self.objects_push_coupling_list = [
-                self.n_agents // self.n_objects for _ in range(self.n_objects)
-            ]
+        self.objects_push_coupling_list = resolve_coupling(
+            coupling_def, self.n_agents, self.n_objects
+        )
 
         # Add force tracking
         self.applied_forces = np.zeros((self.n_agents, 2), dtype=np.float32)
