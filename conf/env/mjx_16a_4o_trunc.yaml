@@ -27,4 +27,4 @@ env:
   variant: trunc
 
 params:
-  n_steps: 512
+  n_steps: 1024
