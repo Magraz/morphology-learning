@@ -61,4 +61,4 @@ env:
   coupling_def: even
 
 params:
-  n_steps: 1024
+  n_steps: 512

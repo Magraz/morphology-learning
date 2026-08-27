@@ -9,3 +9,6 @@ env:
   n_agents: 16
   n_objects: 4
   reward_mode: dense
+  
+  params:
+    n_steps: 512

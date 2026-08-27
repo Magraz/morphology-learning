@@ -45,4 +45,4 @@ env:
 params:
   # Matches the `mjx_16a_4o` baseline so the per-update batch (1024 x 32) and
   # the episode coverage are identical across the two arms being compared.
-  n_steps: 1024
+  n_steps: 512
