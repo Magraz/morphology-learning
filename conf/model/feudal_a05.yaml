@@ -1,7 +1,17 @@
 # @package _global_
-# FeUdal intrinsic-reward ablation, alpha = 0.5 — the CALIBRATED value (see the
-# derivation in conf/algorithm/feudal_mappo_jax.yaml). See conf/model/feudal_a0.yaml
-# for why the ablation axis is a model group rather than a bare param override.
+# FeUdal intrinsic-reward ablation, alpha = 0.5 — once believed to be the
+# CALIBRATED value. See conf/model/feudal_a0.yaml for why the ablation axis is a
+# model group rather than a bare param override.
+#
+# ⚠ HISTORICAL — DO NOT RE-RUN THIS GROUP, and note the calibration behind the
+# 0.5 was wrong in kind: it divided by the CONVERGED baseline reward rate
+# (~0.4/step) rather than the rate the policy can actually reach when learning
+# has to start (~5e-05/step), understating the true ratio by ~4 orders of
+# magnitude. See conf/algorithm/feudal_mappo_jax.yaml.
+#
+# As with `feudal_a01`, this group named the old reward-level fold, that code
+# path is gone, and re-running it would silently become `feudal_n05` while
+# overwriting the only record of the old arm. Use `model=feudal_n05` instead.
 defaults:
   - feudal
   - _self_

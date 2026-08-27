@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax.serialization import from_bytes, to_bytes
 
@@ -102,10 +103,20 @@ class Feudal_MAPPO_JAX_Runner:
         # and, in the multi-goal env, the goal rings derived from them.
         environment = env_config.get("environment")
         reward_mode = env_config.get("reward_mode", "dense")
+        # `max_steps` is OPTIONAL, so it is only forwarded when the group actually
+        # declares it. A bare `max_steps=env_config.get("max_steps")` passes None
+        # for every group that omits the key, and None does not fall back to the
+        # constructor default — it overwrites it, and the first `t >= None`
+        # comparison raises. No env group declares `max_steps` today, so that
+        # form breaks all of them.
+        optional_env_kwargs = {}
+        if env_config.get("max_steps") is not None:
+            optional_env_kwargs["max_steps"] = env_config["max_steps"]
         if environment == EnvironmentEnum.MULTI_BOX_MJX:
             self.env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
+                **optional_env_kwargs,
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -114,6 +125,7 @@ class Feudal_MAPPO_JAX_Runner:
             self.env = MultiBoxMultiGoalPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
+                **optional_env_kwargs,
                 reward_mode=reward_mode,
                 boundary_ends_episode=env_config.get("boundary_ends_episode", False),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -139,6 +151,7 @@ class Feudal_MAPPO_JAX_Runner:
             base_env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
+                **optional_env_kwargs,
                 reward_mode=base_reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -193,6 +206,7 @@ class Feudal_MAPPO_JAX_Runner:
             goal_dim=self.model_params.goal_dim,
             goal_horizon=self.params.goal_horizon,
             intrinsic_coef=self.params.intrinsic_coef,
+            intrinsic_anneal=self.params.intrinsic_anneal,
             manager_lr=self.params.manager_lr,
             manager_val_coef=self.params.manager_val_coef,
             manager_gamma=self.params.manager_gamma,
@@ -282,7 +296,14 @@ class Feudal_MAPPO_JAX_Runner:
             collection_time = time.time() - collection_start
 
             update_start = time.time()
-            runner_state, losses = update_fn(runner_state, trajectory, last_value)
+            # Fraction of training elapsed, for the alpha anneal. Passed as a
+            # TRACED scalar — a python float would be baked in as a constant and
+            # recompile the jitted update every iteration. Resume is correct for
+            # free: `start_update` is derived from the restored step count.
+            progress = jnp.float32(update / max(num_updates, 1))
+            runner_state, losses = update_fn(
+                runner_state, trajectory, last_value, progress
+            )
             jax.block_until_ready(losses)
             update_time = time.time() - update_start
 
@@ -369,14 +390,29 @@ class Feudal_MAPPO_JAX_Runner:
     # NOTE: the four msgpack sites below must be kept in lockstep — `from_bytes`
     # needs an exactly-shaped target tree, so adding a component to one save site
     # without the matching restore site breaks resume loudly.
+    #
+    # V^I (the intrinsic critic) is included ONLY when alpha != 0, which is
+    # exactly when `create_train_state` builds it. That keeps the alpha=0 file
+    # format byte-for-byte what it was before the intrinsic stream existed, so
+    # existing `feudal_a0` checkpoints still resume. All five sites route the
+    # decision through `_intrinsic_tree` so they cannot disagree.
+
+    @staticmethod
+    def _intrinsic_tree(train_state, key, params_only):
+        """`{key: <V^I subtree>}` when V^I exists, else `{}`."""
+        ts = train_state.intrinsic_critic_ts
+        if ts is None:
+            return {}
+        return {key: ts.params if params_only else ts}
 
     def save_params(self, train_state, path):
-        """Save worker + critic + manager + manager-critic params as msgpack."""
+        """Save worker + critic + manager + manager-critic (+ V^I) params."""
         params_dict = {
             "actor": train_state.actor_ts.params,
             "critic": train_state.critic_ts.params,
             "manager": train_state.manager_ts.params,
             "manager_critic": train_state.manager_critic_ts.params,
+            **self._intrinsic_tree(train_state, "intrinsic_critic", True),
         }
         with open(path, "wb") as f:
             f.write(to_bytes(params_dict))
@@ -391,6 +427,7 @@ class Feudal_MAPPO_JAX_Runner:
             "critic_ts": ts.critic_ts,
             "manager_ts": ts.manager_ts,
             "manager_critic_ts": ts.manager_critic_ts,
+            **self._intrinsic_tree(ts, "intrinsic_critic_ts", False),
             "rng": runner_state.rng,
             "eval_rng": eval_rng,
         }
@@ -405,6 +442,7 @@ class Feudal_MAPPO_JAX_Runner:
             "critic_ts": ts.critic_ts,
             "manager_ts": ts.manager_ts,
             "manager_critic_ts": ts.manager_critic_ts,
+            **self._intrinsic_tree(ts, "intrinsic_critic_ts", False),
             "rng": runner_state.rng,
             "eval_rng": eval_rng,
         }
@@ -418,6 +456,9 @@ class Feudal_MAPPO_JAX_Runner:
                     critic_ts=loaded["critic_ts"],
                     manager_ts=loaded["manager_ts"],
                     manager_critic_ts=loaded["manager_critic_ts"],
+                    intrinsic_critic_ts=loaded.get(
+                        "intrinsic_critic_ts", ts.intrinsic_critic_ts
+                    ),
                 ),
                 rng=loaded["rng"],
             ),
@@ -450,11 +491,12 @@ class Feudal_MAPPO_JAX_Runner:
             "critic": train_state.critic_ts.params,
             "manager": train_state.manager_ts.params,
             "manager_critic": train_state.manager_critic_ts.params,
+            **self._intrinsic_tree(train_state, "intrinsic_critic", True),
         }
         with open(path, "rb") as f:
             params_dict = from_bytes(target, f.read())
         print(f"Params loaded from {path}")
-        return train_state._replace(
+        restored = train_state._replace(
             actor_ts=train_state.actor_ts.replace(params=params_dict["actor"]),
             critic_ts=train_state.critic_ts.replace(params=params_dict["critic"]),
             manager_ts=train_state.manager_ts.replace(params=params_dict["manager"]),
@@ -462,6 +504,13 @@ class Feudal_MAPPO_JAX_Runner:
                 params=params_dict["manager_critic"]
             ),
         )
+        if "intrinsic_critic" in params_dict:
+            restored = restored._replace(
+                intrinsic_critic_ts=restored.intrinsic_critic_ts.replace(
+                    params=params_dict["intrinsic_critic"]
+                )
+            )
+        return restored
 
     def save_training_stats(self, stats_tracker, path):
         with open(path, "wb") as f:

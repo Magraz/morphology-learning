@@ -438,13 +438,18 @@ def test_detach_rule_holds_in_the_update():
     )
 
 
-def test_intrinsic_reward_fold_is_exact():
-    """reward(alpha) - reward(0) must equal exactly alpha * r^I.
+def test_intrinsic_stream_is_separate_and_exact():
+    """r^I lands in its OWN field, and never touches the extrinsic reward.
 
     Budget-independent: this pins the *arithmetic* of the intrinsic path (that it
-    is added to the right stream, unscaled elsewhere, and applied once), which a
-    learning curve could never isolate. It also checks alpha=0 is a true no-op —
-    the guard that keeps the intrinsic machinery inert in the default config.
+    is built once, unscaled, with its own truncation bootstrap, into its own
+    stream), which a learning curve could never isolate. It also checks alpha=0
+    is a true no-op — the guard that keeps the machinery inert by default.
+
+    The separation is the load-bearing part. r^I is ~0.155/step and near-flat
+    while the extrinsic reward is ~5e-05/step early, so adding the two together
+    hands essentially the whole gradient to r^I. They are only allowed to meet in
+    `ppo_update`, after each has been normalized to unit std.
     """
     from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward
 
@@ -452,14 +457,22 @@ def test_intrinsic_reward_fold_is_exact():
     traj0 = _collect(_config(intrinsic_coef=0.0))[3]
     traj1 = _collect(_config(intrinsic_coef=alpha))[3]
 
-    # Same seed and env => the rollouts are identical apart from the reward term
-    # (the intrinsic pass runs strictly post-scan, so it cannot alter behaviour
-    # within the rollout it is applied to).
+    # Same seed and env => the rollouts are identical (the intrinsic pass runs
+    # strictly post-scan, so it cannot alter behaviour within the rollout).
     assert jnp.allclose(traj0.goal, traj1.goal, atol=1e-6)
     assert jnp.allclose(traj0.state_latent, traj1.state_latent, atol=1e-6)
     assert jnp.allclose(traj0.action, traj1.action, atol=1e-6)
-    # ...and the manager's stream never sees the intrinsic term at all.
+    # The manager's stream never sees the intrinsic term at all...
     assert jnp.allclose(traj0.manager_reward, traj1.manager_reward, atol=1e-6)
+    # ...and neither does the worker's EXTRINSIC stream. This is the assertion
+    # that inverted when the reward-level fold was removed: it used to differ by
+    # exactly alpha * r^I, and must now be bit-identical.
+    assert jnp.array_equal(traj0.reward, traj1.reward), (
+        "extrinsic reward changed with alpha — the intrinsic term is being "
+        "folded into `reward` again instead of kept in its own stream"
+    )
+    # alpha=0 leaves the intrinsic stream as the zeros the scan built.
+    assert jnp.array_equal(traj0.intrinsic_reward, jnp.zeros_like(traj0.reward))
 
     done_a = jnp.broadcast_to(
         traj0.done[..., None].astype(jnp.float32), traj0.state_latent.shape[:-1]
@@ -467,11 +480,114 @@ def test_intrinsic_reward_fold_is_exact():
     r_int = worker_intrinsic_reward(
         traj0.state_latent, traj0.goal, HORIZON, done=done_a
     )
-    assert jnp.allclose(traj1.reward - traj0.reward, alpha * r_int, atol=1e-5), (
-        "worker reward delta != alpha * r^I; max err "
-        f"{float(jnp.max(jnp.abs((traj1.reward - traj0.reward) - alpha * r_int)))}"
+    # The stored stream is r^I plus its own truncation bootstrap (taken against
+    # V^I in-scan), and nothing else — in particular it is NOT scaled by alpha
+    # here; alpha is applied to the normalized advantage in `ppo_update`.
+    expected = r_int + traj1.intrinsic_bootstrap
+    assert jnp.allclose(traj1.intrinsic_reward, expected, atol=1e-5), (
+        "intrinsic stream != r^I + bootstrap; max err "
+        f"{float(jnp.max(jnp.abs(traj1.intrinsic_reward - expected)))}"
     )
     assert jnp.any(jnp.abs(r_int) > 1e-6), "r^I is identically zero — vacuous test"
     # r^I is a mean of cosines, so it is bounded; a violation means the mask
     # denominator or the averaging is wrong.
     assert float(jnp.max(jnp.abs(r_int))) <= 1.0 + 1e-5
+
+
+def test_alpha_zero_builds_no_intrinsic_critic():
+    """alpha=0 must stay a STATIC no-op, not a multiply-by-zero.
+
+    The intrinsic critic is what changes the msgpack checkpoint format, so if it
+    were built unconditionally every existing `feudal_a0` checkpoint would stop
+    resuming. `None` (an empty JAX pytree) is what keeps the slot free.
+    """
+    _, rs0, _, _, _, _ = _collect(_config(intrinsic_coef=0.0))
+    _, rs1, _, _, _, _ = _collect(_config(intrinsic_coef=0.5))
+    assert rs0.train_state.intrinsic_critic_ts is None
+    assert rs1.train_state.intrinsic_critic_ts is not None
+
+
+def test_alpha_is_a_gradient_fraction_not_a_reward_coefficient():
+    """The two streams meet as unit-std advantages, so alpha is the mix ratio.
+
+    Pins the property the whole redesign exists to establish: the combination
+    must be invariant to the RAW scale of r^I. Scaling the stored intrinsic
+    stream by 1000x must leave the combined advantage unchanged, because
+    normalization divides that factor straight back out. Under the old
+    reward-level fold the same 1000x would have swamped the extrinsic term
+    entirely — which is exactly how the measured failure happened.
+    """
+    from algorithms.feudal_mappo_jax.mappo import compute_gae, _annealed_alpha
+
+    config = _config(intrinsic_coef=0.5, intrinsic_anneal="none")
+    _, _, _, traj, boot, _ = _collect(config)
+
+    def combined(scale):
+        dones = traj.done.astype(jnp.float32)
+        adv_e, _ = compute_gae(
+            traj.reward, traj.value, dones, boot.worker,
+            config.gamma, config.gae_lambda,
+        )
+        adv_i, _ = compute_gae(
+            traj.intrinsic_reward * scale, traj.value_int * scale, dones,
+            boot.worker_int * scale, config.gamma, config.gae_lambda,
+        )
+        norm = lambda a: (a - a.mean(0)) / (a.std(0, ddof=1) + 1e-8)
+        alpha = _annealed_alpha(config, jnp.float32(0.0))
+        return norm(adv_e) + alpha * norm(adv_i)
+
+    assert jnp.allclose(combined(1.0), combined(1000.0), atol=1e-4), (
+        "combined advantage depends on the raw intrinsic scale — the per-stream "
+        "normalization is not being applied"
+    )
+
+
+def test_alpha_anneal_schedule():
+    """`linear` reaches exactly 0 at the end of training; `none` holds."""
+    from algorithms.feudal_mappo_jax.mappo import _annealed_alpha
+
+    lin = _config(intrinsic_coef=0.5, intrinsic_anneal="linear")
+    assert float(_annealed_alpha(lin, jnp.float32(0.0))) == pytest.approx(0.5)
+    assert float(_annealed_alpha(lin, jnp.float32(0.5))) == pytest.approx(0.25)
+    assert float(_annealed_alpha(lin, jnp.float32(1.0))) == pytest.approx(0.0)
+    # Clamped, so an overshooting progress cannot flip alpha negative.
+    assert float(_annealed_alpha(lin, jnp.float32(1.5))) == pytest.approx(0.0)
+
+    const = _config(intrinsic_coef=0.5, intrinsic_anneal="none")
+    assert float(_annealed_alpha(const, jnp.float32(1.0))) == pytest.approx(0.5)
+
+    with pytest.raises(ValueError, match="unknown intrinsic_anneal"):
+        _annealed_alpha(_config(intrinsic_anneal="bogus"), jnp.float32(0.0))
+
+
+def test_update_runs_and_moves_the_intrinsic_critic():
+    """End-to-end: the intrinsic path trains V^I and reports its diagnostics."""
+    config = _config(intrinsic_coef=0.5)
+    _, _, new_rs, traj, boot, update_fn = _collect(config)
+    updated_rs, losses = update_fn(new_rs, traj, boot, jnp.float32(0.0))
+
+    before = new_rs.train_state.intrinsic_critic_ts.params
+    after = updated_rs.train_state.intrinsic_critic_ts.params
+    moved = jax.tree.reduce(
+        lambda acc, x: acc or bool(x),
+        jax.tree.map(lambda a, b: bool(jnp.any(a != b)), before, after),
+        False,
+    )
+    assert moved, "V^I params did not move"
+    for key in (
+        "alpha_current",
+        "adv_ext_std_raw",
+        "adv_int_std_raw",
+        "intrinsic_explained_variance",
+        "intrinsic_value_loss",
+    ):
+        assert key in losses, f"missing diagnostic {key}"
+        assert jnp.ndim(losses[key]) == 0, f"{key} is not a scalar"
+    assert float(losses["alpha_current"]) == pytest.approx(0.5)
+
+    # ...and none of it appears at alpha=0, where the stats keys must be
+    # exactly what they were before the intrinsic stream existed.
+    _, _, new_rs0, traj0, boot0, update_fn0 = _collect(_config(intrinsic_coef=0.0))
+    _, losses0 = update_fn0(new_rs0, traj0, boot0)
+    for key in ("alpha_current", "adv_int_std_raw", "intrinsic_value_loss"):
+        assert key not in losses0

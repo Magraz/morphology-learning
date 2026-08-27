@@ -36,28 +36,42 @@ params:
   # the manager loss, so on a short-episode env a large c starves the manager
   # (watch `valid_fraction`).
   goal_horizon: 10
-  # alpha: weight of the worker's intrinsic reward. 0.0 leaves the intrinsic path
-  # inert — goals still condition the worker, but nothing rewards following them.
+  # alpha: the worker's intrinsic-reward weight, as a GRADIENT FRACTION. 0.0
+  # leaves the intrinsic path inert — goals still condition the worker, but
+  # nothing rewards following them — and is a STATIC no-op (no V^I is built and
+  # the checkpoint format is unchanged, so `feudal_a0` runs still resume).
   #
-  # CALIBRATED VALUE IS 0.5; the default is deliberately left OFF because the
-  # ablation that would justify flipping it needs a full-length run. Launch with
-  # `params.intrinsic_coef=0.5` to turn it on.
+  # The two streams are combined at the ADVANTAGE level, each normalized to unit
+  # std first: `adv = adv_ext + alpha * adv_int`. So alpha is the mixing ratio of
+  # the two gradient directions, NOT a coefficient on a reward.
   #
-  # How 0.5 was derived (mjx_16a_4o, measured — do NOT re-derive from a short
-  # run): |r^I| is ~0.152/step and near-constant, but the ENV reward at smoke
-  # budget is 6.2e-07/step, so the ratio is a division by zero and alpha cannot
-  # be scaled from a short run. The usable denominator comes from the converged
-  # mappo_jax baseline instead: eval return ~398-470 over max_steps=1024, i.e.
-  # ~0.39-0.46/step. alpha=0.5 puts 0.5*0.152 = 0.076 at ~17-19% of that, inside
-  # the intended 10-30% band.
+  # ⚠ THE OLD CALIBRATION HERE WAS WRONG IN KIND, and is kept below only as a
+  # record of the mistake. It derived alpha=0.5 by comparing alpha*|r^I| = 0.076
+  # against the CONVERGED mappo_jax baseline's ~0.39-0.46/step, reading 17-19%.
+  # That denominator is the ENDPOINT of learning. The rate that governs whether
+  # learning ever starts is the one the policy can currently reach — measured at
+  # ~5e-05/step — against which the same alpha is ~1500:1. As a reward
+  # coefficient, alpha=0.1 and alpha=0.5 were therefore BOTH ~300-1700x too
+  # large during the whole early phase, and both converged to a task-free fixed
+  # point (worker and manager climbing each other's cosine: `intrinsic_reward`
+  # 0.0002 -> 0.138 monotonically while env reward stayed at ~1e-3 for 1e8
+  # steps, on all three of mjx_16a_4o / _trunc / _partition, 3 seeds each).
+  # It is an absorbing state, not the transient exploration phase the old note
+  # assumed. No value in a 0/0.1/0.5 sweep escapes it — the smallest nonzero
+  # member is already ~300x too large.
   #
-  # ⚠ Known consequence, by construction: early in training the extrinsic reward
-  # really is ~0, so at alpha=0.5 the intrinsic term dominates the worker's
-  # objective by ~5 orders of magnitude until the policy starts moving boxes.
-  # That is FuN's intended exploration behaviour, not a bug — but it means the
-  # early learning curve is driven almost entirely by goal-following, and a
-  # sensible ablation is 0 / 0.1 / 0.5 rather than a single arm.
+  # Per-stream normalization removes the scale gap outright, so alpha now means
+  # what it reads as at any point in training. The arms live in
+  # conf/model/feudal_n01.yaml (0.1) and feudal_n05.yaml (0.5); the default stays
+  # OFF so `algorithm=feudal_mappo_jax model=feudal` is the no-intrinsic control.
+  #
+  # Watch `adv_ext_std_raw` / `adv_int_std_raw` in the training stats — they are
+  # the raw per-stream advantage scales, i.e. the gap the normalization absorbs.
   intrinsic_coef: 0.0
+  # "linear" decays alpha to exactly 0 across n_total_steps; "none" holds it.
+  # Annealing is what makes the ENDPOINT correct: at constant alpha that fraction
+  # of the worker's gradient points at a task-irrelevant objective forever.
+  intrinsic_anneal: linear
   manager_lr: 0.0003
   manager_val_coef: 0.5
   # The manager operates on a longer timescale than the worker, so this may

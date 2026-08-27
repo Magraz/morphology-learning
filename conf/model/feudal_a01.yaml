@@ -1,6 +1,19 @@
 # @package _global_
 # FeUdal intrinsic-reward ablation, alpha = 0.1. See conf/model/feudal_a0.yaml
 # for why the ablation axis is a model group rather than a bare param override.
+#
+# ⚠ HISTORICAL — DO NOT RE-RUN THIS GROUP. It named the old reward-level fold
+# (`reward += alpha * r^I`), and that code path no longer exists: alpha is now a
+# gradient fraction applied to a separately-normalized advantage stream. Since
+# this group only sets `intrinsic_coef`, re-running it would pick up the new
+# mechanism (and the inherited `intrinsic_anneal: linear`), making it identical
+# to `feudal_n01` — while overwriting `experiments/results/*/feudal_a01/`, the
+# only record of the old arm.
+#
+# The existing results under that path are the measured FAILURE of the reward
+# level fold (0-4 return against a ~470 ceiling on all three mjx_16a_4o envs,
+# 3 seeds each); keep them for comparison and use `model=feudal_n01` for new
+# runs. See conf/algorithm/feudal_mappo_jax.yaml for the diagnosis.
 defaults:
   - feudal
   - _self_

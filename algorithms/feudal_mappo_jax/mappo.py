@@ -36,23 +36,31 @@ from algorithms.feudal_mappo_jax.worker import bind_goal, init_worker
 
 
 class FeudalTrainState(NamedTuple):
-    """Immutable container for the four learned components.
+    """Immutable container for the learned components.
 
     ``actor_ts`` / ``critic_ts`` keep their flat-MAPPO names (and their position
     first) so ``ppo_update`` and the stats plumbing read unchanged; the worker IS
     the actor here, just goal-conditioned.
 
-    The manager gets its own critic rather than sharing the worker's: the worker's
-    critic predicts the *intrinsic-augmented* return under `gamma`, the manager's
-    the *extrinsic* return under `manager_gamma`. Different targets, different
-    value functions. (What ``manager.py`` rules out is writing another critic
-    *class* — this reuses ``MAPPOCritic``.)
+    Each reward stream gets its own value function, because each regresses a
+    different target: ``critic_ts`` the worker's *extrinsic* return under
+    `gamma`, ``manager_critic_ts`` the manager's under `manager_gamma`, and
+    ``intrinsic_critic_ts`` the *intrinsic* return under `gamma`. (What
+    ``manager.py`` rules out is writing another critic *class* — all three reuse
+    ``MAPPOCritic``.)
+
+    ``intrinsic_critic_ts`` is ``None`` unless ``intrinsic_coef != 0``. `None` is
+    a valid empty JAX pytree — the same trick the manager's `mlp` core uses for
+    its carry — so at alpha=0 the slot costs nothing, no extra critic is built,
+    and the msgpack checkpoint format is byte-for-byte what it was before the
+    intrinsic stream existed (existing `feudal_a0` runs still resume).
     """
 
     actor_ts: TrainState  # FeudalWorker (goal-conditioned)
-    critic_ts: TrainState  # worker value, always per-agent
+    critic_ts: TrainState  # worker value (extrinsic), always per-agent
     manager_ts: TrainState  # FeudalManager
     manager_critic_ts: TrainState  # V^M
+    intrinsic_critic_ts: TrainState | None = None  # V^I, only when alpha != 0
 
 
 # Back-compat alias: `run.py` and `trainer.py` refer to the train state by the
@@ -98,10 +106,13 @@ def create_train_state(
     The worker/critic RNG split is left exactly as the flat stack had it, and the
     manager keys are folded in separately, so worker and critic init are
     bit-identical to ``mappo_jax`` at the same seed — any divergence from the flat
-    baseline is then attributable to the goal columns, not to reseeding.
+    baseline is then attributable to the goal columns, not to reseeding. The
+    intrinsic critic's key is folded in under a *different* index for the same
+    reason: adding it must not perturb any pre-existing init.
     """
     rng_actor, rng_critic = jax.random.split(rng)
     rng_manager, rng_manager_critic = jax.random.split(jax.random.fold_in(rng, 1))
+    rng_intrinsic_critic = jax.random.fold_in(rng, 2)
 
     # The worker takes the raw goal width: `goal_embed_dim` (if set) is applied by
     # an internal bias-free Dense, so the module's input signature is goal_dim.
@@ -129,6 +140,19 @@ def create_train_state(
         rng_manager_critic, jnp.zeros(global_state_dim)
     )
 
+    # V^I: same shape as the worker's extrinsic critic (r^I is per-agent), but
+    # its own params and its own Adam — it regresses a different return.
+    # Built only when the intrinsic stream is live, so alpha=0 is a static no-op.
+    intrinsic_critic = None
+    intrinsic_critic_params = None
+    if config.intrinsic_coef != 0.0:
+        intrinsic_critic = MAPPOCritic(
+            hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs
+        )
+        intrinsic_critic_params = intrinsic_critic.init(
+            rng_intrinsic_critic, jnp.zeros(global_state_dim)
+        )
+
     def _tx(lr):
         return optax.chain(
             optax.clip_by_global_norm(config.grad_clip),
@@ -149,6 +173,15 @@ def create_train_state(
             apply_fn=manager_critic.apply,
             params=manager_critic_params,
             tx=_tx(config.manager_lr),
+        ),
+        intrinsic_critic_ts=(
+            None
+            if intrinsic_critic is None
+            else TrainState.create(
+                apply_fn=intrinsic_critic.apply,
+                params=intrinsic_critic_params,
+                tx=_tx(config.lr),
+            )
         ),
     )
 
@@ -218,6 +251,29 @@ def compute_gae(
 # ---------------------------------------------------------------------------
 
 
+def _annealed_alpha(config: MAPPOConfig, progress: jnp.ndarray) -> jnp.ndarray:
+    """alpha at this point in training. `progress` is a traced scalar in [0, 1].
+
+    "linear" decays to exactly 0 at the end of training so the converged policy
+    optimizes the true objective — with a constant alpha, that fraction of the
+    worker's gradient would permanently point at a task-irrelevant target.
+
+    `progress` MUST be traced (a jnp scalar). A python float would make it a
+    compile-time constant and retrigger jit compilation of the caller on every
+    update.
+    """
+    if config.intrinsic_anneal == "none":
+        return jnp.float32(config.intrinsic_coef)
+    if config.intrinsic_anneal == "linear":
+        return jnp.float32(config.intrinsic_coef) * jnp.clip(
+            1.0 - progress, 0.0, 1.0
+        )
+    raise ValueError(
+        f"unknown intrinsic_anneal: {config.intrinsic_anneal!r} "
+        "(expected 'linear' or 'none')"
+    )
+
+
 def ppo_update(
     train_state: ActorCriticTrainState,
     rng: jax.Array,
@@ -225,13 +281,24 @@ def ppo_update(
     last_value: jnp.ndarray,
     config: MAPPOConfig,
     discrete: bool,
+    last_value_int: jnp.ndarray | None = None,
+    progress: jnp.ndarray | None = None,
 ) -> Tuple[ActorCriticTrainState, dict]:
     """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
 
-    This is the WORKER's update. It touches only ``actor_ts``/``critic_ts``; the
-    two manager states ride through untouched (the manager is trained by
-    ``manager_update``, which cannot share this machinery — its objective needs
-    the time axis in order, which the shuffled minibatches destroy).
+    This is the WORKER's update. It touches ``actor_ts``/``critic_ts`` (and
+    ``intrinsic_critic_ts`` when the intrinsic stream is live); the two manager
+    states ride through untouched (the manager is trained by ``manager_update``,
+    which cannot share this machinery — its objective needs the time axis in
+    order, which the shuffled minibatches destroy).
+
+    **The two reward streams meet here, at the advantage level, and nowhere
+    else.** Extrinsic and intrinsic each get their own GAE and their own
+    normalization to unit std, and are then mixed as
+    ``adv = adv_ext + alpha_t * adv_int``. That makes alpha a gradient fraction
+    rather than a reward coefficient — the distinction the whole intrinsic path
+    turns on, since the raw streams differ in magnitude by 300-600x during early
+    training (see ``types.Params.intrinsic_coef``).
 
     Args:
         train_state: current FeudalTrainState
@@ -240,10 +307,20 @@ def ppo_update(
         last_value: (n_envs, n_agents) worker bootstrap (GAE masks dones internally)
         config: hyperparameters
         discrete: action space type
+        last_value_int: (n_envs, n_agents) intrinsic bootstrap; required iff
+            ``config.intrinsic_coef != 0``
+        progress: traced scalar in [0, 1], the fraction of training elapsed, used
+            to anneal alpha. Defaults to 0.0 (= full alpha).
 
     Returns:
         updated train_state, loss metrics dict
     """
+    # Static python flag: at alpha == 0 none of the intrinsic machinery below is
+    # traced at all, so that path is byte-identical to the pre-intrinsic code.
+    use_intrinsic = config.intrinsic_coef != 0.0
+    if progress is None:
+        progress = jnp.float32(0.0)
+    alpha_t = _annealed_alpha(config, progress)
     n_steps, n_envs, n_agents = trajectory.obs.shape[:3]
     obs_dim = trajectory.obs.shape[3]
     goal_dim = trajectory.pooled_goal.shape[-1]
@@ -265,12 +342,48 @@ def ppo_update(
         jnp.var(returns, ddof=1) + 1e-8
     )
 
-    # Advantage normalization per stream over the rollout steps: per-env for the
-    # team reward, per-(env, agent) under per-agent rewards — which is exactly
-    # vanilla's per-(env, agent) normalization.
-    adv = (advantages - advantages.mean(axis=0)) / (
-        advantages.std(axis=0, ddof=1) + 1e-8
-    )
+    def _normalize(a):
+        """Center and scale to unit std over the rollout steps.
+
+        Per-env for the team reward, per-(env, agent) under per-agent rewards —
+        which is exactly vanilla's per-(env, agent) normalization.
+        """
+        return (a - a.mean(axis=0)) / (a.std(axis=0, ddof=1) + 1e-8)
+
+    adv = _normalize(advantages)
+
+    # --- Intrinsic stream: its own GAE, its own normalization, mixed in at the
+    # advantage level. `compute_gae` is shape-agnostic, so it is reused as-is.
+    int_metrics = {}
+    if use_intrinsic:
+        int_advantages, int_returns = compute_gae(
+            trajectory.intrinsic_reward,
+            trajectory.value_int,
+            dones,
+            last_value_int,
+            config.gamma,
+            config.gae_lambda,
+        )
+        int_explained_variance = 1.0 - jnp.var(
+            int_returns - trajectory.value_int, ddof=1
+        ) / (jnp.var(int_returns, ddof=1) + 1e-8)
+        adv_int = _normalize(int_advantages)
+        # Both terms are unit-std here, so alpha_t is exactly the mixing ratio of
+        # the two gradient directions.
+        adv = adv + alpha_t * adv_int
+        int_metrics = {
+            "alpha_current": alpha_t,
+            # The RAW (pre-normalization) advantage scales of the two streams.
+            # This pair is the diagnostic that reads the defect this whole path
+            # exists to fix: it shows the magnitude gap that the per-stream
+            # normalization is correcting. If they are within an order of
+            # magnitude of each other, normalization is not doing much work; if
+            # they differ by ~100x or more, a reward-level fold would be handing
+            # essentially the entire gradient to the intrinsic term.
+            "adv_ext_std_raw": advantages.std(ddof=1),
+            "adv_int_std_raw": int_advantages.std(ddof=1),
+            "intrinsic_explained_variance": int_explained_variance,
+        }
 
     # --- Timestep-centric flattening: one sample per (step, env) ---
     total_ts = n_steps * n_envs
@@ -293,6 +406,12 @@ def ppo_update(
     else:
         adv_ts = adv.reshape(total_ts)
         ret_ts = returns.reshape(total_ts)
+    # V^I's regression target. Always per-agent (r^I is), independently of
+    # `per_agent` — which in this stack is True anyway, since the worker's reward
+    # is broadcast to the agent axis in the collector.
+    int_ret_ts = (
+        int_returns.reshape(total_ts, n_agents) if use_intrinsic else None
+    )
 
     # minibatch_size agent-samples => minibatch_size // n_agents timesteps
     ts_minibatch_size = max(
@@ -306,7 +425,7 @@ def ppo_update(
         perm = jax.random.permutation(shuffle_rng, total_ts)
 
         def _minibatch_step(carry, mb_idx):
-            actor_ts, critic_ts = carry
+            actor_ts, critic_ts, int_critic_ts = carry
             start = mb_idx * ts_minibatch_size
             mb_ids = jax.lax.dynamic_slice(perm, (start,), (ts_minibatch_size,))
 
@@ -381,6 +500,26 @@ def ppo_update(
             )(critic_ts.params)
             critic_ts = critic_ts.apply_gradients(grads=critic_grads)
 
+            # --- V^I loss: same regression, different stream. Its target is the
+            # intrinsic return, so it needs its own params and its own Adam.
+            if use_intrinsic:
+                mb_int_returns = int_ret_ts[mb_ids]
+
+                def int_critic_loss_fn(int_critic_params):
+                    values = int_critic_ts.apply_fn(int_critic_params, mb_gs)
+                    sq = (values - mb_int_returns) ** 2
+                    v_loss = (sq * mb_active_pa).sum() / jnp.maximum(
+                        mb_active_pa.sum(), 1.0
+                    )
+                    return config.val_coef * v_loss, v_loss
+
+                (_, int_value_loss), int_grads = jax.value_and_grad(
+                    int_critic_loss_fn, has_aux=True
+                )(int_critic_ts.params)
+                int_critic_ts = int_critic_ts.apply_gradients(grads=int_grads)
+            else:
+                int_value_loss = jnp.float32(0.0)
+
             # Stats mirror vanilla: raw component losses + the combined total
             losses = {
                 "total_loss": (
@@ -391,17 +530,28 @@ def ppo_update(
                 "policy_loss": policy_loss,
                 "value_loss": value_loss,
                 "entropy_loss": entropy_loss,
+                "intrinsic_value_loss": int_value_loss,
             }
-            return (actor_ts, critic_ts), losses
+            return (actor_ts, critic_ts, int_critic_ts), losses
 
-        (actor_ts, critic_ts), mb_losses = jax.lax.scan(
+        (actor_ts, critic_ts, int_critic_ts), mb_losses = jax.lax.scan(
             _minibatch_step,
-            (train_state.actor_ts, train_state.critic_ts),
+            (
+                train_state.actor_ts,
+                train_state.critic_ts,
+                train_state.intrinsic_critic_ts,
+            ),
             jnp.arange(n_minibatches),
         )
         # `_replace` rather than a fresh construction: the two manager states are
-        # not part of this update and must ride through untouched.
-        new_ts = train_state._replace(actor_ts=actor_ts, critic_ts=critic_ts)
+        # not part of this update and must ride through untouched. At alpha=0
+        # `intrinsic_critic_ts` is None on both sides — an empty pytree that rides
+        # the scan carry for free.
+        new_ts = train_state._replace(
+            actor_ts=actor_ts,
+            critic_ts=critic_ts,
+            intrinsic_critic_ts=int_critic_ts,
+        )
         return (new_ts, rng), mb_losses
 
     (train_state, rng), epoch_losses = jax.lax.scan(
@@ -416,6 +566,11 @@ def ppo_update(
     mean_losses["worker_goal_column_ratio"] = _goal_column_ratio(
         train_state.actor_ts.params, obs_dim
     )
+    if not use_intrinsic:
+        # The per-minibatch placeholder carries no information at alpha=0; drop
+        # it so the stats keys stay exactly what they were.
+        mean_losses.pop("intrinsic_value_loss", None)
+    mean_losses.update(int_metrics)
 
     return train_state, mean_losses
 

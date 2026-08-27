@@ -32,9 +32,25 @@ class Params:
     # (transition cosine), how many goals the worker's conditioning pools over,
     # and the dilation radius `r` of the manager's LSTM core.
     goal_horizon: int = 10
-    # alpha: weight of the worker's intrinsic reward relative to the env reward.
+    # alpha: the worker's intrinsic-reward weight, as a GRADIENT FRACTION.
+    #
+    # The two streams are combined at the ADVANTAGE level, each normalized to
+    # unit std first: `adv = adv_ext + alpha * adv_int`. So alpha is the mixing
+    # ratio of the two gradient directions, NOT a reward coefficient.
+    #
+    # This distinction is the whole point. As a reward coefficient alpha was
+    # unusable: r^I is ~0.155/step and near-constant, while the extrinsic reward
+    # is ~5e-05/step until the policy starts delivering boxes, so even alpha=0.1
+    # put 300-600x more magnitude on the intrinsic term during exactly the window
+    # where learning had to start. Both 0.1 and 0.5 then converged to a
+    # task-free fixed point (worker and manager climbing each other's cosine)
+    # with the env reward pinned at ~1e-3 for 1e8 steps. Normalizing per stream
+    # removes the scale gap entirely, so alpha means what it reads as at any
+    # point in training.
+    #
     # 0.0 makes the whole intrinsic path inert (the goals still condition the
-    # worker, but nothing rewards following them).
+    # worker, but nothing rewards following them) and is a STATIC no-op: no
+    # intrinsic critic is built and the checkpoint format is unchanged.
     intrinsic_coef: float = 0.0
     # The manager is a separate optimization problem (its own params, its own
     # value function, no importance ratio), so it gets its own lr / value coef /
@@ -52,6 +68,15 @@ class Params:
     # gradient steps per update, so sharing n_manager_epochs=1 leaves V^M ~50x
     # undertrained and `manager_explained_variance` pinned negative.
     n_manager_critic_epochs: int = 8
+    # Schedule for alpha over training: "linear" decays it to 0 across
+    # n_total_steps, "none" holds it constant.
+    #
+    # Annealing exists because alpha is now a GRADIENT FRACTION (see the
+    # `intrinsic_coef` note above): a constant alpha would leave that fraction of
+    # the worker's gradient permanently pointing at a task-irrelevant objective,
+    # biasing the converged policy. Decaying to 0 makes the endpoint optimal for
+    # the true objective while keeping the early exploration pressure.
+    intrinsic_anneal: str = "linear"
 
 
 @dataclass
@@ -106,12 +131,17 @@ class MAPPOConfig:
 
     # ---- FeUdal ----
     # NOTE on the worker critic: unlike mappo_jax it is ALWAYS per-agent, because
-    # the intrinsic reward is inherently per-agent ((T,E,N)) and is added to the
-    # env reward. So the feudal `intrinsic_coef=0` arm is still not numerically
-    # identical to mappo_jax — the flat baseline is `algorithm=mappo_jax`.
+    # the intrinsic reward is inherently per-agent ((T,E,N)) and shares the
+    # worker's advantage. So the feudal `intrinsic_coef=0` arm is still not
+    # numerically identical to mappo_jax — the flat baseline is
+    # `algorithm=mappo_jax`. It regresses the EXTRINSIC return only; the
+    # intrinsic return has its own critic (`intrinsic_critic_ts`) whenever
+    # alpha != 0.
     goal_dim: int = 16
     goal_horizon: int = 10
+    # Gradient fraction, not a reward coefficient — see `Params.intrinsic_coef`.
     intrinsic_coef: float = 0.0
+    intrinsic_anneal: str = "linear"
     manager_lr: float = 3e-4
     manager_val_coef: float = 0.5
     manager_gamma: float = 0.99
@@ -166,9 +196,30 @@ class Transition(NamedTuple):
     manager_value: jax.Array
     # The manager's own reward stream: the extrinsic reward plus a truncation
     # bootstrap taken against V^M, NOT against the worker's critic. It is a
-    # separate field because `reward` carries the worker's bootstrap (and, once
-    # alpha > 0, the intrinsic term), neither of which the manager should see.
+    # separate field because `reward` carries the worker's bootstrap, which the
+    # manager should not see.
     manager_reward: jax.Array
+
+    # ---- Intrinsic stream (all zeros when intrinsic_coef == 0) ----
+    # FuN's r^I plus its own truncation bootstrap, (n_envs, n_agents). A SEPARATE
+    # stream, never folded into `reward`: it gets its own critic, its own GAE and
+    # its own advantage normalization, and only meets the extrinsic signal at the
+    # advantage level in `ppo_update`. Folding it into the reward instead made
+    # the combination a contest of raw magnitudes, which the intrinsic term won
+    # by 300-600x — see `Params.intrinsic_coef`.
+    #
+    # Filled post-scan (r^I looks *backwards* over `goal_horizon` steps, so it is
+    # a whole-trajectory quantity the scan cannot produce).
+    intrinsic_reward: jax.Array
+    # V^I at act time, (n_envs, n_agents) — mirrors `value` for the intrinsic
+    # stream. Always per-agent, as r^I is.
+    value_int: jax.Array
+    # gamma * truncated * V^I(s_next), (n_envs, n_agents), computed IN the scan
+    # (it needs the pre-reset successor state) and added to r^I post-scan. Stored
+    # as the bootstrap term rather than as `truncated` so the intrinsic stream
+    # gets the same treatment the extrinsic one already gets inline, against its
+    # OWN value function.
+    intrinsic_bootstrap: jax.Array
 
 
 class Bootstrap(NamedTuple):
@@ -176,8 +227,10 @@ class Bootstrap(NamedTuple):
 
     Replaces the bare `last_value` of the flat stack: the worker and the manager
     run GAE over different reward streams with different discounts, so each needs
-    its own bootstrap.
+    its own bootstrap. The worker's intrinsic stream is a third such stream.
     """
 
     worker: jax.Array  # (n_envs, n_agents)
     manager: jax.Array  # (n_envs,) | (n_envs, n_agents)
+    # (n_envs, n_agents) — V^I at the final state. Zeros when alpha == 0.
+    worker_int: jax.Array

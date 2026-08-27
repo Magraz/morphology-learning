@@ -73,6 +73,9 @@ def make_train(config: MAPPOConfig, env):
     # post-collect from logged snapshots + the *next* window's proposals.
     from environments.mjx_suite.macro_wrapper import ALIGNED_WINDOWED_DIFFERENCE_REWARDS
     aligned = getattr(env, "reward_mode", "") == ALIGNED_WINDOWED_DIFFERENCE_REWARDS
+    # Static flag: at alpha=0 no intrinsic critic exists, no r^I is computed, and
+    # the whole path below is skipped at trace time — so that arm is unchanged.
+    use_intrinsic = config.intrinsic_coef != 0.0
 
     if not config.parameter_sharing:
         raise NotImplementedError(
@@ -129,6 +132,18 @@ def make_train(config: MAPPOConfig, env):
             train_state.manager_critic_ts.params, global_state
         )
 
+    def _values_int(train_state, global_state):
+        """V^I — the intrinsic stream's own value function.
+
+        Zeros when the intrinsic path is off, so the callers below need no
+        branch and the stored fields keep a stable shape.
+        """
+        if not use_intrinsic:
+            return jnp.zeros(global_state.shape[:-1] + (n_agents,))
+        return train_state.intrinsic_critic_ts.apply_fn(
+            train_state.intrinsic_critic_ts.params, global_state
+        )
+
     def _manager_forward(train_state, m_carry, global_state):
         return train_state.manager_ts.apply_fn(
             train_state.manager_ts.params, m_carry, global_state
@@ -174,6 +189,7 @@ def make_train(config: MAPPOConfig, env):
 
         values = _values(train_state, global_state)
         manager_values = _manager_values(train_state, global_state)
+        values_int = _values_int(train_state, global_state)
         actions, log_probs = _actor_forward(
             train_state, obs, pooled_goal, action_rng, deterministic=False
         )
@@ -195,14 +211,22 @@ def make_train(config: MAPPOConfig, env):
         # must value the *real* successor here, before the reset, and fold the
         # bootstrap into the reward (SB3-style). GAE's own `not_done` bootstrap
         # term is then correctly 0 at this step, avoiding a double count.
-        # Both learners need this, against their OWN value function and discount:
-        # the worker critic predicts the intrinsic-augmented return, V^M the
-        # extrinsic one, so bootstrapping the manager stream off the worker's
-        # critic would be simply the wrong number.
+        # EVERY stream needs this, against its OWN value function and discount:
+        # the worker critic predicts the extrinsic return, V^M the same quantity
+        # under manager_gamma, V^I the intrinsic one. Bootstrapping any of them
+        # off another's critic would be simply the wrong number.
         next_gs = next_obs.reshape(config.n_envs, -1)
         trunc_f = truncated.astype(jnp.float32)
         next_value = _values(train_state, next_gs)  # (E, N), always per-agent
         next_m_value = _manager_values(train_state, next_gs)
+
+        # The intrinsic stream's truncation bootstrap. Computed HERE because it
+        # needs the pre-reset successor `next_gs`, but applied post-scan, where
+        # r^I itself is formed — hence it is carried as its own field rather than
+        # folded in now.
+        intrinsic_bootstrap = (
+            config.gamma * trunc_f[:, None] * _values_int(train_state, next_gs)
+        )
 
         # The manager's stream is the RAW extrinsic reward: scalar under a dense
         # env, per-agent under difference rewards — which is exactly the condition
@@ -211,9 +235,10 @@ def make_train(config: MAPPOConfig, env):
         m_trunc_f = trunc_f[:, None] if next_m_value.ndim > 1 else trunc_f
         manager_reward = reward + config.manager_gamma * m_trunc_f * next_m_value
 
-        # The worker's stream is per-agent because the intrinsic term (added
-        # post-scan) is. A scalar env reward must be broadcast EXPLICITLY:
-        # (E,) + (E,N) right-aligns E against N and RAISES at E=32/N=16.
+        # The worker's stream is per-agent because it shares an advantage with
+        # the intrinsic term, which is. A scalar env reward must be broadcast
+        # EXPLICITLY: (E,) + (E,N) right-aligns E against N and RAISES at
+        # E=32/N=16.
         if reward.ndim == 1:
             reward = jnp.broadcast_to(reward[:, None], (config.n_envs, n_agents))
         reward = reward + config.gamma * trunc_f[:, None] * next_value
@@ -277,6 +302,11 @@ def make_train(config: MAPPOConfig, env):
             state_latent=state_latent,
             manager_value=manager_values,
             manager_reward=manager_reward,
+            # Filled post-scan (r^I looks backwards over `goal_horizon` steps);
+            # zeros here so the field has a stable shape inside the scan.
+            intrinsic_reward=jnp.zeros((config.n_envs, n_agents)),
+            value_int=values_int,
+            intrinsic_bootstrap=intrinsic_bootstrap,
         )
         carry = (train_state, next_env_state, next_obs, rng, m_carry, goal_hist)
         if aligned:
@@ -319,7 +349,7 @@ def make_train(config: MAPPOConfig, env):
         return trajectory._replace(reward=reward)
 
     def _apply_intrinsic_reward(trajectory):
-        """Fold FuN's intrinsic reward into the worker's stream, post-scan.
+        """Build FuN's intrinsic reward stream, post-scan.
 
         Follows the same post-collect-rewrite pattern as
         ``_apply_aligned_rewards``: r^I_t looks *backwards* over `c` steps, so it
@@ -327,6 +357,15 @@ def make_train(config: MAPPOConfig, env):
         ``worker_intrinsic_reward`` detaches both arguments — this is a reward,
         i.e. data, and leaving it attached would also backprop the worker's
         objective into the manager, which FuN explicitly rules out.
+
+        **It is written to its own field, NOT added to `reward`.** The two
+        streams stay separate all the way to ``ppo_update``, where each is run
+        through its own critic and GAE, normalized to unit std, and only then
+        mixed as `adv_ext + alpha * adv_int`. Folding here instead made the
+        combination a contest of raw magnitudes, and r^I (~0.155/step, flat)
+        outweighed the extrinsic reward (~5e-05/step until boxes start moving) by
+        300-600x through exactly the window where learning had to start — which
+        drove both alpha=0.1 and alpha=0.5 into a task-free fixed point.
         """
         # `done` is (T, E); the helpers require the FULL leading shape of the
         # cosine, (T, E, N) — a partially-shaped mask used to broadcast into
@@ -338,8 +377,10 @@ def make_train(config: MAPPOConfig, env):
         r_int = worker_intrinsic_reward(
             trajectory.state_latent, trajectory.goal, horizon, done=done_a
         )  # (T, E, N)
+        # The truncation bootstrap was computed in-scan against V^I (it needs the
+        # pre-reset successor state); add it here, where the stream is formed.
         return trajectory._replace(
-            reward=trajectory.reward + config.intrinsic_coef * r_int
+            intrinsic_reward=r_int + trajectory.intrinsic_bootstrap
         ), r_int
 
     @jax.jit
@@ -368,10 +409,10 @@ def make_train(config: MAPPOConfig, env):
             trajectory = scan_out
 
         # Static python guard: alpha=0 skips the work entirely and leaves the
-        # worker's stream exactly as the scan built it.
+        # intrinsic stream as the zeros the scan built.
         mean_intrinsic = jnp.float32(0.0)
         abs_intrinsic = jnp.float32(0.0)
-        if config.intrinsic_coef != 0.0:
+        if use_intrinsic:
             trajectory, r_int = _apply_intrinsic_reward(trajectory)
             mean_intrinsic = r_int.mean()
             # The SIGNED mean cancels (cosines are symmetric about 0) and can sit
@@ -385,6 +426,7 @@ def make_train(config: MAPPOConfig, env):
         last_value = Bootstrap(
             worker=_values(train_state, last_gs),
             manager=_manager_values(train_state, last_gs),
+            worker_int=_values_int(train_state, last_gs),
         )
 
         rollout_stats = {
@@ -407,7 +449,19 @@ def make_train(config: MAPPOConfig, env):
     # ------------------------------------------------------------------ update
 
     @jax.jit
-    def update_fn(runner_state: RunnerState, trajectory, last_value: Bootstrap):
+    def update_fn(
+        runner_state: RunnerState,
+        trajectory,
+        last_value: Bootstrap,
+        progress: jax.Array = jnp.float32(0.0),
+    ):
+        """One update. `progress` is the fraction of training elapsed, in [0, 1],
+        and anneals alpha inside ``ppo_update``.
+
+        It MUST be passed as a traced jnp scalar — a python float would be a
+        compile-time constant and would retrigger compilation every update. The
+        0.0 default (= full alpha) keeps callers that do not anneal working.
+        """
         train_state, rng = runner_state
         rng, update_rng = jax.random.split(rng)
         # Worker (PPO) and manager (transition PG) touch disjoint parameters and
@@ -415,7 +469,14 @@ def make_train(config: MAPPOConfig, env):
         # manager runs second so its diagnostics describe the goals the worker
         # was actually just updated against.
         train_state, losses = ppo_update(
-            train_state, update_rng, trajectory, last_value.worker, config, discrete
+            train_state,
+            update_rng,
+            trajectory,
+            last_value.worker,
+            config,
+            discrete,
+            last_value_int=last_value.worker_int,
+            progress=progress,
         )
         train_state, m_losses = manager_update(
             train_state,

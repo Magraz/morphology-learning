@@ -1,0 +1,32 @@
+# @package _global_
+# FeUdal, NORMALIZED intrinsic stream, alpha_0 = 0.1, linearly annealed to 0.
+#
+# The `n` prefix distinguishes these from the `feudal_a*` arms: same alpha
+# values, but alpha means something different now. In `feudal_a01`/`feudal_a05`
+# it was a REWARD coefficient (r^I folded straight into the worker's reward); it
+# is now a GRADIENT FRACTION — extrinsic and intrinsic advantages are each
+# normalized to unit std and mixed as `adv_ext + alpha * adv_int`.
+#
+# Why the old arms had to be replaced rather than retuned: r^I is ~0.155/step and
+# near-flat, while the extrinsic reward is ~5e-05/step until the policy starts
+# delivering boxes. As a reward coefficient even alpha=0.1 therefore put 300-600x
+# more magnitude on the intrinsic term through exactly the window where learning
+# had to start, and both 0.1 and 0.5 converged to a task-free fixed point (worker
+# and manager climbing each other's cosine) with env reward pinned near 1e-3 for
+# 1e8 steps. No value in a 0/0.1/0.5 sweep escapes that, because the smallest
+# nonzero member is already ~300x too large. Per-stream normalization removes the
+# scale gap outright.
+#
+# The anneal to 0 is what makes the ENDPOINT correct: at constant alpha, that
+# fraction of the worker's gradient would permanently point at a task-irrelevant
+# objective. Early exploration pressure is kept, asymptotic bias is not.
+#
+# Read `adv_ext_std_raw` / `adv_int_std_raw` in the training stats to see the raw
+# scale gap the normalization is absorbing, and `alpha_current` for the schedule.
+defaults:
+  - feudal
+  - _self_
+
+params:
+  intrinsic_coef: 0.1
+  intrinsic_anneal: linear

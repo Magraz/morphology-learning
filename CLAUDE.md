@@ -935,8 +935,22 @@ drop-in comparable:
   `run.py` has one `elif` per supported env group
   (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX`), each passing its
   constructor arguments explicitly — deliberately not a shared kwargs helper.
-  Note this means an `env:` key is only reachable where a branch names it:
-  **`max_steps` is still forwarded by no branch.**
+  This means an `env:` key is only reachable where a branch names it.
+- **`env.max_steps` is now wired** (all three branches, in **both**
+  `mappo_jax/run.py` and its `feudal_mappo_jax` copy, which must stay in sync).
+  It is the enabler for a time-budget arm — the untried knob that would forbid
+  the sequential swarm strategy the drift and partition arms both failed to
+  suppress. No env group declares it today, so every group still gets the
+  constructor default of 1024 and **no existing arm changes**.
+  - ⚠ **It must be forwarded conditionally, via `optional_env_kwargs`, and this
+    is easy to re-break.** A bare `max_steps=env_config.get("max_steps")` passes
+    `None` for every group that omits the key, and `None` does **not** fall back
+    to the constructor default — it overwrites it, and the first `t >=
+    self.max_steps` raises `TypeError: '>=' not supported between instances of
+    'BatchTracer' and 'NoneType'` inside the collect scan. Since no group
+    declares `max_steps`, that form breaks **every** `mappo_jax` and
+    `feudal_mappo_jax` run, not an obscure one. Same trap for any future
+    optional env key.
 - **`env.coupling_def` is wired** (all three branches — bare `MultiBoxPushMJX`,
   `MultiBoxMultiGoalPushMJX`, and the macro wrapper's base env — in **both**
   `mappo_jax/run.py` and its `feudal_mappo_jax` copy, which must stay in sync).
@@ -1251,28 +1265,75 @@ terminates), so a large `c` starves the manager. Watch it when changing `c`.
   on); agent-major flattening pairs each agent's obs with its own goal; and the
   **PPO ratio is exactly 1** before any update. Run:
   `uv run pytest algorithms/tests/test_feudal_seams.py -q`
-### Intrinsic reward (`intrinsic_coef`) — implemented, calibrated, shipped OFF
+### Intrinsic reward (`intrinsic_coef`) — DUAL ADVANTAGE STREAMS, shipped OFF
 
-The worker's FuN intrinsic reward `r^I` is wired (post-scan, following
-`_apply_aligned_rewards`' precedent) and runs end-to-end, but **`intrinsic_coef`
-defaults to 0.0**: the arm that would justify turning it on is a learning-curve
-ablation, which is not judgeable at smoke budget.
+**alpha is a GRADIENT FRACTION, not a reward coefficient.** The extrinsic and
+intrinsic streams each get their own critic, their own GAE and their own
+normalization to unit std, and meet only in `ppo_update` as
+`adv = adv_ext + alpha_t * adv_int`. `intrinsic_coef` still defaults to 0.0
+(the no-intrinsic control); the live arms are `conf/model/feudal_n01.yaml`
+(alpha=0.1) and `feudal_n05.yaml` (0.5), both with `intrinsic_anneal: linear`.
 
-- **alpha cannot be calibrated from a short run, and it is worth knowing why.**
-  `|r^I|` is measurable at any budget — ~0.152/step on `mjx_16a_4o`, tightly
-  ranged [0.141, 0.157], since it depends only on the `(s, g)` geometry. The
-  *extrinsic* reward is not: at 65k steps it is **6.2e-07/step**, so the
-  intrinsic/extrinsic ratio is a division by zero. The usable denominator comes
-  from the **already-converged `mappo_jax` baseline**: eval return 398–470 over
-  `max_steps=1024` ⇒ ~0.39–0.46/step. That puts **alpha = 0.5** at
-  `0.5*0.152 = 0.076` ≈ **17–19%** of converged extrinsic, inside the intended
-  10–30% band. Recorded in `conf/algorithm/feudal_mappo_jax.yaml`; launch with
-  `params.intrinsic_coef=0.5`.
-- **⚠ By construction the intrinsic term dominates early.** Since the extrinsic
-  reward really is ~0 until the policy moves boxes, at alpha=0.5 the worker's
-  objective is ~5 orders of magnitude intrinsic for the whole early phase. That
-  is FuN's intended exploration pressure, not a bug, but it means an ablation
-  should sweep `params.intrinsic_coef=0,0.1,0.5` rather than run one arm.
+- **⚠ The `feudal_a01` / `feudal_a05` arms are DEAD RUNS — do not cite them as
+  evidence about hierarchy.** They used the old reward-level fold
+  (`reward += alpha * r^I`) and scored **0–4** against a ~470 ceiling on all
+  three of `mjx_16a_4o` / `_trunc` / `_partition`, 3 seeds each. Cause, measured:
+  `r^I` is ~0.155/step and near-flat while the extrinsic reward is
+  **~5e-05/step** until boxes start moving, so even alpha=0.1 put **300–600×**
+  (alpha=0.5: **1100–1700×**) more magnitude on the intrinsic term through
+  exactly the window where learning had to start — the alpha=0 arm's
+  `train_reward` climbs 7.9e-05 → 3.8e-03 → 0.122 over 3e5 → 1e6 → 5e6 steps,
+  and the alpha>0 arms sat frozen at ~5e-05 straight through it.
+- **The failure was an absorbing state, not a transient exploration phase.**
+  `r^I = d_cos(s_t − s_{t−i}, g_{t−i})` uses the manager's own outputs, and the
+  manager's objective (`mappo.py`, `-mean(cos * m_adv)`) is the *same cosine*, so
+  worker and manager raise it together **through the environment** — no gradient
+  crosses the detach, which is why FuN's detach rule does not block it. Measured
+  over the full 1e8 steps: `d_cos_mean` 0.0003 → 0.125 and `intrinsic_reward`
+  0.0002 → 0.138, monotone, with 8× headroom still unspent at the end, while task
+  reward stayed at ~1e-3. Three effects compound: advantage normalization makes
+  it a **variance-share** contest (not an additive bonus); `r^I` is trivially
+  climbable where box delivery is not; and it never saturates.
+- **The old calibration was wrong in kind, and no value in a 0/0.1/0.5 sweep
+  could have worked.** It divided by the *converged* baseline rate (~0.4/step)
+  and read a reassuring 17–19%. The rate that governs whether learning *starts*
+  is ~5e-05/step, against which the same alpha is ~1500:1 — so the smallest
+  nonzero member of that sweep was already ~300× too large.
+- **Anneal (`intrinsic_anneal`)**: `"linear"` (default) decays alpha to exactly 0
+  across `n_total_steps`; `"none"` holds it. Required for asymptotic correctness
+  — at constant alpha that fraction of the worker's gradient points at a
+  task-irrelevant objective forever. `progress` must reach `update_fn` as a
+  **traced** jnp scalar (a python float recompiles the jitted update every
+  iteration); it is derived from `update / num_updates`, so resume is correct for
+  free. `alpha_current` is logged.
+  - ⚠ The schedule is relative to the **current** `n_total_steps`, so *extending*
+    a finished run restarts the decay partway rather than continuing it. Verified:
+    a 196608-step run annealed 0.1 → 0.00104, and resuming it with
+    `n_total_steps=393216` picked up at `0.1*(1 − 96/192) = 0.05` and decayed to
+    0.00052. Each run's schedule is internally exact; the seam is a step. Only
+    matters if you extend an intrinsic arm — set `intrinsic_anneal: none` for the
+    extension if you need a continuous schedule.
+- **alpha=0 is a STATIC no-op**, gated on a python-level `config.intrinsic_coef
+  != 0.0`: no `intrinsic_critic_ts` is built (it is `None`, a valid empty JAX
+  pytree, like the mlp core's carry), no `r^I` is computed, and the msgpack
+  format is unchanged — **existing `feudal_a0` checkpoints still resume**
+  (verified against `mjx_16a_4o/feudal_a0/1`). Verified **bit-identical** to the
+  pre-change code across the rollout, both bootstraps, all 18 loss keys and the
+  post-update actor/critic/manager params (StubEnv, one seed; the StubEnv is pure
+  CPU JAX so unlike MJX it *is* reproducible across processes — the comparison
+  was run in two git worktrees).
+- **New diagnostics** in `ppo_update`'s metrics: `alpha_current`,
+  **`adv_ext_std_raw` / `adv_int_std_raw`** (the raw, pre-normalization advantage
+  scales — the pair that reads the defect this path exists to fix),
+  `intrinsic_explained_variance`, `intrinsic_value_loss`. Note the *advantage*
+  gap is much smaller than the *reward* gap (a smoke run measured 0.30 vs 0.79 at
+  init) because the critic centers the extrinsic stream — but it widens as the
+  critic improves (0.0067 vs 0.78 by the end of that run, ~116:1), which is
+  precisely why the normalization has to be per-stream and permanent.
+- `MAPPOCritic` is reused for V^I (writing another critic *class* is what
+  `manager.py` rules out); it is keyed off `jax.random.fold_in(rng, 2)` so adding
+  it perturbs no pre-existing init. There are now **five** msgpack sites in
+  `run.py`, all routed through `_intrinsic_tree` so they cannot disagree.
 - **Scale against `intrinsic_reward_abs`, never `intrinsic_reward`.** The signed
   mean is ~-4e-4 — cosines cancel about zero — so it reads as "no intrinsic
   signal" while the per-step term is 0.152. Both are logged; the raw (unscaled)
