@@ -591,3 +591,121 @@ def test_update_runs_and_moves_the_intrinsic_critic():
     _, losses0 = update_fn0(new_rs0, traj0, boot0)
     for key in ("alpha_current", "adv_int_std_raw", "intrinsic_value_loss"):
         assert key not in losses0
+
+
+# ---------------------------------------------------------------------------
+# The zero-goal isolate arm (conf/model/feudal_zerogoal.yaml)
+# ---------------------------------------------------------------------------
+
+
+def test_zero_goal_makes_the_policy_independent_of_the_manager():
+    """The ablation's whole claim: the worker's output cannot depend on `w_t`.
+
+    Checked against *arbitrary* goals rather than a zero goal, because the
+    failure this guards is a half-wired ablation that still lets some goal
+    signal through (e.g. zeroing after an embedding with a bias, or zeroing only
+    one of the two call paths).
+    """
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    obs = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, N_AGENTS, OBS_DIM))
+    g1 = jax.random.normal(jax.random.PRNGKey(2), (N_ENVS, N_AGENTS, GOAL_DIM))
+    g2 = jax.random.normal(jax.random.PRNGKey(3), (N_ENVS, N_AGENTS, GOAL_DIM)) * 17.0
+
+    for embed in (None, 4):
+        worker, params = init_worker(
+            jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8,
+            discrete=False, goal_embed_dim=embed, zero_goal=True,
+        )
+        m1, s1 = worker.apply(params, obs, g1)
+        m2, s2 = worker.apply(params, obs, g2)
+        assert jnp.array_equal(m1, m2), f"goal leaked into the policy (embed={embed})"
+        assert jnp.array_equal(s1, s2)
+
+    # ...and the ablation is OFF by default: the live arm must still respond.
+    worker, params = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8, discrete=False,
+    )
+    m1, _ = worker.apply(params, obs, g1)
+    m2, _ = worker.apply(params, obs, g2)
+    assert not jnp.allclose(m1, m2), "zero_goal must default to False"
+
+
+def test_zero_goal_keeps_the_param_tree_shape_identical():
+    """Checkpoints stay interchangeable: the goal columns are kept, not dropped."""
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    trees = [
+        init_worker(jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8,
+                    discrete=False, zero_goal=z)[1]
+        for z in (False, True)
+    ]
+    shapes = [jax.tree.map(jnp.shape, t) for t in trees]
+    assert shapes[0] == shapes[1]
+    # Same init, too — the arms differ only in what reaches the input.
+    for a, b in zip(jax.tree.leaves(trees[0]), jax.tree.leaves(trees[1])):
+        assert jnp.array_equal(a, b)
+
+
+def test_zero_goal_still_trains_the_manager_and_freezes_the_goal_columns():
+    """Rungs (2) and (3) must stay live; only goal conditioning is removed.
+
+    The manager must keep learning (its PG is scored on the observed state
+    transition, which the worker still produces), and the worker's goal columns
+    must receive EXACTLY zero gradient — which is what makes
+    `worker_goal_column_ratio` a wiring check for this arm rather than a
+    diagnostic of it.
+    """
+    config = _config(zero_goal=True)
+    _, _, new_rs, traj, boot, update_fn = _collect(config)
+    updated_rs, losses = update_fn(new_rs, traj, boot)
+
+    for name in ("manager_ts", "manager_critic_ts", "critic_ts", "actor_ts"):
+        before = jax.tree.leaves(getattr(new_rs.train_state, name).params)
+        after = jax.tree.leaves(getattr(updated_rs.train_state, name).params)
+        assert any(not jnp.array_equal(a, b) for a, b in zip(before, after)), (
+            f"{name} did not move under zero_goal"
+        )
+
+    def goal_cols(ts):
+        return ts.params["params"]["MAPPOActor_0"]["Dense_0"]["kernel"][OBS_DIM:]
+
+    assert jnp.array_equal(
+        goal_cols(new_rs.train_state.actor_ts),
+        goal_cols(updated_rs.train_state.actor_ts),
+    ), "goal columns moved under zero_goal (ablation not wired at the input)"
+
+    # The manager diagnostics must stay live and finite, or the arm is not
+    # comparable to feudal_a0 on the axes it is supposed to hold fixed.
+    for key in ("state_latent_erank", "goal_direction_count", "d_cos_var",
+                "manager_explained_variance", "worker_goal_column_ratio"):
+        assert np.isfinite(float(losses[key])), (key, losses[key])
+
+
+def test_normalize_pooled_goal_false_reproduces_the_raw_sum():
+    """The pre-2026-08-28 fusion stays exactly reproducible."""
+    from algorithms.feudal_mappo_jax.network import MAPPOActor
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    obs = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, OBS_DIM))
+    goal = jax.random.normal(jax.random.PRNGKey(2), (N_ENVS, GOAL_DIM)) * 10.0
+
+    worker, params = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8,
+        discrete=False, normalize_pooled_goal=False,
+    )
+    # Same params on both sides: flax init is scope-dependent, so a freshly
+    # initialized standalone actor would differ for reasons unrelated to fusion.
+    ref = MAPPOActor(action_dim=ACTION_DIM, hidden_dim=8, discrete=False)
+    m1, s1 = worker.apply(params, obs, goal)
+    m2, s2 = ref.apply({"params": params["params"]["MAPPOActor_0"]},
+                       jnp.concatenate([obs, goal], axis=-1))
+    assert jnp.array_equal(m1, m2) and jnp.array_equal(s1, s2)
+
+    # ...and the default really does normalize: scale-only changes are invisible.
+    worker, params = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8, discrete=False,
+    )
+    a, _ = worker.apply(params, obs, goal)
+    b, _ = worker.apply(params, obs, goal * 3.0)
+    assert jnp.allclose(a, b, atol=1e-6)

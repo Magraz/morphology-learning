@@ -1,0 +1,64 @@
+# @package _global_
+# ISOLATE ARM (rung 2 of the ablation ladder). FeUdal with the goal CUT OUT of
+# the worker's input — `w_t` is replaced by zeros — while the manager network,
+# its transition policy gradient, its critic, all of its diagnostics, and the
+# worker's per-agent critic head keep running exactly as in `feudal_a0`.
+#
+# WHY THIS EXISTS. `feudal_a0` is routinely read as "the hierarchy with the
+# intrinsic reward off", i.e. as a measurement of what the goal mechanism does.
+# It is not. It differs from the flat `algorithm=mappo_jax` baseline in THREE
+# ways at once:
+#
+#   1. goal conditioning       — the worker eats [obs, w_t], not obs;
+#   2. a per-agent worker critic head — `n_critic_outputs = n_agents`
+#      UNCONDITIONALLY (types.py / trainer.py), because the intrinsic reward is
+#      inherently per-agent. Under a dense TEAM SCALAR reward that is 16 heads
+#      regressing 16 identical targets, with the value loss meaned over all of
+#      them — a different critic and a different gradient scale than mappo_jax's
+#      single head;
+#   3. manager training        — a second network and optimizer, and the
+#      transition PG, all live whether or not alpha is 0.
+#
+# So the ~250-point gap measured against `mlp` on mjx_16a_4o / _trunc (3 seeds,
+# matched 30M-step budget: mlp 411/381 vs feudal_a0 114/149) is UNATTRIBUTABLE.
+# The three have opposite implications: (3) is a nuisance to control for, (2) is
+# an implementation artifact to fix, (1) would be the actual result about
+# hierarchy. Nothing in the current arm set separates them.
+#
+# HOW TO READ IT. This arm removes (1) and keeps (2) and (3):
+#
+#   mappo_jax + mlp   <   feudal_zerogoal   <   feudal_a0   <   feudal_n01/n05
+#                    (2)+(3)              (1)                (intrinsic reward)
+#
+#   * feudal_zerogoal ~ feudal_a0, both << mlp  -> the goals are NOT the cause;
+#     the deficit is the critic head / manager optimization. A bug hunt, not a
+#     finding.
+#   * feudal_zerogoal ~ mlp, feudal_a0 << mlp   -> goal conditioning itself is
+#     what hurts. That is the reportable result.
+#
+# The manager still trains, so its diagnostics stay live and comparable
+# (state_latent_erank, goal_direction_count, d_cos_var, manager_explained_
+# variance).
+#
+# ⚠ THE WIRING CHECK IS THE NUMERATOR, NOT THE RATIO. With a zero goal the
+# worker's goal columns receive exactly zero gradient and stay frozen at their
+# init RMS (0.109109 for a 168-wide layer — shape-determined under
+# orthogonal(sqrt(2)) init, so it is the same number in every run and every
+# seed). But `worker_goal_column_ratio` is goal_rms / obs_rms, and the OBS block
+# keeps growing, so the logged ratio still falls (measured 1.005 -> 0.813 over a
+# 97-update smoke run with the ablation correctly wired). Read the ratio here as
+# "obs block growth" and check the ablation with the frozen goal_rms instead —
+# `test_zero_goal_still_trains_the_manager_and_freezes_the_goal_columns` in
+# algorithms/tests/test_feudal_seams.py pins exactly that.
+#
+# NOTE ON alpha. `zero_goal` is defined only at intrinsic_coef=0 and run.py
+# RAISES otherwise — a worker that cannot see the goals cannot coherently be
+# rewarded for reaching them, and that arm would still train and log healthy
+# numbers, which is exactly how an uninterpretable run gets mistaken for a
+# result. This group inherits alpha=0 from `feudal`.
+defaults:
+  - feudal
+  - _self_
+
+model_params:
+  zero_goal: true

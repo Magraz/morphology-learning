@@ -215,7 +215,22 @@ class Feudal_MAPPO_JAX_Runner:
             manager_hidden_dim=self.model_params.manager_hidden_dim,
             manager_core=self.model_params.manager_core,
             goal_embed_dim=self.model_params.goal_embed_dim,
+            normalize_pooled_goal=self.model_params.normalize_pooled_goal,
+            zero_goal=self.model_params.zero_goal,
         )
+
+        # Fail loudly rather than open. A zero-goal worker cannot see the goals,
+        # so rewarding it for achieving them (r^I = d_cos(s_t - s_{t-i}, g_{t-i}))
+        # is not an ablation of anything — it is an uninterpretable arm that
+        # would still train, log healthy diagnostics, and look like a result.
+        if self.config.zero_goal and self.config.intrinsic_coef != 0.0:
+            raise ValueError(
+                "model_params.zero_goal=True is incompatible with "
+                f"params.intrinsic_coef={self.config.intrinsic_coef} (!= 0): the "
+                "worker cannot see the goals it would be rewarded for reaching. "
+                "The zero-goal ablation is defined at alpha=0 — use "
+                "model=feudal_zerogoal."
+            )
 
         print(
             f"FeUdal MAPPO | env={environment} | n_envs={self.config.n_envs} | "

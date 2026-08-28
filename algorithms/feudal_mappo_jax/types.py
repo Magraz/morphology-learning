@@ -96,6 +96,21 @@ class Model_Params:
     # Optional bias-free Dense on the goal before it meets the obs (FuN's `phi`).
     # None = raw concat fusion; see the degeneracy note in worker.py.
     goal_embed_dim: int | None = None
+    # L2-normalize the pooled goal `w_t` before it is concatenated onto the obs.
+    # True (default) is the FIX for a measured defect: `w_t` is a sum of c
+    # near-collinear unit goals, so it arrives at ~c x unit scale (measured
+    # ||w_t|| = 9.95 at c=10) and takes 91.6% of the worker's first-layer
+    # preactivation variance away from the observation. False reproduces the
+    # raw-sum behaviour of runs before this change. See worker.py's docstring.
+    normalize_pooled_goal: bool = True
+    # ABLATION: feed the worker a zero goal, so its policy is independent of the
+    # manager while the manager, its critic, its PG, its diagnostics and the
+    # worker's per-agent critic head all still run. This is the isolate rung
+    # between `algorithm=mappo_jax` and `feudal_a0` — see
+    # conf/model/feudal_zerogoal.yaml for why the alpha=0 arm is NOT one.
+    # Incoherent with intrinsic_coef != 0 (it would reward the worker for
+    # reaching goals it cannot see); run.py raises on that combination.
+    zero_goal: bool = False
 
 
 @dataclass
@@ -150,6 +165,8 @@ class MAPPOConfig:
     manager_hidden_dim: int = 256
     manager_core: str = "mlp"
     goal_embed_dim: int | None = None
+    normalize_pooled_goal: bool = True
+    zero_goal: bool = False
 
 
 class Transition(NamedTuple):

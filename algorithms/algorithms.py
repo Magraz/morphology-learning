@@ -76,6 +76,9 @@ def _dispatch(
             from algorithms.mappo_jax.run import MAPPO_JAX_Runner
             from algorithms.mappo_jax.types import Experiment
 
+            if debug:
+                jax.config.update("jax_disable_jit", True)
+
             exp_config = Experiment(**exp_dict)
             runner = MAPPO_JAX_Runner(
                 exp_config.device,
@@ -86,8 +89,6 @@ def _dispatch(
                 exp_config,
                 env_config,
             )
-            if debug:
-                jax.config.update("jax_disable_jit", True)
 
         case AlgorithmEnum.FEUDAL_MAPPO_JAX:
             # FeUdal Networks hierarchy over the same functional MJX envs as
@@ -95,6 +96,9 @@ def _dispatch(
             # a goal-conditioned worker emits the primitive action.
             from algorithms.feudal_mappo_jax.run import Feudal_MAPPO_JAX_Runner
             from algorithms.feudal_mappo_jax.types import Experiment
+
+            if debug:
+                jax.config.update("jax_disable_jit", True)
 
             exp_config = Experiment(**exp_dict)
             runner = Feudal_MAPPO_JAX_Runner(
@@ -106,8 +110,6 @@ def _dispatch(
                 exp_config,
                 env_config,
             )
-            if debug:
-                jax.config.update("jax_disable_jit", True)
 
         case AlgorithmEnum.DCG:
             from algorithms.dcg.run import DCG_Runner

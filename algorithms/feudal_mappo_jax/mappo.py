@@ -124,6 +124,8 @@ def create_train_state(
         hidden_dim=config.hidden_dim,
         discrete=discrete,
         goal_embed_dim=config.goal_embed_dim,
+        normalize_pooled_goal=config.normalize_pooled_goal,
+        zero_goal=config.zero_goal,
     )
     critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs)
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))
@@ -588,6 +590,27 @@ def _goal_column_ratio(actor_params, obs_dim: int) -> jnp.ndarray:
     Per-input-dimension RMS ratio, so the two blocks are compared fairly despite
     their different widths; ~1.0 at orthogonal init. A decay toward 0 is the
     trigger to switch fusion (set ``goal_embed_dim``, or go bilinear).
+
+    ⚠ TWO WAYS TO MISREAD THIS SERIES, both of which have already happened.
+
+    1. It is a ratio of WEIGHTS, blind to the scale of the inputs they multiply.
+       Under the pre-2026-08-28 raw-sum fusion the goal arrived at ~5x the
+       observation's per-dimension RMS, so a 1.0 weight ratio meant the goal
+       owned ~92% of the layer's preactivation variance. With
+       ``normalize_pooled_goal=True`` the goal enters at unit scale and the
+       weight ratio and the contribution ratio coincide. The series is therefore
+       NOT like-for-like across that flag.
+    2. **A falling ratio is not evidence that the goal columns shrank.** It has
+       a denominator. Measured on the trained ``feudal_a0``/``n01``/``n05``
+       checkpoints, the ratio fell to 0.36-0.65 while the goal block **GREW
+       2.2-4.7x** from init — the obs block simply grew 6-10x, faster. Combined
+       with the 5x oversized input, the goal still held **59-78%** of layer-1
+       variance in those runs, i.e. the worker had not disconnected from the
+       manager at all; it was relatively downweighting an input that still
+       dominated it. The zero-goal ablation makes the point cleanly: with the
+       goal columns provably frozen, the logged ratio still drifts 1.005 ->
+       0.813. To claim goal-blindness, check ``goal_rms`` against its
+       shape-determined init (0.109109 at hidden_dim=168), not this ratio.
     """
     kernel = actor_params["params"]["MAPPOActor_0"]["Dense_0"]["kernel"]
     obs_block, goal_block = kernel[:obs_dim], kernel[obs_dim:]

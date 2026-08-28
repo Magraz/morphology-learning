@@ -9,6 +9,14 @@ env:
   n_agents: 16
   n_objects: 4
   reward_mode: dense
-  
-  params:
-    n_steps: 512
+
+# NOTE: top-level, NOT nested under `env:`. This key is `params.n_steps`;
+# `env.params.n_steps` is read by nothing (run.py pulls named keys out of the
+# `env:` block and does not validate unknown ones), so an indented copy is
+# silently inert. It was, from 1fbb3f3 until now: this group ran at the
+# algorithm default of 1024 while `_trunc` / `_partition` ran at 512, i.e.
+# twice their per-update batch. Any mjx_16a_4o result predating this fix is
+# NOT batch-comparable to those arms (within-group mlp-vs-feudal is fine —
+# both arms inherited the same inert override).
+params:
+  n_steps: 512
