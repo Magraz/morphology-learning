@@ -103,20 +103,12 @@ class Feudal_MAPPO_JAX_Runner:
         # and, in the multi-goal env, the goal rings derived from them.
         environment = env_config.get("environment")
         reward_mode = env_config.get("reward_mode", "dense")
-        # `max_steps` is OPTIONAL, so it is only forwarded when the group actually
-        # declares it. A bare `max_steps=env_config.get("max_steps")` passes None
-        # for every group that omits the key, and None does not fall back to the
-        # constructor default — it overwrites it, and the first `t >= None`
-        # comparison raises. No env group declares `max_steps` today, so that
-        # form breaks all of them.
-        optional_env_kwargs = {}
-        if env_config.get("max_steps") is not None:
-            optional_env_kwargs["max_steps"] = env_config["max_steps"]
+
         if environment == EnvironmentEnum.MULTI_BOX_MJX:
             self.env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                **optional_env_kwargs,
+                max_steps=self.params.n_steps,
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -125,7 +117,7 @@ class Feudal_MAPPO_JAX_Runner:
             self.env = MultiBoxMultiGoalPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                **optional_env_kwargs,
+                max_steps=self.params.n_steps,
                 reward_mode=reward_mode,
                 boundary_ends_episode=env_config.get("boundary_ends_episode", False),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -151,7 +143,7 @@ class Feudal_MAPPO_JAX_Runner:
             base_env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                **optional_env_kwargs,
+                max_steps=self.params.n_steps,
                 reward_mode=base_reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),

@@ -228,14 +228,21 @@ class ObservationManager:
         return (dist <= radius).astype(np.float32)
 
     def _calculate_nearest_box_vectors(self):
-        """Relative (dx, dy) from each agent to its nearest *undelivered* object.
+        """Relative (dx, dy) from each agent to its nearest *sensed* object.
 
+        An object is sensed when it is undelivered AND within
+        ``sector_sensor_radius`` — the SAME range cap the density sensors apply,
+        so the two object channels switch on at exactly the same distance.
         Per-axis normalized by world_width so values land in ~[-1, 1]. Returns a
-        zero vector for every agent when the env has no objects, or when every
-        object has already been delivered (no remaining target to point at).
-        Objects the env has marked delivered (``env.delivered_objects``) are
-        dropped from the search, so an agent stops being drawn to a box parked
-        in the goal band — mirrors the MJX env's nearest_box_vec masking.
+        zero vector for every agent when the env has no objects, and a per-agent
+        zero for any agent with no object in range (which subsumes the
+        every-object-delivered case). Objects the env has marked delivered
+        (``env.delivered_objects``) are dropped from the search, so an agent
+        stops being drawn to a box parked in the goal band.
+
+        The range cap mirrors the MJX builder's ``_nearest_box`` — see the
+        rationale there. Both engines must apply it or their observations
+        diverge.
         """
         n_agents = self.env.n_agents
         if self._object_pos_cache.shape[0] == 0:
@@ -255,8 +262,13 @@ class ObservationManager:
                 return np.zeros((n_agents, 2), dtype=np.float32)
             dist[:, idx] = np.inf
 
+        # Strict `<`, matching `_calculate_density_sensors_all`.
+        dist = np.where(dist < self.sector_sensor_radius, dist, np.inf)
+        sensed = np.isfinite(dist).any(axis=1)  # (A,)
+
         nearest = np.argmin(dist, axis=1)  # (A,)
         nearest_vec = rel[np.arange(n_agents), nearest]  # (A, 2)
+        nearest_vec = np.where(sensed[:, np.newaxis], nearest_vec, 0.0)
         return (nearest_vec / float(self.env.world_width)).astype(np.float32)
 
     def _calculate_goal_distances(self):

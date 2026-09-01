@@ -87,7 +87,7 @@ class Model_Params:
     # this is the only width knob. It is also the manager's entire information
     # bottleneck (the recurrent core consumes `s`), so shrinking it throttles the
     # goal RNN too.
-    goal_dim: int = 16
+    goal_dim: int = 32
     manager_hidden_dim: int = 256
     # "mlp" (stateless) or "dilated_lstm" (FuN's dilated recurrence, radius =
     # goal_horizon). The mlp core is the default so that goal-mechanism effects
@@ -152,7 +152,7 @@ class MAPPOConfig:
     # `algorithm=mappo_jax`. It regresses the EXTRINSIC return only; the
     # intrinsic return has its own critic (`intrinsic_critic_ts`) whenever
     # alpha != 0.
-    goal_dim: int = 16
+    goal_dim: int = 32
     goal_horizon: int = 10
     # Gradient fraction, not a reward coefficient — see `Params.intrinsic_coef`.
     intrinsic_coef: float = 0.0

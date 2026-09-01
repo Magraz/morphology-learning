@@ -727,6 +727,10 @@ class MultiBoxMultiGoalPushMJX:
         # nearest-undelivered-box the `nearest_box_vec` component points at, so
         # the two features describe one box.
         nearest = self.obs_builder.nearest_box_indices(agent_pos, box_pos, delivered)
+        # `nearest` is an argmin over +inf for an agent with no box in range, so
+        # every feature keyed to it must be gated on this mask (the goal-distance
+        # component is gated inside `build`; `_coupling_fractions` takes it).
+        sensed = self.obs_builder.nearest_box_sensed(agent_pos, box_pos, delivered)
         base = self.obs_builder.build(
             data,
             agent_pos=agent_pos,
@@ -747,27 +751,26 @@ class MultiBoxMultiGoalPushMJX:
             delivered=delivered,
         )
         return jnp.concatenate(
-            [base, self._coupling_fractions(nearest, delivered)[:, None]], axis=1
+            [base, self._coupling_fractions(nearest, sensed)[:, None]], axis=1
         )
 
-    def _coupling_fractions(self, nearest, delivered=None) -> jnp.ndarray:
+    def _coupling_fractions(self, nearest, sensed) -> jnp.ndarray:
         """(A,) share of the whole team needed to move each agent's nearest box.
 
         ``coupling[nearest] / n_agents`` in [0, 1] — how much of the team has to
         be touching that box *simultaneously* before it drops to its light mass.
-        Keyed to the same nearest-undelivered box as ``nearest_box_vec`` and
+        Keyed to the same nearest *sensed* box as ``nearest_box_vec`` and
         ``goal_distance``, so the three features describe one box.
 
-        Zero when the env has no objects, and (like ``nearest_box_vectors``) when
-        every box is delivered — ``nearest`` is an argmin over +inf there, so the
-        index is meaningless and must not be read as a real requirement.
+        Zero when the env has no objects, and (like ``nearest_box_vectors``) for
+        any agent with no box in range — ``nearest`` is an argmin over +inf
+        there, so the index is meaningless and must not be read as a real
+        requirement. That subsumes the every-box-delivered case, which is why
+        this takes the ``sensed`` mask rather than ``delivered``.
         """
         if self.n_objects == 0:
             return jnp.zeros(self.n_agents)
-        frac = self._coupling_fraction[nearest]  # (A,)
-        if delivered is not None:
-            frac = jnp.where(jnp.all(delivered), 0.0, frac)
-        return frac
+        return jnp.where(sensed, self._coupling_fraction[nearest], 0.0)
 
     # ------------------------------------------------------------------ API
 

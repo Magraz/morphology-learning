@@ -198,43 +198,78 @@ class MJXObservationBuilder:
         """(A, A) euclidean distance between every agent pair; zero on the diagonal."""
         return jnp.linalg.norm(agent_pos[:, None, :] - agent_pos[None, :, :], axis=-1)
 
-    def nearest_box_indices(self, agent_pos, box_pos, delivered=None):
-        """(A,) index of the nearest *undelivered* box for each agent.
+    def _nearest_box(self, agent_pos, box_pos, delivered=None):
+        """``(idx (A,), sensed (A,) bool)`` for the nearest *sensed* box.
 
-        ``delivered`` is an optional (O,) bool mask; delivered boxes are dropped
-        from the search (their distance is set to +inf). With every box
-        delivered the argmin is meaningless and returns 0 — callers must handle
-        that case (``nearest_box_vectors`` zeroes its output).
+        A box counts as sensed when it is undelivered AND within
+        ``sector_sensor_radius`` — the SAME range cap the density sensors apply
+        (``dist_ao < R``). ``sensed`` is False for an agent with no such box, in
+        which case ``idx`` is an argmin over all-+inf and is meaningless; every
+        caller must gate on the mask.
 
-        Exposed because envs with a *per-box* goal need to know which box an
-        agent is sensing in order to describe that box's target; it is the same
-        search ``nearest_box_vectors`` runs, kept in one place.
+        **Why the range cap exists.** ``nearest_box_vec`` used to be an
+        unrestricted global argmin — the only unlimited-range channel in an
+        otherwise entirely local observation (density sectors, lidar and
+        neighbor fraction are all capped). At 16a/4o that single feature
+        collapsed the task's partial observability: mean agent-to-box distance
+        is 22.1 against R = 15.67, so an average agent can locally perceive only
+        22% of the boxes and 48% of agents perceive none at all — yet every one
+        of them was handed an exact bearing and range. Capping it makes the
+        channel consistent with the rest of the vector and restores the gap
+        between what one agent knows (~22% of boxes) and what the joint state
+        contains (~96%).
         """
         rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
         dist = jnp.linalg.norm(rel, axis=-1)  # (A, O)
         if delivered is not None:
             dist = jnp.where(delivered[None, :], jnp.inf, dist)
-        return jnp.argmin(dist, axis=1)  # (A,)
+        # Same strict `<` comparison the density sensors use, so the two object
+        # channels switch on at exactly the same distance.
+        dist = jnp.where(dist < self.sector_sensor_radius, dist, jnp.inf)
+        return jnp.argmin(dist, axis=1), jnp.isfinite(dist).any(axis=1)
+
+    def nearest_box_indices(self, agent_pos, box_pos, delivered=None):
+        """(A,) index of the nearest *sensed* box for each agent.
+
+        Undelivered and within ``sector_sensor_radius``; see ``_nearest_box``.
+        With no such box the argmin is meaningless and returns 0 — callers must
+        gate on ``nearest_box_sensed`` (``nearest_box_vectors`` zeroes its
+        output).
+
+        Exposed because envs with a *per-box* goal need to know which box an
+        agent is sensing in order to describe that box's target; it is the same
+        search ``nearest_box_vectors`` runs, kept in one place.
+        """
+        return self._nearest_box(agent_pos, box_pos, delivered)[0]
+
+    def nearest_box_sensed(self, agent_pos, box_pos, delivered=None):
+        """(A,) bool — does this agent have any undelivered box within range?
+
+        The companion gate for ``nearest_box_indices``. An env that keys a
+        feature to the sensed box (per-box goal ring, coupling requirement) must
+        zero that feature where this is False, exactly as
+        ``nearest_box_vectors`` zeroes its vector.
+        """
+        if self.n_objects == 0:
+            return jnp.zeros(self.n_agents, dtype=bool)
+        return self._nearest_box(agent_pos, box_pos, delivered)[1]
 
     def nearest_box_vectors(self, agent_pos, box_pos, delivered=None):
-        """(A, 2) relative vector to the nearest *undelivered* box, normalized by
+        """(A, 2) relative vector to the nearest *sensed* box, normalized by
         world_width.
 
-        ``delivered`` is an optional (O,) bool mask; delivered boxes are dropped
-        from the nearest-box search (their distance is set to +inf) so an agent
-        stops sensing a box that has already been parked in the goal band. The
-        vector is zero when the env has no objects, or when every box is
-        delivered (no remaining target to point at).
+        A box is sensed when it is undelivered and within
+        ``sector_sensor_radius`` (see ``_nearest_box`` for why the range cap is
+        there). The vector is zero when the env has no objects, and per-agent
+        zero for any agent with no box in range — which subsumes the
+        every-box-delivered case.
         """
         if self.n_objects == 0:
             return jnp.zeros((self.n_agents, 2))
         rel = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
-        nearest = self.nearest_box_indices(agent_pos, box_pos, delivered)  # (A,)
+        nearest, sensed = self._nearest_box(agent_pos, box_pos, delivered)
         vec = rel[jnp.arange(self.n_agents), nearest] / self.world_width
-        if delivered is not None:
-            # all boxes delivered -> argmin over +inf is meaningless; zero it out
-            vec = jnp.where(jnp.all(delivered), 0.0, vec)
-        return vec
+        return jnp.where(sensed[:, None], vec, 0.0)
 
     def goal_distances(self, agent_pos, goal_coord=None, goal_axis="y",
                        goal_radius=0.0, from_pos=None):
@@ -354,6 +389,19 @@ class MJXObservationBuilder:
             if self.n_objects
             else jnp.zeros((self.n_agents, 1))
         )
+        goal_dist = self.goal_distances(
+            agent_pos, goal_coord, goal_axis, goal_radius, goal_from_pos
+        )
+        if goal_from_pos is not None and self.n_objects:
+            # `goal_from_pos` means the feature is measured from the box this
+            # agent SENSES (the per-box goal-ring envs), not from the agent — so
+            # it is meaningless for an agent with no box in range, exactly as
+            # `nearest_box_vec` is. Gate it on the same mask. When the goal is
+            # the agent's own distance to a single shared band (`goal_from_pos`
+            # is None) it is always well defined and must NOT be gated.
+            goal_dist = jnp.where(
+                self.nearest_box_sensed(agent_pos, box_pos, delivered), goal_dist, 0.0
+            )
         return jnp.concatenate(
             [
                 agent_vel / self.velocity_norm,
@@ -362,9 +410,7 @@ class MJXObservationBuilder:
                 self.neighbor_fractions(agent_pos)[:, None],
                 (self.contact_forces(data) / self.force_multiplier)[:, None],
                 self.nearest_box_vectors(agent_pos, box_pos, delivered),
-                self.goal_distances(
-                    agent_pos, goal_coord, goal_axis, goal_radius, goal_from_pos
-                )[:, None],
+                goal_dist[:, None],
                 self.lidar(data, agent_pos),
             ],
             axis=1,

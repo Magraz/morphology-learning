@@ -109,6 +109,19 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   `AsyncVectorEnv` to pickle its `shared_memory` buffers and crashes with
   `cannot pickle 'mmap.mmap'`. `Runner.__init__` floors torch threads at
   `max(1, get_num_threads()//2)` since a loky worker can start with 1 thread.
+- **⚠ Nothing validates the `env:` block, so a misindented key is SILENT.**
+  `mappo_jax`/`feudal_mappo_jax` `run.py` pull named keys out of `env:` and warn
+  on nothing (an earlier note here claimed a `_base_env_kwargs` helper warned on
+  unrecognized keys — **it does not exist**). Live example, fixed 2026-08-28:
+  `conf/env/mjx_16a_4o.yaml` carried `n_steps: 512` indented **under `env:`**
+  (commit `1fbb3f3`), i.e. `env.params.n_steps`, which nothing reads — so that
+  group ran at the algorithm default of **1024** while `_trunc` / `_partition`
+  ran at 512, i.e. twice their per-update batch. Diagnose it from the stats:
+  `total_steps[1] - total_steps[0]` is `n_steps * n_envs` (32768 vs 16384 here).
+  `params:` belongs at **column 0** in an env group (`# @package _global_`).
+  Any `mjx_16a_4o` result predating the fix is not batch-comparable to those
+  arms; within-group `mlp`-vs-`feudal` is unaffected (both inherited the same
+  inert override).
 - **Migration status:** `multi_box_push_9a_3o` (MAPPO) and `dcg_smaclite_2s3z`
   (DCG) are currently ported into `conf/`. Other batches under
   `experiments/yamls/` must be migrated to `conf/env` + `conf/model` before they
@@ -139,12 +152,50 @@ All `environments/box2d_suite` envs share `ObservationManager.get_observation`
 - `is_touching_object` (1)
 - `neighbor_fraction` (1) — fraction of agents within `neighbor_detection_range` (incl. self)
 - `contact_force` (1) — per-agent contact force / `force_multiplier`
-- `nearest_box_vec` (2) — relative (dx, dy) to the nearest **undelivered**
-  object, per axis normalized by `world_width`; zero vector when the env has no
-  objects or when every object has been delivered. Already-delivered objects
+- `nearest_box_vec` (2) — relative (dx, dy) to the nearest **sensed** object,
+  per axis normalized by `world_width`. An object is sensed when it is
+  undelivered **and within `sector_sensor_radius`** — the same strict `<` range
+  cap the density sensors apply, so the two object channels switch on at exactly
+  the same distance. Zero vector when the env has no objects, and **per-agent**
+  zero for any agent with no object in range (which subsumes the
+  every-object-delivered case). Already-delivered objects
   (`env.delivered_objects` in Box2D, the `delivered` mask in MJX) are excluded
-  from the nearest-object search, so an agent stops being drawn to a box parked
-  in the goal band. Egocentric (no absolute world anchor).
+  from the search, so an agent stops being drawn to a box parked in the goal
+  band. Egocentric (no absolute world anchor).
+  - **⚠ The range cap was added 2026-08-31 and it changes every env's
+    observation semantics — results before that date are not comparable.**
+    Until then this was an *unrestricted global argmin*: the ONLY unlimited-range
+    channel in an otherwise entirely local vector (density sectors, lidar and
+    `neighbor_fraction` are all capped). Measured at `mjx_16a_4o` (40 seeds,
+    spawn): mean agent-to-box distance **22.1** against R = **15.67** in a
+    47-wide arena, so an average agent locally perceives only **21.9%** of the
+    boxes and **47.8%** perceive none at all — yet every one was handed an exact
+    bearing and range. That single feature collapsed the task's partial
+    observability and made "approach your nearest undelivered box" a *fully
+    local* near-optimal policy, which is why a shared-parameter flat policy had
+    no role-assignment problem left to solve. Capped, one agent knows ~22% of
+    the boxes while the joint state (what a centralized manager reads) contains
+    **95.6%** — a 73.7-point gap that did not previously exist.
+  - The cap is **not** configurable and there is no opt-out flag: it is applied
+    directly in `MJXObservationBuilder._nearest_box` and, in parity, in the
+    Box2D `ObservationManager._calculate_nearest_box_vectors`. **Both engines
+    must apply it or their observations diverge.**
+  - Anything keyed to the sensed box must gate on `nearest_box_sensed` — the
+    companion mask — because `nearest_box_indices` is an argmin over all-`+inf`
+    when nothing is in range and its index is then meaningless. Live consumers:
+    `MJXObservationBuilder.build` zeroes `goal_distance` **only when
+    `goal_from_pos` is not None** (i.e. the per-box goal-ring envs, where the
+    feature is measured from the sensed box); it must NOT be gated when the goal
+    is the agent's own distance to a single shared band, which is always well
+    defined. `MultiBoxMultiGoalPushMJX._coupling_fractions` takes the mask too.
+    Verified: `nearest_box_vec`, `goal_distance` and `coupling_fraction` gate
+    together on all 320 checked (seed, agent) rows of the multi-goal env.
+  - Verified surgical: over 20 seeds at 16a/4o exactly columns **[21, 22]** of
+    the 40-dim vector differ from the pre-change observation, and for every one
+    of the 165 agents that *does* have a box in range the vector is bit-identical
+    to the old global argmin (nearest-in-range == nearest-globally whenever the
+    global nearest is in range). Max nonzero magnitude is now bounded by
+    `R / world_width` (measured 0.3331 against the 0.3333 cap).
 - `goal_distance` (1) — signed relative distance from the agent to the target
   region center, measured along the env's **goal axis**: the y axis by default
   (normalized by `world_height`), or the x axis (normalized by `world_width`)
@@ -159,6 +210,20 @@ Note: absolute `own_pos` is intentionally **not** in the vector — the
 observation is egocentric. `nearest_box_vec` + `goal_distance` restore goal
 grounding (where to push, and how far) without reintroducing an absolute
 world-frame anchor.
+
+⚠ **Consequence of the egocentric design for any centralized reader** (the
+feudal manager, whose input is literally `obs.reshape(n_envs, -1)`): it receives
+N egocentric views with **no shared frame**, so exploiting the union of partial
+views requires it to *learn to localize agents first*. The anchors available are
+`goal_distance` (an exact coordinate on the goal axis) and the lidar wall
+returns (in a 47-wide arena with R = 15.67, ~89% of positions are within range
+of at least one wall, giving a partial cross-axis fix). Sufficient in principle,
+but a real representation-learning burden — and in `feudal_mappo_jax` the whole
+manager bottleneck is `goal_dim` (16 by default), i.e. 16 numbers to encode
+where every agent and box is. Raising `goal_dim` also raises the ceiling on the
+`goal_direction_count` diagnostic, whose healthy random-direction baseline is
+`N^2 / (N + N(N-1)/goal_dim)` — 8.26 at N=16/goal_dim=16 — so that series stops
+being comparable across runs with different widths.
 
 ### Sensor overlay (debug rendering)
 
@@ -936,21 +1001,7 @@ drop-in comparable:
   (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX`), each passing its
   constructor arguments explicitly — deliberately not a shared kwargs helper.
   This means an `env:` key is only reachable where a branch names it.
-- **`env.max_steps` is now wired** (all three branches, in **both**
-  `mappo_jax/run.py` and its `feudal_mappo_jax` copy, which must stay in sync).
-  It is the enabler for a time-budget arm — the untried knob that would forbid
-  the sequential swarm strategy the drift and partition arms both failed to
-  suppress. No env group declares it today, so every group still gets the
-  constructor default of 1024 and **no existing arm changes**.
-  - ⚠ **It must be forwarded conditionally, via `optional_env_kwargs`, and this
-    is easy to re-break.** A bare `max_steps=env_config.get("max_steps")` passes
-    `None` for every group that omits the key, and `None` does **not** fall back
-    to the constructor default — it overwrites it, and the first `t >=
-    self.max_steps` raises `TypeError: '>=' not supported between instances of
-    'BatchTracer' and 'NoneType'` inside the collect scan. Since no group
-    declares `max_steps`, that form breaks **every** `mappo_jax` and
-    `feudal_mappo_jax` run, not an obscure one. Same trap for any future
-    optional env key.
+
 - **`env.coupling_def` is wired** (all three branches — bare `MultiBoxPushMJX`,
   `MultiBoxMultiGoalPushMJX`, and the macro wrapper's base env — in **both**
   `mappo_jax/run.py` and its `feudal_mappo_jax` copy, which must stay in sync).
@@ -1040,6 +1091,69 @@ uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o \
     avoids with a bilinear `logits = U(obs) @ phi(g)` and no bias, so a zero
     goal expresses no preference. If the manager's goals turn out not to steer
     the worker, swap the fusion; the module interface stays the same.
+  - **⚠ `normalize_pooled_goal` (default `True`, `Model_Params` /
+    `MAPPOConfig`) — a MEASURED defect in the concat fusion, fixed 2026-08-28.**
+    The worker eats FuN's `w_t = sum_{i=t-c+1..t} g_i`, a sum of `c` unit goals.
+    Measured on trained `mjx_16a_4o` / `_trunc` checkpoints, **consecutive goals
+    are 0.95-0.99 collinear**, so that sum pools nothing — it is a near-exact
+    `c`x multiplier on one slowly-varying direction (`||w_t||` = 9.95 of a max
+    10 at `c=10`). Concatenated raw it entered the first Dense at **~5x** the
+    obs's per-dim RMS (2.49 vs 0.48), so 16 goal dims took **91.6%** of the
+    layer's preactivation variance from 40 obs dims — into a Tanh. Decomposed on
+    the trained checkpoints, the goal block still held **59-78%** of layer-1
+    variance at the end of training. `||w_t||` also ramps `1 -> c` over
+    the first `c` steps of **every** episode, so the scale is non-stationary in
+    episode phase. FuN never hits this: its bilinear fusion makes `||w_t||` a
+    pure logit rescale that never competes with the obs inside a saturating
+    nonlinearity. The fix L2-normalizes `w_t` in `FeudalWorker.__call__` (before
+    `goal_embed_dim`), discarding **only the magnitude** — the direction is the
+    whole content of a FuN goal and the only thing the scale-invariant `d_cos`
+    objective scores, so it costs the mechanism nothing. Verified:
+    `normalize_pooled_goal=False` is **bit-identical** to the pre-fix worker on
+    the same params (so old behaviour is exactly reproducible), `True` drops the
+    goal's variance share 90.7% -> 8.8% and makes the output invariant to
+    `||g||`; 21 seam tests + all 9 manager self-checks + a smoke train pass.
+    **Every `feudal_*` result before this date used the raw sum.**
+    - ⚠ **`worker_goal_column_ratio` is easy to misread, in two ways.** (a) It
+      is a ratio of *weights*, blind to the scale of the inputs they multiply,
+      so it is not like-for-like across `normalize_pooled_goal`. (b) **A falling
+      ratio does not mean the goal columns shrank** — it has a denominator.
+      Measured on the trained `feudal_*` checkpoints the ratio fell to 0.36-0.65
+      while the goal block **GREW 2.2-4.7x** from init; the obs block just grew
+      6-10x, faster. So the worker was *not* disconnecting from the manager, and
+      an earlier reading of that decay as goal-blindness was wrong. The
+      `zero_goal` arm demonstrates it: with the goal columns provably frozen the
+      ratio still drifts 1.005 -> 0.813. To claim goal-blindness compare
+      `goal_rms` to its shape-determined init (**0.109109** at `hidden_dim=168`,
+      identical across seeds under `orthogonal(sqrt(2))`), not this ratio.
+- **`conf/model/feudal_zerogoal.yaml` — the ISOLATE ARM** (`model_params.
+  zero_goal`, default `False`). `FeudalWorker` receives `jnp.zeros_like(goal)`,
+  so the policy is provably independent of the manager while the manager net,
+  its PG, its critic, its diagnostics and the worker's per-agent critic head all
+  still train. **It exists because `feudal_a0` is not an isolate of "hierarchy
+  vs flat"** — it differs from `algorithm=mappo_jax` in three ways at once:
+  goal conditioning; an **unconditionally** `n_agents`-wide worker critic head
+  (`trainer.py`, because `r^I` is inherently per-agent — under a dense team
+  scalar that is N heads regressing N identical targets); and manager training.
+  The measured ~250-point gap vs `mlp` is therefore unattributable, and the
+  three have opposite implications (nuisance / implementation bug / actual
+  result). The ladder is `mappo_jax+mlp` < `feudal_zerogoal` < `feudal_a0` <
+  `feudal_n01|n05`, each rung adding one thing. Read it as: `zerogoal ~ a0`,
+  both << `mlp` ⇒ the goals are not the cause (bug hunt); `zerogoal ~ mlp`,
+  `a0` << `mlp` ⇒ goal conditioning is what hurts (the reportable result).
+  - Zeroing is at the **input**, so the param tree is shape-identical and
+    checkpoints stay interchangeable; the goal columns just get zero gradient.
+  - `zero_goal=True` with `intrinsic_coef != 0` **raises** in `run.py` — the
+    worker cannot see the goals it would be rewarded for reaching, and that arm
+    would still train and log healthy numbers, which is how an uninterpretable
+    run gets mistaken for a result.
+  - Pinned by 4 seam tests (policy invariant to arbitrary goals for both
+    fusions, off by default, param tree unchanged, manager still moves + goal
+    columns frozen). Launch:
+    ```
+    uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o \
+        model=feudal_zerogoal trial_id=0
+    ```
 - **`manager.py` — `FeudalManager`** (done, network only; nothing calls it).
   Centralized manager emitting **one unit-norm goal per agent**. `s` (the latent
   state space) and `g` share a space — in FuN a goal is a *direction in the state
