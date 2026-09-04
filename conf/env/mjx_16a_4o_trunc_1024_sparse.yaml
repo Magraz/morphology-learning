@@ -1,0 +1,35 @@
+# @package _global_
+#
+# SPARSE-reward arm. Identical to `mjx_16a_4o_trunc_1024` in every respect
+# except `reward_mode: sparse`, so it is the controlled sparse-vs-dense
+# comparison against that group (NOT against `mjx_16a_4o_1024`, which differs in
+# boundary semantics as well).
+#
+# `sparse` drops the per-step displacement shaping and pays only the one-time
+# +100 per delivered box (multi_box_push_mjx.py: `completion + (shaping if
+# self._dense else 0.0)`). Everything else — delivery latching, the goal-distance
+# bookkeeping, the observation, the physics — is bit-identical to the dense arm.
+#
+# WHY THE `trunc` BASE, not the plain baseline: `mjx_16a_4o_1024` has
+# `boundary_ends_episode: true` and `boundary_hit` is `any()` over 16 agents, so
+# episodes die at ~43 steps on incidental wall contact. With the shaping removed
+# there is nothing in the gradient before the first delivery, and a 43-step
+# episode essentially never reaches one — the reward signal would be all-zero.
+# Inert walls give the full 1024-step episode, so a delivery is at least
+# reachable (a scripted balanced partition delivers 3/3 at 9a/3o by step ~245).
+#
+# ⚠ Do NOT combine sparse with the `drift` variant. The decay's only channel
+# into the reward is the shaping term; with shaping gone an unattended box can
+# sink for free until it makes delivery outright impossible, so that arm is
+# closer to plain sparse than to "sparse with coalition pressure".
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 16
+  n_objects: 4
+  reward_mode: sparse
+
+  variant: trunc
+
+params:
+  n_steps: 1024
