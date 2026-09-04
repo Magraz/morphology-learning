@@ -175,6 +175,10 @@ def ppo_update(
     obs_dim = trajectory.obs.shape[3]
     # Static: (n_steps, n_envs, n_agents) rewards => per-agent credit path.
     per_agent = trajectory.reward.ndim == 3
+    # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked categorical.
+    # Envs without `avail_actions` store a scalar placeholder, so this is False and the
+    # update is byte-identical to the pre-masking code.
+    use_mask = trajectory.action_mask.ndim == 4
 
     dones = trajectory.done.astype(jnp.float32)
     advantages, returns = compute_gae(
@@ -210,6 +214,10 @@ def ppo_update(
     # staggered starts). All-ones for every ordinary run — the masked means below
     # then reduce to plain means, keeping the update byte-identical.
     active_ts = trajectory.active_mask.reshape(total_ts, n_agents)
+    # Legal-action mask, flattened like obs so it stays paired with its own agent.
+    mask_ts = (
+        trajectory.action_mask.reshape(total_ts, n_agents, -1) if use_mask else None
+    )
     if per_agent:
         adv_ts = adv.reshape(total_ts, n_agents)
         ret_ts = returns.reshape(total_ts, n_agents)
@@ -241,6 +249,9 @@ def ppo_update(
             # per-agent critic. All-ones => the masked means are exact plain means.
             mb_active_pa = active_ts[mb_ids]
             mb_active = mb_active_pa.reshape(n_flat)
+            # Same mask the actions were sampled under — without it the ratio compares
+            # two different distributions and PPO's importance weight is meaningless.
+            mb_mask = mask_ts[mb_ids].reshape(n_flat, -1) if use_mask else None
             if per_agent:
                 # Each agent carries its own advantage. `.reshape(-1)` is
                 # agent-major within a timestep, matching mb_obs' flattening.
@@ -254,7 +265,12 @@ def ppo_update(
             # --- Actor loss ---
             def actor_loss_fn(actor_params):
                 log_probs, entropy = evaluate_action(
-                    actor_ts.apply_fn, actor_params, mb_obs, mb_actions, discrete
+                    actor_ts.apply_fn,
+                    actor_params,
+                    mb_obs,
+                    mb_actions,
+                    discrete,
+                    action_mask=mb_mask,
                 )
                 ratio = jnp.exp(log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv

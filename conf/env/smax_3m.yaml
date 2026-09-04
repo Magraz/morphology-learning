@@ -1,0 +1,32 @@
+# @package _global_
+# SMAX (JaxMARL StarCraft) 3m — 3 marines vs 3 marines, the smallest symmetric SMAC
+# map. Discrete action space (8 actions: no-op / stop / 4 moves / attack-enemy-i) with
+# legal-action masking, a real global state (world_state), and units that die
+# mid-episode.
+#
+# Runs on both JAX stacks:
+#   uv run python train.py algorithm=mappo_jax        env=smax_3m model=mlp    trial_id=0
+#   uv run python train.py algorithm=feudal_mappo_jax env=smax_3m model=feudal trial_id=0
+env:
+  environment: SMAX
+  # SMAX scenario / map name -> map_name_to_scenario(). n_agents is a property of the
+  # scenario, so it is NOT set here — the adapter reads it back off the env.
+  env_variant: 3m
+  smax_env_id: HeuristicEnemySMAX
+  # Episode limit. Independent of params.n_steps here (the MJX groups tie the two
+  # together; this benchmark owns its own horizon).
+  max_steps: 100
+  # LITERAL, like every MJX group: this is a vmap width on one device, i.e. a
+  # hyperparameter (per-update batch = n_steps * n_envs, which sets num_updates), NOT a
+  # core budget. Keep it identical across arms being compared.
+  n_envs: 64
+
+# NOTE: column 0, NOT nested under `env:`. Nothing validates the `env:` block, so a
+# `params:` indented under it becomes `env.params.*`, which is read by nothing and is
+# silently inert (this cost the mjx_16a_4o group a whole batch of runs; see CLAUDE.md).
+params:
+  # >= env.max_steps. collect_fn resets every env at the top of every rollout and scans
+  # exactly n_steps, so a shorter rollout means the back half of every episode is never
+  # trained on — and in SMAX the win bonus is paid at the very end of the episode.
+  n_steps: 128
+  n_total_steps: 1e7

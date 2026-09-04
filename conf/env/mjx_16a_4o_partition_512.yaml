@@ -1,0 +1,48 @@
+# @package _global_
+#
+# mjx_16a_4o with UNEQUAL per-box coupling requirements: [2, 3, 5, 6].
+#
+# Purpose: make the boxes non-interchangeable without making the task harder.
+# Under the baseline's `coupling_def: even` every box needs the same crew of 4,
+# so any agent is as good as any other and there is no particular team-to-box
+# assignment to discover — a swarm can sequence the boxes one at a time (which
+# is measurably what the trained baseline policy does: 3.4-4.0 of 4 delivered,
+# episodes ending at ~600 of 1024 steps). Unequal requirements force a
+# *specific* partition of the team.
+#
+# The couplings sum to exactly n_agents (2+3+5+6 = 16), so a simultaneous
+# partition still exists and the task stays feasible; only the assignment
+# becomes specific. Contrast an over-subscribed sum (> 16), which additionally
+# forces sequential delivery and so changes difficulty as well as structure —
+# `resolve_coupling` warns in that case.
+#
+# REGISTERED PREDICTION (write the result down against this, do not revise it):
+# flat MAPPO shares one policy across agents (`parameter_sharing: true`), so it
+# can only differentiate roles through each agent's own local observation. A
+# centralized manager that sees global state and emits one goal per agent
+# (feudal_mappo_jax) has an architectural channel for exactly this assignment.
+# The prediction is therefore that the mlp-vs-feudal gap NARROWS here relative
+# to `mjx_16a_4o`. It is NOT predicted that feudal wins outright — the feudal
+# arm's intrinsic path is currently inert at the shipped `intrinsic_coef: 0.0`,
+# so the goal mechanism is unrewarded; see conf/algorithm/feudal_mappo_jax.yaml.
+#
+# ⚠ UNCONTROLLED DIFFERENCE, do not overlook it when attributing a result: box
+# size follows the coupling (`box_half_extents = max(1.5, coupling * 0.4)`), so
+# this arm's boxes are [1.5, 1.5, 2.0, 2.4] against the baseline's uniform 1.6.
+# Masses and contact geometry differ accordingly. The arm changes the
+# assignment structure AND the box geometry; a clean geometry control would
+# need equal-sized boxes with unequal couplings, which the size rule does not
+# currently allow.
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 16
+  n_objects: 4
+  reward_mode: dense
+  # Explicit per-box list. `even` (the default) would give [4, 4, 4, 4].
+  coupling_def: [2, 3, 5, 6]
+
+params:
+  # Matches the `mjx_16a_4o` baseline so the per-update batch (1024 x 32) and
+  # the episode coverage are identical across the two arms being compared.
+  n_steps: 512

@@ -1,0 +1,22 @@
+# @package _global_
+env:
+  environment: multi_box_push_mjx
+  # n_envs is set centrally in conf/config.yaml (usable_cores // n_jobs). That
+  # default targets subprocess box2d envs; MJX envs are vmapped on one device,
+  # so the count is not core-bound — pin it on the CLI (e.g. env.n_envs=32).
+  # The per-update batch scales with it: params.n_steps * n_envs env-steps.
+  n_envs: 32
+  n_agents: 16
+  n_objects: 4
+  reward_mode: dense
+
+# NOTE: top-level, NOT nested under `env:`. This key is `params.n_steps`;
+# `env.params.n_steps` is read by nothing (run.py pulls named keys out of the
+# `env:` block and does not validate unknown ones), so an indented copy is
+# silently inert. It was, from 1fbb3f3 until now: this group ran at the
+# algorithm default of 1024 while `_trunc` / `_partition` ran at 512, i.e.
+# twice their per-update batch. Any mjx_16a_4o result predating this fix is
+# NOT batch-comparable to those arms (within-group mlp-vs-feudal is fine —
+# both arms inherited the same inert override).
+params:
+  n_steps: 1024

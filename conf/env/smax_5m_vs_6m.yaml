@@ -1,0 +1,21 @@
+# @package _global_
+# SMAX 5m_vs_6m — 5 marines against 6, the standard asymmetric "hard" SMAC map. Same
+# surface as smax_3m; only the scenario changes (n_agents and both observation and
+# world-state widths follow from it, so nothing here needs updating).
+#
+#   uv run python train.py algorithm=mappo_jax        env=smax_5m_vs_6m model=mlp    trial_id=0
+#   uv run python train.py algorithm=feudal_mappo_jax env=smax_5m_vs_6m model=feudal trial_id=0
+env:
+  environment: SMAX
+  env_variant: 5m_vs_6m
+  smax_env_id: HeuristicEnemySMAX
+  max_steps: 100
+  # LITERAL vmap width — a hyperparameter (batch = n_steps * n_envs), not a core budget.
+  n_envs: 64
+
+# Column 0, NOT under `env:` — see the note in smax_3m.yaml.
+params:
+  # >= env.max_steps, so a rollout covers a whole episode including the terminal win
+  # bonus. See smax_3m.yaml.
+  n_steps: 128
+  n_total_steps: 1e7

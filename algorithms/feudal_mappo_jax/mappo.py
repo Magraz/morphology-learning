@@ -328,6 +328,10 @@ def ppo_update(
     goal_dim = trajectory.pooled_goal.shape[-1]
     # Static: (n_steps, n_envs, n_agents) rewards => per-agent credit path.
     per_agent = trajectory.reward.ndim == 3
+    # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked
+    # categorical. Envs without `avail_actions` store a scalar placeholder, so this
+    # is False and the update is byte-identical to the pre-masking code.
+    use_mask = trajectory.action_mask.ndim == 4
 
     dones = trajectory.done.astype(jnp.float32)
     advantages, returns = compute_gae(
@@ -399,6 +403,10 @@ def ppo_update(
     # staggered starts). All-ones for every ordinary run — the masked means below
     # then reduce to plain means, keeping the update byte-identical.
     active_ts = trajectory.active_mask.reshape(total_ts, n_agents)
+    # Legal-action mask, flattened like obs so it stays paired with its own agent.
+    mask_ts = (
+        trajectory.action_mask.reshape(total_ts, n_agents, -1) if use_mask else None
+    )
     # The conditioning the worker ACTED on. Flattened agent-major below, exactly
     # like obs, so goal row k = m*n_agents + i pairs with obs row k.
     pg_ts = trajectory.pooled_goal.reshape(total_ts, n_agents, goal_dim)
@@ -440,6 +448,9 @@ def ppo_update(
             # per-agent critic. All-ones => the masked means are exact plain means.
             mb_active_pa = active_ts[mb_ids]
             mb_active = mb_active_pa.reshape(n_flat)
+            # Same mask the actions were sampled under — without it the ratio
+            # compares two different distributions and PPO's weight is meaningless.
+            mb_mask = mask_ts[mb_ids].reshape(n_flat, -1) if use_mask else None
             if per_agent:
                 # Each agent carries its own advantage. `.reshape(-1)` is
                 # agent-major within a timestep, matching mb_obs' flattening.
@@ -463,6 +474,7 @@ def ppo_update(
                     mb_obs,
                     mb_actions,
                     discrete,
+                    action_mask=mb_mask,
                 )
                 ratio = jnp.exp(log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv

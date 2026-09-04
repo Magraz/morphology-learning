@@ -1,0 +1,30 @@
+# @package _global_
+#
+# Ablation control for `mjx_16a_4o_drift`: no drift, but the SAME boundary
+# semantics — wall contact is INERT (it never ends the episode). The walls are
+# real inward-facing planes, so agents are physically confined either way;
+# ending the episode on contact was Box2D parity.
+#
+# The drift arm changes two things at once (the physics and this), so this arm is
+# what makes the comparison attributable. Expect it to be close to `mjx_16a_4o`:
+# without drift there is no negative reward stream to escape from, so wall hits
+# are near-worthless rather than an exit. A large gap here means the baseline's
+# episodes were being cut short by incidental wall contact — note `boundary_hit`
+# is `any()` over 16 agents, so that is not a rare event.
+#
+# NOTE: the name is historical. This arm used to report wall hits as `truncated`
+# (so the trainer bootstrapped `gamma * V(s_next)` through them) rather than make
+# them inert. That priced the escape instead of removing it, and policies still
+# learned to crash on purpose — see the `multi_box_push_mjx` module docstring for
+# why bootstrapping cannot fix it.
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 16
+  n_objects: 4
+  reward_mode: dense
+
+  variant: trunc
+
+params:
+  n_steps: 1024

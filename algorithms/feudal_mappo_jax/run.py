@@ -23,7 +23,11 @@ import numpy as np
 from flax.serialization import from_bytes, to_bytes
 
 from algorithms.feudal_mappo_jax.mappo import create_train_state
-from algorithms.feudal_mappo_jax.trainer import RunnerState, make_train
+from algorithms.feudal_mappo_jax.trainer import (
+    RunnerState,
+    global_state_dim,
+    make_train,
+)
 from algorithms.feudal_mappo_jax.types import (
     Experiment,
     MAPPOConfig,
@@ -108,7 +112,6 @@ class Feudal_MAPPO_JAX_Runner:
             self.env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                max_steps=self.params.n_steps,
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -117,7 +120,6 @@ class Feudal_MAPPO_JAX_Runner:
             self.env = MultiBoxMultiGoalPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                max_steps=self.params.n_steps,
                 reward_mode=reward_mode,
                 boundary_ends_episode=env_config.get("boundary_ends_episode", False),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -143,7 +145,6 @@ class Feudal_MAPPO_JAX_Runner:
             base_env = MultiBoxPushMJX(
                 n_agents=env_config.get("n_agents"),
                 n_objects=env_config.get("n_objects"),
-                max_steps=self.params.n_steps,
                 reward_mode=base_reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
@@ -158,12 +159,29 @@ class Feudal_MAPPO_JAX_Runner:
                 stagger_starts=env_config.get("stagger_starts", False),
                 max_start_delay=env_config.get("max_start_delay", 0),
             )
+        elif environment == EnvironmentEnum.SMAX:
+            # JaxMARL StarCraft, behind an adapter that presents the same functional
+            # array contract as the MJX envs. It brings three things the MJX envs do
+            # not: legal-action masks, a real global state (which the manager reads as
+            # its joint state), and units that die mid-episode (masked out of the loss
+            # via info["active"]).
+            # `max_steps` is the benchmark's own episode limit, NOT params.n_steps —
+            # unlike the MJX branches above, the two are independent here.
+            from environments.smax.smax_env import SMAXAdapter
+
+            self.env = SMAXAdapter(
+                map_name=env_config.get("env_variant", "3m"),
+                smax_env_id=env_config.get("smax_env_id", "HeuristicEnemySMAX"),
+                max_steps=env_config.get("max_steps"),
+                walls_cause_death=env_config.get("walls_cause_death", True),
+                use_self_play_reward=env_config.get("use_self_play_reward", False),
+            )
         else:
             raise ValueError(
                 f"feudal_mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
-                f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}' and "
-                f"'{EnvironmentEnum.MACRO_MJX}' (functional JAX API); "
-                f"got {environment!r}"
+                f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}', "
+                f"'{EnvironmentEnum.MACRO_MJX}' and '{EnvironmentEnum.SMAX}' "
+                f"(functional JAX API); got {environment!r}"
             )
         # A per-agent reward (single-step or windowed difference rewards) switches
         # the critic to a per-agent value head and runs GAE on the agent axis (see
@@ -478,7 +496,7 @@ class Feudal_MAPPO_JAX_Runner:
             jax.random.PRNGKey(0),
             self.config,
             self.env.observation_dim,
-            self.env.observation_dim * self.env.n_agents,
+            global_state_dim(self.env),
             self.env.action_dim,
             discrete=getattr(self.env, "discrete", False),
             n_agents=self.env.n_agents,
@@ -527,6 +545,13 @@ class Feudal_MAPPO_JAX_Runner:
 
     def view(self):
         """Render deterministic episodes with the trained policy (vanilla view)."""
+        # Envs that bring their own renderer (SMAX) take a separate path: the MJX
+        # renderers below are not generic — they read world_width, sector_sensor_radius,
+        # objects_push_coupling_list, _build_xml(), state.data.qpos and hardcoded MJX
+        # observation-slice constants off the env.
+        if hasattr(self.env, "render_episode"):
+            return self._view_with_env_renderer()
+
         import imageio
         import matplotlib.pyplot as plt
 
@@ -694,6 +719,96 @@ class Feudal_MAPPO_JAX_Runner:
                 native_path = self.dirs["logs"] / f"episode_{episode}_native.mp4"
                 imageio.mimwrite(native_path, native_frames, fps=30, macro_block_size=1)
                 print(f"Native video saved to {native_path}")
+
+    def _view_with_env_renderer(self, n_episodes: int = 3):
+        """Render episodes using the env's own renderer (SMAX -> SMAXVisualizer).
+
+        Fewer episodes than the MJX path renders (10) because SMAXVisualizer animates
+        through matplotlib, which costs ~2-4s per frame of episode: a battle that runs
+        the full `max_steps` takes several minutes on its own. Raise `n_episodes` if you
+        want more and are willing to wait.
+
+        Runs the FULL hierarchy — manager read + goal ring + goal-conditioned worker —
+        for the same reason the MJX path does: the worker is goal-conditioned, so
+        rendering it without the manager drives it with a goal it never saw. Actions are
+        a deterministic argmax under the legal-action mask, matching `eval_fn`.
+        """
+        import matplotlib.pyplot as plt
+
+        import jax.numpy as jnp
+
+        from algorithms.feudal_mappo_jax.manager import (
+            goal_ring_pool,
+            goal_ring_write,
+        )
+        from algorithms.feudal_mappo_jax.mappo import build_manager
+        from algorithms.feudal_mappo_jax.network import sample_action
+        from algorithms.feudal_mappo_jax.worker import bind_goal
+
+        train_state = self._load_train_state()
+        n_agents = self.env.n_agents
+        obs_dim = self.env.observation_dim
+        manager = build_manager(self.config, n_agents)
+        horizon, goal_dim = self.config.goal_horizon, self.config.goal_dim
+
+        reset_fn = jax.jit(self.env.reset)
+        step_fn = jax.jit(self.env.step)
+        avail_fn = jax.jit(self.env.avail_actions)
+        gs_fn = jax.jit(self.env.global_state)
+
+        @jax.jit
+        def manager_fn(m_carry, gs):
+            return manager.apply(train_state.manager_ts.params, m_carry, gs)
+
+        @jax.jit
+        def policy_fn(obs, pooled_goal, mask):
+            actions, _ = sample_action(
+                jax.random.PRNGKey(0),
+                bind_goal(train_state.actor_ts.apply_fn, pooled_goal),
+                train_state.actor_ts.params,
+                obs.reshape(n_agents, obs_dim),
+                discrete=True,
+                deterministic=True,
+                action_mask=mask.reshape(n_agents, -1),
+            )
+            return actions
+
+        for episode in range(n_episodes):
+            obs, state = reset_fn(jax.random.PRNGKey(self.rng_seed + episode))
+            # Per-episode manager memory: zeroed core carry + zeroed goal ring, the
+            # same convention the training and eval scans use.
+            m_carry = manager.initialize_carry(jax.random.PRNGKey(0), ())
+            goal_hist = jnp.zeros((horizon, n_agents, goal_dim))
+
+            state_seq, rewards = [], []
+            for t in range(self.env.max_steps):
+                # The manager reads the env's real global state here, exactly as the
+                # trainer does — not a reshape of the observations.
+                m_carry, goal, _ = manager_fn(m_carry, gs_fn(state))
+                goal_hist = goal_ring_write(goal_hist, goal, t)
+                actions = policy_fn(obs, goal_ring_pool(goal_hist), avail_fn(state))
+                state_seq.append(
+                    (state.key, state.env_state, self.env.to_action_dict(actions))
+                )
+                obs, state, _, terminated, truncated, info = step_fn(state, actions)
+                rewards.append(float(info["task_reward"]))
+                if bool(terminated) or bool(truncated):
+                    break
+
+            gif_path = self.dirs["logs"] / f"episode_{episode}.gif"
+            self.env.render_episode(state_seq, gif_path)
+            print(
+                f"Episode {episode}: return={sum(rewards):.2f} "
+                f"steps={len(rewards)} -> {gif_path}"
+            )
+
+            fig, ax = plt.subplots()
+            ax.plot(rewards)
+            ax.set_xlabel("step")
+            ax.set_ylabel("team reward")
+            ax.set_title(f"Episode {episode} (return {sum(rewards):.2f})")
+            fig.savefig(self.dirs["logs"] / f"episode_{episode}_reward.png")
+            plt.close(fig)
 
     def evaluate(self):
         """Deterministic evaluation of the saved policy (PolicyEvaluator parity)."""

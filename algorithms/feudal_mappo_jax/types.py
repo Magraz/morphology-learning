@@ -190,9 +190,18 @@ class Transition(NamedTuple):
     team_reward: jax.Array  # (n_envs,) scalar team reward — logging only
     # (n_envs, n_agents) 1.0/0.0 — did this agent contribute a real decision this
     # step? All 1.0 for ordinary envs (no change); 0.0 for agents that were offline
-    # under SyncMacroMJX's staggered-starts mode, whose transition is masked out of
-    # the PPO loss. All-ones keeps the loss byte-identical to the unmasked path.
+    # under SyncMacroMJX's staggered-starts mode, or dead under SMAX, whose transition
+    # is masked out of the PPO loss. All-ones keeps the loss byte-identical.
     active_mask: jax.Array
+    # (n_envs, n_agents, action_dim) 1.0/0.0 legal-action mask, for discrete envs that
+    # expose `avail_actions` (SMAX). For every other env this is a **scalar placeholder**
+    # and no masking happens: storing a real all-ones array would cost a
+    # (n_steps, n_envs, n_agents, action_dim) buffer for nothing. `ppo_update` switches
+    # on `action_mask.ndim == 4`, the same static-shape idiom as `reward.ndim == 3`.
+    #
+    # The stored mask MUST be the one used at sampling time — the PPO ratio is only
+    # valid if `evaluate_action` sees the same masked distribution `sample_action` did.
+    action_mask: jax.Array
 
     # ---- FeUdal hierarchy ----
     # The manager's raw per-step directive, (n_envs, n_agents, goal_dim), unit

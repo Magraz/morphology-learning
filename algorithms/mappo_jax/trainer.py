@@ -40,6 +40,22 @@ class RunnerState(NamedTuple):
     rng: jax.Array
 
 
+def global_state_dim(env) -> int:
+    """Width of the centralized critic's input for `env`.
+
+    An env may publish a real global state (SMAX's world state — absolute unit features,
+    and much narrower than N egocentric views); otherwise the global state is the
+    concatenation of the per-agent observations, which is what the MJX envs use.
+
+    Shared by `make_train` and `run.py`'s checkpoint reload so the critic built at resume
+    cannot disagree with the one that was trained — `flax.serialization.from_bytes`
+    needs an exactly-shaped target tree, so a mismatch here is a load failure.
+    """
+    if hasattr(env, "global_state"):
+        return int(env.global_state_dim)
+    return int(env.observation_dim) * int(env.n_agents)
+
+
 def make_train(config: MAPPOConfig, env):
     """Build jitted train functions for a functional MJX env.
 
@@ -73,9 +89,49 @@ def make_train(config: MAPPOConfig, env):
     v_reset = jax.vmap(env.reset)
     v_step = jax.vmap(env.step)
 
-    def _actor_forward(train_state, obs, rng, deterministic):
+    # --- Optional env hooks. Both are static (presence is decided at trace time), so an
+    # env that has neither takes byte-identical code paths to before they existed.
+
+    # Legal-action masking (SMAX). Without it a categorical actor spends probability on
+    # illegal actions and a deterministic argmax can select one outright.
+    use_action_mask = hasattr(env, "avail_actions")
+    if use_action_mask:
+        _v_avail = jax.vmap(env.avail_actions)
+        # Placeholder stored in Transition when masking is off — see types.Transition.
+        _mask_placeholder = None
+    else:
+        _v_avail = None
+        _mask_placeholder = jnp.zeros(())
+
+    def _avail(env_state):
+        return _v_avail(env_state) if use_action_mask else None
+
+    # Centralized-critic input. SMAX ships a real world state (absolute unit features);
+    # the MJX envs do not, and there the global state is the concatenation of the
+    # per-agent observations — which is what this used to do unconditionally.
+    if hasattr(env, "global_state"):
+        _v_gs = jax.vmap(env.global_state)
+
+        def _global_state(obs, env_state):
+            return _v_gs(env_state)
+
+    else:
+
+        def _global_state(obs, env_state):
+            return obs.reshape(obs.shape[0], -1)
+
+    gs_dim = global_state_dim(env)
+
+    def _actor_forward(train_state, obs, rng, deterministic, action_mask=None):
         """Shared actor over (batch, n_agents, obs_dim) in one fused pass."""
         b = obs.shape[0]
+        # The mask flattens agent-major exactly like the obs, so row i of the flattened
+        # batch keeps its own agent's legal actions.
+        mask_flat = (
+            action_mask.reshape(b * n_agents, action_dim)
+            if action_mask is not None
+            else None
+        )
         actions_flat, log_probs_flat = sample_action(
             rng,
             train_state.actor_ts.apply_fn,
@@ -83,6 +139,7 @@ def make_train(config: MAPPOConfig, env):
             obs.reshape(b * n_agents, obs_dim),
             discrete,
             deterministic=deterministic,
+            action_mask=mask_flat,
         )
         # Discrete actions are integer skill indices (no trailing action_dim
         # axis); continuous actions are (action_dim,) force vectors.
@@ -106,7 +163,7 @@ def make_train(config: MAPPOConfig, env):
     def init_fn(rng: jax.Array) -> RunnerState:
         rng, init_rng = jax.random.split(rng)
         train_state = create_train_state(
-            init_rng, config, obs_dim, obs_dim * n_agents, action_dim, discrete,
+            init_rng, config, obs_dim, gs_dim, action_dim, discrete,
             n_critic_outputs=n_critic_outputs,
         )
         return RunnerState(train_state=train_state, rng=rng)
@@ -117,10 +174,14 @@ def make_train(config: MAPPOConfig, env):
         train_state, env_state, obs, rng = carry
         rng, action_rng, reset_rng = jax.random.split(rng, 3)
 
-        global_state = obs.reshape(config.n_envs, -1)
+        global_state = _global_state(obs, env_state)
         values = _values(train_state, global_state)
+        # Fetched from the PRE-step state: these are the actions legal for the state the
+        # policy is acting from, and the same array is stored in the transition so the
+        # update re-evaluates the identical masked distribution.
+        action_mask = _avail(env_state)
         actions, log_probs = _actor_forward(
-            train_state, obs, action_rng, deterministic=False
+            train_state, obs, action_rng, deterministic=False, action_mask=action_mask
         )
 
         next_obs, next_env_state, reward, terminated, truncated, info = v_step(
@@ -141,7 +202,9 @@ def make_train(config: MAPPOConfig, env):
         # bootstrap into the reward (SB3-style). GAE's own `not_done` bootstrap
         # term is then correctly 0 at this step, avoiding a double count.
         trunc_f = truncated.astype(jnp.float32)
-        next_value = _values(train_state, next_obs.reshape(config.n_envs, -1))
+        # NOTE: computed from the successor state BEFORE the restart below overwrites
+        # it — the whole point is to value the real successor, not the reset state.
+        next_value = _values(train_state, _global_state(next_obs, next_env_state))
         if next_value.ndim > trunc_f.ndim:  # per-agent critic head
             trunc_f = trunc_f[:, None]
         reward = reward + config.gamma * trunc_f * next_value
@@ -183,6 +246,7 @@ def make_train(config: MAPPOConfig, env):
             value=values,
             team_reward=team_reward,
             active_mask=active_mask,
+            action_mask=action_mask if use_action_mask else _mask_placeholder,
         )
         carry = (train_state, next_env_state, next_obs, rng)
         if aligned:
@@ -232,7 +296,9 @@ def make_train(config: MAPPOConfig, env):
         # Fresh episodes every rollout, matching vanilla's per-collect reset
         obs, env_state = v_reset(jax.random.split(reset_rng, config.n_envs))
 
-        (train_state, _, last_obs, rng), scan_out = jax.lax.scan(
+        # The final env state is bound (not discarded): with a state-derived global
+        # state the bootstrap below needs it, not just the last observation.
+        (train_state, last_env_state, last_obs, rng), scan_out = jax.lax.scan(
             _env_step,
             (train_state, env_state, obs, rng),
             None,
@@ -245,7 +311,9 @@ def make_train(config: MAPPOConfig, env):
             trajectory = scan_out
 
         # Bootstrap value for GAE (done masking happens inside compute_gae)
-        last_value = _values(train_state, last_obs.reshape(config.n_envs, -1))
+        last_value = _values(
+            train_state, _global_state(last_obs, last_env_state)
+        )
 
         rollout_stats = {
             # Team reward, not the learner's signal — otherwise this would report
@@ -283,8 +351,15 @@ def make_train(config: MAPPOConfig, env):
 
         def _eval_step(carry, _):
             obs, env_state, finished, episode_rewards = carry
+            # The mask matters more here than in collection: an unmasked argmax picks
+            # the single highest logit even when that action is illegal, so eval would
+            # score a policy the env never actually runs.
             actions, _ = _actor_forward(
-                train_state, obs, jax.random.PRNGKey(0), deterministic=True
+                train_state,
+                obs,
+                jax.random.PRNGKey(0),
+                deterministic=True,
+                action_mask=_avail(env_state),
             )
             next_obs, next_env_state, _, terminated, truncated, info = jax.vmap(
                 env.step
