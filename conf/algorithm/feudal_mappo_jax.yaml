@@ -1,24 +1,20 @@
 # @package _global_
-# FeUdal MAPPO (algorithms/feudal_mappo_jax): a FeUdal-Networks hierarchy over
-# the same functional MJX envs as mappo_jax — a centralized manager emits one
+# FeUdal MAPPO (algorithms/feudal_mappo_jax): a centralized manager emits one
 # unit-norm latent goal per agent, a goal-conditioned worker emits the primitive
 # action. The worker's PPO surface is identical to mappo_jax so the two are
-# drop-in comparable; the feudal-only knobs live below and in conf/model/feudal.
+# drop-in comparable.
 #
-# NOTE: always pair this with `model=feudal`, never `model=mlp`. The results path
-# is experiments/results/<env>/<model>/ and does NOT include the algorithm, so
-# `model=mlp` would write into the mappo_jax baseline's directory (and a
-# `checkpoint=true` resume would try to load a 2-state mappo_jax checkpoint into
-# the 4-state feudal train state).
+# ⚠ Always pair with `model=feudal`, never `model=mlp`: the results path
+# experiments/results/<env>/<model>/ does not include the algorithm, so `mlp`
+# writes into the mappo_jax baseline's directory (and `checkpoint=true` would
+# load a 2-state mappo_jax checkpoint into the 4-state feudal train state).
 algorithm: feudal_mappo_jax
 params:
   n_epochs: 6
   n_total_steps: 100000000.0     # float on purpose; env groups override when different
   n_minibatches: 8
-  # Rollout length per env stream. Unlike the torch stacks this must stay
-  # per-env: it is the static length of the jitted collect scan. The batch is
-  # n_steps * env.n_envs, and n_envs is a literal in each MJX env group (a vmap
-  # width, never core-derived), so the batch is still fixed by config alone.
+  # Must stay per-env: it is the static length of the jitted collect scan.
+  # Batch = n_steps * env.n_envs, and n_envs is a literal in each MJX env group.
   n_steps: 1024
   parameter_sharing: true       # shared-worker path only, as in mappo_jax
   lr: 0.0003
@@ -29,86 +25,57 @@ params:
   grad_clip: 0.5
 
   # ---- FeUdal ----
-  # Goal horizon c: the lag at which the manager's directive is scored
-  # (d_cos(s_{t+c} - s_t, g_t)), the number of goals the worker's conditioning
-  # pools over, and the dilation radius of the LSTM core. Note c interacts with
-  # episode length: horizons that straddle an episode boundary are masked out of
-  # the manager loss, so on a short-episode env a large c starves the manager
-  # (watch `valid_fraction`).
+  # Goal horizon c: the lag scored by d_cos(s_{t+c} - s_t, g_t), the number of
+  # goals the worker pools over, and the LSTM core's dilation radius. Horizons
+  # straddling an episode boundary are masked out, so on a short-episode env a
+  # large c starves the manager — watch `valid_fraction`.
   goal_horizon: 10
-  # alpha: the worker's intrinsic-reward weight, as a GRADIENT FRACTION. 0.0
-  # leaves the intrinsic path inert — goals still condition the worker, but
-  # nothing rewards following them — and is a STATIC no-op (no V^I is built and
-  # the checkpoint format is unchanged, so `feudal_a0` runs still resume).
-  #
-  # The two streams are combined at the ADVANTAGE level, each normalized to unit
-  # std first: `adv = adv_ext + alpha * adv_int`. So alpha is the mixing ratio of
-  # the two gradient directions, NOT a coefficient on a reward.
-  #
-  # ⚠ THE OLD CALIBRATION HERE WAS WRONG IN KIND, and is kept below only as a
-  # record of the mistake. It derived alpha=0.5 by comparing alpha*|r^I| = 0.076
-  # against the CONVERGED mappo_jax baseline's ~0.39-0.46/step, reading 17-19%.
-  # That denominator is the ENDPOINT of learning. The rate that governs whether
-  # learning ever starts is the one the policy can currently reach — measured at
-  # ~5e-05/step — against which the same alpha is ~1500:1. As a reward
-  # coefficient, alpha=0.1 and alpha=0.5 were therefore BOTH ~300-1700x too
-  # large during the whole early phase, and both converged to a task-free fixed
-  # point (worker and manager climbing each other's cosine: `intrinsic_reward`
-  # 0.0002 -> 0.138 monotonically while env reward stayed at ~1e-3 for 1e8
-  # steps, on all three of mjx_16a_4o / _trunc / _partition, 3 seeds each).
-  # It is an absorbing state, not the transient exploration phase the old note
-  # assumed. No value in a 0/0.1/0.5 sweep escapes it — the smallest nonzero
-  # member is already ~300x too large.
-  #
-  # Per-stream normalization removes the scale gap outright, so alpha now means
-  # what it reads as at any point in training. The arms live in
-  # conf/model/feudal_n01.yaml (0.1) and feudal_n05.yaml (0.5); the default stays
-  # OFF so `algorithm=feudal_mappo_jax model=feudal` is the no-intrinsic control.
-  #
-  # Watch `adv_ext_std_raw` / `adv_int_std_raw` in the training stats — they are
-  # the raw per-stream advantage scales, i.e. the gap the normalization absorbs.
+  # alpha: the worker's intrinsic-reward weight, as a GRADIENT FRACTION, not a
+  # reward coefficient. The two streams are each normalized to unit std and
+  # combined as `adv = adv_ext + alpha * adv_int`.
+  # 0.0 leaves the intrinsic path inert (goals still condition the worker) and is
+  # a STATIC no-op: no V^I is built and the checkpoint format is unchanged.
+  # ⚠ The alpha>0 arms (conf/model/feudal_n01, feudal_n05) converged to a
+  # task-free fixed point — worker and manager climbing each other's cosine —
+  # under the OLD reward-level fold. Default stays OFF: this is the control.
+  # Watch `adv_ext_std_raw` / `adv_int_std_raw` for the raw per-stream scales.
   intrinsic_coef: 0.0
-  # "linear" decays alpha to exactly 0 across n_total_steps; "none" holds it.
-  # Annealing is what makes the ENDPOINT correct: at constant alpha that fraction
-  # of the worker's gradient points at a task-irrelevant objective forever.
+  # "linear" decays alpha to 0 across n_total_steps; "none" holds it. Required
+  # for asymptotic correctness — at constant alpha that gradient fraction points
+  # at a task-irrelevant objective forever.
   intrinsic_anneal: linear
   manager_lr: 0.0003
   manager_val_coef: 0.5
-  # The manager operates on a longer timescale than the worker, so this may
-  # exceed `gamma`.
+  # The manager operates on a longer timescale, so this may exceed `gamma`.
   manager_gamma: 0.99
-  # Gradient passes per update over the FULL batch. The transition PG has no
-  # importance-sampling correction, so >1 is uncorrected off-policy for the
-  # policy arm; V^M's regression has no such constraint (fixed targets) and is
-  # given its own count below.
+  # Full-batch gradient passes per update. The transition PG has no
+  # importance-sampling correction, so >1 is uncorrected off-policy.
   n_manager_epochs: 1
-  # V^M regresses fixed targets, so extra passes are ordinary supervised
-  # optimization. Kept separate because the worker critic gets
-  # n_epochs * n_minibatches (48 at the defaults) gradient steps per update; at 1
-  # the manager critic would be ~50x undertrained by comparison and
-  # `manager_explained_variance` stays negative.
+  # V^M regresses fixed targets, so extra passes are ordinary supervised fitting.
+  # Separate from n_manager_epochs because the worker critic gets
+  # n_epochs * n_minibatches (48) steps per update; at 1, V^M is ~50x
+  # undertrained and `manager_explained_variance` stays negative.
   n_manager_critic_epochs: 8
 
   # ---- goal-usefulness diagnostics ----
-  # Deterministic episodes per eval. Was an invisible default of 5, so every
-  # `reward` point in every plot predating this is a 5-episode mean. Eval cost
-  # is the fixed env.max_steps SEQUENTIAL scan, so episodes are nearly free
-  # (width, not depth); `mappo_jax` carries the same value so the feudal-vs-flat
-  # comparison does not also compare two eval noise floors.
-  n_eval_episodes: 32
+  # Deterministic episodes per eval. Eval cost is the fixed env.max_steps
+  # sequential scan, so extra episodes are near-free up to ~32 envs of width.
+  # ⚠ mappo_jax sets 32, so feudal-vs-flat currently also compares two eval
+  # noise floors; match them before reading a small gap between the stacks.
+  n_eval_episodes: 16
   # Run the permuted/zeroed goal-ablation eval blocks alongside the real one.
-  # They share ONE scan at 3x vmapped width, so this costs ~+2% of wall rather
-  # than the ~+18.7% three sequential evals would.
+  # Three variants share ONE scan at 3x vmapped width — measured 1.91x one eval
+  # (not 3x), i.e. ~+8.5% wall on a production-length run. Set false to disable.
   eval_goal_variants: true
-  # Cyclic shift for the permutation nulls (agent axis and env axis). A cyclic
-  # shift is a guaranteed derangement, unlike a random permutation which leaves
-  # ~1 agent in 16 holding its own goal. Must not be a multiple of n_agents.
+  # Cyclic shift for the permutation nulls (agent and env axes). A cyclic shift
+  # is a guaranteed derangement, unlike a random permutation which leaves ~1
+  # agent in 16 holding its own goal. Must not be a multiple of n_agents.
   goal_permute_shift: 1
 model_params:
   hidden_dim: 168
   # Width of the manager's latent state `s` AND of the goal `g` (in FuN a goal is
-  # a direction in the state embedding, so they share a space). Also the
-  # manager's whole information bottleneck — the core consumes `s`.
+  # a direction in the state embedding). Also the manager's whole information
+  # bottleneck — the core consumes `s`.
   goal_dim: 32
   manager_hidden_dim: 256
   # "mlp" (stateless) or "dilated_lstm" (FuN's dilated recurrence). mlp is the
