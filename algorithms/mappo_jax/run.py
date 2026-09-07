@@ -201,6 +201,7 @@ class MAPPO_JAX_Runner:
             parameter_sharing=self.params.parameter_sharing,
             hidden_dim=self.model_params.hidden_dim,
             per_agent_rewards=per_agent_rewards,
+            n_eval_episodes=self.params.n_eval_episodes,
         )
 
         print(

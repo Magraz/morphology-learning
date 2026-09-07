@@ -6,20 +6,51 @@ local observation *plus* a latent goal vector `g` produced by the manager
 MAPPO actor drives, so everything downstream of the policy (env stepping,
 PPO update, logging) is unchanged.
 
-Fusion is plain concatenation ``[obs, goal] -> MLP`` for now. The network body
-is the flat :class:`MAPPOActor` reused verbatim (same 2-layer Tanh MLP, same
-orthogonal init, same continuous/discrete head contract), so the worker returns
-exactly what ``sample_action`` / ``evaluate_action`` in ``network.py`` expect —
-logits when ``discrete``, ``(mean, log_std)`` otherwise.
+``worker_fusion`` selects how the goal reaches the policy: ``"concat"``
+(``[obs, goal] -> MLP``, the original and still the default) or ``"film"``
+(zero-initialized Feature-wise Linear Modulation, :class:`FiLM`). Either way the
+network body is the flat :class:`MAPPOActor` reused verbatim (same 2-layer Tanh
+MLP, same orthogonal init, same continuous/discrete head contract), so the worker
+returns exactly what ``sample_action`` / ``evaluate_action`` in ``network.py``
+expect — logits when ``discrete``, ``(mean, log_std)`` otherwise. FiLM rides an
+optional ``modulate`` hook on ``MAPPOActor``; passing ``None`` leaves that module
+byte-identical to the pre-hook version.
 
-Known property of concat fusion: the worker *can* learn to ignore the goal by
-zeroing the goal columns of the first layer, which is precisely the degenerate
-solution FeUdal Networks (Vezhnevets et al., 2017) avoids by making the goal
-enter through a bias-free bilinear projection (``logits = U(obs) @ phi(g)``,
-``phi`` linear without bias) so a zero goal yields no preference and the goal
-direction cannot be dropped. If the worker turns out to be goal-blind, that is
-the next thing to change here — the rest of this module's interface stays the
-same.
+**Why FiLM exists — MEASURED, not anticipated.** The goal-dependence probe
+(``goal_dependence_probe.py``, all 20 trained concat arms, 2026-09-06) found
+that permuting the manager's goals across agents changes the return by *nothing*
+while **zeroing** them *improves* it on 15 of 16 non-control arms. So under
+concat the goal is a net-harmful perturbation whose direction the worker never
+learned to use — and the manager is not at fault (its goals are agent-specific
+and state-conditioned; see CLAUDE.md).
+
+Two STRUCTURAL properties of concatenation cause that, and neither is about
+scale (scale is spent — ``normalize_pooled_goal`` already took the goal block
+from 59-78% of layer-1 variance down to a measured 14-19%):
+
+1. **The default is influence, not no-influence.** Orthogonal init makes the
+   goal columns live from step 0 — measured at init on real observations,
+   swapping the goal moves concat's action mean by 1.40e-03 against an action
+   scale of 1.65e-03, i.e. ~85% of the untrained policy's output is goal-driven
+   before any learning. Goal-*agnosticism* is therefore something the worker
+   must actively learn, and the probe says it never finishes. This is exactly
+   the degeneracy FeUdal Networks (Vezhnevets et al., 2017) avoids with a
+   bias-free bilinear projection (``logits = U(obs) @ phi(g)``), under which an
+   uninformative goal costs nothing by construction. FiLM's zero-init recovers
+   that property: measured 0.000e+00 for both a swapped and a zeroed goal.
+2. **Concat can only TRANSLATE the policy.** ``d z1/d obs = W_obs`` contains no
+   goal term whatsoever, so a concatenated goal cannot change *which*
+   observation features matter — only where the operating point sits. A
+   directive like "work the box on your left, ignore the one behind you" needs
+   the goal to modulate the obs->action map, which is what FiLM's multiplicative
+   gain provides.
+
+⚠ FuN's bilinear was deliberately NOT used here: its "zero goal yields no
+preference" property is stated for *discrete logits*, but the MJX envs are
+continuous force control, where a zero goal would produce a zero mean action —
+"stand still", a specific and consequential action rather than neutrality. For
+the discrete arms (``macro_mjx``, SMAX) it is the right shape; for continuous it
+would have to be residual on the mean.
 
 ``normalize_pooled_goal`` (default True) is a first, cheaper guard on the same
 seam, and it was added in response to a MEASURED defect rather than on
@@ -78,6 +109,53 @@ from algorithms.feudal_mappo_jax.network import MAPPOActor
 from algorithms.feudal_mappo_jax.manager import _unit
 
 
+class FiLM(nn.Module):
+    """Feature-wise Linear Modulation (Perez et al. 2018), zero-initialized.
+
+    ``h <- (1 + gamma(g)) * h + beta(g)``, feature-wise, with ``gamma``/``beta``
+    linear in the goal. Used by ``FeudalWorker(worker_fusion="film")`` to let the
+    manager's directive act as a set of **gains on how the observation is read**
+    rather than as one more observation channel.
+
+    Two properties do the work, and both are structural rather than incidental:
+
+    **Zero-init kernels => identity at step 0.** ``gamma = beta = 0``, so the
+    worker begins bit-identical to the flat ``mappo_jax`` actor and any goal
+    influence has to be *earned*. Under concatenation the opposite holds: the
+    goal columns are live at orthogonal init (measured: ~14-19% of the worker's
+    layer-1 variance on trained checkpoints), so goal-*agnosticism* is what the
+    worker would have to learn — and measurement says it never finishes, which
+    is why zeroing the goal at eval IMPROVES return on 15 of 16 trained arms.
+    The ``1 +`` is load-bearing: a bare ``gamma * h`` with a zero-init kernel
+    would output zeros and kill the forward pass. Same trick as adaLN-Zero /
+    ReZero / LoRA's zero-init B.
+    It does not stall learning: ``dL/dW_gamma = (dL/dz * z) g^T`` is nonzero from
+    the first update, so zero-init sets the default, it does not disconnect.
+
+    **Bias-free => ``gamma(0) = beta(0) = 0`` FOREVER**, not just at init, so
+    "zero goal ⇒ exactly the flat policy" survives training. That is what keeps
+    the ``zeroed`` variant of the goal-dependence probe interpretable: with a
+    bias, a trained ``gamma(0) != 0`` would make that arm "flat policy plus a
+    learned constant modulation" and the control would silently drift. FuN makes
+    its ``phi`` bias-free for the same reason.
+    """
+
+    hidden_dim: int
+
+    @nn.compact
+    def __call__(self, h: jnp.ndarray, goal: jnp.ndarray) -> jnp.ndarray:
+        def _coef():
+            return nn.Dense(
+                self.hidden_dim,
+                use_bias=False,
+                kernel_init=nn.initializers.zeros,
+            )
+
+        gamma = _coef()(goal)
+        beta = _coef()(goal)
+        return h * (1.0 + gamma) + beta
+
+
 class FeudalWorker(nn.Module):
     """Goal-conditioned low-level policy.
 
@@ -86,9 +164,16 @@ class FeudalWorker(nn.Module):
         goal_dim: dimension of the manager's latent goal vector.
         hidden_dim: hidden width of the shared MLP body.
         discrete: action-space type, matching ``MAPPOActor``.
+        worker_fusion: how the goal reaches the policy. ``"concat"`` (default,
+            the original) appends it to the observation; ``"film"`` feeds it
+            through zero-initialized :class:`FiLM` layers on both hidden
+            preactivations. See the module docstring for the measurement that
+            motivates ``"film"``. ⚠ The two are NOT checkpoint-compatible:
+            concat's first Dense has input width ``obs_dim + goal_dim`` against
+            FiLM's ``obs_dim``.
         goal_embed_dim: if set, the goal is mapped through a **bias-free** linear
             layer of this width before concatenation (FuN's ``phi``); ``None``
-            (default) concatenates the goal directly.
+            (default) concatenates the goal directly. Applies to both fusions.
         normalize_pooled_goal: L2-normalize the incoming pooled goal ``w_t`` to
             unit length before it meets the observation. Default True; see the
             module docstring for the measured defect this exists to fix. Applied
@@ -114,6 +199,7 @@ class FeudalWorker(nn.Module):
     goal_embed_dim: Optional[int] = None
     normalize_pooled_goal: bool = True
     zero_goal: bool = False
+    worker_fusion: str = "concat"
 
     @nn.compact
     def __call__(self, obs: jnp.ndarray, goal: jnp.ndarray):
@@ -143,13 +229,27 @@ class FeudalWorker(nn.Module):
             )(goal)
 
         goal = _broadcast_goal(goal, obs)
-        x = jnp.concatenate([obs, goal], axis=-1)
 
-        return MAPPOActor(
+        actor = MAPPOActor(
             action_dim=self.action_dim,
             hidden_dim=self.hidden_dim,
             discrete=self.discrete,
-        )(x)
+        )
+
+        if self.worker_fusion == "concat":
+            return actor(jnp.concatenate([obs, goal], axis=-1))
+
+        if self.worker_fusion == "film":
+            # One FiLM per hidden layer, applied to the PREACTIVATION (see
+            # MAPPOActor.__call__). Named explicitly so the param tree does not
+            # depend on flax's creation-order autonaming.
+            films = [FiLM(self.hidden_dim, name=f"film_{i}") for i in range(2)]
+            return actor(obs, modulate=lambda h, i: films[i](h, goal))
+
+        raise ValueError(
+            f"unknown worker_fusion: {self.worker_fusion!r} (expected "
+            f"'concat' or 'film')"
+        )
 
 
 def _broadcast_goal(goal: jnp.ndarray, obs: jnp.ndarray) -> jnp.ndarray:
@@ -196,6 +296,7 @@ def init_worker(
     goal_embed_dim: Optional[int] = None,
     normalize_pooled_goal: bool = True,
     zero_goal: bool = False,
+    worker_fusion: str = "concat",
 ):
     """Build a `FeudalWorker` and its initial params. Returns ``(module, params)``."""
     worker = FeudalWorker(
@@ -206,6 +307,7 @@ def init_worker(
         goal_embed_dim=goal_embed_dim,
         normalize_pooled_goal=normalize_pooled_goal,
         zero_goal=zero_goal,
+        worker_fusion=worker_fusion,
     )
     params = worker.init(rng, jnp.zeros(obs_dim), jnp.zeros(goal_dim))
     return worker, params

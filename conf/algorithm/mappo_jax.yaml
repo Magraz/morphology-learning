@@ -19,5 +19,11 @@ params:
   eps_clip: 0.2
   ent_coef: 0.01
   grad_clip: 0.5
+  # Deterministic episodes per eval. Was an invisible default of 5, so every
+  # `reward` point in every plot predating this is a 5-episode mean. Eval cost
+  # is the fixed env.max_steps SEQUENTIAL scan, so episodes are nearly free
+  # (width, not depth). Kept equal to conf/algorithm/feudal_mappo_jax.yaml so
+  # the feudal-vs-flat comparison does not also compare two eval noise floors.
+  n_eval_episodes: 32
 model_params:
   hidden_dim: 168

@@ -88,6 +88,22 @@ params:
   # the manager critic would be ~50x undertrained by comparison and
   # `manager_explained_variance` stays negative.
   n_manager_critic_epochs: 8
+
+  # ---- goal-usefulness diagnostics ----
+  # Deterministic episodes per eval. Was an invisible default of 5, so every
+  # `reward` point in every plot predating this is a 5-episode mean. Eval cost
+  # is the fixed env.max_steps SEQUENTIAL scan, so episodes are nearly free
+  # (width, not depth); `mappo_jax` carries the same value so the feudal-vs-flat
+  # comparison does not also compare two eval noise floors.
+  n_eval_episodes: 32
+  # Run the permuted/zeroed goal-ablation eval blocks alongside the real one.
+  # They share ONE scan at 3x vmapped width, so this costs ~+2% of wall rather
+  # than the ~+18.7% three sequential evals would.
+  eval_goal_variants: true
+  # Cyclic shift for the permutation nulls (agent axis and env axis). A cyclic
+  # shift is a guaranteed derangement, unlike a random permutation which leaves
+  # ~1 agent in 16 holding its own goal. Must not be a multiple of n_agents.
+  goal_permute_shift: 1
 model_params:
   hidden_dim: 168
   # Width of the manager's latent state `s` AND of the goal `g` (in FuN a goal is

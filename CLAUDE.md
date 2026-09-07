@@ -4,6 +4,8 @@ Whenever building new code, try to reuse as much code as possible. If the new fu
 
 Always keep the CLAUDE.md file up to date to reflect the current functionality and architecture of the code.
 
+Avoid abbreviating terms, and if you are going to use an abbreviation, explain it don't assume I know what an abbreviated term is.
+
 ## Experiment config: Hydra is the sole path (`conf/` + `train.py`)
 
 Runs are launched **only** through the Hydra entry point `train.py`. The legacy
@@ -220,7 +222,24 @@ returns (in a 47-wide arena with R = 15.67, ~89% of positions are within range
 of at least one wall, giving a partial cross-axis fix). Sufficient in principle,
 but a real representation-learning burden — and in `feudal_mappo_jax` the whole
 manager bottleneck is `goal_dim` (16 by default), i.e. 16 numbers to encode
-where every agent and box is. Raising `goal_dim` also raises the ceiling on the
+where every agent and box is.
+  - **⚠ MEASURED 2026-09-04, and it largely REFUTES the "burden" framing above.**
+    A decoding probe (`algorithms/feudal_mappo_jax/global_state_probe.py`, 8192
+    on-policy states from the trained `mjx_16a_4o_trunc_512/mlp/0` policy) fits
+    agent world coordinates from the 640-dim concat to a held-out mean error of
+    **3.36 world units in a 47-wide arena** — against 17.95 for a
+    predict-the-mean baseline and 0.01 for the compact global state (exact by
+    construction). That is **81% of the gap closed, by a LINEAR readout**, so the
+    joint state is not merely present but essentially unentangled. Per axis it
+    splits exactly as the layout predicts: **y is free** (0.01 — `goal_distance`
+    is an affine function of the agent's own y) and **x costs 3.43** against
+    14.54 knowing nothing. Box positions decode to 2.62. So the manager's input
+    is **not information-poor about where things are**, and an `env.global_state`
+    hook would buy width and exact features, NOT information — do not justify one
+    on the frame argument. The honest residual: a probe is *trained to decode*,
+    whereas the manager is trained on a task gradient, so this shows the
+    information is available and cheap, not that it is used; and 3.4 units is
+    ~22% of the sensor radius, so the recovered resolution is coarse. Raising `goal_dim` also raises the ceiling on the
 `goal_direction_count` diagnostic, whose healthy random-direction baseline is
 `N^2 / (N + N(N-1)/goal_dim)` — 8.26 at N=16/goal_dim=16 — so that series stops
 being comparable across runs with different widths.
@@ -467,6 +486,41 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   nothing from it), but it **is** the training env of the fully-jitted
   `mappo_jax` stack (below) via `EnvironmentEnum.MULTI_BOX_MJX =
   "multi_box_push_mjx"`.
+
+#### `reward_mode="sparse"` (implemented, arm added 2026-09-04)
+
+One branch, no plumbing: `task_reward = completion + (shaping if self._dense
+else 0.0)` (`multi_box_push_mjx.py`, and the identical line in
+`multi_box_multi_goal_push_mjx.py`). `sparse` drops the per-step displacement
+shaping and pays **only** the one-time `+100` per delivered box; delivery
+latching, the `prev_box_goal_dist` bookkeeping, the observation and the physics
+are untouched. Measured (9a/3o, scripted balanced partition, 600 steps): dense
+return 331.09 with the first nonzero reward at step 66 (+9e-4), sparse 300.00
+with the first at step 245 (+100.0), both delivering 3/3.
+
+- Accepted by `MULTI_BOX_MJX` and `MULTI_BOX_MULTI_GOAL_MJX` (both validate
+  `dense|sparse|difference_rewards` and `run.py` forwards it in `mappo_jax` and
+  `feudal_mappo_jax` alike). `MACRO_MJX` passes it to the base env *and* to
+  `SyncMacroMJX`, which accumulates it over the window — structurally fine,
+  **untested**. Not combinable with the windowed DR modes (they raise unless the
+  base is dense); SMAX hardcodes `"dense"`.
+- **The arm is `conf/env/mjx_16a_4o_trunc_1024_sparse.yaml`** — a copy of
+  `mjx_16a_4o_trunc_1024` differing in exactly one key, so it is the controlled
+  sparse-vs-dense comparison against *that* group. Every MJX env group already
+  declares `reward_mode`, so `env.reward_mode=sparse` also works as a plain CLI
+  override under Hydra struct mode.
+- **⚠ Do not pair sparse with `mjx_16a_4o_1024`.** That group has
+  `boundary_ends_episode: true` and `boundary_hit` is `any()` over 16 agents, so
+  episodes die at ~43 steps on incidental wall contact. With shaping removed
+  there is nothing in the gradient before the first delivery and a 43-step
+  episode essentially never reaches one — the signal is all-zero. The `trunc`
+  base (inert walls, full 1024 steps) is what makes a delivery reachable.
+- **⚠ Do not pair sparse with `variant: drift`.** The decay's only channel into
+  the reward is the shaping term; with shaping gone an unattended box sinks for
+  free until it makes delivery outright impossible, so that combination is
+  closer to plain sparse than to "sparse with coalition pressure".
+- **No sparse run has been done** — every number above is a scripted-oracle
+  mechanism check, not a training result.
 
 #### Box drift / "decay" (`box_drift_speed`, off by default)
 
@@ -1332,6 +1386,276 @@ centering — never read `d_cos_mean` alone, a high *flat* value reads as succes
 `valid_fraction`, `manager_pg_loss`, `manager_value_loss`,
 `manager_explained_variance`.
 
+⚠ **Every metric in that paragraph is a COLLAPSE detector — none of them tests
+whether the goals are USEFUL.** They answer "are the goals well-formed?", which
+is a necessary condition and nothing more, and two of them mislead if read as
+usefulness: `d_cos_mean`'s level is uninterpretable because the manager owns
+*both* arguments of the cosine, and `worker_goal_column_ratio` already misled
+once (it fell while the goal block *grew* 2.2–4.7x). The usefulness tests are
+the permutation nulls below.
+
+### Permutation nulls — the "are the goals useful?" diagnostics
+
+The method: permute goals along one axis, which preserves the goal distribution
+**exactly** and destroys exactly one property, so the real-minus-null gap
+isolates that property. Two axes, and they answer different questions:
+
+| variant | agent pairing | state conditioning | a gap measures |
+|---|---|---|---|
+| `real` | ✓ | ✓ | (reference) |
+| `permuted` (agent axis) | ✗ | ✓ | value of the **assignment** |
+| `env_permuted` (env axis) | ✓ | ✗ | value of **state-conditioning** |
+| `zeroed` | ✗ | ✗ | value of goal conditioning at all |
+
+⚠ **READ THE ENV NULL FIRST — the ordering is the finding.** A manager that has
+degenerated into a fixed per-agent code (an agent-ID label with no dependence on
+`s_t`) scores a *large* agent-permutation gap while doing nothing the hierarchy
+exists for — and the collapse suite calls that state healthy, since
+`goal_direction_count` reads ≈8.25 against a random-direction baseline of 8.26.
+If `d_cos_gap_env ≈ 0` the goals are not functions of the state, and
+`d_cos_gap_agent` is uninterpretable however large it is.
+
+**Latent (live, every update, unconditional).** `mappo.manager_cosine_metrics`
+adds `d_cos_null_agent`, `d_cos_null_env`, `d_cos_gap_agent`, `d_cos_gap_env`,
+`goal_perm_cos` next to `d_cos_mean`/`d_cos_var`/`valid_fraction`. Forward-only
+on arrays `manager_update` has already materialized (the loss aux `cos`/`valid`
+is passed in, so the real cosine is not recomputed) — no network forward, no
+backward pass. Ungated, matching every other manager diagnostic; gating would
+make future runs non-comparable. The one invariant it rests on:
+`transition_cosine`'s `valid` is a function of `states` + `done` **only**, never
+of `goals`, so real and null share one mask — pinned by
+`test_transition_cosine_valid_is_independent_of_goals`.
+
+**Behavioural (live, at the eval cadence).** `trainer.eval_fn` gained static
+`variants=` / `detail=` args and runs every variant in **one scan** at
+`V × n_eval_episodes` vmapped width, with `jnp.tile`d reset keys so episode *j*
+of every block starts from a bit-identical state (the gap is therefore a
+**paired** statistic that carries no reset variance).
+Series: `eval_reward_permuted`, `eval_reward_zeroed`, `eval_gap_permuted`,
+`eval_gap_zeroed`, `eval_len_{real,permuted,zeroed}`. The `reward` series is
+still exactly the `real` block, so every existing plot and pickle is unaffected
+(`test_real_eval_variant_is_unchanged` pins the bit-equality).
+`eval_len_*` exists because boundary contact *terminates* in these envs — without
+it a return gap conflates "less reward per step" with "shorter episode".
+
+⚠ **COST, measured 2026-09-06 — vmap width is free only up to a point, and the
+batched scan is NOT ~free.** Clean A/B on `mjx_16a_4o_512/feudal` (983k steps,
+7 evals each, warm median excluding the first-call compile):
+
+| | warm median eval | vs. 1 variant |
+|---|---|---|
+| `eval_goal_variants: false` (32 envs) | 9.58 s | 1.00x |
+| `eval_goal_variants: true` (3 x 32 = 96 envs) | 18.26 s | **1.91x** |
+
+So three variants cost **1.91x** one eval — better than the ~3x of three
+sequential scans, but far from free. Against the production reference
+(`mjx_16a_4o_1024/feudal/0`: 612 evals x 9.63 s = 9.3% of a 22.3 h run) that is
+**~+8.5% wall**, not the ~+2% the batching argument predicted. The premise
+("cost is the fixed sequential scan, not env width") holds only while the GPU is
+underutilized: at 16a/4o it is *exactly* true from 5 to 32 envs (9.63 s at
+`n_eval_episodes=5` vs 9.58 s at 32 — raising the episode count really is free)
+and has broken by 96. Budget the extra ~8.5%, or add a coarser cadence for the
+variant blocks; `eval_goal_variants: false` turns them off entirely.
+
+⚠ **The eval gap's reading is ASYMMETRIC.** A permuted rollout is off-policy
+twice (mispaired input, and it then visits different states), so the gap
+*overstates* the causal value of correct assignment. **gap ≈ 0 is a STRONG
+negative**; **gap > 0 is WEAK evidence** and its magnitude is *not* "the value of
+hierarchy". A collapsed-goal manager also gives gap ≈ 0 (the permutation is then
+near-identity) — `goal_perm_cos` (mean cosine between a goal and the one it was
+swapped with; ≈1 ⇒ the permutation changed nothing) is what separates the two.
+
+**Positive control, and the stop-the-line check:** on a `feudal_zerogoal` arm the
+worker zeroes the goal *inside* the module, so all variants coincide and every
+gap must be **exactly 0.0 bitwise**. Anything else means the harness is wrong and
+no other number is worth reading. (Verified: all 6 zerogoal arms measured so far
+report exactly 0.0.) This works because `_unit(0) == 0` and `goal_embed_dim`'s
+Dense is bias-free, so an externally-zeroed pooled goal *is* `zero_goal=True` —
+which is also why the ablation is applied to the goal outside the module: the
+param tree stays shape-identical and checkpoints remain interchangeable.
+
+**Permutation is a deterministic `jnp.roll`** (`manager.permute_agent_goals` /
+`permute_env_goals`), shift from `params.goal_permute_shift` (default 1). A
+cyclic shift is a guaranteed **derangement**; a uniform random permutation has
+`E[fixed points] = 1`, i.e. on average 1 agent in 16 silently keeps its own goal.
+`manager_update` also has no rng in scope, and determinism is what lets the
+offline probe and the live series produce the same number. Applied to the
+**pooled** `w_t`, never the raw per-step goals: `goal_ring_pool` is a plain sum
+so `roll(pool(h)) == pool(roll(h))` bit-identically for a fixed shift
+(`test_agent_permutation_commutes_with_the_goal_ring`), whereas permuting raw
+goals then pooling would hand agent *i* a sum of *different agents'* goals at
+different times — `‖w‖` drops from ≈`c` to ≈`√c`, i.e. a silent ~3.2x scale
+intervention, and the marginal is no longer preserved. A shift that is a multiple
+of `n_agents` (or `n_agents == 1`) **raises** in `make_train`: the roll would be
+the identity, every gap exactly 0.0, and the diagnostic would report "the goals
+make no difference" having measured nothing — the self-sealing failure again.
+
+**Offline probe (`algorithms/feudal_mappo_jax/goal_dependence_probe.py`).** Runs
+both diagnostics on **already-trained checkpoints**, so the question is
+answerable without a new 1e8-step run per arm. Composes each arm's config through
+`train._build_dispatch_args` (Hydra) rather than rebuilding the env from CLI
+flags as `global_state_probe.py` does — a hand-copied yaml value is how you
+silently measure a different network than the one that trained.
+⚠ It then **reads `goal_dim`/`hidden_dim`/`manager_hidden_dim` back off the
+checkpoint's param shapes and overrides the config**, because the yaml moves
+while checkpoints do not: commit `44c3af0` changed `goal_dim` **16 → 32** after
+every existing feudal arm was trained, so composing today's config for those runs
+fails to load outright. (For an *unparameterized* setting like
+`normalize_pooled_goal` the same drift would load fine and silently evaluate a
+different function — the probe prints the resolved config and checkpoint mtime
+per arm for that reason.) It reports paired-bootstrap CIs over episodes, adds the
+offline-only `env_permuted` variant, and records `goal_direction_count` on both
+the raw goal and the **pooled** `w_t` (the existing series is raw-only, which
+leaves a gap between the collapse metric and the thing actually permuted).
+```
+MUJOCO_GL=egl uv run python -m algorithms.feudal_mappo_jax.goal_dependence_probe \
+    --batches mjx_16a_4o_trunc_1024 --models feudal,feudal_zerogoal \
+    --trials 0,1,2 --n-eval-episodes 64 --shifts 1
+```
+
+#### MEASURED 2026-09-06 — all 20 trained arms (5 env groups × 4 models × 3 trials, 64 episodes)
+
+Results pickled at `algorithms/feudal_mappo_jax/goal_dependence_probe.results.pkl`.
+**The two sides disagree, and that disagreement is the finding.**
+
+**Latent: the manager's goals are well-formed, agent-specific AND
+state-conditioned.** `d_cos_gap_agent ≈ d_cos_mean` in *every* arm (e.g. 0.233 vs
+0.227) — i.e. `d_cos_null_agent ≈ 0`, so handing agent *i* a teammate's goal
+destroys the cosine completely. `d_cos_gap_env` is 60–90% of `d_cos_mean`
+(0.184/0.233), so the env null gate **passes** and the agent gap is interpretable.
+`goal_perm_cos` is −0.016…+0.044 everywhere, so the permutation really is
+disruptive and a zero *behavioural* gap cannot be blamed on collapsed goals.
+`goal_direction_count` is the same on the raw goal and the pooled `w_t`
+(8.4/8.4, 10.9/10.9), so pooling does not collapse the directions either.
+
+**Behavioural: the worker does not use any of it.** `gap_permuted ≈ 0` — only
+**5 of 45** non-control trials have a paired CI excluding 0, and those go in both
+directions. Per the asymmetry above this is the STRONG direction: mispairing the
+goals maximally changes the return by nothing.
+
+**And conditioning on the goals actively COSTS return.** `gap_zeroed` is
+systematically **negative** — 27 of 45 trials significant, essentially all
+negative — i.e. feeding the same trained worker a zero goal *improves* it, e.g.
+`mjx_16a_4o_1024/feudal_n05` 43.7 → 133.3 (3.0x), `partition_512/feudal_n05`
+83.6 → 143.7, `partition_512/feudal` 107.7 → 148.1. Consistent across 15 of the
+16 non-control arms; `mjx_16a_4o_trunc_1024` is the exception (gaps ≈ 0).
+Separately, the `feudal_zerogoal` *training* arm outscores `feudal` outright
+(trunc_1024: 368.9 vs 242.3; 512: 185.0 vs 162.1; partition_512: 152.1 vs 107.7).
+
+⚠ **Two readings of `gap_zeroed < 0`, and this measurement does not separate
+them.** (a) the directives are genuinely misleading; (b) the goal block is a
+large input perturbation and zeroing it merely de-saturates the first Tanh —
+which is mechanistically plausible given the measurement already recorded here
+that the goal block held **59–78%** of layer-1 variance even after
+`normalize_pooled_goal`. The assumption-free claim is the *pairing* one:
+`gap_permuted ≈ 0` with `goal_perm_cos ≈ 0`.
+
+#### The fix: `worker_fusion: film` (`conf/model/feudal_film.yaml`)
+
+`FeudalWorker` gained a `worker_fusion` knob — `"concat"` (default, unchanged)
+or `"film"`, zero-initialized **Feature-wise Linear Modulation** (Perez et al.
+2018) on both hidden preactivations: `h ← (1 + γ(w_t)) ⊙ h + β(w_t)`.
+`MAPPOActor` gained an optional `modulate(x, layer)` hook called *before* each
+Tanh (FiLM's own placement, and the only one that can move units into and out of
+saturation rather than rescaling an already-squashed value); `modulate=None` is
+byte-identical to the pre-hook module, so every other caller is untouched.
+
+It addresses the two **structural** properties of concat, neither of which is
+about scale (scale is spent — `normalize_pooled_goal` already took the goal
+block from 59–78% of layer-1 variance to a measured **14–19%**, while the
+worker's goal columns are actually *larger* than its obs columns per input dim,
+ratio 1.11–1.22):
+
+1. **The default is influence, not no-influence.** Measured at init on real
+   `mjx_16a_4o_trunc_1024` observations: swapping the goal moves concat's action
+   mean by **1.40e-03** against an action scale of **1.65e-03** — i.e. **~85% of
+   the untrained policy's output is goal-driven before any learning**, so
+   goal-*agnosticism* is what the worker must learn. FiLM measures **exactly
+   0.000e+00** for both a swapped and a zeroed goal. Zero-init makes identity the
+   default and influence the thing that must be earned.
+2. **Concat can only translate the policy.** `∂z₁/∂obs = W_obs` contains no
+   goal term, so a concatenated goal cannot change *which* observation features
+   matter — only where the operating point sits. FiLM is multiplicative, so the
+   goal appears in the Jacobian and can gate features up/down/off.
+
+Details that are load-bearing rather than stylistic:
+- **`1 + γ`, not `γ`.** A bare `γ ⊙ h` with a zero-init kernel outputs zeros and
+  kills the forward pass. Same trick as adaLN-Zero / ReZero / LoRA's zero-init B.
+  It does **not** stall learning — `dL/dW_γ = (dL/dz ⊙ z) gᵀ` is nonzero from the
+  first update, so zero-init sets the default, it does not disconnect.
+- **γ/β Dense layers are bias-free**, so `γ(0) = β(0) = 0` *forever*, not just at
+  init: "zero goal ⇒ exactly the flat policy" survives training. That is what
+  keeps the probe's `zeroed` variant interpretable — with a bias, a trained
+  `γ(0) ≠ 0` would make that arm "flat policy plus a learned constant
+  modulation" and the control would silently drift. FuN makes `φ` bias-free for
+  the same reason. It also makes `zero_goal=True` under FiLM a genuinely exact
+  isolate (flat policy + per-agent critic + manager training).
+- ⚠ **Not checkpoint-compatible with the concat arms**: concat's first Dense has
+  input width `obs_dim + goal_dim` (56), FiLM's is `obs_dim` (40). The arm trains
+  from scratch into `results/<env>/feudal_film/`; the 15 existing `feudal`
+  checkpoints cannot warm-start it. Pinned by
+  `test_film_and_concat_are_not_checkpoint_compatible`.
+- ⚠ **FuN's own bilinear `U(obs) @ φ(g)` was NOT used**, deliberately: its "zero
+  goal ⇒ no preference" property holds for *discrete logits*, but these envs are
+  continuous force control, where a zero goal would give a zero mean action —
+  "stand still", a specific and consequential action, not neutrality. A naive
+  port would look principled and be wrong on exactly the arms measured. For the
+  discrete arms (`macro_mjx`, SMAX) it is the right shape; for continuous it
+  needs to be residual on the mean.
+- ⚠ **Watch saturation.** The trunk already runs at 36–43% of units with
+  |tanh| > 0.95 (the goal itself contributes ~5 points of that). A gain before
+  the nonlinearity can worsen it; zero-init means it *starts* at the goal-free
+  36%, and `1 + tanh(γ)` ∈ [0, 2] is the fallback bound if it drifts.
+
+**Acceptance test is the probe, and it needs BOTH:** `gap_zeroed ≈ 0` (the goal
+stopped costing return) **and** `gap_permuted > 0` with a paired CI excluding 0
+(the pairing started mattering). The concat arms have the opposite of both today.
+Expect FiLM alone to deliver only the first — at `intrinsic_coef=0` nothing in
+the worker's objective asks it to follow the goal, and the `n01`/`n05` data says
+the current intrinsic reward is not the answer either. Verified end-to-end
+(train + resume + aligned stats); 6 new seam tests, 52 passing overall.
+
+⚠ **The eval-level pre-flight "all variants agree at init" is VACUOUS — do not
+use it.** At init the actor head is `orthogonal(0.01)`, so the policy is inert:
+returns are 0 and (on `trunc`, with inert walls) every episode runs the full
+1024 steps, for **concat too**. The init-identity property is only observable at
+the network level — compare action means directly, as
+`test_film_is_identity_at_init` does against the flat `MAPPOActor`.
+
+**So the manager side works and the manager→worker channel is where it fails** —
+which locates the concat-fusion degeneracy `worker.py` warns about. Note the
+worker has *not* simply ignored the goal (zeroing it changes the return a lot);
+it has entangled with it in a way that does not help. The thing to change was
+therefore the **fusion**, not the manager, the goal width, or the intrinsic
+reward — implemented as `worker_fusion: film` (see above). This also gives the
+previously-unattributable ~250-point `feudal` vs `mlp` gap a direction: it is the
+goal conditioning.
+
+⚠ **`n_eval_episodes` was a silent `5`.** `MAPPOConfig.n_eval_episodes` defaulted
+to 5 and neither `run.py` nor any `conf/algorithm/*.yaml` ever set it, in
+**both** jax stacks — so every `reward` point in every plot predating this is a
+5-episode deterministic mean, far too noisy to resolve a goal-ablation gap on a
+~470-return env. Now wired through `Params` and defaulted to **32** in
+`feudal_mappo_jax` *and* `mappo_jax` (kept equal so the feudal-vs-flat comparison
+does not also compare two different eval noise floors). It buys width, not depth,
+so it is nearly free; it reduces variance without biasing the mean, so runs at 5
+and at 32 stay comparable in expectation.
+
+⚠ **Any newly-added stats series is a silent resume hazard**, now fixed at the
+source. `append_agent_stats` is a bare `defaultdict(list)` append, so a key that
+did not exist when a run started — or that is absent from the checkpoint a run
+resumed from — is created on its first append and stays permanently *shorter*
+than `total_steps`; the notebook then plots it against `range(1, len+1)`, i.e.
+shifted left and averaged against other runs' wrong iterations.
+`TrainingStatsTracker.to_dict()` (`algorithms/mappo_vanilla/trainer_components/`)
+now **left**-pads every short non-empty series with NaN to `len(total_steps)`.
+Left, not right: element 0 of a late series belongs to the iteration it first
+existed for. Fixed at save time rather than in `load_from_dict` because at load
+time the key is simply *absent* — there is nothing to pad, and padding it there
+would need a hardcoded key list that rots on the next new metric. Empty lists are
+skipped (`action_distribution` is legitimately length 0 for continuous runs, and
+padding it would make it ragged). Pinned by `test_to_dict_left_pads_short_series`.
+
 **Goal collapse: read `goal_direction_count`, not `goal_pairwise_cos` alone.**
 The headline "are the manager's goals unique per agent?" series is
 `goal_direction_count` — the effective number of *distinct* goal directions
@@ -1523,6 +1847,149 @@ attributable separately from recurrence effects.
     spaces, and gradient routing under the detach rule — target arm zeroed, goal
     arm live, `r^I` fully detached, `f_Mspace` still trained). All pass:
     `uv run python -m algorithms.feudal_mappo_jax.manager`
+
+## SMAX (JaxMARL StarCraft) — `environments/smax/smax_env.py`
+
+**Both JAX stacks run on SMAX** (`EnvironmentEnum.SMAX = "SMAX"`, env groups
+`conf/env/smax_3m.yaml` and `conf/env/smax_5m_vs_6m.yaml`):
+
+```
+uv run python train.py algorithm=mappo_jax        env=smax_3m model=mlp    trial_id=0
+uv run python train.py algorithm=feudal_mappo_jax env=smax_3m model=feudal trial_id=0
+```
+
+`SMAXAdapter` presents SMAX under the **same functional array contract** as the MJX
+envs, so the trainers were extended rather than forked — no dict ever reaches them. (An
+older JaxMARL dict-API path existed in commit `f074a3a` and was deleted in `e78638b`; it
+predates the truncation bootstrap, eval, checkpointing and the whole feudal stack, so it
+was **not** resurrected.)
+
+- **`jaxmarl` is a dependency again** (`pyproject.toml`), and it needs
+  `environments/smax/_compat.py` — jaxmarl calls `jax.tree_map`/`jax.tree_leaves`,
+  removed from the top level in JAX 0.9.x (this repo runs 0.10.2). ⚠ **An import smoke
+  test does NOT prove the shim is unnecessary**: `import jaxmarl`, `jaxmarl.make(...)`
+  and `env.reset(key)` all succeed without it; only a call that walks a pytree
+  (`step_env`, `get_avail_actions`) raises. Import `_compat` **before** jaxmarl.
+- **Four contract mismatches the adapter reconciles**, each of which is silent if got
+  wrong:
+  1. **`step_env`, not `step`.** `MultiAgentEnv.step` auto-resets on done; the collector
+     already restarts finished envs itself, so using `step` would double-reset *and*
+     make the truncation bootstrap value the post-reset observation instead of the true
+     successor.
+  2. **`terminated` / `truncated` split.** SMAX gives only `dones["__all__"]`, and
+     `is_terminal = all_allies_dead | all_enemies_dead | (time >= max_steps)`. The
+     adapter splits that flag on `battle_over` rather than recomputing the predicate, so
+     `terminated | truncated` is **exactly** the env's own done. The bootstrap design
+     in this file depends on the two being distinct.
+  3. **The RNG rides in the state.** SMAX's `step` is key-first (the heuristic enemy is
+     stochastic); the contract's `step(state, actions)` has nowhere to pass one, so
+     `SMAXState` carries a key and splits it each step.
+  4. **`info` is empty in SMAX**, so `task_reward`, `active` and `won_episode` are all
+     synthesized. All allies share one team scalar (`compute_reward` returns one value
+     per team), so any agent's entry *is* the team reward.
+- **`SMAXState` must stay a flat, `jnp.where`-able pytree** with a leading `n_envs` axis
+  on every leaf — the collector's `_restart_done` does a `jax.tree.map` select of
+  reset-vs-current state across it. Nothing static lives on that dataclass.
+- **`env.agents` is the allies only** under `HeuristicEnemySMAX`; the enemy team is the
+  built-in heuristic. `self.agents` is fixed once at construction and is the single
+  ordering for every stack/un-stack (obs, actions, rewards, masks, alive flags) —
+  agent-major, matching the trainers' `obs.reshape(b * n_agents, obs_dim)`.
+
+### Three optional env hooks (inert for every other env)
+
+These were added to **both** `mappo_jax` and `feudal_mappo_jax` — the two are
+near-copies and must stay in sync. Each is gated on a **static** (trace-time) check, so
+an env that has none takes byte-identical code paths to before they existed. Verified:
+a hookless CPU stub run through init → collect → update gives **bit-identical** losses,
+`param_sq_sum` and eval on both stacks vs the pre-change code (two git worktrees; MJX
+itself is not reproducible across processes, hence the stub).
+
+1. **`env.avail_actions(state) -> (n_agents, action_dim)`** — legal-action masking.
+   Switched on by `hasattr(env, "avail_actions")`. `network.py` already had the whole
+   masking path (`_masked_logits`, the `action_mask=` kwargs on `sample_action` /
+   `evaluate_action`) as **dead code**; this wires it, it did not rewrite it.
+   - The mask is fetched from the **pre-step** state and **stored** in
+     `Transition.action_mask`. The stored mask must be the one that sampled, or the PPO
+     ratio compares two different distributions — same class of bug as the feudal
+     pooled-goal storage rule.
+   - Envs without the hook store a **scalar placeholder** (stacked by `lax.scan` to
+     `(n_steps,)`), not a real all-ones array: `ppo_update` switches on
+     `action_mask.ndim == 4`, mirroring the `reward.ndim == 3` idiom, and a genuine
+     all-ones buffer would cost `(T, E, N, A)` floats for nothing.
+   - ⚠ **`eval_fn` and `view()` need the mask too.** A deterministic `argmax` over
+     unmasked logits will select an illegal action outright, so eval would score a
+     policy the env never runs.
+2. **`env.global_state(state)` + `env.global_state_dim`** — the centralized critic's
+   input. SMAX ships a real world state (absolute unit features): **72 dims at 3m against
+   195 for the concatenated observations**. Without the hook the global state is
+   `obs.reshape(n_envs, -1)`, exactly as before. Two things this touches that are easy
+   to miss: the truncation bootstrap must read the successor state **before** the reset
+   `lax.cond`, and `collect_fn` now **binds** the scan's final env state (it used to
+   discard it) because the last-value bootstrap needs it.
+   - The rule lives in **one** helper, `trainer.global_state_dim(env)`, used by both
+     `make_train` and `run.py`'s checkpoint reload — `from_bytes` needs an
+     exactly-shaped target tree, so a disagreement there is a load failure.
+   - In the feudal stack this is also the **manager's** joint-state input, which is the
+     one place SMAX is a better fit than the MJX envs: this file notes at length that
+     the egocentric MJX observations give the manager *no shared frame*, so it must
+     learn to localize agents first. SMAX's world state is already a shared frame.
+3. **`info["active"]` — dead units.** Nothing new was built: `Transition.active_mask` and
+   its masked means in `ppo_update` were added for `SyncMacroMJX`'s staggered starts and
+   apply verbatim. Dead units are dropped from the policy loss, the entropy loss and the
+   per-agent critic head. All-ones for every other env keeps those reductions exact plain
+   means. (Note SMAX itself still *pays* dead agents their team reward — "to allow for
+   noble sacrifice" — which is unaffected: this masks the policy gradient, not credit.)
+   - The mask is computed from the **pre-step** state, because the transition stores the
+     pre-step obs/action: an agent that acted and then died in that same step still
+     contributed a real decision and keeps its credit.
+   - Measured: a dead unit's `avail_actions` row is `[0,0,0,0,1,0,0,0]` — SMAX leaves it
+     exactly one legal action (the no-op). So a mask is **never all-zero**, and the
+     `logits + (1-mask)*(-1e9)` path has no degenerate/NaN case. Verified over a full
+     episode: no NaN in obs or reward, log-probs finite.
+
+⚠ The seam tests pin themselves to CPU via an autouse `jax.default_device` fixture. They
+are tiny, and sharing the GPU with a training or rendering job makes them fail on
+cuSolver/OOM errors that read exactly like assertion failures. (`test_feudal_seams.py`
+is **not** pinned and does show this — if it fails en masse, check for a concurrent GPU
+job before believing the failures.) A module-level `JAX_PLATFORMS=cpu` does not work
+here: it only takes effect if that module is imported before JAX initializes, i.e. it
+depends on pytest collection order.
+
+### Verification
+
+- `uv run pytest algorithms/tests/test_smax_seams.py -q` — 11 tests pinning the silent
+  seams: no illegal action is ever sampled or stored; **the PPO ratio is exactly 1
+  before any update** under masking (catches a sampling/update mask mismatch); a
+  *reversed* mask is shown to produce a different action set, so the pairing test is
+  evidence of agent-major flattening and not merely of masking; masked `argmax`; the
+  global-state hook is used and sizes the critic, and falls back to concat without it;
+  a hookless env stores the placeholder; and a dead agent's transition demonstrably
+  changes the actor update.
+- `uv run python -m environments.smax.smax_env` — adapter smoke test: shapes, jit+vmap,
+  `terminated`/`truncated` mutual exclusivity, and that the state pytree survives the
+  collector's `tree.map` reset-select.
+- End-to-end (train / resume / evaluate / view) verified on both stacks at `3m`, plus
+  `5m_vs_6m` on the flat stack.
+
+### Config notes
+
+`n_agents` is a property of the SMAX scenario, so the env groups do **not** set it — the
+adapter reads it back off the env, and `run.py` does not pass it. Unlike the MJX
+branches, `max_steps` is **not** `params.n_steps`: the benchmark owns its own horizon
+(100). `params.n_steps` is 128, i.e. **>= `max_steps`** — `collect_fn` resets every env
+at the top of every rollout, so a shorter rollout would never train on the back half of
+any episode, and in SMAX the win bonus is paid at the very end (the same trap this file
+records for `mjx_16a_4o_multi_goal`). `n_envs` is a **literal** (a vmap width, i.e. a
+hyperparameter), as for every MJX group.
+
+⚠ `model=feudal` is mandatory with `algorithm=feudal_mappo_jax`: results go to
+`results/<env>/<model>/` and the algorithm is **not** in that path, so `model=mlp` would
+write into the `mappo_jax` baseline's directory.
+
+**Not yet done:** no full-length run of either stack on SMAX, so nothing is known about
+final win rates or whether the hierarchy helps — every number above is a mechanism
+check. `use_self_play_reward=True` raises (the adapter reports one shared scalar and
+sets `per_agent_rewards=False`).
 
 ## Coordination-graph novelty exploration (gnn critic)
 

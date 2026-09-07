@@ -436,6 +436,151 @@ def goal_ring_reset(goal_hist: jnp.ndarray, done) -> jnp.ndarray:
     return jnp.where(mask, 0.0, goal_hist)
 
 
+# ---------------------------------------------------------------------------
+# Permutation nulls: the reference level for "are the goals useful?"
+#
+# Every other manager diagnostic in this stack is a COLLAPSE detector — a
+# necessary condition, not a usefulness test. Two of them mislead if read as
+# one: `d_cos_mean` is uninterpretable because the manager owns *both*
+# arguments of the cosine, and `worker_goal_column_ratio` already misled once
+# (it fell while the goal block grew).
+#
+# The method is a permutation that preserves the goal marginal distribution
+# EXACTLY and destroys exactly one property, so the real-minus-null gap
+# isolates that property:
+#
+#     axis      preserves            destroys
+#     agents    state-conditioning   the agent<->goal PAIRING
+#     envs      the pairing          STATE-CONDITIONING
+#
+# Both are needed, and the env one has to be read FIRST. A manager that emits a
+# fixed per-agent constant (an agent-ID code with no dependence on `s_t`)
+# produces a large agent-permutation gap while doing nothing the hierarchy is
+# for — and the existing suite endorses that state, since `goal_direction_count`
+# reads ~8.25 against a random-direction baseline of 8.26, i.e. "maximally
+# diverse". If `d_cos_null_env ~ d_cos_mean` the goals carry no state
+# information and the agent-pairing gap is meaningless whatever its value.
+# ---------------------------------------------------------------------------
+
+
+def _check_permutable(goal: jnp.ndarray, shift: int, axis: int, fn_name: str):
+    """Reject a permutation that is secretly the identity.
+
+    Load-bearing for the same reason as :func:`_check_done`: the failure is
+    silent and self-sealing. At ``n == 1`` (or ``shift % n == 0``) a roll is the
+    identity, every real-minus-null gap is exactly 0.0, and the diagnostic
+    reports "the goals make no difference" — the precise answer it exists to
+    detect — while having measured nothing at all.
+
+    Python-level; shapes and `shift` are static under jit, so this is free.
+    """
+    n = goal.shape[axis]
+    if n < 2:
+        raise ValueError(
+            f"{fn_name}: axis {axis} has length {n}, so a roll is the identity "
+            f"and the null would equal the real value by construction (a "
+            f"vacuous 'no dependence' result). This diagnostic needs at least 2."
+        )
+    if shift % n == 0:
+        raise ValueError(
+            f"{fn_name}: shift={shift} is a multiple of axis {axis}'s length "
+            f"{n}, so the roll is the identity and the null is vacuous. Use a "
+            f"shift that is not a multiple of {n}."
+        )
+
+
+def permute_agent_goals(
+    goal: jnp.ndarray, shift: int = 1, axis: int = -2
+) -> jnp.ndarray:
+    """Re-pair goals across the AGENT axis: agent `i` receives agent `i-shift`'s.
+
+    Destroys the agent<->goal pairing while preserving the goal multiset at each
+    ``(t, env)`` exactly — so a real-minus-null gap measures the *assignment*,
+    not a distribution shift.
+
+    A cyclic shift, deliberately, rather than a random permutation:
+
+    * it is a guaranteed **derangement**. A uniform random permutation has
+      ``E[fixed points] = 1``, i.e. on average one of 16 agents silently keeps
+      its own goal, systematically diluting the intervention.
+    * :func:`~algorithms.feudal_mappo_jax.mappo.manager_update` has no rng in
+      scope, and adding one would change its signature and make the metric
+      non-reproducible epoch to epoch.
+    * determinism is what lets the offline probe and the live training series
+      produce the same number on the same data.
+
+    Rank-agnostic like the ring helpers, so ``(N, D)``, ``(E, N, D)`` and
+    ``(T, E, N, D)`` all work off the default ``axis=-2``.
+
+    NOTE ON PLACEMENT: apply this to the **pooled** goal ``w_t``, not to the raw
+    per-step goals. ``goal_ring_pool`` is a plain sum over the ring, so for a
+    shift fixed across time ``roll(pool(h)) == pool(roll(h))`` bit-identically
+    (pinned by ``test_agent_permutation_commutes_with_the_goal_ring``) — but
+    permuting raw goals per step and *then* pooling would hand agent `i` a sum
+    of goals from different agents at different times. Measured consecutive-goal
+    collinearity is 0.95-0.99, so ``||w_t|| ~ c`` for a true pool against
+    ``~sqrt(c)`` for a cross-agent one: a silent ~3.2x scale intervention under
+    ``normalize_pooled_goal=False``, and a partial goal *collapse* under
+    ``True``. Either way the marginal is no longer preserved and the null stops
+    being a null.
+    """
+    _check_permutable(goal, shift, axis, "permute_agent_goals")
+    return jnp.roll(goal, shift, axis=axis)
+
+
+def permute_env_goals(goal: jnp.ndarray, axis: int, shift: int = 1) -> jnp.ndarray:
+    """Re-pair goals across the ENV axis: env `e` receives env `e-shift`'s goals.
+
+    The companion null to :func:`permute_agent_goals`. It keeps every agent
+    paired with an agent-slot goal but takes that goal from an unrelated state,
+    so it destroys **state-conditioning** while preserving the pairing. This is
+    the null that catches a manager which has degenerated into emitting a fixed
+    per-agent code, which the agent-axis null alone reports as healthy.
+
+    `axis` is REQUIRED and never inferred: the eval path's pooled goal is
+    ``(E, N, D)`` (env axis 0) while the manager path's is ``(T, E, N, D)``
+    (env axis 1), and guessing wrong silently rolls time or agents instead.
+    """
+    _check_permutable(goal, shift, axis, "permute_env_goals")
+    return jnp.roll(goal, shift, axis=axis)
+
+
+def zero_goals(goal: jnp.ndarray) -> jnp.ndarray:
+    """Replace the goal with zeros — destroys pairing AND state-conditioning.
+
+    Equivalent to ``FeudalWorker(zero_goal=True)`` when applied to the pooled
+    goal at the worker's input: ``_unit(0) == 0`` and the optional
+    ``goal_embed_dim`` Dense is bias-free, so ``Dense(0) == 0``. Doing it here
+    rather than by rebuilding the module keeps the parameter tree untouched, so
+    checkpoints stay interchangeable and the ablation costs no re-init.
+    """
+    return jnp.zeros_like(goal)
+
+
+def _goal_transform_variants(shift: int, env_axis: int):
+    """Build the variant name -> transform map for one call site.
+
+    Single source of truth for the variant NAMES, which are simultaneously the
+    eval-block labels, the metric-key suffixes and the offline probe's CLI
+    strings. Defining them in one place is what stops those three drifting.
+    """
+    return {
+        "real": lambda g: g,
+        "permuted": lambda g: permute_agent_goals(g, shift),
+        "env_permuted": lambda g: permute_env_goals(g, env_axis, shift),
+        "zeroed": zero_goals,
+    }
+
+
+GOAL_VARIANTS = ("real", "permuted", "env_permuted", "zeroed")
+"""Every defined goal-ablation variant, in reading order.
+
+The live eval path uses the first, second and fourth; ``env_permuted`` is
+offline-only (the live series is read as a trend, but an offline number has to
+be interpretable in isolation, which is exactly where it is needed).
+"""
+
+
 def transition_cosine(
     states: jnp.ndarray,
     goals: jnp.ndarray,

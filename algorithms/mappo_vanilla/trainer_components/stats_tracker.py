@@ -98,7 +98,42 @@ class TrainingStatsTracker:
                 self.training_stats[key] = value
 
     def to_dict(self) -> dict:
-        return dict(self.training_stats)
+        """The stats dict to pickle, with short series LEFT-padded to alignment.
+
+        Why this exists. `append_agent_stats` is a bare `defaultdict(list)`
+        append, so a metric key that did not exist when a run started — a new
+        diagnostic, or any key absent from the checkpoint a run resumed from —
+        is created on its first append and is then permanently SHORTER than
+        `total_steps`. Nothing detects it. The notebook plots such a series
+        against `range(1, len+1)`, so it silently renders shifted left and
+        averages across mismatched iterations of other runs.
+
+        LEFT, not right: element 0 of a late-created series corresponds to the
+        first iteration it existed for (index N), not to iteration 0. Padding
+        the front is what puts each value back under its own iteration.
+
+        Fixed here rather than in `load_from_dict` because at load time the key
+        is simply ABSENT — there is nothing to pad, and padding it would require
+        a hardcoded list of expected key names that rots the next time anyone
+        adds a metric. By save time every key exists, so this needs no list and
+        covers every future metric automatically.
+
+        Empty lists are skipped: `action_distribution` is legitimately length 0
+        for continuous-action runs, and padding it would make it ragged and
+        break the notebook cell that reads it.
+        """
+        stats = dict(self.training_stats)
+        target = len(stats.get("total_steps", ()))
+        if not target:
+            return stats
+        for key, series in stats.items():
+            if key == "total_steps" or not isinstance(series, list):
+                continue
+            # An empty series means "never recorded for this run", which is a
+            # real state; a short non-empty one means "started late".
+            if 0 < len(series) < target:
+                stats[key] = [float("nan")] * (target - len(series)) + list(series)
+        return stats
 
     def summarize(self, steps_completed: int) -> dict:
         total_time = time.time() - self.training_start_time

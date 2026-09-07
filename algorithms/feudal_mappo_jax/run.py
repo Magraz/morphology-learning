@@ -15,6 +15,8 @@ JAX path wants.
 import pickle
 import random
 import time
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import jax
@@ -45,6 +47,34 @@ def set_seeds(seed: int):
     """Set Python and NumPy seeds. JAX uses explicit PRNG keys."""
     random.seed(seed)
     np.random.seed(seed)
+
+
+def _paired_bootstrap_ci(diff, n_boot: int = 10_000, alpha: float = 0.05, seed: int = 0):
+    """Percentile CI for the mean of a PAIRED per-episode difference.
+
+    Paired because every variant block ran episode `j` from the same reset
+    state, so `diff[j]` already differences out the episode's difficulty. A
+    two-sample CI over independent means would be far wider and would need many
+    more episodes to resolve the same gap.
+
+    Resample the differences, not the two arms separately — that is what keeps
+    the pairing.
+    """
+    diff = np.asarray(diff, dtype=np.float64)
+    if diff.size < 2:
+        return [float("nan"), float("nan")]
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, diff.size, size=(n_boot, diff.size))
+    means = diff[idx].mean(axis=1)
+    lo, hi = np.percentile(means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return [float(lo), float(hi)]
+
+
+def _direction_count(goal):
+    """`mappo._agent_direction_count` on an arbitrary goal tensor, as a float."""
+    from algorithms.feudal_mappo_jax.mappo import _agent_direction_count, _agent_gram
+
+    return float(_agent_direction_count(_agent_gram(goal)))
 
 
 class Feudal_MAPPO_JAX_Runner:
@@ -212,6 +242,9 @@ class Feudal_MAPPO_JAX_Runner:
             parameter_sharing=self.params.parameter_sharing,
             hidden_dim=self.model_params.hidden_dim,
             per_agent_rewards=per_agent_rewards,
+            n_eval_episodes=self.params.n_eval_episodes,
+            goal_permute_shift=self.params.goal_permute_shift,
+            eval_goal_variants=self.params.eval_goal_variants,
             # ---- FeUdal ----
             goal_dim=self.model_params.goal_dim,
             goal_horizon=self.params.goal_horizon,
@@ -227,12 +260,20 @@ class Feudal_MAPPO_JAX_Runner:
             goal_embed_dim=self.model_params.goal_embed_dim,
             normalize_pooled_goal=self.model_params.normalize_pooled_goal,
             zero_goal=self.model_params.zero_goal,
+            worker_fusion=self.model_params.worker_fusion,
         )
 
         # Fail loudly rather than open. A zero-goal worker cannot see the goals,
         # so rewarding it for achieving them (r^I = d_cos(s_t - s_{t-i}, g_{t-i}))
         # is not an ablation of anything — it is an uninterpretable arm that
         # would still train, log healthy diagnostics, and look like a result.
+        if self.config.worker_fusion not in ("concat", "film"):
+            raise ValueError(
+                f"model_params.worker_fusion={self.config.worker_fusion!r} is not "
+                "'concat' or 'film'. Caught here rather than at the first forward "
+                "pass so a typo fails before a run is launched."
+            )
+
         if self.config.zero_goal and self.config.intrinsic_coef != 0.0:
             raise ValueError(
                 "model_params.zero_goal=True is incompatible with "
@@ -312,6 +353,40 @@ class Feudal_MAPPO_JAX_Runner:
             else 0.0
         )
 
+        # Goal-ablation variants ride the SAME scan as the real eval (one call,
+        # V*n_eval_episodes vmapped width), so they cost ~+2% of wall rather
+        # than the ~+18.7% three sequential evals would. `eval_fn` returns the
+        # real block's mean unchanged, so the `reward` series is untouched.
+        eval_variants = (
+            ("real", "permuted", "zeroed")
+            if self.config.eval_goal_variants
+            else ("real",)
+        )
+        # Carried forward between evals exactly as `eval_reward` is, and
+        # appended EVERY iteration — appending only on eval iterations would
+        # misalign these series against `total_steps` within a single run,
+        # before resume even enters the picture.
+        #
+        # NaN, not 0.0, for the pre-first-eval fill: a 0.0 gap reads as a
+        # measured "the goals make no difference", which is precisely the
+        # finding this series exists to detect.
+        ablation_series = {
+            key: (
+                stats_tracker.training_stats[key][-1]
+                if checkpoint_loaded and stats_tracker.training_stats.get(key)
+                else float("nan")
+            )
+            for key in (
+                "eval_reward_permuted",
+                "eval_reward_zeroed",
+                "eval_gap_permuted",
+                "eval_gap_zeroed",
+                "eval_len_real",
+                "eval_len_permuted",
+                "eval_len_zeroed",
+            )
+        }
+
         for update in range(start_update, num_updates):
             collection_start = time.time()
             runner_state, trajectory, last_value, rollout_stats = collect_fn(
@@ -335,8 +410,34 @@ class Feudal_MAPPO_JAX_Runner:
             eval_time = 0.0
             if update % eval_every == 0 or update == num_updates - 1:
                 eval_start = time.time()
+                # ONE split, ONE call: every variant block starts from the same
+                # reset keys, so the gaps below are paired per episode and carry
+                # no reset variance.
                 eval_rng, eval_key = jax.random.split(eval_rng)
-                eval_reward = float(eval_fn(runner_state.train_state, eval_key))
+                ev_rewards, ev_lengths = eval_fn(
+                    runner_state.train_state,
+                    eval_key,
+                    variants=eval_variants,
+                    detail=True,
+                )
+                ev_rewards = np.asarray(ev_rewards)
+                ev_lengths = np.asarray(ev_lengths)
+                by_variant = dict(zip(eval_variants, ev_rewards))
+                eval_reward = float(by_variant["real"].mean())
+                ablation_series["eval_len_real"] = float(ev_lengths[0].mean())
+                for variant in ("permuted", "zeroed"):
+                    if variant not in by_variant:
+                        continue
+                    idx = eval_variants.index(variant)
+                    ablation_series[f"eval_reward_{variant}"] = float(
+                        by_variant[variant].mean()
+                    )
+                    ablation_series[f"eval_gap_{variant}"] = float(
+                        (by_variant["real"] - by_variant[variant]).mean()
+                    )
+                    ablation_series[f"eval_len_{variant}"] = float(
+                        ev_lengths[idx].mean()
+                    )
                 eval_time = time.time() - eval_start
 
             steps_completed += steps_per_update
@@ -354,7 +455,12 @@ class Feudal_MAPPO_JAX_Runner:
                 "intrinsic_reward_abs": float(rollout_stats["intrinsic_reward_abs"]),
             }
             stats_tracker.append_agent_stats(
-                {key: float(value) for key, value in losses.items()} | rollout_series
+                {key: float(value) for key, value in losses.items()}
+                | rollout_series
+                # Appended every iteration, carrying the last eval forward — the
+                # same staircase `reward` already forms, so these stay index-
+                # aligned with `total_steps`.
+                | dict(ablation_series)
             )
             elapsed_time = stats_tracker.record_iteration(
                 steps_completed=steps_completed,
@@ -817,3 +923,137 @@ class Feudal_MAPPO_JAX_Runner:
         reward = float(eval_fn(train_state, jax.random.PRNGKey(self.rng_seed + 1)))
         print(f"Mean eval episode return: {reward:.2f}")
         return reward
+
+    # ------------------------------------------------------------------
+    # Goal-usefulness measurement (offline; see goal_dependence_probe.py)
+    # ------------------------------------------------------------------
+
+    def goal_dependence(self, n_eval_episodes=None, shifts=(1,), make_train_out=None):
+        """Measure whether this checkpoint's manager goals are actually USEFUL.
+
+        Every diagnostic logged during training tests whether the goals are
+        well-FORMED (non-collapsed). This tests whether they DO anything, by
+        two paired interventions that preserve the goal distribution exactly and
+        destroy one property each:
+
+        * **behavioural** — re-run deterministic eval with each worker handed a
+          teammate's directive (`permuted`), a directive from an unrelated env
+          (`env_permuted`), or none (`zeroed`). The return gaps against `real`
+          are the ground-truth measurement.
+        * **latent** — `d_cos` against the same two permutation nulls, straight
+          off a rollout's stored goals and latents. No update, no extra network
+          forward.
+
+        READ ``d_cos_gap_env`` / the ``env_permuted`` return FIRST. If the goals
+        turn out not to depend on the state, the agent-pairing numbers are
+        uninterpretable however large they are.
+
+        The eval gap's reading is ASYMMETRIC. A permuted rollout is off-policy
+        twice (mispaired input, and it then visits different states), so the gap
+        overstates the causal value of correct assignment: ``gap ~ 0`` is a
+        STRONG negative, while ``gap > 0`` is weak evidence of dependence whose
+        magnitude is not "the value of hierarchy".
+
+        Args:
+            n_eval_episodes: override the config's episode count for this
+                measurement only (the offline probe wants far more than a
+                training run does; it is width, so it is nearly free).
+            shifts: permutation shifts to sweep. If the results agree across
+                shifts, the choice of permutation is not load-bearing.
+            make_train_out: reuse an already-built `make_train(...)` tuple, so a
+                probe sweeping many trials of one arm compiles once.
+
+        Returns a dict of plain floats/arrays, JSON/pickle-friendly.
+        """
+        import numpy as np
+
+        from algorithms.feudal_mappo_jax.manager import GOAL_VARIANTS
+        from algorithms.feudal_mappo_jax.mappo import manager_cosine_metrics
+
+        config = self.config
+        if n_eval_episodes is not None and n_eval_episodes != config.n_eval_episodes:
+            config = replace(config, n_eval_episodes=int(n_eval_episodes))
+            make_train_out = None  # episode count changes the traced shapes
+
+        train_state = self._load_train_state()
+        results = {
+            "n_eval_episodes": int(config.n_eval_episodes),
+            "checkpoint_mtime": self._checkpoint_mtime(),
+            # `_load_train_state` rebuilds the networks from the CURRENT yaml.
+            # `normalize_pooled_goal` has no parameters, so a checkpoint trained
+            # under one setting loads cleanly against the other and silently
+            # evaluates a different function. Record what was actually used.
+            "normalize_pooled_goal": bool(config.normalize_pooled_goal),
+            "zero_goal": bool(config.zero_goal),
+            "goal_dim": int(config.goal_dim),
+            "goal_horizon": int(config.goal_horizon),
+            "n_agents": int(self.env.n_agents),
+            "by_shift": {},
+        }
+
+        for shift in shifts:
+            cfg = replace(config, goal_permute_shift=int(shift))
+            init_fn, collect_fn, _, eval_fn, _ = (
+                make_train(cfg, self.env) if make_train_out is None else make_train_out
+            )
+
+            # --- behavioural: one scan, all four variants, shared reset keys ---
+            key = jax.random.PRNGKey(self.rng_seed + 1)
+            rewards, lengths = eval_fn(
+                train_state, key, variants=GOAL_VARIANTS, detail=True
+            )
+            rewards, lengths = np.asarray(rewards), np.asarray(lengths)
+            per_variant = dict(zip(GOAL_VARIANTS, rewards))
+            real = per_variant["real"]
+
+            entry = {
+                "returns": {v: r.tolist() for v, r in zip(GOAL_VARIANTS, rewards)},
+                "lengths": {v: l.mean().item() for v, l in zip(GOAL_VARIANTS, lengths)},
+                "return_mean": {
+                    v: r.mean().item() for v, r in zip(GOAL_VARIANTS, rewards)
+                },
+            }
+            for v in GOAL_VARIANTS[1:]:
+                # PAIRED: episode j of every block started from the same state,
+                # so the per-episode difference removes reset variance.
+                diff = real - per_variant[v]
+                entry[f"gap_{v}"] = diff.mean().item()
+                entry[f"gap_{v}_ci"] = _paired_bootstrap_ci(diff)
+
+            # --- latent: d_cos against the same nulls, off one rollout ---
+            runner_state = init_fn(jax.random.PRNGKey(self.rng_seed))
+            runner_state = runner_state._replace(train_state=train_state)
+            _, trajectory, _, _ = collect_fn(runner_state)
+            done_a = jnp.broadcast_to(
+                trajectory.done.astype(jnp.float32)[..., None],
+                trajectory.goal.shape[:-1],
+            )
+            cos_metrics = manager_cosine_metrics(
+                trajectory.state_latent,
+                trajectory.goal,
+                cfg.goal_horizon,
+                done_a,
+                trajectory.active_mask,
+                int(shift),
+            )
+            entry.update({k: float(v) for k, v in cos_metrics.items()})
+
+            # Collapse metrics on BOTH the raw goal (comparable to the training
+            # series) and the POOLED w_t (what the worker eats, and what the
+            # eval variants actually permute) — without the second there is a
+            # gap between the collapse metric and the intervention.
+            entry["goal_direction_count_raw"] = _direction_count(trajectory.goal)
+            entry["goal_direction_count_pooled"] = _direction_count(
+                trajectory.pooled_goal
+            )
+            results["by_shift"][int(shift)] = entry
+
+        return results
+
+    def _checkpoint_mtime(self):
+        path = self.dirs["models"] / "models_finished.msgpack"
+        if not path.exists():
+            path = self.dirs["models"] / "models_checkpoint.msgpack"
+        if not path.exists():
+            return None
+        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")

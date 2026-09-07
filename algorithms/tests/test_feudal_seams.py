@@ -283,6 +283,139 @@ def test_ring_helpers_agree_across_batched_and_unbatched_layouts():
     assert jnp.allclose(cleared[:, 1:], batched[:, 1:])
 
 
+# --------------------------------------------------------------------------
+# Permutation nulls (the "are the goals useful?" diagnostics)
+# --------------------------------------------------------------------------
+
+
+def test_agent_permutation_commutes_with_the_goal_ring():
+    """`roll(pool(h)) == pool(roll(h))`, which is what licenses permuting `w_t`.
+
+    The eval ablation transforms the POOLED goal at the `goal_ring_pool` read
+    site. That is only equivalent to permuting the manager's raw output because
+    the pool is a plain sum and the shift is fixed across time. If anyone makes
+    the permutation time-varying or random-per-step, this equality breaks and
+    agent `i` starts receiving a sum of *different agents'* goals at different
+    times — which changes ||w|| from ~c to ~sqrt(c) and stops preserving the
+    marginal, i.e. the null quietly stops being a null.
+    """
+    from algorithms.feudal_mappo_jax.manager import (
+        goal_ring_pool,
+        goal_ring_write,
+        permute_agent_goals,
+    )
+
+    key = jax.random.PRNGKey(11)
+    goals = jax.random.normal(key, (2 * HORIZON, N_ENVS, N_AGENTS, GOAL_DIM))
+    ring = jnp.zeros((HORIZON, N_ENVS, N_AGENTS, GOAL_DIM))
+    rolled_ring = jnp.zeros((HORIZON, N_ENVS, N_AGENTS, GOAL_DIM))
+
+    for t in range(2 * HORIZON):  # past one wrap, so slot reuse is exercised
+        ring = goal_ring_write(ring, goals[t], t)
+        rolled_ring = goal_ring_write(
+            rolled_ring, permute_agent_goals(goals[t], 1), t
+        )
+        assert jnp.array_equal(
+            permute_agent_goals(goal_ring_pool(ring), 1),
+            goal_ring_pool(rolled_ring),
+        ), f"t={t}: rolling the pool differs from pooling the rolls"
+
+
+def test_agent_permutation_rejects_degenerate_shifts():
+    """A roll that is the identity must RAISE, not report a vacuous zero gap.
+
+    At n_agents == 1 (or shift % n == 0) the null equals the real value by
+    construction, so every gap is exactly 0.0 — which reads as "the goals make
+    no difference", the precise conclusion the diagnostic exists to reach. This
+    is the self-sealing failure mode, so it is rejected loudly.
+    """
+    from algorithms.feudal_mappo_jax.manager import (
+        permute_agent_goals,
+        permute_env_goals,
+    )
+
+    one_agent = jnp.zeros((N_ENVS, 1, GOAL_DIM))
+    with pytest.raises(ValueError, match="identity"):
+        permute_agent_goals(one_agent, 1)
+
+    goals = jnp.zeros((N_ENVS, N_AGENTS, GOAL_DIM))
+    with pytest.raises(ValueError, match="identity"):
+        permute_agent_goals(goals, 0)
+    with pytest.raises(ValueError, match="identity"):
+        permute_agent_goals(goals, N_AGENTS)
+    with pytest.raises(ValueError, match="identity"):
+        permute_env_goals(goals, 0, N_ENVS)
+
+    # A legitimate shift still works on both axes.
+    assert permute_agent_goals(goals, 1).shape == goals.shape
+    assert permute_env_goals(goals, 0, 1).shape == goals.shape
+
+
+def test_transition_cosine_valid_is_independent_of_goals():
+    """`valid` is a function of (states, done) only — the null's load-bearing fact.
+
+    `manager_cosine_metrics` forms `mask = valid * active` ONCE and reuses it for
+    the real cosine and both nulls. That is only sound if permuting the goals
+    cannot change which entries are valid; otherwise real and null would be
+    averaged over different denominators and the gap would be an artifact.
+    """
+    from algorithms.feudal_mappo_jax.manager import (
+        permute_agent_goals,
+        permute_env_goals,
+        transition_cosine,
+    )
+
+    key = jax.random.PRNGKey(5)
+    k_s, k_g = jax.random.split(key)
+    s = jax.random.normal(k_s, (N_STEPS, N_ENVS, N_AGENTS, GOAL_DIM))
+    goal = jax.random.normal(k_g, (N_STEPS, N_ENVS, N_AGENTS, GOAL_DIM))
+    done = jnp.zeros((N_STEPS, N_ENVS, N_AGENTS))
+    done = done.at[EPISODE_LEN].set(1.0)
+
+    _, valid = transition_cosine(s, goal, HORIZON, done=done)
+    for permuted in (
+        permute_agent_goals(goal, 1),
+        permute_env_goals(goal, 1, 1),
+        jnp.zeros_like(goal),
+    ):
+        _, valid_p = transition_cosine(s, permuted, HORIZON, done=done)
+        assert jnp.array_equal(valid, valid_p)
+
+
+def test_d_cos_null_equals_real_when_goals_are_collapsed():
+    """Collapse => zero gap, per axis. Intended behaviour, not an accident.
+
+    A gap of ~0 is ambiguous on its own: it means EITHER the goals carry no
+    information on that axis OR they were already identical, so permuting them
+    did nothing. `goal_perm_cos` is what separates the two, so it is asserted
+    here alongside each gap.
+    """
+    from algorithms.feudal_mappo_jax.mappo import manager_cosine_metrics
+
+    key = jax.random.PRNGKey(7)
+    k_s, k_g = jax.random.split(key)
+    s = jax.random.normal(k_s, (N_STEPS, N_ENVS, N_AGENTS, GOAL_DIM))
+    done = jnp.zeros((N_STEPS, N_ENVS, N_AGENTS))
+    active = jnp.ones((N_STEPS, N_ENVS, N_AGENTS))
+
+    # One shared goal per (t, env): the agent axis carries nothing.
+    shared = jax.random.normal(k_g, (N_STEPS, N_ENVS, 1, GOAL_DIM))
+    shared = jnp.broadcast_to(shared, (N_STEPS, N_ENVS, N_AGENTS, GOAL_DIM))
+    m = manager_cosine_metrics(s, shared, HORIZON, done, active)
+    assert abs(float(m["d_cos_gap_agent"])) < 1e-5
+    assert float(m["goal_perm_cos"]) > 0.999  # the permutation changed nothing
+
+    # One goal shared across envs: the state-conditioning axis carries nothing.
+    per_agent = jax.random.normal(k_g, (N_STEPS, 1, N_AGENTS, GOAL_DIM))
+    per_agent = jnp.broadcast_to(per_agent, (N_STEPS, N_ENVS, N_AGENTS, GOAL_DIM))
+    m = manager_cosine_metrics(s, per_agent, HORIZON, done, active)
+    assert abs(float(m["d_cos_gap_env"])) < 1e-5
+    # ...and this is exactly the case the agent-axis null alone calls healthy:
+    # a fixed per-agent code with no state dependence. Its agent gap is NOT ~0,
+    # which is why d_cos_gap_env has to be read first.
+    assert float(m["goal_perm_cos"]) < 0.9
+
+
 def test_agent_major_flatten_pairs_obs_with_own_goal(rollout):
     """Row k = b*n_agents + i must carry agent i's obs AND agent i's goal."""
     _, _, _, _, traj, _, _ = rollout
@@ -709,3 +842,326 @@ def test_normalize_pooled_goal_false_reproduces_the_raw_sum():
     a, _ = worker.apply(params, obs, goal)
     b, _ = worker.apply(params, obs, goal * 3.0)
     assert jnp.allclose(a, b, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Goal-ablation eval variants (trainer.eval_fn)
+# ---------------------------------------------------------------------------
+
+
+def _eval_state(**overrides):
+    """A config + initialized train state, for the eval-variant tests."""
+    config = _config(**overrides)
+    env = StubEnv()
+    init_fn, _, _, eval_fn, _ = make_train(config, env)
+    runner_state = init_fn(jax.random.PRNGKey(0))
+    return config, env, runner_state.train_state, eval_fn
+
+
+def test_real_eval_variant_is_unchanged():
+    """Running the ablation blocks must not perturb the `reward` series.
+
+    `eval_fn`'s scalar return is the contract `run.py:evaluate()` and the
+    training loop's `reward` stat both depend on. If widening the scan to V*E
+    envs changed the real block's result, every future run's reward curve would
+    be silently incomparable with every past one.
+    """
+    _, _, train_state, eval_fn = _eval_state()
+    key = jax.random.PRNGKey(4)
+
+    batched = float(eval_fn(train_state, key))          # 3 variants, one scan
+    alone = float(eval_fn(train_state, key, variants=("real",)))
+    assert batched == alone, (batched, alone)
+
+
+def test_eval_variants_share_reset_keys():
+    """Every block starts from bit-identical initial states.
+
+    The gap is a paired statistic. With n_eval_episodes deliberately small, an
+    unpaired design would drown a real gap in reset variance, so the pairing has
+    to be structural (tile the keys) rather than a property anyone remembers to
+    preserve.
+    """
+    config = _config()
+    n_eps = config.n_eval_episodes
+    variants = ("real", "permuted", "zeroed")
+    keys = jnp.tile(jax.random.split(jax.random.PRNGKey(4), n_eps), (len(variants), 1))
+    obs, _ = jax.vmap(StubEnv().reset)(keys)
+
+    blocks = jnp.split(obs, len(variants), axis=0)
+    for i, b in enumerate(blocks[1:], start=1):
+        assert jnp.array_equal(blocks[0], b), f"block {i} starts from a different state"
+
+
+def test_zeroed_eval_variant_equals_a_zero_goal_worker():
+    """The `zeroed` block must be exactly `FeudalWorker(zero_goal=True)`.
+
+    This is the positive control that validates the whole harness, and it holds
+    because `_unit(0) == 0` and the optional `goal_embed_dim` Dense is
+    bias-free, so `Dense(0) == 0`. It is also why the ablation is applied to the
+    goal OUTSIDE the module: the parameter tree stays shape-identical, so
+    checkpoints remain interchangeable.
+
+    Consequence used as the offline probe's stop-the-line check: on a
+    `feudal_zerogoal` arm all three variants coincide inside the module, so the
+    measured gaps must be exactly 0.0.
+    """
+    _, _, train_state, eval_fn = _eval_state()
+    # Same init rng => identical params, since zero_goal does not change shapes.
+    _, _, zg_train_state, zg_eval_fn = _eval_state(zero_goal=True)
+    key = jax.random.PRNGKey(6)
+
+    chex_equal = jax.tree.all(
+        jax.tree.map(
+            lambda a, b: bool(jnp.array_equal(a, b)),
+            train_state.actor_ts.params,
+            zg_train_state.actor_ts.params,
+        )
+    )
+    assert chex_equal, "zero_goal must not perturb the param tree"
+
+    ablated = float(eval_fn(train_state, key, variants=("zeroed",)))
+    native = float(zg_eval_fn(zg_train_state, key, variants=("real",)))
+    assert ablated == native, (ablated, native)
+
+
+def test_eval_variant_blocks_do_not_cross_contaminate():
+    """Block v's return must depend only on block v's transform.
+
+    The batched-scan-specific risk: the blocks share one scan, one manager
+    carry and one goal ring, so a mis-sliced `jnp.split`/`concatenate` (or a
+    roll applied after the agent-major flatten, which crosses env boundaries)
+    would let one variant's goals drive another's envs. That produces plausible
+    numbers, not an error.
+    """
+    _, _, train_state, eval_fn = _eval_state()
+    key = jax.random.PRNGKey(8)
+
+    both, _ = eval_fn(train_state, key, variants=("real", "zeroed"), detail=True)
+    real_alone, _ = eval_fn(train_state, key, variants=("real",), detail=True)
+    zero_alone, _ = eval_fn(train_state, key, variants=("zeroed",), detail=True)
+
+    assert jnp.array_equal(both[0], real_alone[0]), "real block contaminated"
+    assert jnp.array_equal(both[1], zero_alone[0]), "zeroed block contaminated"
+
+    # Reordering the tuple must move the blocks, not the results.
+    swapped, _ = eval_fn(train_state, key, variants=("zeroed", "real"), detail=True)
+    assert jnp.array_equal(swapped[0], zero_alone[0])
+    assert jnp.array_equal(swapped[1], real_alone[0])
+
+
+def test_permutation_stays_within_its_env():
+    """The agent roll must not move a goal across an env boundary.
+
+    `_actor_forward` flattens the pooled goal agent-major to
+    `(n_envs*n_agents, goal_dim)`. A roll applied AFTER that flatten would give
+    env b's agent 0 the goal of env b-1's agent N-1 — the exact class of silent
+    bug CLAUDE.md records for goal flattening, and it would still produce a
+    well-shaped, plausible-looking gap.
+    """
+    from algorithms.feudal_mappo_jax.manager import permute_agent_goals
+
+    goals = jax.random.normal(
+        jax.random.PRNGKey(9), (N_ENVS, N_AGENTS, GOAL_DIM)
+    )
+    rolled = permute_agent_goals(goals, 1)
+
+    for e in range(N_ENVS):
+        # Each env's goal multiset is preserved exactly...
+        assert jnp.array_equal(
+            jnp.sort(goals[e], axis=0), jnp.sort(rolled[e], axis=0)
+        ), f"env {e}: goal multiset not preserved"
+        # ...and every row came from THAT env, shifted by one agent.
+        for i in range(N_AGENTS):
+            assert jnp.array_equal(rolled[e, i], goals[e, (i - 1) % N_AGENTS])
+
+    # The wrong implementation (roll after the agent-major flatten) is caught:
+    wrong = jnp.roll(goals.reshape(-1, GOAL_DIM), 1, axis=0).reshape(goals.shape)
+    assert not jnp.array_equal(wrong, rolled)
+
+
+# ---------------------------------------------------------------------------
+# Stats alignment (the resume hazard for any newly-added metric series)
+# ---------------------------------------------------------------------------
+
+
+def test_to_dict_left_pads_short_series():
+    """A series that started late must be padded at the FRONT, to alignment.
+
+    `append_agent_stats` is a bare defaultdict append, so a metric added after a
+    run began — or absent from the checkpoint a run resumed from — is created on
+    its first append and stays permanently shorter than `total_steps`. Nothing
+    detects it, and the notebook then plots it against `range(1, len+1)`, i.e.
+    silently shifted left and averaged against other runs' wrong iterations.
+
+    Padding the FRONT is what matters: element 0 of a late series belongs to the
+    iteration it first existed for, not to iteration 0.
+    """
+    import math
+
+    from algorithms.mappo_vanilla.trainer_components import TrainingStatsTracker
+
+    tracker = TrainingStatsTracker()
+    tracker.training_stats["total_steps"] = [10, 20, 30, 40]
+    tracker.training_stats["policy_loss"] = [1.0, 2.0, 3.0, 4.0]  # aligned
+    tracker.training_stats["eval_gap_permuted"] = [7.0, 8.0]      # started late
+    tracker.training_stats["action_distribution"] = []            # legitimately empty
+
+    out = tracker.to_dict()
+
+    assert out["policy_loss"] == [1.0, 2.0, 3.0, 4.0], "aligned series must not move"
+    padded = out["eval_gap_permuted"]
+    assert len(padded) == 4
+    assert math.isnan(padded[0]) and math.isnan(padded[1]), "must pad the FRONT"
+    assert padded[2:] == [7.0, 8.0], "existing values must keep their iterations"
+    # Empty is a real state ("never recorded"), not a short one: padding it would
+    # make it ragged and break the notebook cell that reads it.
+    assert out["action_distribution"] == []
+
+
+# ---------------------------------------------------------------------------
+# FiLM fusion (conf/model/feudal_film.yaml)
+# ---------------------------------------------------------------------------
+
+
+def _film_worker(**kw):
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    return init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8,
+        discrete=False, worker_fusion="film", **kw,
+    )
+
+
+def test_film_is_identity_at_init():
+    """At init the FiLM worker must be EXACTLY the flat actor, for any goal.
+
+    This is the property the whole arm rests on: zero-init kernels give
+    gamma = beta = 0, so `h * (1 + 0) + 0 == h`. It makes the arm start at the
+    mappo_jax baseline and forces goal influence to be *earned*, which is the
+    reverse of concat -- where orthogonal init makes the goal columns live from
+    step 0 and goal-agnosticism is what has to be learned.
+
+    It is also the free pre-flight check for the goal-dependence probe: before
+    training, every eval variant must agree bitwise.
+    """
+    from algorithms.feudal_mappo_jax.network import MAPPOActor
+
+    worker, params = _film_worker()
+    obs = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, N_AGENTS, OBS_DIM))
+    g1 = jax.random.normal(jax.random.PRNGKey(2), (N_ENVS, N_AGENTS, GOAL_DIM))
+    g2 = jax.random.normal(jax.random.PRNGKey(3), (N_ENVS, N_AGENTS, GOAL_DIM)) * 31.0
+
+    m1, s1 = worker.apply(params, obs, g1)
+    m2, s2 = worker.apply(params, obs, g2)
+    assert jnp.array_equal(m1, m2), "goal must not reach the policy at init"
+    assert jnp.array_equal(s1, s2)
+
+    # ...and it equals the FLAT actor on the same trunk weights, so the identity
+    # is against mappo_jax's policy rather than merely self-consistent.
+    flat = MAPPOActor(action_dim=ACTION_DIM, hidden_dim=8, discrete=False)
+    flat_mean, flat_std = flat.apply(
+        {"params": params["params"]["MAPPOActor_0"]}, obs
+    )
+    assert jnp.array_equal(m1, flat_mean), "FiLM at init must BE the flat actor"
+    assert jnp.array_equal(s1, flat_std)
+
+    # The two structural properties, asserted directly on the param tree.
+    assert "film_0" in params["params"] and "film_1" in params["params"]
+    for name in ("film_0", "film_1"):
+        for dense in params["params"][name].values():
+            assert jnp.all(dense["kernel"] == 0.0), f"{name} must be zero-init"
+            assert "bias" not in dense, f"{name} must be bias-free"
+
+
+def test_film_becomes_goal_sensitive_once_gamma_is_nonzero():
+    """Zero-init sets the DEFAULT; it must not disconnect the goal permanently."""
+    worker, params = _film_worker()
+    obs = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, N_AGENTS, OBS_DIM))
+    g1 = jax.random.normal(jax.random.PRNGKey(2), (N_ENVS, N_AGENTS, GOAL_DIM))
+    g2 = jax.random.normal(jax.random.PRNGKey(3), (N_ENVS, N_AGENTS, GOAL_DIM))
+
+    p = jax.tree.map(lambda x: x, params)  # copy
+    k = list(p["params"]["film_0"].keys())[0]
+    p["params"]["film_0"][k]["kernel"] = jnp.ones_like(
+        p["params"]["film_0"][k]["kernel"]
+    ) * 0.1
+
+    m1, _ = worker.apply(p, obs, g1)
+    m2, _ = worker.apply(p, obs, g2)
+    assert not jnp.allclose(m1, m2), "goal must reach the policy once gamma != 0"
+
+    # And a gradient exists at the zero-init point, so it can get there.
+    def loss(prm):
+        mean, _ = worker.apply(prm, obs, g1)
+        return jnp.sum(mean**2)
+
+    grads = jax.grad(loss)(params)
+    gnorm = sum(
+        float(jnp.sum(jnp.abs(v["kernel"])))
+        for v in grads["params"]["film_0"].values()
+    )
+    assert gnorm > 0.0, "zero-init must not be a dead start"
+
+
+def test_film_zero_goal_is_exactly_the_flat_policy_after_training():
+    """Bias-free => gamma(0) = beta(0) = 0 FOREVER, not just at init.
+
+    This is what keeps the probe's `zeroed` variant interpretable: with a bias,
+    a trained gamma(0) != 0 would make that arm "flat policy + a learned
+    constant modulation" and the control would silently drift.
+    """
+    worker, params = _film_worker()
+    obs = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, N_AGENTS, OBS_DIM))
+    zero_g = jnp.zeros((N_ENVS, N_AGENTS, GOAL_DIM))
+
+    # Simulate "after training": arbitrary nonzero FiLM kernels.
+    trained = jax.tree.map(lambda x: x, params)
+    for name in ("film_0", "film_1"):
+        for k in trained["params"][name]:
+            trained["params"][name][k]["kernel"] = jax.random.normal(
+                jax.random.PRNGKey(hash(name + k) % 2**31),
+                trained["params"][name][k]["kernel"].shape,
+            )
+
+    at_zero, _ = worker.apply(trained, obs, zero_g)
+    at_init, _ = worker.apply(params, obs, zero_g)
+    assert jnp.array_equal(at_zero, at_init), (
+        "a zero goal must give the flat policy regardless of trained FiLM weights"
+    )
+
+
+def test_film_and_concat_are_not_checkpoint_compatible():
+    """Guard the documented shape difference so it cannot be silently assumed."""
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    _, film_p = _film_worker()
+    _, concat_p = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8, discrete=False,
+    )
+    d0 = lambda p: p["params"]["MAPPOActor_0"]["Dense_0"]["kernel"].shape
+    assert d0(concat_p) == (OBS_DIM + GOAL_DIM, 8)
+    assert d0(film_p) == (OBS_DIM, 8)
+
+
+def test_unknown_worker_fusion_raises():
+    """Fail loudly rather than silently falling back to one of the two fusions."""
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    with pytest.raises(ValueError, match="unknown worker_fusion"):
+        init_worker(
+            jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 8,
+            discrete=False, worker_fusion="bilinear",
+        )
+
+
+def test_concat_path_is_unchanged_by_the_modulate_hook():
+    """`modulate=None` must leave MAPPOActor byte-identical to the pre-hook code."""
+    from algorithms.feudal_mappo_jax.network import MAPPOActor
+
+    actor = MAPPOActor(action_dim=ACTION_DIM, hidden_dim=8, discrete=False)
+    x = jax.random.normal(jax.random.PRNGKey(1), (N_ENVS, OBS_DIM + GOAL_DIM))
+    p = actor.init(jax.random.PRNGKey(0), x)
+    a, _ = actor.apply(p, x)
+    b, _ = actor.apply(p, x, None)
+    assert jnp.array_equal(a, b)

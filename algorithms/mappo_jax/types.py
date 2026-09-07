@@ -26,6 +26,14 @@ class Params:
     ent_coef: float = 0.01
     val_coef: float = 0.5
     grad_clip: float = 0.5
+    # Number of deterministic episodes per eval. This USED to be an invisible
+    # MAPPOConfig default of 5 that nothing ever set, so every `reward` point in
+    # every existing plot is a 5-episode mean. Eval cost is the fixed
+    # env.max_steps SEQUENTIAL scan, so more episodes is nearly free (width, not
+    # depth), and raising it cuts variance without biasing the mean. Kept equal
+    # to the feudal stack's default so the feudal-vs-flat comparison does not
+    # also compare two different eval noise floors.
+    n_eval_episodes: int = 32
 
 
 @dataclass
@@ -58,7 +66,7 @@ class MAPPOConfig:
     n_total_steps: int = 1_000_000
     parameter_sharing: bool = True
     hidden_dim: int = 168
-    n_eval_episodes: int = 5
+    n_eval_episodes: int = 32
     # True when the env emits a per-agent reward (reward_mode="difference_rewards").
     # Switches the critic to a per-agent value head and runs GAE on the agent axis;
     # False keeps the exact scalar-team-reward path (mappo_vanilla parity).

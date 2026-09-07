@@ -16,6 +16,7 @@ The structure deliberately mirrors ``mappo_vanilla``'s trainer components:
   per-episode returns accumulated until each episode first finishes.
 """
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -24,6 +25,7 @@ import jax.numpy as jnp
 from algorithms.feudal_mappo_jax.types import Bootstrap, MAPPOConfig, Transition
 from algorithms.feudal_mappo_jax.network import sample_action
 from algorithms.feudal_mappo_jax.manager import (
+    _goal_transform_variants,
     goal_ring_pool,
     goal_ring_reset,
     goal_ring_write,
@@ -97,6 +99,21 @@ def make_train(config: MAPPOConfig, env):
         raise NotImplementedError(
             "feudal_mappo_jax implements the shared-actor path only "
             "(parameter_sharing=true); use mappo_vanilla for independent actors"
+        )
+
+    # Goal-ablation eval variants (see `eval_fn`). Validate the shift HERE, at
+    # build time, rather than at the first eval hundreds of updates in: a shift
+    # that is a multiple of n_agents makes the permutation the identity, so
+    # every gap is exactly 0.0 and the diagnostic reports "the goals make no
+    # difference" while having measured nothing.
+    default_eval_variants = (
+        ("real", "permuted", "zeroed") if config.eval_goal_variants else ("real",)
+    )
+    if config.eval_goal_variants:
+        from algorithms.feudal_mappo_jax.manager import _check_permutable
+
+        _check_permutable(
+            jnp.zeros((1, n_agents, 1)), config.goal_permute_shift, -2, "make_train"
         )
 
     num_updates = int(config.n_total_steps) // (config.n_steps * config.n_envs)
@@ -556,32 +573,99 @@ def make_train(config: MAPPOConfig, env):
 
     # ------------------------------------------------------------------ eval
 
-    @jax.jit
-    def eval_fn(train_state: ActorCriticTrainState, rng: jax.Array):
-        """Deterministic parallel-episode evaluation (PolicyEvaluator parity)."""
-        keys = jax.random.split(rng, config.n_eval_episodes)
+    @partial(jax.jit, static_argnames=("variants", "detail"))
+    def eval_fn(
+        train_state: ActorCriticTrainState,
+        rng: jax.Array,
+        variants: tuple = None,
+        detail: bool = False,
+    ):
+        """Deterministic parallel-episode evaluation (PolicyEvaluator parity).
+
+        Runs one or more GOAL-ABLATION VARIANTS in a single scan. Each variant
+        is a transform applied to the pooled goal `w_t` just before it reaches
+        the worker, so it changes what the worker is told without touching the
+        manager, the ring, or any parameter:
+
+            real          the manager's actual directives
+            permuted      agent i gets agent i-shift's goal  -> tests the ASSIGNMENT
+            env_permuted  agent i gets its slot's goal from another env
+                          -> tests STATE-CONDITIONING (offline probe only)
+            zeroed        no directive at all -> tests goal conditioning per se
+
+        The gaps against `real` are the only direct measurement of whether the
+        manager's goals are *useful*; every other diagnostic in this stack tests
+        whether they are well-formed, which is a much weaker claim.
+
+        BATCHED, NOT SEQUENTIAL. All variants share one scan at ``V * E``
+        vmapped width because eval cost is dominated by the fixed
+        ``env.max_steps`` SEQUENTIAL scan, not by env width. Measured on
+        ``mjx_16a_4o_1024/feudal/0``: 612 evals x 9.63 s median = 9.3% of a
+        22.3 h run, so three separate scans would cost ~+18.7% wall against
+        ~+2% for this. Tiling the reset keys also makes the paired comparison
+        **structural**: every variant block starts from bit-identical initial
+        states, so the gap carries no reset variance.
+
+        Args:
+            variants: static tuple of variant names; ``None`` takes the
+                config-derived default. ``("real",)`` is byte-identical to the
+                pre-ablation implementation.
+            detail: ``False`` returns the scalar mean return of the ``real``
+                block (so existing callers are unchanged); ``True`` returns
+                ``(rewards, lengths)``, each ``(V, n_eval_episodes)``, for a
+                paired per-episode statistic.
+        """
+        variants = variants or default_eval_variants
+        transforms = _goal_transform_variants(config.goal_permute_shift, 0)
+        n_variants, n_eps = len(variants), config.n_eval_episodes
+        total = n_variants * n_eps
+
+        # Tile, don't re-split: block v env e must start from the SAME state as
+        # block 0 env e, or the gap would measure reset luck as well as goals.
+        # At V=1 this is exactly `jax.random.split(rng, n_eps)`.
+        keys = jnp.tile(jax.random.split(rng, n_eps), (n_variants, 1))
         obs, env_state = jax.vmap(env.reset)(keys)
-        finished = jnp.zeros(config.n_eval_episodes, dtype=bool)
-        episode_rewards = jnp.zeros(config.n_eval_episodes)
+        finished = jnp.zeros(total, dtype=bool)
+        episode_rewards = jnp.zeros(total)
+        episode_lengths = jnp.zeros(total)
         # Eval must run the full hierarchy: the worker is goal-conditioned, so
         # without the manager it would be evaluated on a goal it never sees.
-        m_carry = manager.initialize_carry(rng, (config.n_eval_episodes,))
-        goal_hist = jnp.zeros(
-            (horizon, config.n_eval_episodes, n_agents, goal_dim)
-        )
+        m_carry = manager.initialize_carry(rng, (total,))
+        goal_hist = jnp.zeros((horizon, total, n_agents, goal_dim))
 
         def _eval_step(carry, t):
-            obs, env_state, finished, episode_rewards, m_carry, goal_hist = carry
+            (
+                obs,
+                env_state,
+                finished,
+                episode_rewards,
+                episode_lengths,
+                m_carry,
+                goal_hist,
+            ) = carry
             gs = _global_state(obs, env_state)
             m_carry, goal, _ = _manager_forward(train_state, m_carry, gs)
             goal_hist = goal_ring_write(goal_hist, goal, t)
+            # THE seam. Transform the POOLED goal, per variant block. `variants`
+            # is static so this unrolls at trace time into V concatenated
+            # slices — deliberately not a block-diagonal mixing matrix, which
+            # would be the same arithmetic with far more room for a silent
+            # block/pairing bug.
+            pooled = goal_ring_pool(goal_hist)
+            if n_variants > 1:
+                blocks = jnp.split(pooled, n_variants, axis=0)
+                pooled = jnp.concatenate(
+                    [transforms[v](b) for v, b in zip(variants, blocks)], axis=0
+                )
+            else:
+                pooled = transforms[variants[0]](pooled)
             # The mask matters more here than in collection: an unmasked argmax picks
             # the highest logit even when illegal, so eval would score a policy the
             # env never actually runs.
             actions, _ = _actor_forward(
                 train_state,
                 obs,
-                goal_ring_pool(goal_hist),
+                pooled,
                 jax.random.PRNGKey(0),
                 deterministic=True,
                 action_mask=_avail(env_state),
@@ -594,12 +678,17 @@ def make_train(config: MAPPOConfig, env):
             # what the team achieved.
             reward = info["task_reward"]
             episode_rewards = episode_rewards + jnp.where(finished, 0.0, reward)
+            # Boundary contact TERMINATES in these envs (~43-step episodes), so a
+            # variant can end episodes sooner rather than earn less per step.
+            # Without lengths a return gap conflates the two.
+            episode_lengths = episode_lengths + jnp.where(finished, 0.0, 1.0)
             finished = finished | terminated | truncated
             return (
                 next_obs,
                 next_env_state,
                 finished,
                 episode_rewards,
+                episode_lengths,
                 m_carry,
                 goal_hist,
             ), None
@@ -608,11 +697,28 @@ def make_train(config: MAPPOConfig, env):
         # stepping but their rewards are masked out, like vanilla's `finished`.
         # No done-reset of the ring here: eval never restarts an episode, it just
         # masks finished ones out.
-        (_, _, _, episode_rewards, _, _), _ = jax.lax.scan(
+        (_, _, _, episode_rewards, episode_lengths, _, _), _ = jax.lax.scan(
             _eval_step,
-            (obs, env_state, finished, episode_rewards, m_carry, goal_hist),
+            (
+                obs,
+                env_state,
+                finished,
+                episode_rewards,
+                episode_lengths,
+                m_carry,
+                goal_hist,
+            ),
             jnp.arange(env.max_steps),
         )
-        return episode_rewards.mean()
+        rewards = episode_rewards.reshape(n_variants, n_eps)
+        lengths = episode_lengths.reshape(n_variants, n_eps)
+        if detail:
+            return rewards, lengths
+        # Scalar contract preserved for `evaluate()` and the training loop's
+        # `reward` series: always the `real` block, whatever else ran. Falls
+        # back to block 0 for a variants tuple that omits "real" (the ablation
+        # arms an offline probe may request on their own).
+        real_idx = variants.index("real") if "real" in variants else 0
+        return rewards[real_idx].mean()
 
     return init_fn, collect_fn, update_fn, eval_fn, num_updates

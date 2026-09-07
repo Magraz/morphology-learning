@@ -77,6 +77,25 @@ class Params:
     # biasing the converged policy. Decaying to 0 makes the endpoint optimal for
     # the true objective while keeping the early exploration pressure.
     intrinsic_anneal: str = "linear"
+    # ---- goal-usefulness diagnostics ----
+    # Number of deterministic episodes per eval. This USED to be an invisible
+    # MAPPOConfig default of 5 that nothing ever set, so every `reward` point in
+    # every existing plot is a 5-episode mean — far too noisy to resolve a
+    # goal-ablation gap on a ~470-return env. Eval cost is the fixed
+    # env.max_steps SEQUENTIAL scan, so more episodes is nearly free (it buys
+    # width, not depth). Raising it reduces variance without biasing the mean,
+    # so runs at 5 and at 32 stay comparable in expectation.
+    n_eval_episodes: int = 32
+    # Cyclic shift for the goal permutation nulls, on both the agent and env
+    # axes. Lives in Params (the ALGORITHM group), deliberately not in
+    # Model_Params: the model yamls (feudal / feudal_n01 / feudal_zerogoal) are
+    # the ablation axis, and a diagnostic that varied per arm would destroy the
+    # cross-arm comparability it exists to provide. Must not be a multiple of
+    # n_agents (make_train raises).
+    goal_permute_shift: int = 1
+    # Run the permuted/zeroed eval blocks alongside the real one. They share a
+    # single scan (see trainer.eval_fn), so the cost is ~+2% of wall, not 3x.
+    eval_goal_variants: bool = True
 
 
 @dataclass
@@ -111,6 +130,22 @@ class Model_Params:
     # Incoherent with intrinsic_coef != 0 (it would reward the worker for
     # reaching goals it cannot see); run.py raises on that combination.
     zero_goal: bool = False
+    # How the manager's goal reaches the worker's policy.
+    #   "concat" (default, original): [obs, w_t] -> MLP. The goal is another
+    #       observation channel; d(preactivation)/d(obs) does NOT depend on the
+    #       goal, so a concatenated goal can only TRANSLATE the policy, never
+    #       change which observation features matter.
+    #   "film": zero-initialized Feature-wise Linear Modulation on both hidden
+    #       preactivations, h <- (1 + gamma(w_t)) * h + beta(w_t). Multiplicative,
+    #       so the goal gates how the obs is read; and identity at init, so the
+    #       arm STARTS at the flat mappo_jax policy and goal influence must be
+    #       earned rather than un-learned.
+    # Motivated by the 2026-09-06 goal-dependence measurement: permuting the
+    # goals changes return by nothing while ZEROING them improves it on 15 of 16
+    # trained arms, i.e. under concat the goal is a net-harmful perturbation
+    # whose direction the worker never learned to use.
+    # NOT checkpoint-compatible with "concat" (different first-Dense input width).
+    worker_fusion: str = "concat"
 
 
 @dataclass
@@ -138,7 +173,10 @@ class MAPPOConfig:
     n_total_steps: int = 1_000_000
     parameter_sharing: bool = True
     hidden_dim: int = 168
-    n_eval_episodes: int = 5
+    n_eval_episodes: int = 32
+    # Goal-ablation diagnostics; see the matching fields in `Params`.
+    goal_permute_shift: int = 1
+    eval_goal_variants: bool = True
     # True when the env emits a per-agent reward (reward_mode="difference_rewards").
     # Drives the MANAGER's value head width here; the worker's head is always
     # per-agent (see below). Also runs the manager's GAE on the agent axis.
@@ -167,6 +205,7 @@ class MAPPOConfig:
     goal_embed_dim: int | None = None
     normalize_pooled_goal: bool = True
     zero_goal: bool = False
+    worker_fusion: str = "concat"
 
 
 class Transition(NamedTuple):

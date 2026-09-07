@@ -126,6 +126,7 @@ def create_train_state(
         goal_embed_dim=config.goal_embed_dim,
         normalize_pooled_goal=config.normalize_pooled_goal,
         zero_goal=config.zero_goal,
+        worker_fusion=config.worker_fusion,
     )
     critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs)
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))
@@ -717,6 +718,111 @@ def _agent_direction_count(gram: jnp.ndarray) -> jnp.ndarray:
     return (n**2 / (frob_sq + 1e-12)).mean()
 
 
+def manager_cosine_metrics(
+    s: jnp.ndarray,
+    goal: jnp.ndarray,
+    horizon: int,
+    done_a: jnp.ndarray,
+    active: jnp.ndarray,
+    shift: int = 1,
+    cos: jnp.ndarray = None,
+    valid: jnp.ndarray = None,
+) -> dict:
+    """``d_cos`` and the two permutation nulls that make it interpretable.
+
+    ``d_cos_mean`` alone says nothing about whether the manager's goals are
+    useful, because the manager owns BOTH arguments of the cosine: it picks the
+    measuring stick (`s`) and the target (`g`). Its absolute level is therefore
+    a property of the geometry of `s` as much as of directive-following. What
+    carries information is the gap against a null in which the goals are
+    re-paired but their distribution is untouched.
+
+    Two nulls, and they answer different questions (see the block comment above
+    ``permute_agent_goals`` in ``manager.py``):
+
+    * ``d_cos_null_agent`` — agent `i` scored against agent `i-shift`'s goal.
+      ``d_cos_gap_agent = d_cos_mean - d_cos_null_agent`` is the value of the
+      **assignment**.
+    * ``d_cos_null_env`` — agent `i` scored against its own slot's goal from an
+      unrelated env. ``d_cos_gap_env`` is the value of **state-conditioning**.
+
+    READ ``d_cos_gap_env`` FIRST. If it is ~0 the goals are not functions of the
+    state, and ``d_cos_gap_agent`` is uninterpretable however large it is — a
+    manager emitting a fixed per-agent code scores well on the agent gap while
+    doing nothing.
+
+    ``goal_perm_cos`` is the assumption check that belongs beside both: it is the
+    mean cosine between a goal and the one it was swapped with, so ~1 means the
+    permutation changed nothing and a zero gap says only that the goals were
+    already identical (cross-check against ``goal_direction_count``).
+
+    Both nulls are forward-only on arrays the caller has already materialized —
+    no network forward, no backward pass — so this is unconditional, matching
+    every other manager diagnostic. Gating it would make future runs
+    non-comparable.
+
+    Args:
+        s: ``(T, n_envs, n_agents, goal_dim)`` latent states.
+        goal: ``(T, n_envs, n_agents, goal_dim)`` unit goals, same shape.
+        horizon: `c`.
+        done_a: ``(T, n_envs, n_agents)`` terminal mask, pre-broadcast.
+        active: ``(T, n_envs, n_agents)`` per-agent decision mask.
+        shift: cyclic-permutation shift for both nulls.
+        cos, valid: the REAL ``transition_cosine`` output, when the caller has
+            already computed it (``manager_update`` has it as loss aux). Passing
+            them avoids a third pass over a ``(T, E, N, D)`` tensor; omitting
+            them recomputes, which is what the offline probe does since it never
+            evaluates the loss.
+    """
+    from algorithms.feudal_mappo_jax.manager import (
+        permute_agent_goals,
+        permute_env_goals,
+        transition_cosine,
+    )
+
+    if cos is None or valid is None:
+        cos, valid = transition_cosine(
+            s, goal, horizon, done=done_a, detach_states=True
+        )
+    # ONE mask for all three, so real and null are provably averaged over the
+    # same entries. This is sound because `transition_cosine`'s `valid` is a
+    # function of `states` and `done` only, never of `goals` — the single
+    # invariant the whole null rests on, pinned by
+    # `test_transition_cosine_valid_is_independent_of_goals`.
+    mask = valid * active
+
+    # env axis is 1 here: the manager path's goals are (T, n_envs, n_agents, D).
+    goal_agent = permute_agent_goals(goal, shift)
+    goal_env = permute_env_goals(goal, 1, shift)
+    cos_null_agent, _ = transition_cosine(
+        s, goal_agent, horizon, done=done_a, detach_states=True
+    )
+    cos_null_env, _ = transition_cosine(
+        s, goal_env, horizon, done=done_a, detach_states=True
+    )
+
+    cos_mean = _masked_mean(cos, mask)
+    null_agent = _masked_mean(cos_null_agent, mask)
+    null_env = _masked_mean(cos_null_env, mask)
+
+    unit = goal / (jnp.linalg.norm(goal, axis=-1, keepdims=True) + 1e-6)
+    perm_cos = jnp.sum(unit * permute_agent_goals(unit, shift), axis=-1)
+
+    return {
+        "d_cos_mean": cos_mean,
+        # A CONSTANT cosine is annihilated by advantage centering, so a high
+        # flat d_cos reads as success while the mechanism is dead. Always read
+        # d_cos_var next to d_cos_mean, never the mean alone.
+        "d_cos_var": _masked_mean((cos - cos_mean) ** 2, mask),
+        "valid_fraction": valid.mean(),
+        "d_cos_null_agent": null_agent,
+        "d_cos_null_env": null_env,
+        "d_cos_gap_agent": cos_mean - null_agent,
+        "d_cos_gap_env": cos_mean - null_env,
+        "goal_perm_cos": _masked_mean(perm_cos, mask),
+    }
+
+
 def manager_update(
     train_state: FeudalTrainState,
     trajectory: Transition,
@@ -879,18 +985,19 @@ def manager_update(
         manager_ts = manager_ts.apply_gradients(grads=m_grads)
 
         # --- collapse diagnostics (see the helpers above) ---
-        cos_mean = _masked_mean(cos, mask)
-        cos_var = _masked_mean((cos - cos_mean) ** 2, mask)
+        # `goal`/`s` here are concrete forward values under the PRE-update
+        # params — the right ones — and this is outside the differentiated
+        # region, so the two permutation nulls cost no backward pass.
         goal_gram = _agent_gram(goal)
         metrics = {
             "manager_pg_loss": pg_loss,
             "manager_adv_std": m_adv.std(),
-            "d_cos_mean": cos_mean,
-            # A CONSTANT cosine is annihilated by advantage centering, so a high
-            # flat d_cos reads as success while the mechanism is dead. Always
-            # read d_cos_var next to d_cos_mean, never the mean alone.
-            "d_cos_var": cos_var,
-            "valid_fraction": valid.mean(),
+            # d_cos_mean / d_cos_var / valid_fraction plus the agent- and
+            # env-axis nulls that make the level interpretable at all.
+            **manager_cosine_metrics(
+                s, goal, horizon, done_a, active, config.goal_permute_shift,
+                cos=cos, valid=valid,
+            ),
             "goal_pairwise_cos": _mean_pairwise_cosine(goal_gram),
             # Sign-blind companions to the signed mean: goals collapsed onto one
             # LINE give cos ~ 0 but |cos| ~ 1 and a direction count ~ 1.

@@ -29,18 +29,37 @@ class MAPPOActor(nn.Module):
     discrete: bool = True
 
     @nn.compact
-    def __call__(self, obs: jnp.ndarray):
+    def __call__(self, obs: jnp.ndarray, modulate: Optional[callable] = None):
+        """`modulate(x, layer_idx) -> x` is an optional conditioning hook.
+
+        Called on each hidden layer's preactivation, **before** the Tanh —
+        which is where FiLM belongs (Perez et al. 2018 apply it after
+        normalization and before the activation), and the only placement that
+        lets the conditioning move units into and out of saturation rather than
+        merely rescaling an already-squashed value.
+
+        It exists so `FeudalWorker` can fuse the manager's goal multiplicatively
+        without forking this trunk: concatenation can only *translate* the
+        preactivation (`d z1/d obs = W_obs`, with no dependence on the goal at
+        all), so a concatenated goal is structurally incapable of changing which
+        observation features matter. `None` leaves this module byte-identical to
+        the pre-hook version, so every non-feudal caller is unaffected.
+        """
         x = nn.Dense(
             self.hidden_dim,
             kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
             bias_init=nn.initializers.constant(0.0),
         )(obs)
+        if modulate is not None:
+            x = modulate(x, 0)
         x = nn.tanh(x)
         x = nn.Dense(
             self.hidden_dim,
             kernel_init=nn.initializers.orthogonal(np.sqrt(2)),
             bias_init=nn.initializers.constant(0.0),
         )(x)
+        if modulate is not None:
+            x = modulate(x, 1)
         x = nn.tanh(x)
         action_params = nn.Dense(
             self.action_dim,
