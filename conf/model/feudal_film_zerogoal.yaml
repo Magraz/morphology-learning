@@ -1,6 +1,4 @@
 model_params:
   hidden_dim: 168
   worker_fusion: film
-
-params:
-  intrinsic_coef: 0.5
+  zero_goal: true

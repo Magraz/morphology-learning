@@ -1,6 +1,7 @@
 model_params:
   hidden_dim: 168
   worker_fusion: film
+  manager_core: dilated_lstm
 
 params:
-  intrinsic_coef: 0.5
+  intrinsic_coef: 0.1
