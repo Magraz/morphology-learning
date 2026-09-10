@@ -19,7 +19,7 @@ env:
   # LITERAL, like every MJX group: this is a vmap width on one device, i.e. a
   # hyperparameter (per-update batch = n_steps * n_envs, which sets num_updates), NOT a
   # core budget. Keep it identical across arms being compared.
-  n_envs: 64
+  n_envs: 32
 
 # NOTE: column 0, NOT nested under `env:`. Nothing validates the `env:` block, so a
 # `params:` indented under it becomes `env.params.*`, which is read by nothing and is

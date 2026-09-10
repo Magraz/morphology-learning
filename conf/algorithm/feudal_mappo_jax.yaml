@@ -15,7 +15,7 @@ params:
   n_minibatches: 8
   # Must stay per-env: it is the static length of the jitted collect scan.
   # Batch = n_steps * env.n_envs, and n_envs is a literal in each MJX env group.
-  n_steps: 1024
+  n_steps: 1048
   parameter_sharing: true       # shared-worker path only, as in mappo_jax
   lr: 0.0003
   gamma: 0.99
