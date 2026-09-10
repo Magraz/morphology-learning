@@ -138,19 +138,33 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
     Inferring the widths from the params makes the measurement a property of the
     checkpoint rather than of whatever the config happens to say this week.
 
-    ``goal_dim`` comes from ``f_Mspace`` (``(manager_hidden, n_agents*goal_dim)``)
-    rather than from the actor's first layer, because with ``goal_embed_dim`` set
-    the actor sees the embedding width, not the goal width.
+    ``goal_dim`` comes from ``f_Mspace`` rather than from the actor's first layer,
+    because with ``goal_embed_dim`` set the actor sees the embedding width, not
+    the goal width. Its shape depends on ``manager_latent``, which is ALSO read
+    back off the tree here:
+
+    * ``"centralized"``: ``f_Mspace`` is ``(manager_hidden, n_agents*goal_dim)``
+      and the tree carries ``f_percept_0``/``goal_head``.
+    * ``"local"``: ``f_Mspace`` is ``(manager_hidden, goal_dim)`` — one SHARED
+      per-agent projection — and the tree carries ``f_enc_0``/``f_gpre``/
+      ``f_goalhead`` instead. Dividing by ``n_agents`` here would silently
+      produce ``goal_dim // n_agents`` and the reload would fail (or, worse for a
+      width that happens to divide, load a different network than trained).
     """
     from flax.serialization import msgpack_restore
 
     tree = msgpack_restore(path.read_bytes())
     mgr = tree["manager"]["params"]
     actor = tree["actor"]["params"]["MAPPOActor_0"]
+    local = "f_enc_0" in mgr
     return {
-        "goal_dim": int(mgr["f_Mspace"]["kernel"].shape[1]) // int(n_agents),
-        "manager_hidden_dim": int(mgr["f_percept_0"]["kernel"].shape[1]),
+        "goal_dim": int(mgr["f_Mspace"]["kernel"].shape[1])
+        // (1 if local else int(n_agents)),
+        "manager_hidden_dim": int(
+            mgr["f_enc_0" if local else "f_percept_0"]["kernel"].shape[1]
+        ),
         "hidden_dim": int(actor["Dense_0"]["kernel"].shape[1]),
+        "manager_latent": "local" if local else "centralized",
     }
 
 

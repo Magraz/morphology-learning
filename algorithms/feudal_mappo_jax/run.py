@@ -257,6 +257,7 @@ class Feudal_MAPPO_JAX_Runner:
             n_manager_critic_epochs=self.params.n_manager_critic_epochs,
             manager_hidden_dim=self.model_params.manager_hidden_dim,
             manager_core=self.model_params.manager_core,
+            manager_latent=self.model_params.manager_latent,
             goal_embed_dim=self.model_params.goal_embed_dim,
             normalize_pooled_goal=self.model_params.normalize_pooled_goal,
             zero_goal=self.model_params.zero_goal,
@@ -696,8 +697,11 @@ class Feudal_MAPPO_JAX_Runner:
 
         @jax.jit
         def manager_fn(m_carry, obs):
+            # `obs` is (n_agents, obs_dim) here (unbatched). It is passed twice
+            # on purpose: flattened as the global state, and per-agent for
+            # manager_latent="local". The centralized branch ignores the second.
             return manager.apply(
-                train_state.manager_ts.params, m_carry, obs.reshape(-1)
+                train_state.manager_ts.params, m_carry, obs.reshape(-1), obs
             )
 
         @jax.jit
@@ -863,8 +867,10 @@ class Feudal_MAPPO_JAX_Runner:
         gs_fn = jax.jit(self.env.global_state)
 
         @jax.jit
-        def manager_fn(m_carry, gs):
-            return manager.apply(train_state.manager_ts.params, m_carry, gs)
+        def manager_fn(m_carry, gs, obs):
+            return manager.apply(
+                train_state.manager_ts.params, m_carry, gs, obs
+            )
 
         @jax.jit
         def policy_fn(obs, pooled_goal, mask):
@@ -890,7 +896,9 @@ class Feudal_MAPPO_JAX_Runner:
             for t in range(self.env.max_steps):
                 # The manager reads the env's real global state here, exactly as the
                 # trainer does — not a reshape of the observations.
-                m_carry, goal, _ = manager_fn(m_carry, gs_fn(state))
+                m_carry, goal, _ = manager_fn(
+                    m_carry, gs_fn(state), obs.reshape(n_agents, obs_dim)
+                )
                 goal_hist = goal_ring_write(goal_hist, goal, t)
                 actions = policy_fn(obs, goal_ring_pool(goal_hist), avail_fn(state))
                 state_seq.append(

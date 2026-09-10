@@ -82,6 +82,7 @@ def build_manager(config: MAPPOConfig, n_agents: int) -> FeudalManager:
         hidden_dim=config.manager_hidden_dim,
         core=config.manager_core,
         horizon=config.goal_horizon,
+        latent=config.manager_latent,
     )
 
 
@@ -133,8 +134,14 @@ def create_train_state(
 
     manager = build_manager(config, n_agents)
     manager_carry = manager.initialize_carry(rng_manager, ())
+    # The local branch reads per-agent observations, so its init pass needs a
+    # correctly-shaped (n_agents, obs_dim) dummy; the centralized branch ignores
+    # the argument entirely, so passing None there keeps its init bit-identical.
+    manager_dummy_obs = (
+        jnp.zeros((n_agents, obs_dim)) if config.manager_latent == "local" else None
+    )
     manager_params = manager.init(
-        rng_manager, manager_carry, jnp.zeros(global_state_dim)
+        rng_manager, manager_carry, jnp.zeros(global_state_dim), manager_dummy_obs
     )
     manager_critic = MAPPOCritic(
         hidden_dim=2 * config.hidden_dim, n_outputs=n_manager_outputs
@@ -920,16 +927,22 @@ def manager_update(
     recurrent = config.manager_core != "mlp"  # static
     n_envs = trajectory.global_state.shape[1]
 
+    # `obs` is passed at every recompute site because latent="local" builds `s`
+    # from each agent's own observation. It is ALREADY stored on `Transition`
+    # (types.py), so this costs no extra rollout memory. The centralized branch
+    # ignores it, so those runs are unaffected.
     def _recompute(apply_fn, params):
         if not recurrent:
             # Stateless core: a pure function of the global state, so it
             # vectorizes over (T, E) with no scan and no carry bookkeeping.
-            _, goal, s = apply_fn(params, None, trajectory.global_state)
+            _, goal, s = apply_fn(
+                params, None, trajectory.global_state, trajectory.obs
+            )
             return goal, s
 
         def _step(carry, xs):
-            gs_t, done_t = xs
-            carry, goal_t, s_t = apply_fn(params, carry, gs_t)
+            gs_t, obs_t, done_t = xs
+            carry, goal_t, s_t = apply_fn(params, carry, gs_t, obs_t)
             # Zero the finished envs' sub-state pools AFTER emitting this step's
             # goal — the same order as `_env_step`, and the same semantics as
             # `pool_goals`' episode masking. `DilatedLSTMState.t` is a single
@@ -961,7 +974,7 @@ def manager_update(
             jax.random.PRNGKey(0), (n_envs,)
         )
         _, (goal, s) = jax.lax.scan(
-            _step, init_carry, (trajectory.global_state, dones)
+            _step, init_carry, (trajectory.global_state, trajectory.obs, dones)
         )
         return goal, s
 

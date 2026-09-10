@@ -112,6 +112,26 @@ class Model_Params:
     # goal_horizon). The mlp core is the default so that goal-mechanism effects
     # are attributable separately from recurrence effects.
     manager_core: str = "mlp"
+    # Where the manager's latent `s` comes from. "centralized" (default) is the
+    # original: s = Dense(n_agents*goal_dim)(z) reshaped, i.e. s_i = W_i z + b_i,
+    # so every row reads every agent and each row has its own basis. "local" runs
+    # a SHARED per-agent encoder on each agent's own observation, making
+    # d s[i]/d obs_j structurally zero for j != i and putting all rows (and the
+    # goals) in one basis.
+    #
+    # WHY: `worker_intrinsic_reward` scores s_t[i] - s_{t-k}[i], so under
+    # "centralized" agent i's own intrinsic reward moves as much when a TEAMMATE
+    # moves as when it does. Measured 2026-09-09 over 12 trained arms: the
+    # diagonal share of the block Jacobian d s[i]/d obs_j is 0.0631 against a
+    # uniform 1/N of 0.0625 (init 0.0623) — i.e. no localization at all, where a
+    # block-diagonal manager reads 1.0 and a half-local one 0.128. See
+    # `latent_locality_probe.py` and manager.py's "Latent locality" docstring.
+    #
+    # NOT checkpoint-compatible with "centralized": the param tree differs
+    # (f_enc_0/f_enc_1/f_gpre/f_goalhead vs f_percept_0/f_percept_1/goal_head,
+    # and f_Mspace is (manager_hidden, goal_dim) rather than
+    # (manager_hidden, n_agents*goal_dim)).
+    manager_latent: str = "centralized"
     # Optional bias-free Dense on the goal before it meets the obs (FuN's `phi`).
     # None = raw concat fusion; see the degeneracy note in worker.py.
     goal_embed_dim: int | None = None
@@ -202,6 +222,8 @@ class MAPPOConfig:
     n_manager_critic_epochs: int = 8
     manager_hidden_dim: int = 256
     manager_core: str = "mlp"
+    # See Model_Params.manager_latent — "centralized" (default) or "local".
+    manager_latent: str = "centralized"
     goal_embed_dim: int | None = None
     normalize_pooled_goal: bool = True
     zero_goal: bool = False

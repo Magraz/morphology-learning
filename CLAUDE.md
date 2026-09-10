@@ -6,6 +6,8 @@ Always keep the CLAUDE.md file up to date to reflect the current functionality a
 
 Avoid abbreviating terms, and if you are going to use an abbreviation, explain it don't assume I know what an abbreviated term is.
 
+When analyzing results, explain to me the quantities that are being logged, their meaning as well as why use them.
+
 ## Experiment config: Hydra is the sole path (`conf/` + `train.py`)
 
 Runs are launched **only** through the Hydra entry point `train.py`. The legacy
@@ -1615,6 +1617,39 @@ the worker's objective asks it to follow the goal, and the `n01`/`n05` data says
 the current intrinsic reward is not the answer either. Verified end-to-end
 (train + resume + aligned stats); 6 new seam tests, 52 passing overall.
 
+⚠ **A `conf/model/*.yaml` WITHOUT `# @package _global_` is SILENTLY INERT — it
+cost 12 full runs (found 2026-09-08).** Every model group's keys must land at the
+top level (`model_params:` / `params:` at column 0 under that header); without it
+Hydra nests them under the `model` node, where nothing reads them, and the run
+proceeds at the **algorithm defaults** with no warning. The six
+`conf/model/feudal_film_{n01,n05,zerogoal}{,_dilated}.yaml` shipped without it, so
+every arm of `mjx_12a_3o_trunc_1024` and `mjx_12a_3o_partition_1024` trained as
+plain **concat** feudal with `zero_goal=False`, `manager_core=mlp` and
+`intrinsic_coef=0.0` — i.e. **6 identical configurations x 3 seeds per batch, not
+6 arms.** Those 36 runs answer no FiLM / intrinsic / recurrence question and must
+be re-run (header added 2026-09-08; composition re-verified for all six).
+Diagnose it from the CHECKPOINT, which cannot lie about what trained:
+`actor/params/MAPPOActor_0/Dense_0/kernel` is `(obs+goal, hidden)` = `(72, 168)`
+for concat and `(obs, hidden)` = `(40, 168)` for FiLM (whose tree also carries
+`film_0`/`film_1`); `manager/params/core` is a single Dense for the mlp core and
+LSTM gates for `dilated_lstm`; and `intrinsic_reward_abs` is identically 0.0 in
+the stats when `intrinsic_coef` never arrived. The three existing header-carrying
+groups (`feudal`, `feudal_film`, `feudal_zerogoal`, and the `feudal_n0*` files
+that inherit via `defaults:`) were unaffected.
+
+⚠ **The `eval_gap_*` positive control FAILED on those runs, and that is the same
+bug, not a harness fault** — worth knowing because the failure mode is generic:
+`feudal_film_zerogoal` reported max |gap| of 48-92 where the invariant demands
+exactly 0.0 (offline probe on trial 0: perm -12.99, **env -26.21 with a paired CI
+excluding 0**, zeroed -0.06). With `zero_goal` silently False those arms were
+ordinary goal-conditioned workers, so the gaps were real. Two things this
+established that survive the bug: the MJX env is **bit-identical across vmap
+lanes** (96 lanes, tiled reset keys, identical actions, 1024 steps -> `max|obs
+diff| = 0.0`), so a nonzero gap can only come from the policy and there is **no
+chaotic noise floor** to blame; and `goal_dependence_probe.py`'s positive-control
+assertion keys on the literal model name `feudal_zerogoal`, so every
+`*_zerogoal*` variant slips past it — check the gaps by hand for renamed arms.
+
 ⚠ **The eval-level pre-flight "all variants agree at init" is VACUOUS — do not
 use it.** At init the actor head is `orthogonal(0.01)`, so the policy is inert:
 returns are 0 and (on `trunc`, with inert walls) every episode runs the full
@@ -1656,6 +1691,114 @@ would need a hardcoded key list that rots on the next new metric. Empty lists ar
 skipped (`action_distribution` is legitimately length 0 for continuous runs, and
 padding it would make it ragged). Pinned by `test_to_dict_left_pads_short_series`.
 
+#### The manager's latent is NOT agent-local — measured 2026-09-09, and it is what makes `r^I` unusable
+
+`worker_intrinsic_reward` scores `d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i])`, so
+whatever `s[i]` responds to is what agent *i* gets paid for. Under the original
+`manager_latent: centralized`, `s` is one `Dense(n_agents*goal_dim)` over a
+2-layer MLP of the **full joint state**, reshaped to `(N, goal_dim)` — i.e.
+`s_i = W_i z + b_i`. The agent axis is a **slice index, not a factorization**.
+
+`algorithms/feudal_mappo_jax/latent_locality_probe.py` measures the block
+Jacobian `B[i,j] = ||d s[i,:] / d obs_block_j||_F` (input columns scaled by
+on-policy std) at on-policy states under the trained hierarchy, and reports
+`diag_share[i] = B[i,i] / sum_j B[i,j]`. Over **12 trained arms** (4 env groups
+x {`feudal`, `feudal_n01`, `feudal_n05`}, trial 0, 256 states each, N=16 so
+uniform = 0.0625):
+
+| | trained | same net at init | uniform (1/N) |
+|---|---|---|---|
+| `s` (the space `r^I` is measured in) | **0.0631** (0.0621-0.0645) | 0.0623 | 0.0625 |
+| `g` (the assigned goal) | **0.0628** (0.0621-0.0636) | 0.0624 | 0.0625 |
+
+Paired trained-minus-init is **+0.00086** for `s` (positive in 10/12 arms). The
+metric is **not** blind — its built-in control (`--control`) reads **1.0000** for
+a surgically block-diagonal manager and **0.128** for a half-local one, so these
+arms moved **~1.3% of the way to *half* localized**. `best-perm` (Hungarian
+assignment over the row-normalized `B`, which catches localization stored under a
+*relabeling*) is 0.0655 trained vs 0.0650 at init — there is no permutation under
+which the rows are agent-local either.
+
+**So agent *i*'s "own" intrinsic reward moves as much when a TEAMMATE moves as
+when it does.** `r^I` is per-agent in **indexing**, not in **causation**: it has
+the same credit-assignment structure as the team scalar it was supposed to
+decompose. This is the mechanism behind
+`plans/feudal_goal_reward_diagnosis_2026-09-09.md`: intrinsic coefficient 0.1 ->
+145.7 and 0.5 -> 91.0 against a zero-goal control at 252-278 and MAPPO at 264.5,
+monotone in alpha, **while** `d_cos_mean` rises to 0.258 — workers farming a
+team-aggregate alignment signal that no individual worker controls. Note the
+dual-advantage-stream normalization did **not** rescue those arms, so the
+magnitude story alone does not explain them.
+
+- **⚠ Every logged diagnostic is blind to this.** `state_latent_erank` and
+  `state_pairwise_cos` are computed on the rows **alone** and read healthy here —
+  correctly, because the rows *are* distinct from one another. Distinct-but-
+  non-local is a **third** failure mode, separate from the rank-1 collapse and
+  the row-uniformity residual `manager.py` already flags. Nothing in
+  `manager_update` looks at the rows' relationship to the *inputs*.
+- **The fix is `model_params.manager_latent: local`** (arm:
+  `conf/model/feudal_film_local.yaml`, which differs from `feudal_film` in
+  exactly that one key). A **shared** per-agent encoder builds `s_i` from agent
+  *i*'s own observation:
+  ```
+  obs_i --f_enc (SHARED, per agent)--> f_Mspace (SHARED) --> s_i
+  [s_1..s_N] --core--> y --f_gpre--> y_i --f_goalhead (SHARED)--> g_i
+  ```
+  This fixes **two** independently-identified defects at once: `d s[i]/d obs_j`
+  is structurally **zero** for `j != i` (verified exactly: max off-diagonal block
+  norm `0.0`, diag share `1.0`), and sharing `f_enc`/`f_Mspace` puts every row in
+  **one basis** — the diagnosis note's point that each `W_i` otherwise gives
+  agent *i* its own private coordinate system. `f_goalhead` **must** be shared
+  too, or `g` keeps N private bases and the cosine compares incommensurate axes.
+  - The core still consumes `s`, so the bottleneck that keeps `f_Mspace`
+    trainable under FuN's detach rule survives (self-check `[10](d)` asserts
+    `f_enc_*`/`f_Mspace` all receive gradient).
+  - **Centralization is preserved** — the core mixes all N local latents, so goal
+    assignment still reads the whole team. For the MJX envs `global_state` **is**
+    `obs.reshape(E, -1)`, so nothing is lost. ⚠ **Not so for SMAX**, whose
+    `env.global_state` carries simulator state absent from the concatenated obs;
+    the local branch does not build `f_percept` at all, so a SMAX local arm would
+    need `z` concatenated into `core_in`.
+  - **`centralized` is the default and is bit-identical to pre-change code** —
+    verified against a `git worktree` at HEAD: 0.0 max diff on every param leaf,
+    `goal` and `s`, for **both** cores. The extra `obs` argument is ignored there.
+  - ⚠ **Not checkpoint-compatible** with any existing `feudal*` arm: the manager
+    tree carries `f_enc_0`/`f_enc_1`/`f_gpre`/`f_goalhead` instead of
+    `f_percept_0`/`f_percept_1`/`goal_head`, and `f_Mspace` is
+    `(manager_hidden, goal_dim)` rather than `(manager_hidden, n_agents*goal_dim)`.
+    `goal_dependence_probe._dims_from_checkpoint` keys off `f_enc_0` to tell them
+    apart — without that it would infer `goal_dim // n_agents` for a local run.
+- **Residual the shared encoder does NOT remove.** `obs_i` is egocentric but not
+  *proprioceptive*: density sensors, `neighbor_fraction` and lidar all respond to
+  teammates inside `sector_sensor_radius`. So `s_i` is agent *i*'s **view**, which
+  teammates still perturb through channels agent *i* can perceive. Arguably the
+  right notion of own-progress under partial observability, and a large reduction
+  from uniform 1/N mixing, but it is not literally own-physical-state. Measure it
+  with `--wrt positions` (finite-difference, because the lidar's `mjx.ray` is not
+  usefully differentiable); even a perfectly obs-local manager scores < 1.0 there.
+- ⚠ **This is necessary, not sufficient, and it is only observable at `alpha > 0`.**
+  `intrinsic_coef` ships at 0.0, so nothing currently running depends on `r^I`.
+  **Before running any `alpha > 0` arm on this latent, fix the `r^I` timing
+  misalignment** (`plans/feudal_goal_reward_diagnosis_2026-09-09.md` §4: the
+  stream stores `cos(s[t]-s[t-i], g[t-i])` on the transition for `a[t]`, one
+  action later than the outcome it scores) — it is a separate correctness fix and
+  it will confound any alpha comparison. Acceptance for the latent change itself
+  is **structural** (diag share 1.0); a return claim needs competitive extrinsic
+  return against matched active-goal/alpha=0 and zero-goal controls, and per the
+  diagnosis note a high cosine or a positive permutation gap does not meet that bar.
+- Probe (its **positive control is mandatory** — a flat reading is otherwise
+  indistinguishable from a dead metric):
+  ```
+  uv run python -m algorithms.feudal_mappo_jax.latent_locality_probe --control
+  MUJOCO_GL=egl uv run python -m algorithms.feudal_mappo_jax.latent_locality_probe \
+      --batches mjx_16a_4o_trunc_1024 --models feudal --trial 0 [--wrt positions]
+  ```
+  Train the fixed arm:
+  ```
+  uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o_trunc_1024 \
+      model=feudal_film_local trial_id=0
+  ```
+
 **Goal collapse: read `goal_direction_count`, not `goal_pairwise_cos` alone.**
 The headline "are the manager's goals unique per agent?" series is
 `goal_direction_count` — the effective number of *distinct* goal directions
@@ -1695,7 +1838,7 @@ reaches 0.97 after 1e8 steps. Judge `V^M` on a real-length run, not a smoke.
 are masked out, and `mjx_16a_4o` episodes are short (~43 steps, boundary contact
 terminates), so a large `c` starves the manager. Watch it when changing `c`.
 
-- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (11 tests, CPU stub
+- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (54 tests, CPU stub
   env, no MJX — fast and *deterministic*, unlike an MJX rollout). They pin the
   joints where a mistake is silent: the in-scan ring equals the `pool_goals`
   oracle including done-masking; the stored goals are reproducible by re-scanning

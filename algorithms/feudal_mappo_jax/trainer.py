@@ -215,9 +215,15 @@ def make_train(config: MAPPOConfig, env):
             train_state.intrinsic_critic_ts.params, global_state
         )
 
-    def _manager_forward(train_state, m_carry, global_state):
+    def _manager_forward(train_state, m_carry, global_state, obs):
+        # `obs` is only read by manager_latent="local" (a shared per-agent
+        # encoder); the centralized branch ignores it, so those runs are
+        # byte-identical. It must be the SAME obs the global state was built
+        # from — `manager_update` recomputes (goal, s) from the stored pair, and
+        # the two must agree or the manager is optimized for goals that never
+        # acted.
         return train_state.manager_ts.apply_fn(
-            train_state.manager_ts.params, m_carry, global_state
+            train_state.manager_ts.params, m_carry, global_state, obs
         )
 
     # ------------------------------------------------------------------ init
@@ -253,7 +259,7 @@ def make_train(config: MAPPOConfig, env):
 
         # --- Manager: one read of the joint state -> one directive per agent ---
         m_carry, goal, state_latent = _manager_forward(
-            train_state, m_carry, global_state
+            train_state, m_carry, global_state, obs
         )
         goal_hist = goal_ring_write(goal_hist, goal, t)
         pooled_goal = goal_ring_pool(goal_hist)
@@ -644,7 +650,7 @@ def make_train(config: MAPPOConfig, env):
                 goal_hist,
             ) = carry
             gs = _global_state(obs, env_state)
-            m_carry, goal, _ = _manager_forward(train_state, m_carry, gs)
+            m_carry, goal, _ = _manager_forward(train_state, m_carry, gs, obs)
             goal_hist = goal_ring_write(goal_hist, goal, t)
             # THE seam. Transform the POOLED goal, per variant block. `variants`
             # is static so this unrolls at trace time into V concatenated

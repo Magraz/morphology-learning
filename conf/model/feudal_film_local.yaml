@@ -1,0 +1,89 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# FeUdal with a LOCAL manager latent: `s_i` is built by a SHARED encoder from
+# agent i's OWN observation, instead of being a slice of one Dense over the
+# joint state.
+#
+# WHY THIS ARM EXISTS — measured 2026-09-09 by
+# `algorithms/feudal_mappo_jax/latent_locality_probe.py` over 12 trained arms
+# (4 env groups x {feudal, feudal_n01, feudal_n05} x trial 0, 256 on-policy
+# states each). With B[i,j] = ||d s[i,:] / d obs_block_j||_F (input columns
+# scaled by on-policy std), the diagonal share B[i,i]/sum_j B[i,j] is:
+#
+#     trained   0.0631  (range 0.0621-0.0645 across all 12 arms)
+#     same net at init   0.0623
+#     uniform, i.e. NO localization at all   0.0625 = 1/16
+#
+# Paired trained-minus-init is +0.00086 (positive in 10/12). The metric is not
+# blind: a surgically block-diagonal manager reads 1.0000 and a half-local one
+# 0.128, so these arms moved ~1.3% of the way to *half* localized. Hungarian
+# assignment over B, which would catch localization stored under a relabeling,
+# reads 0.0655 vs 0.0650 at init.
+#
+# `worker_intrinsic_reward` scores s_t[i] - s_{t-k}[i], so under the centralized
+# latent agent i's "own" intrinsic reward moves as much when a TEAMMATE moves as
+# when it does: r^I is per-agent in INDEXING, not in CAUSATION, and carries
+# exactly the credit-assignment confound a worker-level reward exists to remove.
+# This is the mechanism behind the result in
+# plans/feudal_goal_reward_diagnosis_2026-09-09.md: intrinsic coefficient 0.1 ->
+# 145.7 and 0.5 -> 91.0 against a zero-goal control at 252-278 and MAPPO at
+# 264.5, monotone in alpha, WHILE d_cos_mean rises to 0.258 — workers farming a
+# team-aggregate alignment signal no individual worker controls.
+#
+# WHAT `local` CHANGES (see manager.py "Latent locality" for the full topology):
+#
+#     obs_i --f_enc (SHARED, per agent)--> f_Mspace (SHARED) --> s_i
+#     [s_1..s_N] --core--> y --f_gpre--> y_i --f_goalhead (SHARED)--> g_i
+#
+#   * d s[i]/d obs_j is structurally ZERO for j != i — exactly, not
+#     approximately (verified: max off-diagonal block norm 0.0, diag share 1.0).
+#   * f_enc/f_Mspace are shared, so all rows land in ONE basis, and the final
+#     projection producing `g` is shared too, so g_i and s_i live in the same
+#     space. Without that second sharing `g` keeps N private coordinate systems
+#     and the cosine compares incommensurate axes.
+#   * The core still consumes `s`, preserving the bottleneck that keeps
+#     f_Mspace trainable under FuN's detach rule (manager.py self-check [8]).
+#   * Centralization is preserved: the core mixes all N local latents, so goal
+#     assignment still reads the whole team. For MJX envs `global_state` IS
+#     obs.reshape(E, -1), so no information is lost.
+#
+# RESIDUAL this does NOT remove: obs_i is egocentric but not proprioceptive —
+# density sensors, neighbor_fraction and lidar all respond to teammates inside
+# sector_sensor_radius. So s_i is agent i's *view*, which teammates still
+# perturb through channels agent i can perceive. Arguably the right notion of
+# own-progress under partial observability, but not literally own-physical-
+# state; `latent_locality_probe.py --wrt positions` measures what is left.
+#
+# ⚠ NOT checkpoint-compatible with `feudal_film` (or any `feudal*` arm): the
+# manager param tree differs (f_enc_0/f_enc_1/f_gpre/f_goalhead vs
+# f_percept_0/f_percept_1/goal_head) and f_Mspace is (manager_hidden, goal_dim)
+# rather than (manager_hidden, n_agents*goal_dim). This arm trains from scratch
+# into results/<env>/feudal_film_local/.
+#
+# ⚠ BEFORE RUNNING ANY intrinsic_coef > 0 ARM ON THIS LATENT, fix the r^I
+# timing misalignment (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4: the
+# stream stores cos(s[t]-s[t-i], g[t-i]) on the transition for a[t], delayed one
+# action relative to the outcome scored). It is a separate correctness fix and
+# it will confound any alpha comparison made here.
+#
+# ACCEPTANCE for the mechanism is STRUCTURAL, not behavioural — diag share
+# exactly 1.0 from `latent_locality_probe.py`. A return claim additionally needs
+# competitive extrinsic return against matched active-goal/alpha=0 and zero-goal
+# controls; a high cosine or a positive permutation gap does not meet that bar.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o_trunc_1024 \
+#       model=feudal_film_local trial_id=0
+#
+# Compare against `model=feudal_film` on the SAME env group — the two differ in
+# exactly one key.
+defaults:
+  - feudal_film
+  - _self_
+
+model_params:
+  manager_latent: local

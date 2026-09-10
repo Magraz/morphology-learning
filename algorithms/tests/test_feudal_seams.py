@@ -163,8 +163,9 @@ def test_goal_ring_matches_pool_goals_oracle(rollout):
     )
 
 
+@pytest.mark.parametrize("latent", ["centralized", "local"])
 @pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
-def test_goals_are_reproducible_from_stored_states(core):
+def test_goals_are_reproducible_from_stored_states(core, latent):
     """Re-running the manager over the stored global states reproduces the goals.
 
     ``manager_update`` recomputes ``(goal, s)`` differentiably from
@@ -179,13 +180,13 @@ def test_goals_are_reproducible_from_stored_states(core):
     masking). The re-scan below is deliberately an independent restatement of
     that convention rather than a call into the trainer's own helper.
     """
-    config = _config(manager_core=core)
+    config = _config(manager_core=core, manager_latent=latent)
     _, rs, _, traj = _collect(config)[:4]
     manager = build_manager(config, N_AGENTS)
     params = rs.train_state.manager_ts.params
 
     if core == "mlp":
-        _, goal, s = manager.apply(params, None, traj.global_state)
+        _, goal, s = manager.apply(params, None, traj.global_state, traj.obs)
     else:
         # NOTE: this assumes initialize_carry is deterministic (zeroed pools,
         # rng unused). If that ever stops being true, the rollout and the update
@@ -194,8 +195,8 @@ def test_goals_are_reproducible_from_stored_states(core):
         dones = traj.done.astype(jnp.float32)
 
         def _step(carry, xs):
-            gs_t, done_t = xs
-            carry, goal_t, s_t = manager.apply(params, carry, gs_t)
+            gs_t, obs_t, done_t = xs
+            carry, goal_t, s_t = manager.apply(params, carry, gs_t, obs_t)
             carry = carry._replace(
                 cell=tuple(
                     jnp.where(done_t[:, None, None], 0.0, p) for p in carry.cell
@@ -203,31 +204,34 @@ def test_goals_are_reproducible_from_stored_states(core):
             )
             return carry, (goal_t, s_t)
 
-        _, (goal, s) = jax.lax.scan(_step, init_carry, (traj.global_state, dones))
+        _, (goal, s) = jax.lax.scan(
+            _step, init_carry, (traj.global_state, traj.obs, dones)
+        )
 
     assert jnp.allclose(goal, traj.goal, atol=1e-5), (
-        f"core={core}: recomputed goals differ from the rollout's; max diff "
+        f"core={core}/{latent}: recomputed goals differ from the rollout's; max diff "
         f"{float(jnp.max(jnp.abs(goal - traj.goal)))}"
     )
     assert jnp.allclose(s, traj.state_latent, atol=1e-5)
 
 
+@pytest.mark.parametrize("latent", ["centralized", "local"])
 @pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
-def test_full_update_runs_for_both_cores(core):
+def test_full_update_runs_for_both_cores(core, latent):
     """collect -> update end-to-end on each core, with the manager actually moving.
 
     For the recurrent core this exercises the rematerialized BPTT scan inside
     `manager_update`, which is a different code path from the rollout's scan.
     """
-    config = _config(manager_core=core)
+    config = _config(manager_core=core, manager_latent=latent)
     _, _, new_rs, traj, boot, update_fn = _collect(config)
     updated_rs, losses = update_fn(new_rs, traj, boot)
     for key in ("policy_loss", "manager_pg_loss", "state_latent_erank"):
-        assert np.isfinite(float(losses[key])), (core, key, losses[key])
+        assert np.isfinite(float(losses[key])), (core, latent, key, losses[key])
     before = jax.tree.leaves(new_rs.train_state.manager_ts.params)
     after = jax.tree.leaves(updated_rs.train_state.manager_ts.params)
     assert any(not jnp.array_equal(a, b) for a, b in zip(before, after)), (
-        f"core={core}: manager params did not move"
+        f"core={core}/{latent}: manager params did not move"
     )
 
 
@@ -1165,3 +1169,182 @@ def test_concat_path_is_unchanged_by_the_modulate_hook():
     a, _ = actor.apply(p, x)
     b, _ = actor.apply(p, x, None)
     assert jnp.array_equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Manager latent locality (`manager_latent="local"`)
+#
+# The centralized latent computes `s = Dense(N*goal_dim)(z)` and reshapes, so
+# `s_i = W_i z + b_i`: the agent axis is a SLICE INDEX. Measured over 12 trained
+# arms (2026-09-09, `latent_locality_probe.py`), the diagonal share of the block
+# Jacobian `d s[i]/d obs_j` is 0.0631 against a uniform 1/16 of 0.0625 — i.e. no
+# localization at all. Since `worker_intrinsic_reward` scores `s_t[i]-s_{t-k}[i]`,
+# agent i's "own" intrinsic reward then moves as much when a TEAMMATE moves as
+# when it does.
+#
+# `"local"` fixes that structurally, and these tests pin the structure rather
+# than any trained outcome — a property that holds by construction is worth
+# nothing if a refactor quietly reintroduces the mixing.
+# ---------------------------------------------------------------------------
+
+
+def _local_manager(core="mlp", n_agents=N_AGENTS, obs_dim=OBS_DIM):
+    config = _config(manager_core=core, manager_latent="local")
+    manager = build_manager(config, n_agents)
+    carry = manager.initialize_carry(jax.random.PRNGKey(0), ())
+    params = manager.init(
+        jax.random.PRNGKey(1),
+        carry,
+        jnp.zeros(n_agents * obs_dim),
+        jnp.zeros((n_agents, obs_dim)),
+    )
+    return manager, params, carry
+
+
+@pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
+def test_local_latent_is_exactly_agent_local(core):
+    """`d s[i]/d obs_j` is BITWISE zero for j != i — the whole point of the mode.
+
+    Asserted exactly (`== 0.0`), not within a tolerance: the encoder is applied
+    per agent, so the off-diagonal blocks are structurally absent from the graph
+    rather than merely small. A tolerance here would let a partial reintroduction
+    of joint-state mixing pass.
+    """
+    manager, params, carry = _local_manager(core)
+    obs = jax.random.normal(jax.random.PRNGKey(2), (N_AGENTS, OBS_DIM))
+
+    def s_of(o):
+        return manager.apply(params, carry, o.reshape(-1), o)[2]
+
+    jac = jax.jacrev(s_of)(obs)  # (N, goal_dim, N, obs_dim)
+    blocks = np.asarray(jnp.sqrt((jac**2).sum(axis=(1, 3))))  # (N, N)
+    off = blocks - np.diag(np.diag(blocks))
+    assert np.abs(off).max() == 0.0, (
+        f"core={core}: s[i] depends on another agent's observation; max "
+        f"off-diagonal block norm {np.abs(off).max()}"
+    )
+    share = np.diag(blocks) / blocks.sum(axis=1)
+    assert np.allclose(share, 1.0), share
+
+
+def test_local_latent_shares_one_encoder_across_agents():
+    """Permuting the agent axis permutes `s` rows identically.
+
+    This is what a SHARED encoder buys beyond locality: all rows land in one
+    basis, so "goal coordinate 3" means the same thing for every agent. Per-agent
+    encoders would be equally local and still leave N private coordinate systems
+    — the second defect named in
+    plans/feudal_goal_reward_diagnosis_2026-09-09.md.
+    """
+    manager, params, carry = _local_manager()
+    obs = jax.random.normal(jax.random.PRNGKey(3), (N_AGENTS, OBS_DIM))
+    perm = np.array([2, 0, 3, 1])
+    s_ref = manager.apply(params, carry, obs.reshape(-1), obs)[2]
+    s_perm = manager.apply(params, carry, obs[perm].reshape(-1), obs[perm])[2]
+    assert jnp.array_equal(s_ref[perm], s_perm), (
+        "encoder is not shared across agents: permuting agents did not permute "
+        "the latent rows identically"
+    )
+
+
+def test_local_goal_head_is_shared_so_g_and_s_share_a_basis():
+    """The final projection to goal space is one shared `(goal_dim, goal_dim)`.
+
+    `f_goalhead` must be shared for the same reason `f_Mspace` is: `d_cos` scores
+    `g_i` against a displacement of `s_i`, so the two have to be expressed in the
+    same coordinates. A per-agent final layer (what the centralized branch has,
+    `goal_head: (H, N*goal_dim)`) would give every agent its own goal basis.
+    """
+    _, params, _ = _local_manager()
+    mgr = params["params"]
+    assert mgr["f_goalhead"]["kernel"].shape == (GOAL_DIM, GOAL_DIM), mgr[
+        "f_goalhead"
+    ]["kernel"].shape
+    assert mgr["f_Mspace"]["kernel"].shape[1] == GOAL_DIM, mgr["f_Mspace"][
+        "kernel"
+    ].shape
+
+
+def test_local_latent_still_trains_f_Mspace_under_the_detach_rule():
+    """The core must consume `s`, or the detach starves the encoder.
+
+    `transition_cosine(detach_states=True)` kills the gradient through the TARGET
+    arm of the cosine; `f_enc`/`f_Mspace` survive only because `g_t(theta)` still
+    depends on them THROUGH the core. Wire the core to anything else and this
+    goes to exactly 0.0 while every loss stays finite and every diagnostic stays
+    healthy — the same self-sealing failure `manager.py` self-check [8] guards on
+    the centralized branch.
+    """
+    from algorithms.feudal_mappo_jax.manager import transition_cosine
+
+    manager, params, carry = _local_manager()
+    T = 8
+    obs = jax.random.normal(jax.random.PRNGKey(4), (T, N_ENVS, N_AGENTS, OBS_DIM))
+
+    def loss(p):
+        _, goal, s = manager.apply(p, carry, obs.reshape(T, N_ENVS, -1), obs)
+        cos, valid = transition_cosine(s, goal, HORIZON, detach_states=True)
+        return -(cos * valid).sum() / jnp.maximum(valid.sum(), 1.0)
+
+    grads = jax.grad(loss)(params)["params"]
+    for name in ("f_enc_0", "f_enc_1", "f_Mspace"):
+        g = float(jnp.abs(grads[name]["kernel"]).sum())
+        assert g > 0.0, f"{name} received no gradient ({g}) — the bottleneck broke"
+
+
+def test_centralized_latent_ignores_the_obs_argument():
+    """The default branch is untouched by the new argument.
+
+    `manager.apply(..., gs)` and `manager.apply(..., gs, obs)` must agree
+    bitwise, so every existing arm, checkpoint and probe keeps its meaning.
+    """
+    config = _config()
+    manager = build_manager(config, N_AGENTS)
+    carry = manager.initialize_carry(jax.random.PRNGKey(0), ())
+    gs = jax.random.normal(jax.random.PRNGKey(5), (N_AGENTS * OBS_DIM,))
+    params = manager.init(jax.random.PRNGKey(1), carry, gs)
+    obs = jax.random.normal(jax.random.PRNGKey(6), (N_AGENTS, OBS_DIM))
+    _, g0, s0 = manager.apply(params, carry, gs)
+    _, g1, s1 = manager.apply(params, carry, gs, obs)
+    assert jnp.array_equal(g0, g1) and jnp.array_equal(s0, s1)
+
+
+def test_local_and_centralized_are_not_checkpoint_compatible():
+    """Loading one into the other must FAIL rather than silently half-work.
+
+    The manager trees differ in both names and shapes (f_enc_0/f_gpre/f_goalhead
+    vs f_percept_0/goal_head; f_Mspace is (H, goal_dim) vs (H, N*goal_dim)).
+    `goal_dependence_probe._dims_from_checkpoint` keys off `f_enc_0` to tell them
+    apart — without that it would infer `goal_dim // n_agents` for a local run.
+    """
+    _, local_params, _ = _local_manager()
+    config = _config()
+    central = build_manager(config, N_AGENTS)
+    carry = central.initialize_carry(jax.random.PRNGKey(0), ())
+    central_params = central.init(
+        jax.random.PRNGKey(1), carry, jnp.zeros(N_AGENTS * OBS_DIM)
+    )
+    assert set(local_params["params"]) != set(central_params["params"])
+    assert "f_enc_0" in local_params["params"]
+    assert "f_enc_0" not in central_params["params"]
+    assert (
+        local_params["params"]["f_Mspace"]["kernel"].shape
+        != central_params["params"]["f_Mspace"]["kernel"].shape
+    )
+
+
+def test_unknown_manager_latent_raises():
+    """Fail loudly, not open — the `VARIANTS` StrEnum lesson in CLAUDE.md."""
+    config = _config(manager_latent="bogus")
+    manager = build_manager(config, N_AGENTS)
+    with pytest.raises(ValueError, match="latent must be"):
+        manager.init(
+            jax.random.PRNGKey(0), None, jnp.zeros(N_AGENTS * OBS_DIM)
+        )
+
+
+def test_local_latent_requires_obs():
+    """`latent='local'` with no obs raises instead of silently using the wrong input."""
+    manager, params, carry = _local_manager()
+    with pytest.raises(ValueError, match="needs `obs`"):
+        manager.apply(params, carry, jnp.zeros(N_AGENTS * OBS_DIM))

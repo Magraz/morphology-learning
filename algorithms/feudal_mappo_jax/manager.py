@@ -187,14 +187,71 @@ class FeudalManager(nn.Module):
         hidden_dim: width of ``f_Mspace`` and of the recurrent core.
         core: ``"dilated_lstm"`` (FuN, default) or ``"mlp"`` (stateless).
         horizon: goal horizon `c`; doubles as the LSTM dilation radius `r`.
+        latent: where `s` comes from — ``"centralized"`` (default, the original)
+            or ``"local"`` (a shared per-agent encoder). See "Latent locality".
 
     Call:
-        ``__call__(carry, global_state) -> (carry, goal, state_latent)``
+        ``__call__(carry, global_state, obs=None) -> (carry, goal, state_latent)``
 
         ``global_state`` is ``(..., n_agents * obs_dim)``; `goal` and
         `state_latent` are both ``(..., n_agents, goal_dim)`` and `goal` is
         L2-normalized per agent. With ``core="mlp"`` the carry is ``None`` and
         passes through, so the signature is the same for both cores.
+        ``obs`` is ``(..., n_agents, obs_dim)`` and is REQUIRED by
+        ``latent="local"``; the centralized branch ignores it entirely.
+
+    Latent locality (``latent``)
+    ----------------------------
+    ``"centralized"`` computes ``s = Dense(N*goal_dim)(z)`` and reshapes, i.e.
+    ``s_i = W_i z + b_i``: the agent axis is a SLICE INDEX, not a factorization.
+    Two consequences, both measured:
+
+    * **`s_i` is not about agent i.** Block-Jacobian probe over 12 trained arms
+      (4 env groups x {feudal, feudal_n01, feudal_n05}, 256 on-policy states,
+      2026-09-09): with ``B[i,j] = ||d s[i,:] / d obs_block_j||_F``, the diagonal
+      share ``B[i,i]/sum_j B[i,j]`` is **0.0631** against a uniform 1/N of
+      **0.0625** and the same net at init of 0.0623. Paired trained-minus-init is
+      +0.00086. The metric is not blind: a surgically block-diagonal manager
+      reads 1.0000 and a half-local one 0.128, so these arms moved ~1.3% of the
+      way to *half* localized. Hungarian assignment over `B` (catching
+      localization stored under a relabeling) reads 0.0655 vs 0.0650 at init.
+      Since ``worker_intrinsic_reward`` scores ``s_t[i] - s_{t-k}[i]``, agent i's
+      "own" intrinsic reward therefore moves as much when a TEAMMATE moves as
+      when it does: `r^I` is per-agent in indexing, not in causation, and carries
+      exactly the credit-assignment confound a worker-level reward exists to
+      remove.
+    * **Each row has its own basis.** Nothing ties ``W_i`` and ``W_j`` together,
+      so "goal coordinate 3" means something different for every agent, and the
+      shared worker must learn N goal-to-action mappings.
+
+    ``"local"`` removes both by construction:
+
+        obs_i --f_enc (SHARED, per agent)--> f_Mspace (SHARED) --> s_i
+        [s_1..s_N] --core--> y --f_gpre--> y_i --f_goalhead (SHARED)--> g_i
+
+    * ``d s[i]/d obs_j`` is structurally **zero** for ``j != i`` — exactly, not
+      approximately.
+    * ``f_enc``/``f_Mspace`` are shared, so all rows land in ONE basis; and the
+      final projection producing `g` is shared too, so `g_i` and `s_i` live in
+      the same space. Without that second sharing `g` would keep per-agent bases
+      and the cosine would still compare incommensurate coordinates.
+    * The core still consumes `s`, so the bottleneck property below (what keeps
+      ``f_Mspace`` trainable under the detach rule) is preserved.
+    * Centralization is preserved through the core, which mixes all N local
+      latents. For the MJX envs ``global_state`` IS ``obs.reshape(E, -1)``, so
+      nothing is lost. NOTE for SMAX: ``env.global_state`` there carries
+      simulator state absent from the concatenated obs, and the local branch does
+      not build ``f_percept`` at all, so that information is unavailable to it.
+      Concatenate `z` into ``core_in`` if a SMAX local arm is ever wanted.
+
+    Residual `"local"` does NOT fix: ``obs_i`` is egocentric but not
+    proprioceptive — density sensors, ``neighbor_fraction`` and lidar all respond
+    to teammates inside ``sector_sensor_radius``. So `s_i` is agent i's *view*,
+    which teammates still perturb through channels agent i can perceive. That is
+    arguably the right notion of own-progress under partial observability, and it
+    is a large reduction from uniform 1/N mixing, but it is not literally
+    own-physical-state. ``latent_locality_probe.py`` measures the physical
+    residual separately (Jacobian w.r.t. agent world positions).
     """
 
     n_agents: int
@@ -202,10 +259,20 @@ class FeudalManager(nn.Module):
     hidden_dim: int = 256
     core: str = "dilated_lstm"
     horizon: int = 10
+    latent: str = "centralized"
 
     def _check_core(self):
         if self.core not in ("dilated_lstm", "mlp"):
             raise ValueError(f"core must be 'dilated_lstm' or 'mlp', got {self.core!r}")
+
+    def _check_latent(self):
+        # Reject an unknown value rather than failing open. CLAUDE.md records the
+        # `VARIANTS` regression where a silently-false guard turned a whole arm
+        # into its own baseline for two commits.
+        if self.latent not in ("centralized", "local"):
+            raise ValueError(
+                f"latent must be 'centralized' or 'local', got {self.latent!r}"
+            )
 
     def _dense(self, features: int, scale: float, name: str):
         return nn.Dense(
@@ -216,23 +283,48 @@ class FeudalManager(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, carry, global_state: jnp.ndarray):
+    def __call__(self, carry, global_state: jnp.ndarray, obs: jnp.ndarray = None):
         self._check_core()
+        self._check_latent()
 
-        # f_percept: joint observation -> team embedding.
-        z = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_percept_0")(global_state))
-        z = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_percept_1")(z))
+        if self.latent == "local":
+            if obs is None:
+                raise ValueError(
+                    "latent='local' needs `obs` (..., n_agents, obs_dim): `s` is "
+                    "built per agent from its OWN observation, which the flattened "
+                    "global state cannot be un-mixed back into for every env. Pass "
+                    "obs explicitly — the trainer, the eval scan, view() and "
+                    "manager_update all have it in scope."
+                )
+            # f_enc: ONE encoder, applied to each agent's own observation. Sharing
+            # it is what puts every row of `s` in a single basis; applying it per
+            # agent is what makes d s[i]/d obs_j structurally zero for j != i.
+            h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_0")(obs))
+            h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_1")(h))
+            # Shared, so the goal-space coordinates mean the same thing for all
+            # agents. Same `orthogonal(1.0)` as the centralized f_Mspace.
+            s = self._dense(self.goal_dim, 1.0, "f_Mspace")(h)
+            lead = s.shape[:-2]
+        else:
+            # f_percept: joint observation -> team embedding.
+            z = nn.tanh(
+                self._dense(self.hidden_dim, np.sqrt(2), "f_percept_0")(global_state)
+            )
+            z = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_percept_1")(z))
 
-        # f_Mspace: the latent space the goals live in. Feedforward from `z` and
-        # *upstream* of the core, so `s` is a function of the current state alone
-        # (no history), exactly as in FuN.
-        s = self._dense(self.n_agents * self.goal_dim, 1.0, "f_Mspace")(z)
-        s = s.reshape(z.shape[:-1] + (self.n_agents, self.goal_dim))
+            # f_Mspace: the latent space the goals live in. Feedforward from `z` and
+            # *upstream* of the core, so `s` is a function of the current state alone
+            # (no history), exactly as in FuN.
+            s = self._dense(self.n_agents * self.goal_dim, 1.0, "f_Mspace")(z)
+            s = s.reshape(z.shape[:-1] + (self.n_agents, self.goal_dim))
+            lead = z.shape[:-1]
 
         # f_Mrnn consumes `s`, not `z` — this is load-bearing, see the module
         # docstring: it is what keeps `f_Mspace` trainable once the transition
-        # PG detaches the target arm of the cosine.
-        core_in = s.reshape(z.shape[:-1] + (self.n_agents * self.goal_dim,))
+        # PG detaches the target arm of the cosine. It is ALSO what makes the
+        # local branch centralized: the core is where the N per-agent latents
+        # are mixed, so goal assignment still reads the whole team.
+        core_in = s.reshape(lead + (self.n_agents * self.goal_dim,))
         if self.core == "dilated_lstm":
             carry, y = DilatedLSTM(
                 features=self.hidden_dim, radius=self.horizon, name="core"
@@ -240,8 +332,18 @@ class FeudalManager(nn.Module):
         else:
             y = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "core")(core_in))
 
-        goal = self._dense(self.n_agents * self.goal_dim, 1.0, "goal_head")(y)
-        goal = goal.reshape(y.shape[:-1] + (self.n_agents, self.goal_dim))
+        if self.latent == "local":
+            # Per-agent context out of the centralized mix, THEN a shared
+            # projection into goal space. The second step is what puts `g_i` in
+            # the same basis as `s_i`; with a per-agent final layer (as the
+            # centralized branch has) `g` would keep N private coordinate systems
+            # and the cosine would compare incommensurate axes.
+            y_i = self._dense(self.n_agents * self.goal_dim, 1.0, "f_gpre")(y)
+            y_i = y_i.reshape(y.shape[:-1] + (self.n_agents, self.goal_dim))
+            goal = self._dense(self.goal_dim, 1.0, "f_goalhead")(nn.tanh(y_i))
+        else:
+            goal = self._dense(self.n_agents * self.goal_dim, 1.0, "goal_head")(y)
+            goal = goal.reshape(y.shape[:-1] + (self.n_agents, self.goal_dim))
         goal = _unit(goal)
 
         return carry, goal, s
@@ -249,6 +351,7 @@ class FeudalManager(nn.Module):
     def initialize_carry(self, rng: jax.Array, batch_shape=()):
         """Initial carry for this manager: pools for the LSTM core, else ``None``."""
         self._check_core()
+        self._check_latent()
         if self.core != "dilated_lstm":
             return None
         return dilated_lstm_carry(self.hidden_dim, self.horizon, batch_shape)
@@ -263,10 +366,15 @@ def init_manager(
     core: str = "dilated_lstm",
     horizon: int = 10,
     batch_shape=(),
+    latent: str = "centralized",
+    obs_dim: int = None,
 ):
     """Build a `FeudalManager`, its params and its initial carry.
 
     Returns ``(module, params, carry)``. Mirrors ``worker.init_worker``.
+
+    ``latent="local"`` needs `obs_dim` so the init pass can supply a correctly
+    shaped ``(*batch, n_agents, obs_dim)`` dummy observation.
     """
     manager = FeudalManager(
         n_agents=n_agents,
@@ -274,11 +382,17 @@ def init_manager(
         hidden_dim=hidden_dim,
         core=core,
         horizon=horizon,
+        latent=latent,
     )
     carry_rng, init_rng = jax.random.split(rng)
     carry = manager.initialize_carry(carry_rng, batch_shape)
     dummy = jnp.zeros(tuple(batch_shape) + (global_state_dim,))
-    params = manager.init(init_rng, carry, dummy)
+    dummy_obs = None
+    if latent == "local":
+        if obs_dim is None:
+            raise ValueError("init_manager(latent='local') requires obs_dim")
+        dummy_obs = jnp.zeros(tuple(batch_shape) + (n_agents, obs_dim))
+    params = manager.init(init_rng, carry, dummy, dummy_obs)
     return manager, params, carry
 
 
@@ -968,5 +1082,87 @@ if __name__ == "__main__":
     assert pool_goals(g_b, cb).shape == g_b.shape
     assert worker_intrinsic_reward(s_b, g_b, cb).shape == (Tb, Eb, Nb)
     print("[9] trainer shapes (T,E,N,D) + guards  OK")
+
+    # ---------------------------------------------------------------- [10]
+    # latent="local": the structural guarantees, asserted EXACTLY.
+    #
+    # Why exactly: under latent="centralized" the diagonal share of the block
+    # Jacobian d s[i]/d obs_j measures 0.0631 on 12 trained arms against a
+    # uniform 1/16 = 0.0625 (init 0.0623) — no localization at all, where a
+    # block-diagonal manager reads 1.0 and a half-local one 0.128. So "roughly
+    # local" is exactly the state this mode exists to escape, and a tolerance
+    # here would let a partial reintroduction of joint-state mixing pass.
+    for core_name in ("mlp", "dilated_lstm"):
+        lm, lp, lc = init_manager(
+            jax.random.PRNGKey(0),
+            global_state_dim=N * OBS_DIM,
+            n_agents=N,
+            goal_dim=GOAL_DIM,
+            hidden_dim=HIDDEN,
+            core=core_name,
+            horizon=HORIZON,
+            latent="local",
+            obs_dim=OBS_DIM,
+        )
+        lobs = jax.random.normal(jax.random.PRNGKey(11), (N, OBS_DIM))
+
+        # (a) exact locality
+        jac = jax.jacrev(lambda o: lm.apply(lp, lc, o.reshape(-1), o)[2])(lobs)
+        blocks = np.asarray(jnp.sqrt((jac ** 2).sum(axis=(1, 3))))
+        off = blocks - np.diag(np.diag(blocks))
+        assert np.abs(off).max() == 0.0, (core_name, np.abs(off).max())
+        assert np.allclose(np.diag(blocks) / blocks.sum(1), 1.0)
+
+        # (b) the encoder is SHARED -> permuting agents permutes s rows
+        perm = np.roll(np.arange(N), 1)
+        s_ref = lm.apply(lp, lc, lobs.reshape(-1), lobs)[2]
+        s_perm = lm.apply(lp, lc, lobs[perm].reshape(-1), lobs[perm])[2]
+        assert jnp.array_equal(s_ref[perm], s_perm), core_name
+
+        # (c) g and s share one basis: the final projection is (D, D), not
+        #     per-agent. Without this the cosine compares incommensurate axes.
+        assert lp["params"]["f_goalhead"]["kernel"].shape == (GOAL_DIM, GOAL_DIM)
+
+        # (d) gradient routing under the detach rule. Same property [8] checks
+        #     on the centralized branch: the core consumes `s`, so f_enc and
+        #     f_Mspace keep a signal through the GOAL arm even though the target
+        #     arm is detached. Wire the core elsewhere and these go to exactly
+        #     0.0 while every loss stays finite.
+        Tl, El = 6, 2
+        obs_seq = jax.random.normal(
+            jax.random.PRNGKey(12), (Tl, El, N, OBS_DIM)
+        )
+
+        def _loss(pp, core_name=core_name):
+            carry = lm.initialize_carry(jax.random.PRNGKey(0), (El,))
+            _, gg, ss = lm.apply(pp, carry, obs_seq.reshape(Tl, El, -1), obs_seq)
+            cc, vv = transition_cosine(ss, gg, HORIZON, detach_states=True)
+            return -(cc * vv).sum() / jnp.maximum(vv.sum(), 1.0)
+
+        gr = jax.grad(_loss)(lp)["params"]
+        for nm in ("f_enc_0", "f_enc_1", "f_Mspace"):
+            gsum = float(jnp.abs(gr[nm]["kernel"]).sum())
+            assert gsum > 0.0, f"{core_name}/{nm} got no gradient ({gsum})"
+
+    # (e) the centralized default is untouched by the new argument.
+    cm, cp, cc_ = init_manager(
+        jax.random.PRNGKey(0), N * OBS_DIM, N, GOAL_DIM, HIDDEN, "mlp", HORIZON
+    )
+    cgs = jax.random.normal(jax.random.PRNGKey(13), (N * OBS_DIM,))
+    cobs = jax.random.normal(jax.random.PRNGKey(14), (N, OBS_DIM))
+    a0 = cm.apply(cp, cc_, cgs)
+    a1 = cm.apply(cp, cc_, cgs, cobs)
+    assert jnp.array_equal(a0[1], a1[1]) and jnp.array_equal(a0[2], a1[2])
+
+    # (f) an unknown latent raises rather than failing open.
+    try:
+        FeudalManager(n_agents=N, goal_dim=GOAL_DIM, latent="bogus").init(
+            jax.random.PRNGKey(0), None, jnp.zeros(N * OBS_DIM)
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown latent did not raise")
+    print("[10] local latent: exact locality/shared/grad  OK")
 
     print("\nall manager checks passed")
