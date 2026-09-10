@@ -1755,10 +1755,34 @@ magnitude story alone does not explain them.
     `f_enc_*`/`f_Mspace` all receive gradient).
   - **Centralization is preserved** — the core mixes all N local latents, so goal
     assignment still reads the whole team. For the MJX envs `global_state` **is**
-    `obs.reshape(E, -1)`, so nothing is lost. ⚠ **Not so for SMAX**, whose
-    `env.global_state` carries simulator state absent from the concatenated obs;
-    the local branch does not build `f_percept` at all, so a SMAX local arm would
-    need `z` concatenated into `core_in`.
+    `obs.reshape(E, -1)` (`trainer._global_state` falls back to exactly that when
+    the env has no `global_state` hook), so nothing is lost and `local` is a pure
+    refactoring of the same input.
+  - **`manager_latent: local_global` is the third value, and it is the SMAX arm**
+    (`conf/model/feudal_film_local_global.yaml`). It is `local` plus
+    `core_in = concat(s_flat, z)` with `z = f_percept(global_state)`: `s` stays a
+    pure function of `obs` — locality and `r^I` unaffected — while **goal
+    generation** regains the env's own global state. It exists because on SMAX
+    `global_state` is **not** recoverable from the observations, so plain `local`
+    would make the manager strictly blinder than the centralized branch:
+    `SMAX.get_obs` zeroes unit *j* out of unit *i*'s observation entirely unless
+    `‖pos_j − pos_i‖ < sight_range_i`, while `get_world_state` applies no such
+    gate; and obs positions are relative/sight-normalized against the world
+    state's absolute ones. (Allies are recoverable either way — `get_self_features`
+    carries each unit's own absolute position — so the loss is specifically about
+    **enemies**.) Measured, 64 envs x 100 steps, random legal actions, fraction of
+    alive enemies invisible to **every** ally: **100% at t=0** on all of `3m` /
+    `5m_vs_6m` / `2s3z` / `3s5z`, falling to 28–42% over the first 10 steps.
+    ⚠ Read the t=0 column only — under random actions the teams never engage, so
+    the mid/late figures are pessimistic and a trained policy would push them far
+    lower; but t=0 is a **spawn** property, not a policy artifact, and with
+    `goal_horizon: 10` that is exactly the window the first pooled `w_t` is built
+    in. **Do not use it on an MJX env**: `z` would be computed from numbers the
+    encoder already saw, it costs an extra `f_percept`, and it would make the arm
+    differ from `feudal_film` in two things instead of one.
+  - **All three critics keep reading `global_state` under every latent**
+    (`trainer._values` / `_manager_values` / `_values_int`), so CTDE is intact in
+    all three modes. Only the manager's *directives* change.
   - **`centralized` is the default and is bit-identical to pre-change code** —
     verified against a `git worktree` at HEAD: 0.0 max diff on every param leaf,
     `goal` and `s`, for **both** cores. The extra `obs` argument is ignored there.
@@ -1838,7 +1862,7 @@ reaches 0.97 after 1e8 steps. Judge `V^M` on a real-length run, not a smoke.
 are masked out, and `mjx_16a_4o` episodes are short (~43 steps, boundary contact
 terminates), so a large `c` starves the manager. Watch it when changing `c`.
 
-- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (54 tests, CPU stub
+- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (65 tests, CPU stub
   env, no MJX — fast and *deterministic*, unlike an MJX rollout). They pin the
   joints where a mistake is silent: the in-scan ring equals the `pool_goals`
   oracle including done-masking; the stored goals are reproducible by re-scanning

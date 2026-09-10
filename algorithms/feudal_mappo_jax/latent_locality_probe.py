@@ -407,7 +407,9 @@ def main():
                     jax.random.PRNGKey(0),
                     None,
                     jnp.zeros(N * obs_dim),
-                    jnp.zeros((N, obs_dim)) if cfg.manager_latent == "local" else None,
+                    jnp.zeros((N, obs_dim))
+                    if cfg.manager_latent in ("local", "local_global")
+                    else None,
                 )
                 Bs0, Bg0 = block_jacobian_wrt_obs(
                     manager, init_p, states, N, obs_dim

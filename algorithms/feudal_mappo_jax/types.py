@@ -117,7 +117,18 @@ class Model_Params:
     # so every row reads every agent and each row has its own basis. "local" runs
     # a SHARED per-agent encoder on each agent's own observation, making
     # d s[i]/d obs_j structurally zero for j != i and putting all rows (and the
-    # goals) in one basis.
+    # goals) in one basis. "local_global" is "local" plus a direct read of the
+    # env's global state on the GOAL path only (core_in = concat(s_flat, z)) —
+    # `s` stays a pure function of obs, so r^I stays clean, while goal generation
+    # regains state the observations do not carry.
+    #
+    # Which to use: for every MJX env `global_state` IS obs.reshape(E, -1), so
+    # "local" loses nothing and "local_global" is redundant. Use "local_global"
+    # on SMAX, where `env.global_state` is NOT recoverable from the observations
+    # — get_obs zeroes out any unit beyond the viewer's sight range, and at t=0
+    # 100% of enemies are invisible to every ally (measured on 3m/5m_vs_6m/2s3z/
+    # 3s5z; that one is a spawn property, not a policy artifact). See manager.py
+    # "Latent locality".
     #
     # WHY: `worker_intrinsic_reward` scores s_t[i] - s_{t-k}[i], so under
     # "centralized" agent i's own intrinsic reward moves as much when a TEAMMATE
@@ -222,7 +233,8 @@ class MAPPOConfig:
     n_manager_critic_epochs: int = 8
     manager_hidden_dim: int = 256
     manager_core: str = "mlp"
-    # See Model_Params.manager_latent — "centralized" (default) or "local".
+    # See Model_Params.manager_latent — "centralized" (default), "local" or
+    # "local_global".
     manager_latent: str = "centralized"
     goal_embed_dim: int | None = None
     normalize_pooled_goal: bool = True

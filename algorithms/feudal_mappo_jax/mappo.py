@@ -134,11 +134,13 @@ def create_train_state(
 
     manager = build_manager(config, n_agents)
     manager_carry = manager.initialize_carry(rng_manager, ())
-    # The local branch reads per-agent observations, so its init pass needs a
+    # The local branches read per-agent observations, so their init pass needs a
     # correctly-shaped (n_agents, obs_dim) dummy; the centralized branch ignores
     # the argument entirely, so passing None there keeps its init bit-identical.
     manager_dummy_obs = (
-        jnp.zeros((n_agents, obs_dim)) if config.manager_latent == "local" else None
+        jnp.zeros((n_agents, obs_dim))
+        if config.manager_latent in ("local", "local_global")
+        else None
     )
     manager_params = manager.init(
         rng_manager, manager_carry, jnp.zeros(global_state_dim), manager_dummy_obs

@@ -187,8 +187,10 @@ class FeudalManager(nn.Module):
         hidden_dim: width of ``f_Mspace`` and of the recurrent core.
         core: ``"dilated_lstm"`` (FuN, default) or ``"mlp"`` (stateless).
         horizon: goal horizon `c`; doubles as the LSTM dilation radius `r`.
-        latent: where `s` comes from — ``"centralized"`` (default, the original)
-            or ``"local"`` (a shared per-agent encoder). See "Latent locality".
+        latent: where `s` comes from — ``"centralized"`` (default, the original),
+            ``"local"`` (a shared per-agent encoder), or ``"local_global"`` (the
+            same encoder, plus a direct read of the env's global state on the
+            GOAL path only). See "Latent locality".
 
     Call:
         ``__call__(carry, global_state, obs=None) -> (carry, goal, state_latent)``
@@ -238,11 +240,47 @@ class FeudalManager(nn.Module):
     * The core still consumes `s`, so the bottleneck property below (what keeps
       ``f_Mspace`` trainable under the detach rule) is preserved.
     * Centralization is preserved through the core, which mixes all N local
-      latents. For the MJX envs ``global_state`` IS ``obs.reshape(E, -1)``, so
-      nothing is lost. NOTE for SMAX: ``env.global_state`` there carries
-      simulator state absent from the concatenated obs, and the local branch does
-      not build ``f_percept`` at all, so that information is unavailable to it.
-      Concatenate `z` into ``core_in`` if a SMAX local arm is ever wanted.
+      latents. For the MJX envs ``global_state`` IS ``obs.reshape(E, -1)``
+      (``trainer._global_state`` falls back to exactly that when the env has no
+      ``global_state`` hook), so **nothing is lost** and ``"local"`` is a pure
+      refactoring of the same input.
+
+    ``"local_global"`` is ``"local"`` plus ``core_in = concat(s_flat, z)``, where
+    ``z = f_percept(global_state)`` as in the centralized branch. `s` remains a
+    pure function of `obs` — so ``d s[i]/d obs_j`` is still exactly zero for
+    ``j != i`` and `r^I` is still clean — while **goal generation** regains the
+    env's own global state.
+
+    It exists for envs where ``global_state`` is NOT recoverable from the
+    observations. SMAX is the live case, and the gap is structural rather than a
+    matter of formatting:
+
+    * ``SMAX.get_obs`` zeroes unit `j` out of unit `i`'s observation entirely
+      unless ``||pos_j - pos_i|| < sight_range_i``; ``SMAX.get_world_state``
+      applies no such gate, so a unit invisible to *every* ally is present in the
+      world state and in no observation.
+    * observation positions are *relative* and sight-normalized, world-state
+      positions are *absolute*. (Allies are recoverable either way —
+      ``get_self_features`` puts each unit's own absolute position in its own
+      observation — so the loss is specifically about ENEMIES.)
+
+    Measured (64 envs x 100 steps, random legal actions): the fraction of alive
+    enemies invisible to every ally is **100% at t=0** on all of 3m / 5m_vs_6m /
+    2s3z / 3s5z, falling to 28-42% over the first 10 steps. Read the t=0 number
+    and not the rest: under random actions the teams never engage, so the
+    mid-episode figures are pessimistic and a trained policy would push them far
+    lower. But t=0 is a SPAWN property, not a policy artifact — SMAX starts the
+    teams beyond sight range — and with ``goal_horizon=10`` that is exactly the
+    window in which the first pooled goal ``w_t`` is assembled.
+
+    Note what is NOT lost under plain ``"local"``: all three critics keep reading
+    ``global_state`` directly (``trainer._values`` / ``_manager_values`` /
+    ``_values_int``), so CTDE is intact either way. Only the manager's directives
+    change.
+
+    On an MJX env ``"local_global"`` is redundant (it feeds `z` computed from the
+    same numbers the encoder already saw) and costs an extra ``f_percept``, so
+    prefer ``"local"`` there and keep arms differing in one thing at a time.
 
     Residual `"local"` does NOT fix: ``obs_i`` is egocentric but not
     proprioceptive — density sensors, ``neighbor_fraction`` and lidar all respond
@@ -269,9 +307,10 @@ class FeudalManager(nn.Module):
         # Reject an unknown value rather than failing open. CLAUDE.md records the
         # `VARIANTS` regression where a silently-false guard turned a whole arm
         # into its own baseline for two commits.
-        if self.latent not in ("centralized", "local"):
+        if self.latent not in ("centralized", "local", "local_global"):
             raise ValueError(
-                f"latent must be 'centralized' or 'local', got {self.latent!r}"
+                "latent must be 'centralized', 'local' or 'local_global', got "
+                f"{self.latent!r}"
             )
 
     def _dense(self, features: int, scale: float, name: str):
@@ -287,14 +326,15 @@ class FeudalManager(nn.Module):
         self._check_core()
         self._check_latent()
 
-        if self.latent == "local":
+        is_local = self.latent in ("local", "local_global")
+        if is_local:
             if obs is None:
                 raise ValueError(
-                    "latent='local' needs `obs` (..., n_agents, obs_dim): `s` is "
-                    "built per agent from its OWN observation, which the flattened "
-                    "global state cannot be un-mixed back into for every env. Pass "
-                    "obs explicitly — the trainer, the eval scan, view() and "
-                    "manager_update all have it in scope."
+                    f"latent={self.latent!r} needs `obs` (..., n_agents, obs_dim): "
+                    "`s` is built per agent from its OWN observation, which the "
+                    "flattened global state cannot be un-mixed back into for every "
+                    "env. Pass obs explicitly — the trainer, the eval scan, view() "
+                    "and manager_update all have it in scope."
                 )
             # f_enc: ONE encoder, applied to each agent's own observation. Sharing
             # it is what puts every row of `s` in a single basis; applying it per
@@ -322,9 +362,20 @@ class FeudalManager(nn.Module):
         # f_Mrnn consumes `s`, not `z` — this is load-bearing, see the module
         # docstring: it is what keeps `f_Mspace` trainable once the transition
         # PG detaches the target arm of the cosine. It is ALSO what makes the
-        # local branch centralized: the core is where the N per-agent latents
+        # local branches centralized: the core is where the N per-agent latents
         # are mixed, so goal assignment still reads the whole team.
         core_in = s.reshape(lead + (self.n_agents * self.goal_dim,))
+        if self.latent == "local_global":
+            # ...plus a direct read of the env's own global state, for envs where
+            # that is NOT recoverable from the observations. `s` stays a pure
+            # function of `obs` (so `r^I` stays clean); only GOAL GENERATION gains
+            # the extra input. See "Latent locality" for the SMAX measurement that
+            # motivates it.
+            zg = nn.tanh(
+                self._dense(self.hidden_dim, np.sqrt(2), "f_percept_0")(global_state)
+            )
+            zg = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_percept_1")(zg))
+            core_in = jnp.concatenate([core_in, zg], axis=-1)
         if self.core == "dilated_lstm":
             carry, y = DilatedLSTM(
                 features=self.hidden_dim, radius=self.horizon, name="core"
@@ -332,7 +383,7 @@ class FeudalManager(nn.Module):
         else:
             y = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "core")(core_in))
 
-        if self.latent == "local":
+        if is_local:
             # Per-agent context out of the centralized mix, THEN a shared
             # projection into goal space. The second step is what puts `g_i` in
             # the same basis as `s_i`; with a per-agent final layer (as the
@@ -373,8 +424,8 @@ def init_manager(
 
     Returns ``(module, params, carry)``. Mirrors ``worker.init_worker``.
 
-    ``latent="local"`` needs `obs_dim` so the init pass can supply a correctly
-    shaped ``(*batch, n_agents, obs_dim)`` dummy observation.
+    ``latent="local"``/``"local_global"`` need `obs_dim` so the init pass can
+    supply a correctly shaped ``(*batch, n_agents, obs_dim)`` dummy observation.
     """
     manager = FeudalManager(
         n_agents=n_agents,
@@ -388,9 +439,9 @@ def init_manager(
     carry = manager.initialize_carry(carry_rng, batch_shape)
     dummy = jnp.zeros(tuple(batch_shape) + (global_state_dim,))
     dummy_obs = None
-    if latent == "local":
+    if latent in ("local", "local_global"):
         if obs_dim is None:
-            raise ValueError("init_manager(latent='local') requires obs_dim")
+            raise ValueError(f"init_manager(latent={latent!r}) requires obs_dim")
         dummy_obs = jnp.zeros(tuple(batch_shape) + (n_agents, obs_dim))
     params = manager.init(init_rng, carry, dummy, dummy_obs)
     return manager, params, carry
@@ -1092,7 +1143,11 @@ if __name__ == "__main__":
     # block-diagonal manager reads 1.0 and a half-local one 0.128. So "roughly
     # local" is exactly the state this mode exists to escape, and a tolerance
     # here would let a partial reintroduction of joint-state mixing pass.
-    for core_name in ("mlp", "dilated_lstm"):
+    for core_name, latent_name in [
+        (c, l)
+        for c in ("mlp", "dilated_lstm")
+        for l in ("local", "local_global")
+    ]:
         lm, lp, lc = init_manager(
             jax.random.PRNGKey(0),
             global_state_dim=N * OBS_DIM,
@@ -1101,7 +1156,7 @@ if __name__ == "__main__":
             hidden_dim=HIDDEN,
             core=core_name,
             horizon=HORIZON,
-            latent="local",
+            latent=latent_name,
             obs_dim=OBS_DIM,
         )
         lobs = jax.random.normal(jax.random.PRNGKey(11), (N, OBS_DIM))
@@ -1140,11 +1195,33 @@ if __name__ == "__main__":
             return -(cc * vv).sum() / jnp.maximum(vv.sum(), 1.0)
 
         gr = jax.grad(_loss)(lp)["params"]
-        for nm in ("f_enc_0", "f_enc_1", "f_Mspace"):
+        names = ("f_enc_0", "f_enc_1", "f_Mspace")
+        if latent_name == "local_global":
+            # f_percept feeds the GOAL arm only, which is the un-detached one, so
+            # it must train too. If it ever reads 0.0 the extra input is dead
+            # weight and the arm is silently plain `local`.
+            names = names + ("f_percept_0", "f_percept_1")
+        for nm in names:
             gsum = float(jnp.abs(gr[nm]["kernel"]).sum())
-            assert gsum > 0.0, f"{core_name}/{nm} got no gradient ({gsum})"
+            assert gsum > 0.0, f"{core_name}/{latent_name}/{nm} got no gradient"
 
-    # (e) the centralized default is untouched by the new argument.
+        # (e) `s` is blind to the global state in BOTH variants — that is what
+        #     keeps r^I clean under local_global. The goal, however, must read it
+        #     under local_global and must NOT under local.
+        gs_a = jax.random.normal(jax.random.PRNGKey(15), (N * OBS_DIM,))
+        gs_b = jax.random.normal(jax.random.PRNGKey(16), (N * OBS_DIM,))
+        assert jnp.array_equal(
+            lm.apply(lp, lc, gs_a, lobs)[2], lm.apply(lp, lc, gs_b, lobs)[2]
+        ), f"{latent_name}: s moved when only the global state changed"
+        goal_moved = not jnp.allclose(
+            lm.apply(lp, lc, gs_a, lobs)[1], lm.apply(lp, lc, gs_b, lobs)[1]
+        )
+        assert goal_moved == (latent_name == "local_global"), (
+            f"{latent_name}: goal-vs-global_state dependence is wrong "
+            f"(moved={goal_moved})"
+        )
+
+    # (f) the centralized default is untouched by the new argument.
     cm, cp, cc_ = init_manager(
         jax.random.PRNGKey(0), N * OBS_DIM, N, GOAL_DIM, HIDDEN, "mlp", HORIZON
     )
@@ -1154,7 +1231,7 @@ if __name__ == "__main__":
     a1 = cm.apply(cp, cc_, cgs, cobs)
     assert jnp.array_equal(a0[1], a1[1]) and jnp.array_equal(a0[2], a1[2])
 
-    # (f) an unknown latent raises rather than failing open.
+    # (g) an unknown latent raises rather than failing open.
     try:
         FeudalManager(n_agents=N, goal_dim=GOAL_DIM, latent="bogus").init(
             jax.random.PRNGKey(0), None, jnp.zeros(N * OBS_DIM)
@@ -1163,6 +1240,6 @@ if __name__ == "__main__":
         pass
     else:
         raise AssertionError("unknown latent did not raise")
-    print("[10] local latent: exact locality/shared/grad  OK")
+    print("[10] local latents: locality/shared/grad/gs-routing  OK")
 
     print("\nall manager checks passed")

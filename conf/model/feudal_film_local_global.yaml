@@ -1,0 +1,86 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# `feudal_film_local`, plus a direct read of the env's global state on the GOAL
+# path only. THIS IS THE SMAX ARM — on any MJX env use `feudal_film_local`
+# instead (see "when NOT to use this" below).
+#
+# WHAT IT CHANGES vs `feudal_film_local` — exactly one thing, the core input:
+#
+#     local          core_in = s_flat
+#     local_global   core_in = concat(s_flat, z),  z = f_percept(global_state)
+#
+# `s` is still built ONLY by the shared per-agent encoder from `obs`, so
+# `d s[i]/d obs_j` is still structurally zero for `j != i` and the intrinsic
+# reward stays clean. Verified in both directions (manager self-check [10](e),
+# `test_state_latent_never_depends_on_the_global_state`): `s` is bitwise
+# invariant to the global state under BOTH local variants, while the goal moves
+# with it under `local_global` and provably does not under `local`.
+#
+# WHY IT EXISTS — on SMAX, `env.global_state` is NOT recoverable from the
+# observations, so plain `local` would make the manager strictly blinder than
+# the centralized branch. Two structural differences in jaxmarl's SMAX:
+#
+#   * `SMAX.get_obs` zeroes unit j out of unit i's observation ENTIRELY unless
+#     ||pos_j - pos_i|| < sight_range_i. `SMAX.get_world_state` applies no such
+#     gate — every alive unit's health/position/cooldown/type is present
+#     regardless of who can see it. A unit invisible to EVERY ally therefore
+#     exists in the world state and in no observation.
+#   * observation positions are RELATIVE and sight-normalized; world-state
+#     positions are ABSOLUTE. (Allies are recoverable either way — get_self_
+#     features puts each unit's own absolute position in its own observation —
+#     so the loss is specifically about ENEMIES.)
+#
+# MEASURED (64 envs x 100 steps, random legal actions), fraction of ALIVE
+# enemies invisible to every ally:
+#
+#     scenario      t=0     t<10    t>=90
+#     3m           100.0%   41.6%   100.0%
+#     5m_vs_6m     100.0%   37.6%   100.0%
+#     2s3z         100.0%   30.0%   100.0%
+#     3s5z         100.0%   27.7%   100.0%
+#
+# ⚠ READ THE t=0 COLUMN AND NOT THE OTHERS. These are RANDOM actions, so the
+# teams never engage and the mid/late figures are pessimistic — a trained policy
+# that closes distance would push them far lower. But t=0 = 100% is a SPAWN
+# property, not a policy artifact (SMAX starts the teams beyond sight range),
+# and with `goal_horizon: 10` that is exactly the window in which the first
+# pooled goal `w_t` is assembled.
+#
+# WHEN **NOT** TO USE THIS: every MJX env. `trainer._global_state` falls back to
+# `obs.reshape(E, -1)` when the env has no `global_state` hook, so there the
+# global state IS the concatenated observations and `z` is computed from numbers
+# the encoder already saw — redundant, and it costs an extra `f_percept` (two
+# Dense layers). Worse, it would make the arm differ from `feudal_film` in TWO
+# things instead of one and stop being attributable.
+#
+# WHAT IS NOT AT STAKE EITHER WAY: all three critics read `global_state`
+# directly (`trainer._values` / `_manager_values` / `_values_int`) under every
+# latent, so CTDE is intact regardless. Only the manager's DIRECTIVES change.
+#
+# ⚠ NOT checkpoint-compatible with `feudal_film_local` (which has no
+# `f_percept_*`) or with any centralized `feudal*` arm. The three latents are
+# separated by the PAIR of keys, not either alone — `f_enc_0` is in both local
+# variants and `f_percept_0` is in both `centralized` and `local_global` — which
+# is how `goal_dependence_probe._dims_from_checkpoint` tells them apart.
+#
+# ⚠ BEFORE RUNNING ANY intrinsic_coef > 0 ARM, fix the r^I timing misalignment
+# (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4). Separate correctness
+# fix; it confounds any alpha comparison.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax env=smax_3m \
+#       model=feudal_film_local_global trial_id=0
+#
+# Compare against `model=feudal_film_local` on the SAME env group — the two
+# differ in exactly one key, and the difference is precisely "can the manager
+# see enemies no ally can see".
+defaults:
+  - feudal_film_local
+  - _self_
+
+model_params:
+  manager_latent: local_global

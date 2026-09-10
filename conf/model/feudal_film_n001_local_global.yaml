@@ -1,0 +1,8 @@
+# @package _global_
+model_params:
+  hidden_dim: 168
+  worker_fusion: film
+  manager_latent: local_global
+
+params:
+  intrinsic_coef: 0.01
