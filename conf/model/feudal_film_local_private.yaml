@@ -1,0 +1,88 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# FeUdal with a LOCAL manager latent AND PER-AGENT projections into goal space:
+#
+#     obs_i --f_enc (SHARED, per agent)--> W_i        --> s_i
+#     [s_1..s_N] --core--> y              --W^g_i     --> g_i
+#
+# This is `feudal_film_local` with the two SHARED projections (`f_Mspace`, and
+# `f_gpre`+`f_goalhead`) replaced by per-agent ones. It differs from
+# `feudal_film_local` in exactly one key: `manager_latent: local_private`.
+#
+# WHY THIS ARM EXISTS — measured 2026-09-14 by
+# `algorithms/feudal_mappo_jax/latent_diversity_probe.py` on the trained 12-agent
+# arms (both env groups, 3 seeds), reporting the participation ratio over the N
+# agent rows at each stage of the manager (1.0 = all rows identical, N = mutually
+# orthogonal):
+#
+#     stage                    "local"        "centralized"
+#     obs_i (the SAME input)   3.85 - 4.19    3.63 - 4.07
+#     s                        1.03 - 2.89    8.92 - 9.22
+#     g                        1.46 - 1.67    8.73 - 9.10
+#     s_t - s_{t-1}  (r^I)     2.00 - 3.66    8.99 - 9.01
+#
+# `local` collapses 12 agents onto ~1.5 distinct goal directions; the live
+# `goal_direction_count` series reads 1.39-1.95 for it against 8.87-9.16 for
+# centralized, where the random-direction baseline at N=12/goal_dim=32 is 8.93.
+# That cost return: over 24 paired (batch, alpha, seed) comparisons `local`
+# scored -25.4 against `centralized` (95% CI [-48.6, -0.7]), and on the
+# unconfounded alpha=0 cut -64.6 (CI [-97.0, -27.1], better in 1 of 6 seeds).
+#
+# The cause is NOT a rank collapse in the weights — on those checkpoints
+# f_Mspace has effective rank 31.3/32, f_goalhead 25.6-30.9/32, and f_gpre's
+# per-agent blocks are near-orthogonal. It is structural: a SHARED projection can
+# only transmit the row diversity its input already has, and N homogeneous agents
+# with egocentric observations supply only ~4 of 12. The centralized branch
+# escapes that ceiling because its diversity lives in the WEIGHTS — one team
+# vector read through N near-orthogonal blocks manufactures distinctness that was
+# never in the input.
+#
+# `local_private` takes that mechanism back while KEEPING the locality, which is
+# a property of where the encoder is applied, not of whether the projection is
+# shared: `d s[i]/d obs_j` is still structurally zero for j != i.
+#
+# WHAT IT GIVES UP, deliberately. `local`'s rationale is that a shared final
+# projection puts `g_i` and `s_i` in one basis. That requirement is real but
+# weaker than stated: the objective contracts d_cos(s_t[i] - s_{t-k}[i],
+# g_{t-k}[i]) PER AGENT and never compares agent i's axes to agent j's, so it
+# needs `s_i` and `g_i` to agree for each i — which a MATCHED PAIR of per-agent
+# projections gives. What is genuinely lost is cross-agent commensurability:
+# "goal coordinate 3" means something different per agent again, so the shared
+# worker must learn N goal-to-action mappings, as under `centralized`. That trade
+# — row diversity for basis sharing — is the hypothesis this arm tests.
+#
+# ⚠ NOT checkpoint-compatible with ANY existing feudal arm. The manager tree has
+# `f_Mspace_agent_kernel` (n_agents, manager_hidden, goal_dim) and
+# `goal_head_agent_kernel` in place of `f_Mspace`/`f_gpre`/`f_goalhead`. Trains
+# from scratch into results/<env>/feudal_film_local_private/.
+# `goal_dependence_probe._dims_from_checkpoint` keys off `f_Mspace_agent_kernel`
+# and checks it FIRST, since `f_enc_0` is shared with the other local variants.
+#
+# ACCEPTANCE. Structural, and check it BEFORE reading any return:
+#   1. `latent_locality_probe.py --wrt obs` must still read diag share 1.0 —
+#      the locality is the thing this must not break.
+#   2. `latent_diversity_probe.py` must show `s` and `g` back near the
+#      centralized 8.9-9.2, not `local`'s 1.0-2.9.
+#   3. the live `goal_direction_count` must sit near the 8.93 baseline.
+# Only then is a return comparison meaningful — and note that BOTH existing
+# latents currently sit 40-70% below flat MAPPO (mlp: 271.6 / 294.6 on
+# trunc/partition), and `eval_gap_permuted` is ~0 on every arm measured so far,
+# so restoring goal diversity is necessary for the mechanism to be testable at
+# all and is NOT on its own expected to close that gap.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_local_private trial_id=0
+#
+# Compare against `model=feudal_film_local` (one key apart) and
+# `model=feudal_film` (the centralized control) on the SAME env group.
+defaults:
+  - feudal_film
+  - _self_
+
+model_params:
+  manager_latent: local_private

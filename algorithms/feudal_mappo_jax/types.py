@@ -138,10 +138,24 @@ class Model_Params:
     # block-diagonal manager reads 1.0 and a half-local one 0.128. See
     # `latent_locality_probe.py` and manager.py's "Latent locality" docstring.
     #
+    # "local_private" keeps "local"'s per-agent encoder but makes BOTH
+    # projections into goal space per-agent (f_Mspace_agent / goal_head_agent).
+    # It exists because a SHARED projection can only transmit the row diversity
+    # its input already has: measured 2026-09-14 on the trained 12a arms, the
+    # observations carry a participation ratio of ~4 of 12, and "local" turns
+    # that into 1.0-2.9 for `s` and 1.5-1.7 for `g`, where "centralized" — given
+    # the SAME observations — reads 8.9-9.2 and 8.7-9.1, because its per-agent
+    # blocks MANUFACTURE distinctness rather than inheriting it. Locality is
+    # preserved (it is a property of where the encoder runs, not of whether the
+    # projection is shared); cross-agent basis sharing is given up, which is the
+    # explicit trade. See manager.py "Latent locality" and
+    # `latent_diversity_probe.py`.
+    #
     # NOT checkpoint-compatible with "centralized": the param tree differs
     # (f_enc_0/f_enc_1/f_gpre/f_goalhead vs f_percept_0/f_percept_1/goal_head,
     # and f_Mspace is (manager_hidden, goal_dim) rather than
-    # (manager_hidden, n_agents*goal_dim)).
+    # (manager_hidden, n_agents*goal_dim)). "local_private" is compatible with
+    # NEITHER: it has no f_Mspace/f_gpre/f_goalhead at all.
     manager_latent: str = "centralized"
     # Optional bias-free Dense on the goal before it meets the obs (FuN's `phi`).
     # None = raw concat fusion; see the degeneracy note in worker.py.
@@ -233,8 +247,8 @@ class MAPPOConfig:
     n_manager_critic_epochs: int = 8
     manager_hidden_dim: int = 256
     manager_core: str = "mlp"
-    # See Model_Params.manager_latent — "centralized" (default), "local" or
-    # "local_global".
+    # See Model_Params.manager_latent — "centralized" (default), "local",
+    # "local_global" or "local_private".
     manager_latent: str = "centralized"
     goal_embed_dim: int | None = None
     normalize_pooled_goal: bool = True

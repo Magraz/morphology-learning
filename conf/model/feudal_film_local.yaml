@@ -65,11 +65,20 @@
 # rather than (manager_hidden, n_agents*goal_dim). This arm trains from scratch
 # into results/<env>/feudal_film_local/.
 #
-# ⚠ BEFORE RUNNING ANY intrinsic_coef > 0 ARM ON THIS LATENT, fix the r^I
-# timing misalignment (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4: the
-# stream stores cos(s[t]-s[t-i], g[t-i]) on the transition for a[t], delayed one
-# action relative to the outcome scored). It is a separate correctness fix and
-# it will confound any alpha comparison made here.
+# The r^I timing misalignment (plans/feudal_goal_reward_diagnosis_2026-09-09.md
+# §4: the stream stores cos(s[t]-s[t-i], g[t-i]) on the transition for a[t],
+# delayed one action relative to the outcome scored) is real — r^I_t is EXACTLY
+# independent of a_t, verified bitwise — but MEASURED 2026-09-14 it does not
+# block an alpha sweep. `algorithms/feudal_mappo_jax/intrinsic_timing_probe.py`
+# rebuilds the actor's first-epoch gradient on one trajectory under both
+# indexings and reports the angle between them: 0.08 deg at alpha=0.01, 1.2 at
+# 0.1, 3.6 at 0.5, against 0.7 / 6.7 / 26.3 deg for the intrinsic term's own
+# rotation away from extrinsic-only — i.e. the timing is ~13% of the effect the
+# intrinsic reward is already having. GAE is why: it integrates over
+# 1/(1-gamma*lambda) = 16.8 steps and r^I has lag-1 autocorrelation 0.53-0.73,
+# so shifting it one step leaves the advantage 0.986-0.998 correlated.
+# An earlier version of this note said to fix it FIRST; that was an argument,
+# not a measurement, and the measurement does not support it.
 #
 # ACCEPTANCE for the mechanism is STRUCTURAL, not behavioural — diag share
 # exactly 1.0 from `latent_locality_probe.py`. A return claim additionally needs

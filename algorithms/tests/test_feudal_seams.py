@@ -1188,7 +1188,22 @@ def test_concat_path_is_unchanged_by_the_modulate_hook():
 # ---------------------------------------------------------------------------
 
 
+# The latents whose projections into goal space are SHARED across agents. The
+# two tests that assert permutation-equivariance of `s` and a shared
+# `f_goalhead` are properties of exactly these.
 LOCAL_VARIANTS = ["local", "local_global"]
+# Every latent that runs the encoder per agent. `"local_private"` shares the
+# ENCODER but gives each agent its own projection, so it must satisfy the
+# locality and detach-rule invariants while deliberately failing the two
+# sharing ones above.
+ALL_LOCAL_VARIANTS = LOCAL_VARIANTS + ["local_private"]
+# The projection params each latent carries, for the detach-rule test: the
+# gradient must reach the encoder AND whatever plays the role of `f_Mspace`.
+_MSPACE_PARAM = {
+    "local": "f_Mspace",
+    "local_global": "f_Mspace",
+    "local_private": "f_Mspace_agent_kernel",
+}
 
 
 def _local_manager(core="mlp", n_agents=N_AGENTS, obs_dim=OBS_DIM, latent="local"):
@@ -1204,7 +1219,7 @@ def _local_manager(core="mlp", n_agents=N_AGENTS, obs_dim=OBS_DIM, latent="local
     return manager, params, carry
 
 
-@pytest.mark.parametrize("latent", LOCAL_VARIANTS)
+@pytest.mark.parametrize("latent", ALL_LOCAL_VARIANTS)
 @pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
 def test_local_latent_is_exactly_agent_local(core, latent):
     """`d s[i]/d obs_j` is BITWISE zero for j != i — the whole point of the mode.
@@ -1271,7 +1286,7 @@ def test_local_goal_head_is_shared_so_g_and_s_share_a_basis(latent):
     ].shape
 
 
-@pytest.mark.parametrize("latent", LOCAL_VARIANTS)
+@pytest.mark.parametrize("latent", ALL_LOCAL_VARIANTS)
 def test_local_latent_still_trains_f_Mspace_under_the_detach_rule(latent):
     """The core must consume `s`, or the detach starves the encoder.
 
@@ -1294,8 +1309,10 @@ def test_local_latent_still_trains_f_Mspace_under_the_detach_rule(latent):
         return -(cos * valid).sum() / jnp.maximum(valid.sum(), 1.0)
 
     grads = jax.grad(loss)(params)["params"]
-    for name in ("f_enc_0", "f_enc_1", "f_Mspace"):
-        g = float(jnp.abs(grads[name]["kernel"]).sum())
+    for name in ("f_enc_0", "f_enc_1", _MSPACE_PARAM[latent]):
+        leaf = grads[name]
+        # The stacked per-agent projection is a bare param, not a Dense.
+        g = float(jnp.abs(leaf["kernel"] if isinstance(leaf, dict) else leaf).sum())
         assert g > 0.0, (
             f"{latent}/{name} received no gradient ({g}) — the bottleneck broke"
         )
@@ -1341,6 +1358,129 @@ def test_local_and_centralized_are_not_checkpoint_compatible(latent):
         local_params["params"]["f_Mspace"]["kernel"].shape
         != central_params["params"]["f_Mspace"]["kernel"].shape
     )
+
+
+# ---------------------------------------------------------------------------
+# `manager_latent="local_private"` — shared encoder, PER-AGENT projections.
+#
+# Measured 2026-09-14 (`latent_diversity_probe.py`, trained 12a arms): given the
+# SAME observations (participation ratio ~4 of 12 across the agent axis),
+# `"local"` produced `s` rows at PR 1.03-2.89 and goals at 1.46-1.67, while
+# `"centralized"` produced 8.92-9.22 and 8.73-9.10. A shared projection can only
+# TRANSMIT input row diversity; per-agent blocks MANUFACTURE it. These tests pin
+# that mechanism exactly, at init, with no training involved.
+# ---------------------------------------------------------------------------
+
+
+def test_local_private_manufactures_row_diversity_that_local_cannot():
+    """Identical observations => `"local"` gives identical `s` rows, `"local_private"` does not.
+
+    The sharpest possible statement of why this latent exists, and it needs no
+    training: feed every agent the SAME observation. A shared projection is a
+    function, so `s_1 == s_2 == ... == s_N` EXACTLY — the rows carry zero
+    information about which agent is which, whatever the encoder learned. The
+    per-agent blocks break that tie structurally.
+
+    Real observations are correlated rather than identical, which is why the
+    measured gap is 1.0-2.9 vs 8.9-9.2 rather than 1.0 vs N; this test is the
+    limiting case that isolates the cause.
+    """
+    obs_one = jax.random.normal(jax.random.PRNGKey(7), (OBS_DIM,))
+    obs = jnp.broadcast_to(obs_one, (N_AGENTS, OBS_DIM))
+
+    def rows(latent):
+        manager, params, carry = _local_manager(latent=latent)
+        return manager.apply(params, carry, obs.reshape(-1), obs)[2]
+
+    shared = rows("local")
+    for i in range(1, N_AGENTS):
+        assert jnp.array_equal(shared[0], shared[i]), (
+            "latent='local' gave distinct rows for identical observations — the "
+            "projection is no longer shared"
+        )
+
+    private = rows("local_private")
+    gram = np.asarray(
+        (private / jnp.linalg.norm(private, axis=-1, keepdims=True))
+        @ (private / jnp.linalg.norm(private, axis=-1, keepdims=True)).T
+    )
+    off = gram[~np.eye(N_AGENTS, dtype=bool)]
+    assert np.abs(off).max() < 0.99, (
+        "latent='local_private' rows are collinear for identical observations; "
+        f"max |cos| {np.abs(off).max():.4f} — the per-agent blocks are not "
+        "distinguishing agents"
+    )
+    # Participation ratio: N^2 / ||G||_F^2, the live `goal_direction_count` stat.
+    pr = N_AGENTS**2 / float((gram**2).sum())
+    assert pr > 1.5, f"local_private participation ratio {pr:.2f} is near-collapsed"
+
+
+def test_block_orthogonal_blocks_are_mutually_near_orthogonal():
+    """Per-agent blocks must be orthogonal to EACH OTHER, not merely internally.
+
+    Independently drawn orthogonal matrices are orthogonal within themselves and
+    share directions with one another, which would weaken the diversity this
+    latent exists to restore from step 0. `block_orthogonal` splits ONE
+    orthogonal matrix instead, reproducing the centralized branch's measured
+    block statistics (mean |cos| 0.013-0.019 after training there).
+    """
+    from algorithms.feudal_mappo_jax.manager import block_orthogonal
+
+    n, d_in, d_out = N_AGENTS, 64, GOAL_DIM
+    w = block_orthogonal(n)(jax.random.PRNGKey(0), (n, d_in, d_out))
+    assert w.shape == (n, d_in, d_out)
+    flat = np.asarray(w).reshape(n, -1)
+    flat = flat / np.linalg.norm(flat, axis=1, keepdims=True)
+    gram = flat @ flat.T
+    off = np.abs(gram[~np.eye(n, dtype=bool)])
+    assert off.max() < 0.2, f"blocks share directions; max |cos| {off.max():.3f}"
+    with pytest.raises(ValueError, match="expected"):
+        block_orthogonal(n)(jax.random.PRNGKey(0), (n + 1, d_in, d_out))
+
+
+def test_local_private_pairs_s_and_g_with_matched_per_agent_projections():
+    """Both projections are per-agent and the SAME shape — the basis argument.
+
+    `d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i])` contracts per agent and never
+    compares agent i's axes to agent j's, so what it requires is that `s_i` and
+    `g_i` agree FOR EACH i. A per-agent `s` with a SHARED goal head would break
+    exactly that, which is why `f_gpre`/`f_goalhead` are gone here rather than
+    only `f_Mspace` being replaced.
+    """
+    _, params, _ = _local_manager(latent="local_private")
+    mgr = params["params"]
+    assert "f_Mspace" not in mgr and "f_goalhead" not in mgr and "f_gpre" not in mgr
+    s_w, g_w = mgr["f_Mspace_agent_kernel"], mgr["goal_head_agent_kernel"]
+    assert s_w.shape == g_w.shape, (s_w.shape, g_w.shape)
+    assert s_w.shape[0] == N_AGENTS and s_w.shape[2] == GOAL_DIM, s_w.shape
+
+
+def test_local_private_is_not_checkpoint_compatible_with_the_shared_latents():
+    """Loading across must FAIL, and the probe must tell them apart.
+
+    `local_private` shares `f_enc_0` with the other local variants, so the
+    `(f_enc_0, f_percept_0)` pair that separates `local` from `local_global` is
+    NOT enough. `_dims_from_checkpoint` keys off `f_Mspace_agent_kernel` and
+    checks it first; reading `f_Mspace` here would raise rather than mis-infer,
+    which is the safe direction but only because the key is genuinely absent.
+    """
+    private = _local_manager(latent="local_private")[1]["params"]
+    shared = _local_manager(latent="local")[1]["params"]
+    assert set(private) != set(shared)
+    assert "f_enc_0" in private, "locality marker missing"
+    assert "f_Mspace" in shared and "f_Mspace" not in private
+
+    def infer(mgr):
+        if "f_Mspace_agent_kernel" in mgr:
+            return "local_private"
+        local, percept = "f_enc_0" in mgr, "f_percept_0" in mgr
+        return ("local_global" if percept else "local") if local else "centralized"
+
+    assert infer(private) == "local_private"
+    assert infer(shared) == "local"
+    assert infer(_local_manager(latent="local_global")[1]["params"]) == "local_global"
+    # goal_dim must come off the stacked kernel's LAST axis, not the second.
+    assert int(private["f_Mspace_agent_kernel"].shape[2]) == GOAL_DIM
 
 
 def test_unknown_manager_latent_raises():

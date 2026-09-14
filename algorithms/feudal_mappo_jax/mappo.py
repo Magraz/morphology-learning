@@ -31,7 +31,7 @@ from algorithms.feudal_mappo_jax.network import (
     MAPPOCritic,
     evaluate_action,
 )
-from algorithms.feudal_mappo_jax.manager import FeudalManager
+from algorithms.feudal_mappo_jax.manager import LOCAL_LATENTS, FeudalManager
 from algorithms.feudal_mappo_jax.worker import bind_goal, init_worker
 
 
@@ -139,7 +139,7 @@ def create_train_state(
     # the argument entirely, so passing None there keeps its init bit-identical.
     manager_dummy_obs = (
         jnp.zeros((n_agents, obs_dim))
-        if config.manager_latent in ("local", "local_global")
+        if config.manager_latent in LOCAL_LATENTS
         else None
     )
     manager_params = manager.init(

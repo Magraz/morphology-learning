@@ -359,6 +359,7 @@ def main():
         _checkpoint_path,
         _runner,
     )
+    from algorithms.feudal_mappo_jax.manager import LOCAL_LATENTS
     from algorithms.feudal_mappo_jax.mappo import build_manager
     from algorithms.feudal_mappo_jax.worker import FeudalWorker
 
@@ -408,7 +409,7 @@ def main():
                     None,
                     jnp.zeros(N * obs_dim),
                     jnp.zeros((N, obs_dim))
-                    if cfg.manager_latent in ("local", "local_global")
+                    if cfg.manager_latent in LOCAL_LATENTS
                     else None,
                 )
                 Bs0, Bg0 = block_jacobian_wrt_obs(

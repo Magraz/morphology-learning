@@ -100,6 +100,39 @@ import flax.linen as nn
 
 _EPS = 1e-6
 
+#: Every accepted value of ``FeudalManager.latent``. One copy, so the guard, the
+#: ``obs``-requirement in ``init_manager`` and the callers in ``mappo.py`` /
+#: ``trainer.py`` cannot drift apart. ``LOCAL_LATENTS`` are the ones that build
+#: `s` per agent from ``obs`` (and therefore REQUIRE it).
+LOCAL_LATENTS = ("local", "local_global", "local_private")
+LATENTS = ("centralized",) + LOCAL_LATENTS
+
+
+def block_orthogonal(n_blocks: int):
+    """Init for a stacked per-agent projection ``(n_blocks, d_in, d_out)``.
+
+    Builds ONE ``orthogonal(1.0)`` matrix of shape ``(d_in, n_blocks * d_out)``
+    and splits it into the per-agent blocks, so they start **mutually**
+    near-orthogonal with exactly the statistics of the centralized branch's
+    ``Dense(N * goal_dim)`` slices — which is the property that manufactures row
+    diversity (measured mean |cos| between blocks 0.013-0.019 there after
+    training, against 0.04-0.15 for ``"local"``'s ``f_gpre``).
+
+    Initializing each block independently would NOT give that: independently
+    drawn orthogonal matrices are orthogonal *within* themselves, not to each
+    other, so the blocks would share directions and the diversity this whole
+    variant exists to restore would be weaker from step 0.
+    """
+
+    def init(key, shape, dtype=jnp.float32):
+        n, d_in, d_out = shape
+        if n != n_blocks:
+            raise ValueError(f"expected {n_blocks} blocks, got shape {shape}")
+        w = nn.initializers.orthogonal(1.0)(key, (d_in, n * d_out), dtype)
+        return w.reshape(d_in, n, d_out).transpose(1, 0, 2)
+
+    return init
+
 
 # ---------------------------------------------------------------------------
 # Dilated LSTM (FuN section 3)
@@ -188,9 +221,11 @@ class FeudalManager(nn.Module):
         core: ``"dilated_lstm"`` (FuN, default) or ``"mlp"`` (stateless).
         horizon: goal horizon `c`; doubles as the LSTM dilation radius `r`.
         latent: where `s` comes from — ``"centralized"`` (default, the original),
-            ``"local"`` (a shared per-agent encoder), or ``"local_global"`` (the
+            ``"local"`` (a shared per-agent encoder), ``"local_global"`` (the
             same encoder, plus a direct read of the env's global state on the
-            GOAL path only). See "Latent locality".
+            GOAL path only), or ``"local_private"`` (the same encoder, with
+            PER-AGENT projections into goal space on both `s` and `g`). See
+            "Latent locality".
 
     Call:
         ``__call__(carry, global_state, obs=None) -> (carry, goal, state_latent)``
@@ -251,9 +286,60 @@ class FeudalManager(nn.Module):
     ``j != i`` and `r^I` is still clean — while **goal generation** regains the
     env's own global state.
 
-    It exists for envs where ``global_state`` is NOT recoverable from the
-    observations. SMAX is the live case, and the gap is structural rather than a
-    matter of formatting:
+    ``"local_private"`` keeps ``"local"``'s per-agent encoder and replaces both
+    SHARED projections with per-agent ones::
+
+        obs_i --f_enc (SHARED, per agent)--> W_i --> s_i
+        [s_1..s_N] --core--> y --W^g_i--> g_i
+
+    **Why**, measured 2026-09-14 on the trained 12-agent arms with
+    ``latent_diversity_probe.py`` (participation ratio over the N agent rows on
+    on-policy states; 1.0 = all rows identical, N = mutually orthogonal):
+
+    ======================  ==============  ==================
+    stage                   ``"local"``     ``"centralized"``
+    ======================  ==============  ==================
+    ``obs_i`` (same input)  3.85-4.19       3.63-4.07
+    ``s``                   **1.03-2.89**   **8.92-9.22**
+    ``g``                   **1.46-1.67**   **8.73-9.10**
+    ``s_t - s_{t-1}``       2.00-3.66       8.99-9.01
+    ======================  ==============  ==================
+
+    The two branches are handed the *same* observations and differ by 6-9x in
+    how distinct the resulting per-agent rows are. The cause is not a rank
+    collapse in the weights — on those same checkpoints ``f_Mspace`` has
+    effective rank 31.3/32, ``f_goalhead`` 25.6-30.9/32, and ``f_gpre``'s blocks
+    are near-orthogonal — it is structural: **a shared projection can only
+    transmit the row diversity its input already has, and N homogeneous agents'
+    egocentric observations supply a participation ratio of only ~4 of 12.**
+    The centralized branch is not under that ceiling because its diversity lives
+    in the WEIGHTS: one team vector through N near-orthogonal blocks manufactures
+    distinctness that was never in the input. ``"local_private"`` takes that
+    mechanism back while keeping the locality, which is a property of *where the
+    encoder is applied*, not of whether the projection is shared.
+
+    Consequence for ``goal_direction_count`` (the live collapse diagnostic): the
+    ``"local"`` arms sit at 1.39-1.95 against a random-direction baseline of 8.93
+    at N=12/goal_dim=32, i.e. 12 agents receiving ~1.5 distinct directives; the
+    centralized arms sit at 8.87-9.16, i.e. exactly maximally diverse.
+
+    **What this gives up, deliberately.** ``"local"``'s docstring argues that a
+    shared final projection is required so `g_i` and `s_i` share one basis. That
+    requirement is real but weaker than stated: the objective contracts
+    ``d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i])`` **per agent** and never compares
+    agent i's axes against agent j's, so what it needs is that `s_i` and `g_i`
+    agree FOR EACH i — not that all N agents share one global basis. A matched
+    pair of per-agent projections (``f_Mspace_agent`` for `s`, ``goal_head_agent``
+    for `g`) satisfies that. What is genuinely lost is cross-agent
+    commensurability: "goal coordinate 3" means something different per agent
+    again, so the shared worker must learn N goal-to-action mappings, exactly as
+    under ``"centralized"``. That is the trade being made — row diversity for
+    basis sharing — and it is the reason this is a separate value rather than a
+    fix applied in place.
+
+    ``"local_global"`` exists for envs where ``global_state`` is NOT recoverable
+    from the observations. SMAX is the live case, and the gap is structural
+    rather than a matter of formatting:
 
     * ``SMAX.get_obs`` zeroes unit `j` out of unit `i`'s observation entirely
       unless ``||pos_j - pos_i|| < sight_range_i``; ``SMAX.get_world_state``
@@ -307,10 +393,9 @@ class FeudalManager(nn.Module):
         # Reject an unknown value rather than failing open. CLAUDE.md records the
         # `VARIANTS` regression where a silently-false guard turned a whole arm
         # into its own baseline for two commits.
-        if self.latent not in ("centralized", "local", "local_global"):
+        if self.latent not in LATENTS:
             raise ValueError(
-                "latent must be 'centralized', 'local' or 'local_global', got "
-                f"{self.latent!r}"
+                f"latent must be one of {LATENTS}, got {self.latent!r}"
             )
 
     def _dense(self, features: int, scale: float, name: str):
@@ -321,12 +406,46 @@ class FeudalManager(nn.Module):
             name=name,
         )
 
+    def _agent_proj(self, x, name: str, per_agent_input: bool):
+        """``out_i = W_i x_i + b_i`` — a PER-AGENT projection into goal space.
+
+        The point of the whole ``"local_private"`` variant: a *shared* map can
+        only transmit whatever row diversity its input already has, whereas N
+        separate blocks manufacture diversity from a common input. Measured on
+        the trained 12a arms, the observations themselves carry a participation
+        ratio of only ~4 of 12, which is the ceiling a shared projection is stuck
+        under (`s` came out at 1.0-2.9); the centralized branch's per-agent
+        slices turn that same input into 8.9-9.2.
+
+        `per_agent_input` selects the contraction: True for `h` of shape
+        ``(..., N, d_in)`` (each agent's own encoding), False for the team vector
+        `y` of shape ``(..., d_in)`` (one vector read N different ways, exactly
+        as the centralized ``goal_head`` does).
+
+        Params are flat (``<name>_kernel`` / ``<name>_bias``) rather than nested
+        under a Dense, because this is a stacked weight, not a layer — see
+        ``goal_dependence_probe._dims_from_checkpoint``, which keys the latent
+        off ``f_Mspace_agent_kernel``.
+        """
+        w = self.param(
+            f"{name}_kernel",
+            block_orthogonal(self.n_agents),
+            (self.n_agents, self.hidden_dim, self.goal_dim),
+        )
+        b = self.param(
+            f"{name}_bias",
+            nn.initializers.constant(0.0),
+            (self.n_agents, self.goal_dim),
+        )
+        eq = "...nh,nhg->...ng" if per_agent_input else "...h,nhg->...ng"
+        return jnp.einsum(eq, x, w) + b
+
     @nn.compact
     def __call__(self, carry, global_state: jnp.ndarray, obs: jnp.ndarray = None):
         self._check_core()
         self._check_latent()
 
-        is_local = self.latent in ("local", "local_global")
+        is_local = self.latent in LOCAL_LATENTS
         if is_local:
             if obs is None:
                 raise ValueError(
@@ -341,9 +460,18 @@ class FeudalManager(nn.Module):
             # agent is what makes d s[i]/d obs_j structurally zero for j != i.
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_0")(obs))
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_1")(h))
-            # Shared, so the goal-space coordinates mean the same thing for all
-            # agents. Same `orthogonal(1.0)` as the centralized f_Mspace.
-            s = self._dense(self.goal_dim, 1.0, "f_Mspace")(h)
+            if self.latent == "local_private":
+                # PER-AGENT projection. `h` is already local (the encoder ran on
+                # obs_i alone), so `d s[i]/d obs_j` is still exactly zero for
+                # j != i — the locality is a property of WHERE the encoder is
+                # applied, not of whether the projection is shared. What changes
+                # is that the N rows no longer have to inherit their distinctness
+                # from the observations. See `_agent_proj`.
+                s = self._agent_proj(h, "f_Mspace_agent", per_agent_input=True)
+            else:
+                # Shared, so the goal-space coordinates mean the same thing for
+                # all agents. Same `orthogonal(1.0)` as the centralized f_Mspace.
+                s = self._dense(self.goal_dim, 1.0, "f_Mspace")(h)
             lead = s.shape[:-2]
         else:
             # f_percept: joint observation -> team embedding.
@@ -383,7 +511,25 @@ class FeudalManager(nn.Module):
         else:
             y = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "core")(core_in))
 
-        if is_local:
+        if self.latent == "local_private":
+            # `g_i` gets the SAME per-agent projection treatment as `s_i`, and it
+            # has to: `s_i` now lives in agent i's own basis (W_i above), so a
+            # SHARED goal head would emit goals in one common basis and the
+            # per-agent cosine d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i]) would
+            # contract two vectors expressed in DIFFERENT coordinates. What that
+            # cosine requires is that `s_i` and `g_i` agree FOR EACH i — it never
+            # contracts agent i's axes against agent j's — which a matched pair
+            # of per-agent projections satisfies exactly.
+            #
+            # Structurally identical to the centralized `goal_head`: one team
+            # vector `y` read N different ways. `f_gpre` + the shared
+            # `f_goalhead` are gone, and with them the second collapse point
+            # measured on the `"local"` arms (goal rows re-diversified to a
+            # participation ratio of 3.26 by `f_gpre`, then squashed back to 1.62
+            # by `f_goalhead`, whose top singular direction had grown to carry
+            # 15.7-27.9% of its energy against 3.1% at orthogonal init).
+            goal = self._agent_proj(y, "goal_head_agent", per_agent_input=False)
+        elif is_local:
             # Per-agent context out of the centralized mix, THEN a shared
             # projection into goal space. The second step is what puts `g_i` in
             # the same basis as `s_i`; with a per-agent final layer (as the
@@ -424,7 +570,7 @@ def init_manager(
 
     Returns ``(module, params, carry)``. Mirrors ``worker.init_worker``.
 
-    ``latent="local"``/``"local_global"`` need `obs_dim` so the init pass can
+    Every latent in ``LOCAL_LATENTS`` needs `obs_dim` so the init pass can
     supply a correctly shaped ``(*batch, n_agents, obs_dim)`` dummy observation.
     """
     manager = FeudalManager(
@@ -439,7 +585,7 @@ def init_manager(
     carry = manager.initialize_carry(carry_rng, batch_shape)
     dummy = jnp.zeros(tuple(batch_shape) + (global_state_dim,))
     dummy_obs = None
-    if latent in ("local", "local_global"):
+    if latent in LOCAL_LATENTS:
         if obs_dim is None:
             raise ValueError(f"init_manager(latent={latent!r}) requires obs_dim")
         dummy_obs = jnp.zeros(tuple(batch_shape) + (n_agents, obs_dim))
@@ -1143,11 +1289,16 @@ if __name__ == "__main__":
     # block-diagonal manager reads 1.0 and a half-local one 0.128. So "roughly
     # local" is exactly the state this mode exists to escape, and a tolerance
     # here would let a partial reintroduction of joint-state mixing pass.
+    # `local_private` is included for (a)/(d)/(e) — the load-bearing invariants —
+    # and skips (b)/(c), which are exactly the two properties it trades away: it
+    # replaces both SHARED projections with per-agent ones, so permuting agents
+    # no longer permutes `s` rows and there is no `(D, D)` `f_goalhead`. See the
+    # "Latent locality" docstring for why the per-agent cosine does not need
+    # cross-agent commensurability.
     for core_name, latent_name in [
-        (c, l)
-        for c in ("mlp", "dilated_lstm")
-        for l in ("local", "local_global")
+        (c, l) for c in ("mlp", "dilated_lstm") for l in LOCAL_LATENTS
     ]:
+        shared_proj = latent_name != "local_private"
         lm, lp, lc = init_manager(
             jax.random.PRNGKey(0),
             global_state_dim=N * OBS_DIM,
@@ -1168,15 +1319,43 @@ if __name__ == "__main__":
         assert np.abs(off).max() == 0.0, (core_name, np.abs(off).max())
         assert np.allclose(np.diag(blocks) / blocks.sum(1), 1.0)
 
-        # (b) the encoder is SHARED -> permuting agents permutes s rows
-        perm = np.roll(np.arange(N), 1)
-        s_ref = lm.apply(lp, lc, lobs.reshape(-1), lobs)[2]
-        s_perm = lm.apply(lp, lc, lobs[perm].reshape(-1), lobs[perm])[2]
-        assert jnp.array_equal(s_ref[perm], s_perm), core_name
+        if shared_proj:
+            # (b) the encoder AND the projection are SHARED -> permuting agents
+            #     permutes s rows. Under `local_private` the projection is
+            #     per-agent, so this is deliberately false there.
+            perm = np.roll(np.arange(N), 1)
+            s_ref = lm.apply(lp, lc, lobs.reshape(-1), lobs)[2]
+            s_perm = lm.apply(lp, lc, lobs[perm].reshape(-1), lobs[perm])[2]
+            assert jnp.array_equal(s_ref[perm], s_perm), core_name
 
-        # (c) g and s share one basis: the final projection is (D, D), not
-        #     per-agent. Without this the cosine compares incommensurate axes.
-        assert lp["params"]["f_goalhead"]["kernel"].shape == (GOAL_DIM, GOAL_DIM)
+            # (c) g and s share one basis: the final projection is (D, D), not
+            #     per-agent. Without this the cosine compares incommensurate axes.
+            assert lp["params"]["f_goalhead"]["kernel"].shape == (GOAL_DIM, GOAL_DIM)
+        else:
+            # (b') the diversity property `local_private` exists for, asserted in
+            #      its limiting case: hand every agent the SAME observation. A
+            #      shared projection is a function, so `local` returns N
+            #      IDENTICAL rows; per-agent blocks cannot. Measured on trained
+            #      arms with real (merely correlated) observations, this is the
+            #      difference between `s` at participation ratio 1.0-2.9 and
+            #      8.9-9.2 — see `latent_diversity_probe.py`.
+            same = jnp.broadcast_to(lobs[0], (N, OBS_DIM))
+            s_same = lm.apply(lp, lc, same.reshape(-1), same)[2]
+            u = s_same / jnp.linalg.norm(s_same, axis=-1, keepdims=True)
+            gram = np.asarray(u @ u.T)
+            off = np.abs(gram[~np.eye(N, dtype=bool)])
+            assert off.max() < 0.99, (
+                f"{latent_name}: rows collinear for identical observations "
+                f"(max |cos| {off.max():.4f}) — per-agent blocks not distinguishing"
+            )
+
+            # (c') `s` and `g` get MATCHED per-agent projections of the same
+            #      shape, which is what makes the per-agent cosine contract two
+            #      vectors in one coordinate system.
+            sw = lp["params"]["f_Mspace_agent_kernel"]
+            gw = lp["params"]["goal_head_agent_kernel"]
+            assert sw.shape == gw.shape == (N, HIDDEN, GOAL_DIM), (sw.shape, gw.shape)
+            assert "f_goalhead" not in lp["params"]
 
         # (d) gradient routing under the detach rule. Same property [8] checks
         #     on the centralized branch: the core consumes `s`, so f_enc and
@@ -1195,14 +1374,17 @@ if __name__ == "__main__":
             return -(cc * vv).sum() / jnp.maximum(vv.sum(), 1.0)
 
         gr = jax.grad(_loss)(lp)["params"]
-        names = ("f_enc_0", "f_enc_1", "f_Mspace")
+        names = ("f_enc_0", "f_enc_1", "f_Mspace" if shared_proj else "f_Mspace_agent_kernel")
         if latent_name == "local_global":
             # f_percept feeds the GOAL arm only, which is the un-detached one, so
             # it must train too. If it ever reads 0.0 the extra input is dead
             # weight and the arm is silently plain `local`.
             names = names + ("f_percept_0", "f_percept_1")
         for nm in names:
-            gsum = float(jnp.abs(gr[nm]["kernel"]).sum())
+            leaf = gr[nm]
+            # The stacked per-agent projection is a bare param, not a Dense.
+            leaf = leaf["kernel"] if isinstance(leaf, dict) else leaf
+            gsum = float(jnp.abs(leaf).sum())
             assert gsum > 0.0, f"{core_name}/{latent_name}/{nm} got no gradient"
 
         # (e) `s` is blind to the global state in BOTH variants — that is what

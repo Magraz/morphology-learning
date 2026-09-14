@@ -1758,6 +1758,80 @@ magnitude story alone does not explain them.
     `obs.reshape(E, -1)` (`trainer._global_state` falls back to exactly that when
     the env has no `global_state` hook), so nothing is lost and `local` is a pure
     refactoring of the same input.
+  - **⚠ `local` FIXED THE JACOBIAN AND BROKE THE GOALS — measured 2026-09-14 over
+    all 24 trained 12a arms (2 env groups x 4 alphas x 3 seeds).** It is worse
+    than `centralized` on return by **−25.4** (95% paired-bootstrap CI
+    [−48.6, −0.7], better in 9/24), and on the *unconfounded* `intrinsic_coef=0`
+    cut — the only one the still-unfixed `r^I` timing misalignment cannot touch —
+    by **−64.6** (CI [−97.0, −27.1], better in 1 of 6 seeds). Both latents remain
+    far under flat MAPPO (`mlp` 271.6 / 294.6 on trunc / partition).
+    The mechanism, from `algorithms/feudal_mappo_jax/latent_diversity_probe.py`
+    (participation ratio over the N agent rows on on-policy states; 1.0 = all
+    rows identical, N = mutually orthogonal):
+
+    | stage | `local` | `centralized` |
+    |---|---|---|
+    | `obs_i` (**the same input**) | 3.85–4.19 | 3.63–4.07 |
+    | `s` | **1.03–2.89** | **8.92–9.22** |
+    | `g` | **1.46–1.67** | **8.73–9.10** |
+    | `s_t − s_{t−1}` (what `r^I` scores) | 2.00–3.66 | 8.99–9.01 |
+
+    So 12 agents under `local` receive ~1.5 distinct directives; the live
+    `goal_direction_count` reads 1.39–1.95 against the 8.93 random baseline,
+    where `centralized` reads 8.87–9.16. **It is NOT a weight-rank collapse** —
+    on those checkpoints `f_Mspace` has effective rank 31.3/32, `f_goalhead`
+    25.6–30.9/32, and `f_gpre`'s per-agent blocks are near-orthogonal
+    (mean |cos| 0.04–0.15). It is structural: **a shared projection can only
+    TRANSMIT the row diversity its input already has, and N homogeneous agents'
+    egocentric observations supply only ~4 of 12.** `centralized` escapes that
+    ceiling because its diversity lives in the *weights* — one team vector read
+    through N near-orthogonal blocks manufactures distinctness that was never in
+    the input. Secondary collapse point: the shared `f_goalhead` squashes goals
+    that `f_gpre` had just re-diversified (3.26 → 1.62), its top singular
+    direction having grown to carry 15.7–27.9% of its energy against 3.1% at
+    orthogonal init.
+  - **`manager_latent: local_private` is the fix for that** (arm
+    `conf/model/feudal_film_local_private.yaml`, plus `_n001/_n01/_n05`
+    variants): `local`'s shared encoder is kept, and **both** shared projections
+    are replaced by per-agent ones — `s_i = W_i · f_enc(obs_i)` and
+    `g_i = W^g_i · y`, stacked `(n_agents, manager_hidden, goal_dim)` params
+    `f_Mspace_agent_*` / `goal_head_agent_*` initialized by `block_orthogonal`
+    (ONE orthogonal matrix split into blocks, so they start mutually
+    near-orthogonal — independently drawn orthogonal blocks are *not*).
+    Locality is untouched: it is a property of *where the encoder runs*, not of
+    whether the projection is shared. Verified on a smoke checkpoint —
+    `latent_locality_probe.py --wrt obs` reads diag share **exactly 1.0000** for
+    `s`, and the diversity probe reads `s` **8.72**, `g` **9.24**, differences
+    **8.95** against the same ~3-of-12 observation ceiling, i.e. back at the
+    centralized branch's numbers.
+    - **What it gives up, deliberately.** `local`'s rationale is that a shared
+      final projection puts `g_i` and `s_i` in one basis. That is real but
+      weaker than stated: the objective contracts `d_cos(s_t[i] − s_{t−k}[i],
+      g_{t−k}[i])` **per agent** and never compares agent i's axes to agent j's,
+      so it needs `s_i` and `g_i` to agree *for each i* — which a **matched
+      pair** of per-agent projections gives. Genuinely lost is cross-agent
+      commensurability: "goal coordinate 3" means something different per agent
+      again, so the shared worker must learn N goal-to-action mappings, as under
+      `centralized`. Row diversity traded for basis sharing; that is the
+      hypothesis the arm tests.
+    - ⚠ **Checkpoint-incompatible with every existing feudal arm** (no
+      `f_Mspace`/`f_gpre`/`f_goalhead` at all).
+      `goal_dependence_probe._dims_from_checkpoint` keys off
+      `f_Mspace_agent_kernel` and must check it **first** — `f_enc_0` is shared
+      with the other local variants, so the `(f_enc_0, f_percept_0)` pair that
+      separates `local` from `local_global` does not separate this one.
+    - ⚠ **The numbers above are from a 200k-step smoke run, i.e. near init.**
+      `local`'s collapse happened by **10M** steps and was permanent, so
+      `goal_direction_count` staying near 8.93 across a full run is the thing to
+      watch, not its value at the start. And restoring goal diversity is
+      *necessary* for the mechanism to be testable, not sufficient for return:
+      `eval_gap_permuted` is ≈0 on every arm measured so far.
+    - ⚠ Pre-existing at `cffe917` and **not** introduced by this change:
+      `test_goals_are_reproducible_from_stored_states[mlp-local]` fails with a
+      max diff of 5.2e-4 against `atol=1e-5`. It fails only for `local`, not
+      `centralized`, which is more than float noise would explain — and that
+      test is the one guarding "the manager is optimized for the policy that
+      actually acted". Worth a look before trusting any `local` arm.
   - **`manager_latent: local_global` is the third value, and it is the SMAX arm**
     (`conf/model/feudal_film_local_global.yaml`). It is `local` plus
     `core_in = concat(s_flat, z)` with `z = f_percept(global_state)`: `s` stays a
@@ -1802,11 +1876,40 @@ magnitude story alone does not explain them.
   usefully differentiable); even a perfectly obs-local manager scores < 1.0 there.
 - ⚠ **This is necessary, not sufficient, and it is only observable at `alpha > 0`.**
   `intrinsic_coef` ships at 0.0, so nothing currently running depends on `r^I`.
-  **Before running any `alpha > 0` arm on this latent, fix the `r^I` timing
-  misalignment** (`plans/feudal_goal_reward_diagnosis_2026-09-09.md` §4: the
-  stream stores `cos(s[t]-s[t-i], g[t-i])` on the transition for `a[t]`, one
-  action later than the outcome it scores) — it is a separate correctness fix and
-  it will confound any alpha comparison. Acceptance for the latent change itself
+- **The `r^I` timing misalignment is REAL but SMALL — measured 2026-09-14, and it
+  demotes a warning this file used to carry.** `trainer._env_step` stores the
+  *pre-action* `state_latent[t]`, so `r^I_t = 1/c Σ_i d_cos(s_t − s_{t−i},
+  g_{t−i})` is built entirely from quantities fixed **before `a_t` is sampled** —
+  i.e. `r^I_t` is *exactly* independent of the action on its own transition
+  (verified bitwise), while `reward[t]` on that same transition **is** `a_t`'s
+  consequence. The two streams score different actions
+  (`plans/feudal_goal_reward_diagnosis_2026-09-09.md` §4).
+  `algorithms/feudal_mappo_jax/intrinsic_timing_probe.py` measures what that
+  costs the **update**, which is the decision-relevant quantity: it rebuilds the
+  actor's first-epoch gradient (where the PPO ratio is exactly 1, so the gradient
+  is exactly `Σ_t A_t ∇log π`) on one trajectory, same params and same critics,
+  under both indexings, and reports the angle between them. Over 13 trained arms
+  (both 12a env groups × α ∈ {0.01, 0.1, 0.5} × 3 seeds):
+
+  | α | gradient rotation from **fixing the timing** | rotation the **intrinsic term itself** causes |
+  |---|---|---|
+  | 0.01 | **0.08°** | 0.68° |
+  | 0.1 | **1.2°** | 6.7° |
+  | 0.5 | **3.6°** | 26.3° |
+
+  So the fix is ~13% of the effect `r^I` is already having, and **it is not why
+  the α>0 arms fail.** The mechanism is measurable, not hand-waved: GAE
+  integrates over `1/(1 − γλ) = 16.8` steps at γ=0.99/λ=0.95, and `r^I` has lag-1
+  autocorrelation **0.53–0.73**, so shifting it one step leaves the advantage
+  **0.986–0.998** correlated even though the raw reward streams correlate only
+  0.53–0.73. Two corollaries: (1) it applies identically to every arm, so it can
+  **never** bias a paired local-vs-centralized comparison — the α>0 pairs in the
+  `local` measurement above are valid, not confounded; (2) `V^I` is not the
+  problem either — `intrinsic_explained_variance` reads **0.96–0.99** on these
+  arms, often above the extrinsic critic's, so the history-dependence of `r^I` is
+  recoverable from the current state. ⚠ Measured at *trained* checkpoints at the
+  *configured* (pre-anneal) α, i.e. the strongest case for it mattering; a
+  full-trajectory claim would need the same probe early in training. Acceptance for the latent change itself
   is **structural** (diag share 1.0); a return claim needs competitive extrinsic
   return against matched active-goal/alpha=0 and zero-goal controls, and per the
   diagnosis note a high cosine or a positive permutation gap does not meet that bar.
