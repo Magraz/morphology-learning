@@ -26,12 +26,48 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from algorithms.feudal_mappo_jax.manager import pool_goals
+from algorithms.feudal_mappo_jax.manager import (
+    GLOBAL_LATENTS,
+    LOCAL_LATENTS,
+    PRIVATE_LATENTS,
+    pool_goals,
+)
 from algorithms.feudal_mappo_jax.mappo import build_manager
 from algorithms.feudal_mappo_jax.network import evaluate_action
 from algorithms.feudal_mappo_jax.trainer import make_train
 from algorithms.feudal_mappo_jax.types import MAPPOConfig
 from algorithms.feudal_mappo_jax.worker import bind_goal
+
+@pytest.fixture(autouse=True)
+def _run_on_cpu():
+    """Pin these tests to CPU — same reasoning as `test_smax_seams.py`, plus one
+    of its own.
+
+    They are tiny, so the GPU buys nothing, and sharing it with a training or
+    rendering job makes them fail on cuSolver/OOM errors that look exactly like
+    assertion failures.
+
+    The extra reason here is `test_goals_are_reproducible_from_stored_states`,
+    which asserts a MATHEMATICAL identity (the manager update's recompute equals
+    what the rollout emitted) with an f32 tolerance. On GPU it failed for all
+    four local latents at 4e-4 - 7e-4 while passing for `centralized`, which
+    looked like a `local`-specific logic bug and is recorded in CLAUDE.md as one.
+    It is not: MEASURED 2026-09-14, the gap is **exactly 0.0 in float64** for
+    every latent, eager and jitted alike. It is XLA associating the f32
+    reductions differently between the rollout's `collect_fn` compilation and the
+    test's standalone one — the same class of artifact CLAUDE.md already records
+    for `mjx.ray` (~3e-4, "compare both under jit"). Loosening the tolerance
+    instead would have hidden it behind a number; pinning the platform keeps the
+    assertion exact and keeps the suite deterministic, which is the whole reason
+    these seams are run on a CPU stub env rather than on MJX.
+
+    `jax.default_device` is used rather than a module-level `JAX_PLATFORMS=cpu`,
+    which only takes effect if this module happens to be imported before JAX is
+    initialized (i.e. it depends on pytest collection order).
+    """
+    with jax.default_device(jax.devices("cpu")[0]):
+        yield
+
 
 N_AGENTS = 4
 OBS_DIM = 6
@@ -163,7 +199,7 @@ def test_goal_ring_matches_pool_goals_oracle(rollout):
     )
 
 
-@pytest.mark.parametrize("latent", ["centralized", "local"])
+@pytest.mark.parametrize("latent", ["centralized", *LOCAL_LATENTS])
 @pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
 def test_goals_are_reproducible_from_stored_states(core, latent):
     """Re-running the manager over the stored global states reproduces the goals.
@@ -215,7 +251,7 @@ def test_goals_are_reproducible_from_stored_states(core, latent):
     assert jnp.allclose(s, traj.state_latent, atol=1e-5)
 
 
-@pytest.mark.parametrize("latent", ["centralized", "local"])
+@pytest.mark.parametrize("latent", ["centralized", *LOCAL_LATENTS])
 @pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
 def test_full_update_runs_for_both_cores(core, latent):
     """collect -> update end-to-end on each core, with the manager actually moving.
@@ -1188,21 +1224,22 @@ def test_concat_path_is_unchanged_by_the_modulate_hook():
 # ---------------------------------------------------------------------------
 
 
+# Every latent that runs the encoder per agent — the 2x2 over the `private` and
+# `global` axes. Derived from the manager's own tuples rather than spelled out,
+# so adding a fifth variant cannot leave these lists behind (the failure mode
+# would be a new arm that silently runs no structural test at all).
+ALL_LOCAL_VARIANTS = list(LOCAL_LATENTS)
 # The latents whose projections into goal space are SHARED across agents. The
 # two tests that assert permutation-equivariance of `s` and a shared
-# `f_goalhead` are properties of exactly these.
-LOCAL_VARIANTS = ["local", "local_global"]
-# Every latent that runs the encoder per agent. `"local_private"` shares the
-# ENCODER but gives each agent its own projection, so it must satisfy the
-# locality and detach-rule invariants while deliberately failing the two
-# sharing ones above.
-ALL_LOCAL_VARIANTS = LOCAL_VARIANTS + ["local_private"]
+# `f_goalhead` are properties of exactly these; the `PRIVATE_LATENTS` trade both
+# away deliberately, while still having to satisfy the locality and detach-rule
+# invariants.
+LOCAL_VARIANTS = [l for l in ALL_LOCAL_VARIANTS if l not in PRIVATE_LATENTS]
 # The projection params each latent carries, for the detach-rule test: the
 # gradient must reach the encoder AND whatever plays the role of `f_Mspace`.
 _MSPACE_PARAM = {
-    "local": "f_Mspace",
-    "local_global": "f_Mspace",
-    "local_private": "f_Mspace_agent_kernel",
+    l: "f_Mspace_agent_kernel" if l in PRIVATE_LATENTS else "f_Mspace"
+    for l in ALL_LOCAL_VARIANTS
 }
 
 
@@ -1518,14 +1555,15 @@ def test_local_latent_requires_obs(latent):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("latent", LOCAL_VARIANTS)
+@pytest.mark.parametrize("latent", ALL_LOCAL_VARIANTS)
 def test_state_latent_never_depends_on_the_global_state(latent):
-    """`s` is blind to `global_state` in BOTH local variants.
+    """`s` is blind to `global_state` in ALL FOUR local variants.
 
-    This is what keeps `r^I` clean under `local_global`: whatever the goal path
-    gains, the measuring stick stays a function of the agent's own observation.
-    If this ever fails, `local_global` has silently become a centralized latent
-    with extra steps and the whole locality result is void.
+    This is what keeps `r^I` clean under the `global` axis: whatever the goal
+    path gains, the measuring stick stays a function of the agent's own
+    observation. If this ever fails, `local_global`/`local_global_private` has
+    silently become a centralized latent with extra steps and the whole locality
+    result is void.
     """
     manager, params, carry = _local_manager(latent=latent)
     obs = jax.random.normal(jax.random.PRNGKey(7), (N_AGENTS, OBS_DIM))
@@ -1541,59 +1579,110 @@ def test_state_latent_never_depends_on_the_global_state(latent):
     assert float(jnp.abs(g).max()) == 0.0
 
 
-def test_local_global_goal_reads_the_global_state_but_plain_local_does_not():
-    """The one behavioural difference between the two local variants.
+@pytest.mark.parametrize("latent", ALL_LOCAL_VARIANTS)
+def test_the_goal_reads_the_global_state_for_exactly_the_global_latents(latent):
+    """The `global` axis, asserted in BOTH directions over the whole 2x2.
 
-    Under `local` the manager is a pure function of `obs`, so an env whose global
-    state carries information the observations do not (SMAX) is unreachable to
-    it. Under `local_global` the goal path sees it. Asserted in both directions
-    so neither variant can silently drift into the other.
+    Without it the manager is a pure function of `obs`, so an env whose global
+    state carries information the observations do not (SMAX: 100% of alive
+    enemies are invisible to every ally at t=0) is unreachable to it. With it the
+    goal path sees it. Both directions matter: a `local_global*` arm that
+    silently ignored the extra input would be plain `local*` wearing an extra
+    `f_percept`, and a `local*` arm that read it would void the locality claim
+    for the goal.
+
+    This is the axis that is INDEPENDENT of `private`, so it is parametrized over
+    all four rather than asserted on the two single-axis names — that is what
+    makes `local_global_private` covered rather than assumed.
     """
     obs = jax.random.normal(jax.random.PRNGKey(7), (N_AGENTS, OBS_DIM))
     gs_a = jax.random.normal(jax.random.PRNGKey(8), (N_AGENTS * OBS_DIM,))
     gs_b = jax.random.normal(jax.random.PRNGKey(9), (N_AGENTS * OBS_DIM,))
 
-    m_l, p_l, c_l = _local_manager(latent="local")
-    assert jnp.array_equal(
-        m_l.apply(p_l, c_l, gs_a, obs)[1], m_l.apply(p_l, c_l, gs_b, obs)[1]
-    ), "latent='local' goal depends on the global state — f_percept leaked in"
-    assert "f_percept_0" not in p_l["params"]
+    m, p, c = _local_manager(latent=latent)
+    moved = not jnp.allclose(
+        m.apply(p, c, gs_a, obs)[1], m.apply(p, c, gs_b, obs)[1]
+    )
+    expected = latent in GLOBAL_LATENTS
+    assert moved == expected, (
+        f"latent={latent!r}: goal-vs-global_state dependence is wrong "
+        f"(moved={moved}, expected={expected})"
+    )
+    assert ("f_percept_0" in p["params"]) == expected
 
-    m_g, p_g, c_g = _local_manager(latent="local_global")
-    assert not jnp.allclose(
-        m_g.apply(p_g, c_g, gs_a, obs)[1], m_g.apply(p_g, c_g, gs_b, obs)[1]
-    ), "latent='local_global' goal ignored the global state"
-    assert "f_percept_0" in p_g["params"]
 
+def test_every_latent_is_distinguishable_from_the_checkpoint_alone(tmp_path):
+    """`_dims_from_checkpoint` must separate all FIVE, by PAIRS of keys.
 
-def test_the_three_latents_are_distinguishable_from_the_checkpoint_alone():
-    """`_dims_from_checkpoint` must separate all three, and by the PAIR of keys.
+    No single key does it. `f_enc_0` says "local family" but not which of the
+    four; `f_percept_0` is shared by `centralized`, `local_global` and
+    `local_global_private`; `f_Mspace_agent_kernel` says "private" but not
+    whether it also reads the global state. The two axes are independent, so the
+    inference needs both bits.
 
-    `f_enc_0` alone does not do it (both local variants have it) and
-    `f_percept_0` alone does not either (centralized and local_global share it).
-    The yaml moves while checkpoints do not, so this inference is what makes a
-    probe a measurement of what actually trained.
+    This calls the REAL `_dims_from_checkpoint` on serialized trees rather than
+    reimplementing its rule, because a reimplementation is exactly what would
+    have kept passing when `local_global_private` was added: the probe's own
+    early-return for `f_Mspace_agent_kernel` hardcoded `"local_private"`, and a
+    copy of the rule living here would have been "fixed" in lockstep with
+    nothing. The yaml moves while checkpoints do not, so this inference is what
+    makes a probe a measurement of what actually trained.
     """
-    trees = {
-        "centralized": None,
-        "local": _local_manager(latent="local")[1]["params"],
-        "local_global": _local_manager(latent="local_global")[1]["params"],
-    }
+    from flax.serialization import msgpack_serialize
+
+    from algorithms.feudal_mappo_jax.goal_dependence_probe import (
+        _dims_from_checkpoint,
+    )
+
     config = _config()
     central = build_manager(config, N_AGENTS)
-    trees["centralized"] = central.init(
-        jax.random.PRNGKey(1),
-        central.initialize_carry(jax.random.PRNGKey(0), ()),
-        jnp.zeros(N_AGENTS * OBS_DIM),
-    )["params"]
-
-    def infer(mgr):
-        local, percept = "f_enc_0" in mgr, "f_percept_0" in mgr
-        return ("local_global" if percept else "local") if local else "centralized"
+    trees = {
+        "centralized": central.init(
+            jax.random.PRNGKey(1),
+            central.initialize_carry(jax.random.PRNGKey(0), ()),
+            jnp.zeros(N_AGENTS * OBS_DIM),
+        )["params"]
+    }
+    for latent in ALL_LOCAL_VARIANTS:
+        trees[latent] = _local_manager(latent=latent)[1]["params"]
+    assert set(trees) == {"centralized", *LOCAL_LATENTS}
 
     for expected, mgr in trees.items():
-        assert infer(mgr) == expected, (expected, sorted(mgr))
-    # goal_dim inference: divided by n_agents only on the centralized branch.
-    assert trees["centralized"]["f_Mspace"]["kernel"].shape[1] == N_AGENTS * GOAL_DIM
-    for k in ("local", "local_global"):
-        assert trees[k]["f_Mspace"]["kernel"].shape[1] == GOAL_DIM
+        # Minimal checkpoint: the probe reads the manager tree plus the actor's
+        # first Dense (for `hidden_dim`).
+        path = tmp_path / f"{expected}.msgpack"
+        path.write_bytes(
+            msgpack_serialize(
+                jax.device_get(
+                    {
+                        "manager": {"params": mgr},
+                        "actor": {
+                            "params": {
+                                "MAPPOActor_0": {
+                                    "Dense_0": {
+                                        "kernel": jnp.zeros(
+                                            (OBS_DIM, config.hidden_dim)
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                    }
+                )
+            )
+        )
+        dims = _dims_from_checkpoint(path, N_AGENTS)
+        assert dims["manager_latent"] == expected, (
+            expected, dims["manager_latent"], sorted(mgr)
+        )
+        # goal_dim must come back as the TRUE width for every latent — the
+        # centralized branch stores `n_agents * goal_dim` in one Dense, so a
+        # missed division (or a spurious one) silently rebuilds a different
+        # network, and for a width that happens to divide it loads without error.
+        assert dims["goal_dim"] == GOAL_DIM, (expected, dims["goal_dim"])
+        # The private branch reads its widths off a 3-D stacked param
+        # `(n_agents, manager_hidden, goal_dim)` rather than a 2-D Dense kernel,
+        # so a transposed axis here would produce a plausible-looking wrong width.
+        assert dims["manager_hidden_dim"] == config.manager_hidden_dim, (
+            expected, dims["manager_hidden_dim"]
+        )

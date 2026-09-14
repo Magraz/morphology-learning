@@ -104,7 +104,24 @@ _EPS = 1e-6
 #: ``obs``-requirement in ``init_manager`` and the callers in ``mappo.py`` /
 #: ``trainer.py`` cannot drift apart. ``LOCAL_LATENTS`` are the ones that build
 #: `s` per agent from ``obs`` (and therefore REQUIRE it).
-LOCAL_LATENTS = ("local", "local_global", "local_private")
+#:
+#: The local family is a 2x2 over two INDEPENDENT axes, and the names spell the
+#: cross product out rather than encoding it in flags — every other branch in
+#: this repo keys off the literal string, and a flag pair would have to be
+#: reconstructed at each of them:
+#:
+#: * *private* — the projections into goal space (`s` and `g`) are PER-AGENT
+#:   (``W_i``) instead of shared. Restores the row diversity a shared projection
+#:   cannot manufacture. See ``PRIVATE_LATENTS``.
+#: * *global* — the GOAL path additionally reads the env's own ``global_state``.
+#:   For envs where that is not recoverable from the observations (SMAX). See
+#:   ``GLOBAL_LATENTS``.
+#:
+#: Neither axis touches locality: `s` is a function of ``obs`` alone in all four,
+#: so ``d s[i]/d obs_j == 0`` for ``j != i`` and `r^I` stays clean throughout.
+PRIVATE_LATENTS = ("local_private", "local_global_private")
+GLOBAL_LATENTS = ("local_global", "local_global_private")
+LOCAL_LATENTS = ("local", "local_global", "local_private", "local_global_private")
 LATENTS = ("centralized",) + LOCAL_LATENTS
 
 
@@ -220,12 +237,13 @@ class FeudalManager(nn.Module):
         hidden_dim: width of ``f_Mspace`` and of the recurrent core.
         core: ``"dilated_lstm"`` (FuN, default) or ``"mlp"`` (stateless).
         horizon: goal horizon `c`; doubles as the LSTM dilation radius `r`.
-        latent: where `s` comes from — ``"centralized"`` (default, the original),
-            ``"local"`` (a shared per-agent encoder), ``"local_global"`` (the
-            same encoder, plus a direct read of the env's global state on the
-            GOAL path only), or ``"local_private"`` (the same encoder, with
-            PER-AGENT projections into goal space on both `s` and `g`). See
-            "Latent locality".
+        latent: where `s` comes from — ``"centralized"`` (default, the original)
+            or one of the four local variants, which are a 2x2 over two
+            independent axes on top of a shared per-agent encoder: ``"local"``
+            (neither), ``"local_global"`` (+ a direct read of the env's global
+            state on the GOAL path only), ``"local_private"`` (+ PER-AGENT
+            projections into goal space on both `s` and `g`), and
+            ``"local_global_private"`` (both). See "Latent locality".
 
     Call:
         ``__call__(carry, global_state, obs=None) -> (carry, goal, state_latent)``
@@ -368,6 +386,30 @@ class FeudalManager(nn.Module):
     same numbers the encoder already saw) and costs an extra ``f_percept``, so
     prefer ``"local"`` there and keep arms differing in one thing at a time.
 
+    ``"local_global_private"`` is both single-axis variants at once — the shared
+    per-agent encoder, PER-AGENT projections on `s` and `g`, and ``f_percept`` on
+    the goal path::
+
+        obs_i --f_enc (SHARED, per agent)--> W_i --> s_i
+        global_state --f_percept--> z
+        concat([s_1..s_N], z) --core--> y --W^g_i--> g_i
+
+    It exists because the two axes are orthogonal and SMAX needs both: the
+    ``"global"`` axis is what keeps the manager from being strictly blinder than
+    the centralized branch there (the enemy-visibility measurement above), and
+    the ``"private"`` axis is what keeps the N goal rows from collapsing onto
+    ~1.5 directions. Using ``"local_private"`` on SMAX would take the second fix
+    and reintroduce the first defect; using ``"local_global"`` would do the
+    reverse. Locality is untouched by either axis, so `s` is still a pure
+    function of ``obs`` and ``d s[i]/d obs_j`` is still exactly zero for
+    ``j != i``.
+
+    Prefer the narrowest variant the env actually needs: on an MJX env the
+    ``"global"`` axis is dead weight (``global_state`` IS ``obs.reshape(E, -1)``
+    there), so compare ``"local_private"`` against ``"local"``; on SMAX compare
+    ``"local_global_private"`` against ``"local_global"``. Crossing the two
+    families in one comparison changes two things at once.
+
     Residual `"local"` does NOT fix: ``obs_i`` is egocentric but not
     proprioceptive — density sensors, ``neighbor_fraction`` and lidar all respond
     to teammates inside ``sector_sensor_radius``. So `s_i` is agent i's *view*,
@@ -446,6 +488,12 @@ class FeudalManager(nn.Module):
         self._check_latent()
 
         is_local = self.latent in LOCAL_LATENTS
+        # The two axes of the local family, read independently so the 2x2 is a
+        # cross product rather than four hand-written branches: `local_global`
+        # and `local_private` are the two single-axis arms, `local_global_private`
+        # is both.
+        is_private = self.latent in PRIVATE_LATENTS
+        is_global = self.latent in GLOBAL_LATENTS
         if is_local:
             if obs is None:
                 raise ValueError(
@@ -460,7 +508,7 @@ class FeudalManager(nn.Module):
             # agent is what makes d s[i]/d obs_j structurally zero for j != i.
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_0")(obs))
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_1")(h))
-            if self.latent == "local_private":
+            if is_private:
                 # PER-AGENT projection. `h` is already local (the encoder ran on
                 # obs_i alone), so `d s[i]/d obs_j` is still exactly zero for
                 # j != i — the locality is a property of WHERE the encoder is
@@ -493,7 +541,7 @@ class FeudalManager(nn.Module):
         # local branches centralized: the core is where the N per-agent latents
         # are mixed, so goal assignment still reads the whole team.
         core_in = s.reshape(lead + (self.n_agents * self.goal_dim,))
-        if self.latent == "local_global":
+        if is_global:
             # ...plus a direct read of the env's own global state, for envs where
             # that is NOT recoverable from the observations. `s` stays a pure
             # function of `obs` (so `r^I` stays clean); only GOAL GENERATION gains
@@ -511,7 +559,7 @@ class FeudalManager(nn.Module):
         else:
             y = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "core")(core_in))
 
-        if self.latent == "local_private":
+        if is_private:
             # `g_i` gets the SAME per-agent projection treatment as `s_i`, and it
             # has to: `s_i` now lives in agent i's own basis (W_i above), so a
             # SHARED goal head would emit goals in one common basis and the
@@ -1289,16 +1337,21 @@ if __name__ == "__main__":
     # block-diagonal manager reads 1.0 and a half-local one 0.128. So "roughly
     # local" is exactly the state this mode exists to escape, and a tolerance
     # here would let a partial reintroduction of joint-state mixing pass.
-    # `local_private` is included for (a)/(d)/(e) — the load-bearing invariants —
-    # and skips (b)/(c), which are exactly the two properties it trades away: it
-    # replaces both SHARED projections with per-agent ones, so permuting agents
-    # no longer permutes `s` rows and there is no `(D, D)` `f_goalhead`. See the
-    # "Latent locality" docstring for why the per-agent cosine does not need
-    # cross-agent commensurability.
+    # The `PRIVATE_LATENTS` are included for (a)/(d)/(e) — the load-bearing
+    # invariants — and skip (b)/(c), which are exactly the two properties they
+    # trade away: they replace both SHARED projections with per-agent ones, so
+    # permuting agents no longer permutes `s` rows and there is no `(D, D)`
+    # `f_goalhead`. See the "Latent locality" docstring for why the per-agent
+    # cosine does not need cross-agent commensurability.
+    #
+    # All four local variants are swept, and the two axes are read independently
+    # ((b)/(c) off `private`, (d)/(e) off `global`) rather than off the literal
+    # names — that is what makes `local_global_private` covered by construction
+    # instead of by a fifth hand-written case.
     for core_name, latent_name in [
         (c, l) for c in ("mlp", "dilated_lstm") for l in LOCAL_LATENTS
     ]:
-        shared_proj = latent_name != "local_private"
+        shared_proj = latent_name not in PRIVATE_LATENTS
         lm, lp, lc = init_manager(
             jax.random.PRNGKey(0),
             global_state_dim=N * OBS_DIM,
@@ -1375,7 +1428,7 @@ if __name__ == "__main__":
 
         gr = jax.grad(_loss)(lp)["params"]
         names = ("f_enc_0", "f_enc_1", "f_Mspace" if shared_proj else "f_Mspace_agent_kernel")
-        if latent_name == "local_global":
+        if latent_name in GLOBAL_LATENTS:
             # f_percept feeds the GOAL arm only, which is the un-detached one, so
             # it must train too. If it ever reads 0.0 the extra input is dead
             # weight and the arm is silently plain `local`.
@@ -1387,9 +1440,9 @@ if __name__ == "__main__":
             gsum = float(jnp.abs(leaf).sum())
             assert gsum > 0.0, f"{core_name}/{latent_name}/{nm} got no gradient"
 
-        # (e) `s` is blind to the global state in BOTH variants — that is what
-        #     keeps r^I clean under local_global. The goal, however, must read it
-        #     under local_global and must NOT under local.
+        # (e) `s` is blind to the global state in ALL FOUR variants — that is what
+        #     keeps r^I clean under the `global` axis. The goal, however, must
+        #     read it under exactly `GLOBAL_LATENTS` and must NOT under the rest.
         gs_a = jax.random.normal(jax.random.PRNGKey(15), (N * OBS_DIM,))
         gs_b = jax.random.normal(jax.random.PRNGKey(16), (N * OBS_DIM,))
         assert jnp.array_equal(
@@ -1398,7 +1451,7 @@ if __name__ == "__main__":
         goal_moved = not jnp.allclose(
             lm.apply(lp, lc, gs_a, lobs)[1], lm.apply(lp, lc, gs_b, lobs)[1]
         )
-        assert goal_moved == (latent_name == "local_global"), (
+        assert goal_moved == (latent_name in GLOBAL_LATENTS), (
             f"{latent_name}: goal-vs-global_state dependence is wrong "
             f"(moved={goal_moved})"
         )

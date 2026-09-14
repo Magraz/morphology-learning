@@ -1826,12 +1826,30 @@ magnitude story alone does not explain them.
       watch, not its value at the start. And restoring goal diversity is
       *necessary* for the mechanism to be testable, not sufficient for return:
       `eval_gap_permuted` is ≈0 on every arm measured so far.
-    - ⚠ Pre-existing at `cffe917` and **not** introduced by this change:
-      `test_goals_are_reproducible_from_stored_states[mlp-local]` fails with a
-      max diff of 5.2e-4 against `atol=1e-5`. It fails only for `local`, not
-      `centralized`, which is more than float noise would explain — and that
-      test is the one guarding "the manager is optimized for the policy that
-      actually acted". Worth a look before trusting any `local` arm.
+    - ✅ **RESOLVED 2026-09-14 — it WAS float noise, and the `local` arms are
+      fine.** This file previously recorded
+      `test_goals_are_reproducible_from_stored_states[mlp-local]` failing at
+      5.2e-4 against `atol=1e-5` and argued that failing for `local` but not
+      `centralized` was "more than float noise would explain". Measured, that
+      reasoning was wrong on both halves. (1) It is not `local`-specific: on GPU
+      it fails for **all four** local latents on the `mlp` core (`local` 5.2e-4,
+      `local_global` 4.0e-4, `local_private` 4.6e-4, `local_global_private`
+      6.8e-4), ordered by the depth of the goal path — `centralized` has the
+      shallowest and merely stays under the tolerance. (2) It is **exactly 0.0 in
+      float64**, every latent, eager and jitted alike, and it passes on CPU at
+      f32. So the recompute is mathematically identical and the manager IS
+      optimized for the policy that acted; XLA is just associating the f32
+      reductions differently between the rollout's `collect_fn` compilation and
+      the test's standalone one — the same artifact this file already records for
+      `mjx.ray` (~3e-4, "compare both under jit"). Adding `jax.jit` to the
+      recompute fixes the two private latents exactly and leaves the shared-
+      projection ones, because the enclosing program still differs.
+      **Fix: `test_feudal_seams.py` now has the autouse `_run_on_cpu` fixture**
+      that `test_smax_seams.py` already had (CLAUDE.md previously flagged this
+      suite as the unpinned one that "does show this"). The tolerance was
+      deliberately NOT loosened — a real convention bug (wrong carry, wrong reset
+      order) is O(1), so a widened atol would have hidden a precision artifact
+      behind a number instead of removing it.
   - **`manager_latent: local_global` is the third value, and it is the SMAX arm**
     (`conf/model/feudal_film_local_global.yaml`). It is `local` plus
     `core_in = concat(s_flat, z)` with `z = f_percept(global_state)`: `s` stays a
@@ -1854,9 +1872,76 @@ magnitude story alone does not explain them.
     in. **Do not use it on an MJX env**: `z` would be computed from numbers the
     encoder already saw, it costs an extra `f_percept`, and it would make the arm
     differ from `feudal_film` in two things instead of one.
+  - **`manager_latent: local_global_private` is the fourth value — `local_global`
+    and `local_private` at once, and it is the arm to run on SMAX** (arm
+    `conf/model/feudal_film_local_global_private.yaml`, plus `_n001/_n01/_n05`).
+    The local family is a **2×2 over two independent axes** on top of the shared
+    per-agent encoder, and the code now reads them as such (`PRIVATE_LATENTS` /
+    `GLOBAL_LATENTS` in `manager.py`, membership tests rather than four
+    hand-written string equalities):
+
+    | model group | *private* (per-agent `W_i` on `s` and `g`) | *global* (`f_percept` on the goal path) |
+    |---|---|---|
+    | `feudal_film_local` | – | – |
+    | `feudal_film_local_private` | ✓ | – |
+    | `feudal_film_local_global` | – | ✓ |
+    | `feudal_film_local_global_private` | ✓ | ✓ |
+
+    It exists because on SMAX **both** defects are live and each single-axis arm
+    fixes only one: `local_private` there leaves the manager blind to enemies no
+    ally can see (100% of them at t=0), and `local_global` there leaves the N goal
+    rows collapsing onto ~1.5 directions. **Yes, `local_private` *runs* on SMAX**
+    (verified end-to-end: train + resume at `smax_3m`) — nothing crashes, which is
+    exactly why this needed a separate value rather than a guard.
+    - **Locality is untouched by either axis.** `s` is a pure function of `obs` in
+      all four, so `d s[i]/d obs_j` is exactly 0 for `j != i` and `r^I` stays
+      clean. Only goal *generation* reads `z`.
+    - **Pick the narrowest variant the env needs.** On MJX the `global` axis is
+      dead weight (`global_state` **is** `obs.reshape(E, -1)` there), so compare
+      `local` vs `local_private`; on SMAX compare `local_global` vs
+      `local_global_private`. Crossing the two families changes two things at once.
+    - ⚠ **`_dims_from_checkpoint` needed a second bit.** Its
+      `f_Mspace_agent_kernel` early-return hardcoded `"local_private"`, which for
+      a `local_global_private` checkpoint (that key **and** `f_percept_*`) would
+      build a target tree missing `f_percept_*` — a loud `from_bytes` failure, but
+      at the arm you were trying to measure. It now splits that branch on
+      `f_percept_0` too. **No single key separates the five latents**: `f_enc_0`
+      is in all four locals, `f_percept_0` is in `centralized`/`local_global`/
+      `local_global_private`, `f_Mspace_agent_kernel` is in both private ones.
+      `test_every_latent_is_distinguishable_from_the_checkpoint_alone` now calls
+      the **real** function on serialized trees for all five rather than
+      reimplementing its rule — a copy of the rule in the test is precisely what
+      would have kept passing through this change.
+    - ⚠ **`latent_diversity_probe.py` had a live bug this surfaced**: its
+      `local_global` branch built `core_in` **without** `z`, so `y` and every goal
+      number it printed for those arms came from a forward pass the checkpoint
+      never computed. Fixed (shared `with_global` helper) for both global variants.
+    - ⚠ **Neither latent probe works on SMAX arms, at any latent.**
+      `latent_locality_probe.py` and `latent_diversity_probe.py` both derive
+      per-agent observations by un-flattening the stored global state
+      (`gs.reshape(N, obs_dim)`), valid only when the env has **no**
+      `global_state` hook. The diversity probe now skips such arms with a message
+      instead of reshaping a 72-dim world state into fake observations; measuring
+      them needs `collect_states` to store `obs` alongside `global_state`.
+    - **Verified**: the four pre-existing latents are **bit-identical** to the
+      pre-change code (0.0 max diff on every param leaf, `goal` and `s`, both
+      cores — checked against a reverted copy of the module loaded side by side);
+      all 10 manager self-checks pass with `[10]` now sweeping all four local
+      latents × both cores; 103 seam tests pass
+      (`test_feudal_seams.py` + `test_smax_seams.py`), with the two end-to-end
+      latent tests (goal reproducibility, full update) widened from
+      `["centralized", "local"]` to every latent.
+    - ⚠ **No training result** — every number here is a mechanism check. And note
+      the `private` axis's motivation was measured at **N=12 homogeneous** agents
+      (`obs_i` participation ratio only ~4 of 12); `smax_3m` is N=3 with a
+      random-direction baseline of 2.82/3, and `2s3z`/`3s5z` have heterogeneous
+      unit types, so a shared projection may not bind there. Read
+      `goal_direction_count` on a `local_global` run before assuming it does —
+      and read it **across the whole run**, since `local`'s collapse on the 12a
+      arms happened by ~10M steps.
   - **All three critics keep reading `global_state` under every latent**
     (`trainer._values` / `_manager_values` / `_values_int`), so CTDE is intact in
-    all three modes. Only the manager's *directives* change.
+    every mode. Only the manager's *directives* change.
   - **`centralized` is the default and is bit-identical to pre-change code** —
     verified against a `git worktree` at HEAD: 0.0 max diff on every param leaf,
     `goal` and `s`, for **both** cores. The extra `obs` argument is ignored there.
@@ -1965,7 +2050,7 @@ reaches 0.97 after 1e8 steps. Judge `V^M` on a real-length run, not a smoke.
 are masked out, and `mjx_16a_4o` episodes are short (~43 steps, boundary contact
 terminates), so a large `c` starves the manager. Watch it when changing `c`.
 
-- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (65 tests, CPU stub
+- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (92 tests, CPU stub
   env, no MJX — fast and *deterministic*, unlike an MJX rollout). They pin the
   joints where a mistake is silent: the in-scan ring equals the `pool_goals`
   oracle including done-masking; the stored goals are reproducible by re-scanning
@@ -2219,11 +2304,11 @@ itself is not reproducible across processes, hence the stub).
 
 ⚠ The seam tests pin themselves to CPU via an autouse `jax.default_device` fixture. They
 are tiny, and sharing the GPU with a training or rendering job makes them fail on
-cuSolver/OOM errors that read exactly like assertion failures. (`test_feudal_seams.py`
-is **not** pinned and does show this — if it fails en masse, check for a concurrent GPU
-job before believing the failures.) A module-level `JAX_PLATFORMS=cpu` does not work
-here: it only takes effect if that module is imported before JAX initializes, i.e. it
-depends on pytest collection order.
+cuSolver/OOM errors that read exactly like assertion failures. **`test_feudal_seams.py`
+now has the same fixture** (2026-09-14) — it previously did not, which is what produced
+the phantom `local`-latent reproducibility failure recorded in the Feudal section. A
+module-level `JAX_PLATFORMS=cpu` does not work here: it only takes effect if that module
+is imported before JAX initializes, i.e. it depends on pytest collection order.
 
 ### Verification
 

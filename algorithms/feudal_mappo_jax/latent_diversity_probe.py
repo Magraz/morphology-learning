@@ -10,6 +10,11 @@ from flax.serialization import msgpack_restore
 
 from algorithms.feudal_mappo_jax.goal_dependence_probe import _checkpoint_path, _runner
 from algorithms.feudal_mappo_jax.latent_locality_probe import collect_states
+from algorithms.feudal_mappo_jax.manager import (
+    GLOBAL_LATENTS,
+    LOCAL_LATENTS,
+    PRIVATE_LATENTS,
+)
 from algorithms.feudal_mappo_jax.mappo import build_manager
 from algorithms.feudal_mappo_jax.worker import FeudalWorker
 
@@ -51,8 +56,22 @@ for batch in a.batches.split(","):
         zero_goal=cfg.zero_goal, worker_fusion=cfg.worker_fusion)
     states, _ = collect_states(runner, manager, mp, worker, wp,
         jax.random.PRNGKey(0), a.n_envs, a.n_samples, 32, keep_env_states=False)
-    # states: (S, N*obs_dim) flattened joint obs
+    # states: (S, N*obs_dim) flattened joint obs.
+    #
+    # NOTE this un-flattening assumes `global_state == obs.reshape(-1)`, i.e. an
+    # env with NO `global_state` hook (every MJX env). On an env that has one
+    # (SMAX: a 72-dim world state at 3m, against 3*obs_dim of concatenated
+    # observations) the reshape is meaningless, so refuse rather than print
+    # confident numbers about the wrong array.
     S = np.asarray(states)
+    if S.shape[1] != N * obs_dim:
+        print(
+            f"{batch}/{model}: global_state is {S.shape[1]}-dim but "
+            f"N*obs_dim is {N * obs_dim} — this env has its own global_state "
+            "hook, which `collect_states` does not store observations alongside. "
+            "Skipping (the probe would reshape the world state into fake obs)."
+        )
+        continue
     obs = S.reshape(S.shape[0], N, obs_dim)
     P = mp["params"]
     def dense(x, name): return x @ np.asarray(P[name]["kernel"]) + np.asarray(P[name]["bias"])
@@ -60,7 +79,21 @@ for batch in a.batches.split(","):
     print(f"    statistic: PR over the {N} agent rows (1.0 = identical, {N} = orthogonal) | mean|cos|")
     stages = []
     stages.append(("obs_i  (raw input)", obs))
-    if cfg.manager_latent == "local_private":
+
+    def with_global(core_in):
+        """Append `z = f_percept(global_state)` for the `global` axis.
+
+        The core reads `concat(s_flat, z)` under GLOBAL_LATENTS, so omitting it
+        does not merely drop a stage — it makes `y`, and therefore every goal
+        number below, a forward pass the checkpoint never computed. (This was
+        missing for `local_global` before `local_global_private` was added.)
+        """
+        if cfg.manager_latent not in GLOBAL_LATENTS:
+            return core_in
+        zg = np.tanh(dense(np.tanh(dense(S, "f_percept_0")), "f_percept_1"))
+        return np.concatenate([core_in, zg], axis=-1)
+
+    if cfg.manager_latent in PRIVATE_LATENTS:
         # Shared encoder, PER-AGENT projections on both `s` and `g`. The point of
         # the variant is that the two einsums below are where row diversity is
         # MANUFACTURED rather than merely transmitted, so `s`/`g` should read near
@@ -70,16 +103,16 @@ for batch in a.batches.split(","):
         Ws = np.asarray(P["f_Mspace_agent_kernel"]); bs = np.asarray(P["f_Mspace_agent_bias"])
         s = np.einsum("...nh,nhg->...ng", h1, Ws) + bs
         stages.append(("s = W_i h_i", s))
-        core_in = s.reshape(s.shape[0], N*cfg.goal_dim)
+        core_in = with_global(s.reshape(s.shape[0], N*cfg.goal_dim))
         y = np.tanh(dense(core_in, "core"))
         Wg = np.asarray(P["goal_head_agent_kernel"]); bg = np.asarray(P["goal_head_agent_bias"])
         g = np.einsum("...h,nhg->...ng", y, Wg) + bg
         stages.append(("g = W^g_i y", g))
-    elif cfg.manager_latent in ("local","local_global"):
+    elif cfg.manager_latent in LOCAL_LATENTS:
         h0 = np.tanh(dense(obs, "f_enc_0")); stages.append(("f_enc_0 (tanh)", h0))
         h1 = np.tanh(dense(h0, "f_enc_1")); stages.append(("f_enc_1 (tanh)", h1))
         s  = dense(h1, "f_Mspace");         stages.append(("s = f_Mspace(h)", s))
-        core_in = s.reshape(s.shape[0], N*cfg.goal_dim)
+        core_in = with_global(s.reshape(s.shape[0], N*cfg.goal_dim))
         y = np.tanh(dense(core_in, "core"))
         yi = dense(y, "f_gpre").reshape(-1, N, cfg.goal_dim); stages.append(("y_i = f_gpre(y)", yi))
         tyi = np.tanh(yi);                  stages.append(("tanh(y_i)", tyi))
