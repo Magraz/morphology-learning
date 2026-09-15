@@ -153,7 +153,33 @@ class FiLM(nn.Module):
 
         gamma = _coef()(goal)
         beta = _coef()(goal)
-        return h * (1.0 + gamma) + beta
+        out = h * (1.0 + gamma) + beta
+
+        # Expose the modulation for `mappo._film_goal_metrics`. `sow` is a no-op
+        # unless "diagnostics" is passed as mutable at apply time, so every
+        # normal forward (rollout, update, eval, view) is untouched.
+        #
+        # SOWN rather than recomputed from the params, deliberately. Reading
+        # `film_0/Dense_0/kernel` out of the tree and redoing `goal @ kernel` at
+        # the metric site would duplicate the goal normalization, the
+        # `goal_embed_dim` Dense and this layer's own arithmetic — and a
+        # diagnostic that drifts from the forward pass it claims to describe is
+        # exactly how `worker_goal_column_ratio` ended up reporting NaN on 84
+        # runs without anyone noticing.
+        #
+        # ⚠ GUARDED ON `is_initializing()`, and that guard is load-bearing.
+        # `sow` fires under `init` too, so without it `init_worker`'s
+        # `worker.init(...)` returns {"params": ..., "diagnostics": ...} — and
+        # that dict IS the train state's `params` here, so the extra collection
+        # would reach `create_train_state`, the optimizer and every msgpack
+        # site, making the tree incompatible with all 84 existing FiLM
+        # checkpoints (`from_bytes` needs an exactly-shaped target tree).
+        if not self.is_initializing():
+            self.sow("diagnostics", "gain", gamma)
+            self.sow("diagnostics", "shift", beta)
+            self.sow("diagnostics", "pre", h)
+            self.sow("diagnostics", "post", out)
+        return out
 
 
 class FeudalWorker(nn.Module):

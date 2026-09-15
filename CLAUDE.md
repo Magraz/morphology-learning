@@ -1,4 +1,4 @@
-# When user gives instructions, push back if you think the user is wrong. Do not accept everything the user says as source truth. Use your best judgement but share your reasoning with the user and provide both options. Always go with what the user chooses after this. 
+# When user gives instructions, push back if you think the user is wrong. Do not accept everything the user says as source truth. Use your best judgement but share your reasoning with the user and provide both options. Always go with what the user chooses after this.
 
 Whenever building new code, try to reuse as much code as possible. If the new functionality overlaps heavily with other parts of the code, find a way to abstract and reuse the logic instead of duplicating the functionality.
 
@@ -2255,6 +2255,78 @@ normalization to unit std, and meet only in `ppo_update` as
   loss keeps improving. A decay toward 0 is the trigger to set `goal_embed_dim`
   or change the fusion. (0.9998 → 0.951 over 64 updates — far too short to read
   anything into.)
+  - ⚠ **It is CONCAT-ONLY, and for a year it silently logged NaN on every FiLM
+    run.** It slices the goal block as `kernel[obs_dim:]`; under FiLM the first
+    Dense has input width `obs_dim` exactly, so that is an empty `(0, hidden)`
+    array and `jnp.mean` of nothing is NaN. Measured: NaN at **every** logged
+    point in **84 of 84** feudal trials across `mjx_12a_3o_trunc_1024` and
+    `mjx_12a_3o_partition_1024` — i.e. the whole default arm family trained for
+    1e8 steps with no logged signal whatsoever about whether the manager→worker
+    channel was connected. `ppo_update` now routes on `config.worker_fusion`
+    (concat → this ratio; film → `_film_goal_metrics` below) and the concat
+    function **raises** on a FiLM kernel rather than returning NaN, because
+    reaching it means the routing is wrong.
+- **FiLM goal-influence metrics** (`mappo._film_goal_metrics`, `worker_fusion:
+  film` only): `worker_film_gain_rms`, `worker_film_shift_ratio`,
+  `worker_tanh_saturation`, `worker_goal_action_delta`. Forward-only on arrays
+  `ppo_update` already holds — one apply with the `diagnostics` collection
+  mutable plus one on a re-paired goal — and ungated like every other manager
+  diagnostic.
+  - **What they are.** The modulation is `h ← (1+γ(w))·h + β(w)` before each
+    Tanh. `gain_rms` = RMS(γ) over batch × units × both layers: the fractional
+    swing of each unit's gain around 1, **dimensionless so it needs no
+    denominator** — precisely what made the concat ratio misreadable twice.
+    `shift_ratio` = mean over layers of RMS(β_i)/RMS(pre_i); β is *additive* so
+    it does need the scale it is added to, and **per-layer rather than pooled**
+    because the two layers' preactivations differ ~4.5x in scale and a pooled
+    ratio is dominated by the larger. `tanh_saturation` = fraction of modulated
+    preactivations with |tanh| > 0.95. `goal_action_delta` =
+    RMS(μ(obs,w) − μ(obs,w′))/RMS(μ(obs,w)) with w′ a **half-batch roll** (a
+    goal from an unrelated (timestep, env, agent)) — deliberately NOT the
+    agent-axis roll of `eval_gap_permuted`, which degenerates to a no-op once
+    the manager has collapsed to one team direction, so this series stays
+    meaningful exactly where the permutation nulls stop being.
+  - **`gain_rms`/`shift_ratio`/`action_delta` are exactly 0.0 at init** (FiLM's
+    zero-init) and exactly 0.0 on a `zero_goal` arm forever (γ/β Dense are
+    bias-free, so `γ(0)=β(0)=0`). That is a **built-in positive control**:
+    verified 0.000 on all three `feudal_film_zerogoal` seeds. `saturation` is
+    correctly nonzero there — it is a property of the trunk, not of the goal.
+  - **Reference values**, trained `mjx_12a_3o_trunc_1024`, 3 seeds each:
+
+    | arm | gain_rms | shift_ratio | saturation | action_delta |
+    |---|---|---|---|---|
+    | `feudal_film` (α=0) | 0.72–0.76 | 0.164–0.166 | 0.50–0.52 | 0.91–1.09 |
+    | `feudal_film_n05` | 0.90–1.06 | 0.187–0.211 | 0.53–0.54 | 1.22–1.33 |
+    | `feudal_film_local` | 2.30–2.57 | 0.174–0.198 | 0.49–0.66 | 0.99–1.14 |
+    | `feudal_film_n01_local` | 3.89–5.22 | 0.249–0.306 | 0.75–0.85 | 0.63–1.28 |
+    | `feudal_film_zerogoal` | **0.000** | **0.000** | 0.56–0.61 | **0.000** |
+
+  - ⚠ **THEY REFUTE "the worker ignores the goal".** Every centralized arm has
+    `eval_gap_zeroed` ≈ 0 — which reads as a disconnected channel — while running
+    a gain that swings ±75% and moving its action by ~100% of the action's own
+    magnitude when handed a different goal. The channel is wide open; the
+    behaviour it induces is orthogonal to return. **The two readings call for
+    opposite fixes** (change the fusion / add goal-following pressure, vs change
+    the objective or the task), and with only the eval gaps logged the wrong one
+    is the natural inference — `feudal_film_n05` is the counterexample: forced
+    goal-dependence (`real − zeroed` = +35.4, `dir_count` 9.10) at a return of
+    **36.2** against 151.9 for α=0.
+  - They also give `feudal_film_n01_local`'s collapse a mechanism: at γ RMS ~4.6
+    the trunk runs **75–85% saturated** against 16–20% for the same weights with
+    the goal zeroed (layer-0 preactivation RMS 7.2–9.1 vs ~1.4). Zeroing that
+    goal does not delete a directive, it relocates the trunk to a never-trained
+    operating point — which is why return falls to ~1.5. A high saturation is
+    not itself the pathology (`zerogoal` sits at 0.56–0.61); the **gap** between
+    modulated and unmodulated is.
+  - ⚠ **Implementation note that is easy to re-break:** γ/β are exposed by
+    `self.sow("diagnostics", ...)` inside `FiLM.__call__`, **guarded on
+    `is_initializing()`**. `sow` fires under `init` too, and `init_worker`'s
+    return *is* the train state's `params`, so without the guard a
+    `"diagnostics"` collection reaches `create_train_state`, the optimizer and
+    every msgpack site — incompatible with all 84 existing FiLM checkpoints.
+    Sown rather than recomputed from the kernels so the diagnostic cannot drift
+    from the forward pass it describes, which is how the concat ratio managed to
+    report NaN for 84 runs unnoticed. Pinned by 6 seam tests.
 - Rollout-level series (`train_reward`, `intrinsic_reward`,
   `intrinsic_reward_abs`) are appended to the same per-update stats dict as the
   losses. Note `train_reward` is the **rollout** team reward; the `reward` series

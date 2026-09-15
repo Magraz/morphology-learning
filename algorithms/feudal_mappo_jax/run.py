@@ -669,7 +669,7 @@ class Feudal_MAPPO_JAX_Runner:
     # ------------------------------------------------------------------ view / eval
 
     def view(self):
-        """Render deterministic episodes with the trained policy (vanilla view)."""
+        """Render trained-policy episodes and plot manager goals versus outcomes."""
         # Envs that bring their own renderer (SMAX) take a separate path: the MJX
         # renderers below are not generic — they read world_width, sector_sensor_radius,
         # objects_push_coupling_list, _build_xml(), state.data.qpos and hardcoded MJX
@@ -689,6 +689,7 @@ class Feudal_MAPPO_JAX_Runner:
         from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal
+        from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
@@ -751,7 +752,9 @@ class Feudal_MAPPO_JAX_Runner:
             reimplementation would drift silently: a wrong slot index or a stale
             pool renders perfectly happily, just as a different policy.
             """
-            m_carry, goal, _ = manager_fn(m_carry, obs)
+            m_carry, goal, latent = manager_fn(m_carry, obs)
+            episode_goals.append(np.asarray(goal))
+            episode_latents.append(np.asarray(latent))
             goal_hist = goal_ring_write(goal_hist, goal, t)
             return m_carry, goal_hist, goal_ring_pool(goal_hist)
 
@@ -780,6 +783,7 @@ class Feudal_MAPPO_JAX_Runner:
             if is_macro:
                 state = self.env.base_state(state)
             rewards, frames, native_frames = [], [], []
+            episode_goals, episode_latents = [], []
             m_carry, goal_hist = _fresh_goal_state()
 
             if is_macro:
@@ -817,6 +821,14 @@ class Feudal_MAPPO_JAX_Runner:
                     rewards.append(float(info["task_reward"]))
                     if bool(terminated) or bool(truncated):
                         break
+            # Include s_T from the final observation, without resetting the env
+            # or advancing the policy. Macro horizons count policy decisions.
+            _, _, final_latent = manager_fn(m_carry, obs)
+            episode_latents.append(np.asarray(final_latent))
+            save_goal_plot(
+                episode_goals, episode_latents, horizon,
+                self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+            )
             rewards = np.asarray(rewards)
 
             # Episode *return* (sum), not the final step's reward — the delivery
@@ -872,6 +884,7 @@ class Feudal_MAPPO_JAX_Runner:
         from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal
+        from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
 
         train_state = self._load_train_state()
         n_agents = self.env.n_agents
@@ -911,12 +924,15 @@ class Feudal_MAPPO_JAX_Runner:
             goal_hist = jnp.zeros((horizon, n_agents, goal_dim))
 
             state_seq, rewards = [], []
+            episode_goals, episode_latents = [], []
             for t in range(self.env.max_steps):
                 # The manager reads the env's real global state here, exactly as the
                 # trainer does — not a reshape of the observations.
-                m_carry, goal, _ = manager_fn(
+                m_carry, goal, latent = manager_fn(
                     m_carry, gs_fn(state), obs.reshape(n_agents, obs_dim)
                 )
+                episode_goals.append(np.asarray(goal))
+                episode_latents.append(np.asarray(latent))
                 goal_hist = goal_ring_write(goal_hist, goal, t)
                 actions = policy_fn(obs, goal_ring_pool(goal_hist), avail_fn(state))
                 state_seq.append(
@@ -926,6 +942,15 @@ class Feudal_MAPPO_JAX_Runner:
                 rewards.append(float(info["task_reward"]))
                 if bool(terminated) or bool(truncated):
                     break
+
+            _, _, final_latent = manager_fn(
+                m_carry, gs_fn(state), obs.reshape(n_agents, obs_dim)
+            )
+            episode_latents.append(np.asarray(final_latent))
+            save_goal_plot(
+                episode_goals, episode_latents, horizon,
+                self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+            )
 
             gif_path = self.dirs["logs"] / f"episode_{episode}.gif"
             self.env.render_episode(state_seq, gif_path)

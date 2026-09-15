@@ -41,6 +41,11 @@ METRICS = (
     "adv_ext_std_raw", "adv_int_std_raw", "explained_variance",
     "intrinsic_explained_variance", "manager_explained_variance",
     "state_latent_erank", "goal_direction_count", "valid_fraction",
+    # FiLM goal-influence (worker_fusion=film only; `worker_goal_column_ratio`
+    # is concat-only and reads NaN on these arms). gain_rms and action_delta
+    # are what refute "the worker ignores the goal" on the centralized arms.
+    "worker_film_gain_rms", "worker_film_shift_ratio",
+    "worker_tanh_saturation", "worker_goal_action_delta",
 )
 
 

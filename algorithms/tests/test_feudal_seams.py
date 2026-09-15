@@ -1139,6 +1139,153 @@ def test_constant_variant_equals_real_when_the_manager_has_collapsed():
 
 
 # ---------------------------------------------------------------------------
+# FiLM goal-influence metrics (mappo._film_goal_metrics)
+# ---------------------------------------------------------------------------
+
+_FILM_KEYS = (
+    "worker_film_gain_rms",
+    "worker_film_shift_ratio",
+    "worker_tanh_saturation",
+    "worker_goal_action_delta",
+)
+
+
+def _film_update(**overrides):
+    """Run one real `ppo_update` on a FiLM worker and return its metrics."""
+    config = _config(worker_fusion="film", **overrides)
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(config, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    rs, traj, last_value, _ = collect_fn(rs)
+    _, losses = update_fn(rs, traj, last_value, jnp.float32(0.0))
+    return losses
+
+
+def test_film_metrics_replace_the_concat_ratio_and_are_not_nan():
+    """The gap this closes: `worker_goal_column_ratio` was NaN on every FiLM run.
+
+    `_goal_column_ratio` slices `kernel[obs_dim:]` for the goal block, which
+    under FiLM is an empty (0, hidden) array — `jnp.mean` of nothing is NaN, and
+    it was logged as such at every point of 84 of 84 feudal trials across both
+    12a batches. So the default arm family trained for 1e8 steps with no logged
+    signal at all about whether the manager->worker channel was connected.
+    """
+    losses = _film_update()
+    assert "worker_goal_column_ratio" not in losses, (
+        "the concat-only ratio must not be emitted for a FiLM worker — that is "
+        "the NaN series this replaces"
+    )
+    for k in _FILM_KEYS:
+        assert k in losses, f"{k} missing"
+        assert jnp.isfinite(losses[k]), f"{k} is not finite: {losses[k]}"
+
+
+def test_concat_still_gets_the_column_ratio_and_not_the_film_metrics():
+    """Routing by fusion, both directions. A concat worker has no FiLM layers at
+    all, so emitting the FiLM keys there would require inventing them."""
+    config = _config(worker_fusion="concat")
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(config, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    rs, traj, last_value, _ = collect_fn(rs)
+    _, losses = update_fn(rs, traj, last_value, jnp.float32(0.0))
+
+    assert "worker_goal_column_ratio" in losses
+    assert jnp.isfinite(losses["worker_goal_column_ratio"])
+    for k in _FILM_KEYS:
+        assert k not in losses, f"{k} emitted for a concat worker"
+
+
+def test_goal_column_ratio_raises_on_a_film_kernel_instead_of_returning_nan():
+    """Reaching the concat metric with FiLM params is a routing bug, and a
+    routing bug must be loud. Returning NaN is what let this go unnoticed across
+    ~84 runs, so the failure mode is pinned rather than merely fixed."""
+    from algorithms.feudal_mappo_jax.mappo import _goal_column_ratio
+
+    film_params = {"params": {"MAPPOActor_0": {"Dense_0": {"kernel": jnp.zeros((OBS_DIM, 8))}}}}
+    with pytest.raises(ValueError, match="concat-only"):
+        _goal_column_ratio(film_params, OBS_DIM)
+
+
+def test_film_metrics_are_exactly_zero_for_a_zero_goal_worker():
+    """POSITIVE CONTROL, and it is exact rather than approximate.
+
+    FiLM's gamma/beta Dense layers are bias-free, so `gamma(0) = beta(0) = 0`
+    for the life of the run, not just at init. On a `zero_goal` arm the worker
+    zeroes the goal inside the module, so all three goal-driven metrics must be
+    **bitwise 0.0**. Anything else means they are reading something other than
+    the live modulation. Verified on the trained arms too:
+    `mjx_12a_3o_trunc_1024/feudal_film_zerogoal` reads 0.000 on all three seeds.
+
+    `worker_tanh_saturation` is deliberately NOT in this control — it is a
+    property of the trunk, not of the goal, and is correctly nonzero (0.56-0.61
+    on those same trained arms).
+    """
+    losses = _film_update(zero_goal=True)
+    for k in ("worker_film_gain_rms", "worker_film_shift_ratio",
+              "worker_goal_action_delta"):
+        assert losses[k] == 0.0, f"{k} = {losses[k]}, must be exactly 0.0"
+    assert 0.0 <= losses["worker_tanh_saturation"] <= 1.0
+
+
+def test_film_metrics_are_zero_at_init_and_move_once_the_goal_is_connected():
+    """Zero-init makes the floor a KNOWN 0.0, unlike `worker_goal_column_ratio`
+    which starts near 1.0 at orthogonal init and whose movement is therefore
+    ambiguous between the numerator and the denominator (both documented
+    misreadings). Here any nonzero gain is influence that was earned."""
+    from algorithms.feudal_mappo_jax.mappo import _film_goal_metrics
+    from flax.training.train_state import TrainState
+    import optax
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    worker, params = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 32,
+        discrete=False, worker_fusion="film",
+    )
+    ts = TrainState.create(apply_fn=worker.apply, params=params, tx=optax.sgd(0.0))
+    obs = jax.random.normal(jax.random.PRNGKey(1), (64, OBS_DIM))
+    goal = jax.random.normal(jax.random.PRNGKey(2), (64, GOAL_DIM))
+
+    at_init = _film_goal_metrics(ts, obs, goal)
+    assert at_init["worker_film_gain_rms"] == 0.0
+    assert at_init["worker_film_shift_ratio"] == 0.0
+    assert at_init["worker_goal_action_delta"] == 0.0
+
+    # Give film_0 a nonzero gain kernel: the metrics must register it.
+    connected = jax.tree.map(lambda x: x, ts.params)
+    connected["params"]["film_0"]["Dense_0"]["kernel"] = jnp.ones((GOAL_DIM, 32)) * 0.1
+    moved = _film_goal_metrics(ts.replace(params=connected), obs, goal)
+    assert moved["worker_film_gain_rms"] > 0.0
+    assert moved["worker_goal_action_delta"] > 0.0
+
+
+def test_film_sow_does_not_change_the_param_tree_or_the_forward():
+    """The `is_initializing()` guard on the sow is load-bearing.
+
+    `sow` fires under `init` as well, and `init_worker`'s return IS the train
+    state's `params`. Without the guard the extra "diagnostics" collection would
+    reach `create_train_state`, the optimizer and every msgpack site, making the
+    tree incompatible with all 84 existing FiLM checkpoints.
+    """
+    from algorithms.feudal_mappo_jax.worker import init_worker
+
+    worker, params = init_worker(
+        jax.random.PRNGKey(0), OBS_DIM, GOAL_DIM, ACTION_DIM, 32,
+        discrete=False, worker_fusion="film",
+    )
+    assert list(params.keys()) == ["params"], (
+        f"init returned extra collections {list(params.keys())} — this changes "
+        f"the checkpoint tree"
+    )
+
+    obs = jax.random.normal(jax.random.PRNGKey(1), (5, OBS_DIM))
+    goal = jax.random.normal(jax.random.PRNGKey(2), (5, GOAL_DIM))
+    plain = worker.apply(params, obs, goal)
+    sown, _ = worker.apply(params, obs, goal, mutable=["diagnostics"])
+    assert jnp.array_equal(plain[0], sown[0]), "sow perturbed the forward pass"
+
+
+# ---------------------------------------------------------------------------
 # Stats alignment (the resume hazard for any newly-added metric series)
 # ---------------------------------------------------------------------------
 

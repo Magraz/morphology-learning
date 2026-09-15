@@ -587,9 +587,22 @@ def ppo_update(
     # Average losses across epochs and minibatches
     mean_losses = jax.tree.map(lambda x: x.mean(), epoch_losses)
     mean_losses["explained_variance"] = explained_variance
-    mean_losses["worker_goal_column_ratio"] = _goal_column_ratio(
-        train_state.actor_ts.params, obs_dim
-    )
+    # Goal-influence diagnostics, routed by fusion: the concat metric reads a
+    # goal block that FiLM's first Dense does not have, and used to return a
+    # silent NaN for it (84/84 feudal trials). Different keys per fusion is
+    # deliberate — one number cannot mean the same thing for an input column and
+    # for a multiplicative gain, and pretending otherwise is what produced the
+    # two documented misreadings of `worker_goal_column_ratio`.
+    if config.worker_fusion == "film":
+        mean_losses.update(
+            _film_goal_metrics(
+                train_state.actor_ts, trajectory.obs, trajectory.pooled_goal
+            )
+        )
+    else:
+        mean_losses["worker_goal_column_ratio"] = _goal_column_ratio(
+            train_state.actor_ts.params, obs_dim
+        )
     if not use_intrinsic:
         # The per-minibatch placeholder carries no information at alpha=0; drop
         # it so the stats keys stay exactly what they were.
@@ -635,10 +648,182 @@ def _goal_column_ratio(actor_params, obs_dim: int) -> jnp.ndarray:
        shape-determined init (0.109109 at hidden_dim=168), not this ratio.
     """
     kernel = actor_params["params"]["MAPPOActor_0"]["Dense_0"]["kernel"]
+    if kernel.shape[0] <= obs_dim:
+        # FiLM: the goal never enters this layer, so `kernel[obs_dim:]` is an
+        # empty (0, hidden) slice and the ratio below is `mean of nothing` = NaN.
+        # It used to return that NaN silently: measured, `worker_goal_column_ratio`
+        # is NaN at every one of ~3000 logged points in 84 of 84 feudal trials
+        # across both 12a batches, i.e. there was NO logged signal at all about
+        # whether the manager->worker channel was connected. Raise instead —
+        # `ppo_update` routes FiLM arms to `_film_goal_metrics`, so reaching here
+        # means the routing is wrong, and a NaN series is not a diagnostic.
+        raise ValueError(
+            f"_goal_column_ratio is concat-only: the worker's first Dense has "
+            f"input width {kernel.shape[0]} <= obs_dim {obs_dim}, so there is no "
+            f"goal block. Use `_film_goal_metrics` for worker_fusion='film'."
+        )
     obs_block, goal_block = kernel[:obs_dim], kernel[obs_dim:]
     obs_rms = jnp.sqrt(jnp.mean(obs_block**2))
     goal_rms = jnp.sqrt(jnp.mean(goal_block**2))
     return goal_rms / (obs_rms + 1e-8)
+
+
+_SATURATED = 0.95
+"""|tanh(z)| above which a hidden unit counts as saturated."""
+
+_FILM_METRIC_ROWS = 8192
+"""Rows subsampled for the FiLM diagnostics.
+
+The full flattened batch is n_steps*n_envs*n_agents (402k at the 12a config),
+and these metrics need two extra actor forwards over it. A strided subsample is
+plenty for four RMS-style statistics and keeps the cost negligible; STRIDED
+rather than the first N so the sample spans the whole rollout instead of only
+its first timesteps (the goal ring fills over the first `goal_horizon` steps, so
+a head slice would systematically over-weight the ramp).
+"""
+
+
+def _film_goal_metrics(actor_ts, obs, goal) -> dict:
+    """How hard does the manager's directive actually drive a FiLM worker?
+
+    The FiLM counterpart of :func:`_goal_column_ratio`, and the series that stops
+    a zero behavioural gap being misread as a disconnected channel. Measured on
+    the trained `mjx_12a_3o_trunc_1024` arms, `eval_gap_zeroed` ~ 0 on every
+    centralized arm — which reads as "the worker ignores the goal" — while
+    `worker_film_gain_rms` is 0.78-0.84 and swapping an agent's goal moves its
+    action by 87-114% of the action's own magnitude. The channel is wide open;
+    the behaviour it induces is simply orthogonal to return. Those two readings
+    call for opposite fixes (change the fusion vs. change the objective), so the
+    distinction is not cosmetic.
+
+    Metrics, and why each is shaped the way it is:
+
+    ``worker_film_gain_rms``
+        RMS of ``gamma`` over batch x units x both layers. The modulation is
+        ``h <- (1 + gamma)*h + beta``, so this is the RMS fractional swing of
+        each unit's gain around 1. **Dimensionless, so it needs no denominator**
+        — which is precisely what made `worker_goal_column_ratio` misreadable
+        twice (see its docstring: a ratio of weights is blind to input scale,
+        and a falling ratio can mean the denominator grew). **Exactly 0.0 at
+        init** by FiLM's zero-init, so the series starts at a known floor and
+        any rise is influence that was earned.
+
+    ``worker_film_shift_ratio``
+        Mean over layers of RMS(beta_i) / RMS(pre-modulation preactivation_i).
+        `beta` is ADDITIVE, so unlike gamma it does need the scale of what it is
+        added to — and per-layer rather than pooled, see the comment at the
+        computation. Also 0.0 at init.
+
+    ``worker_tanh_saturation``
+        Fraction of modulated preactivations with ``|tanh(z)| > 0.95``. FiLM
+        sits BEFORE the nonlinearity — the placement that moves units into and
+        out of saturation rather than rescaling an already-squashed value — so a
+        large gain can change the trunk's operating regime outright. On
+        `feudal_film_n01_local` the modulated trunk runs at 0.75-0.85 against
+        0.16-0.20 for the same weights with the goal zeroed (layer-0
+        preactivation RMS 7.2-9.1 vs ~1.4). That is the mechanism behind that
+        arm's collapse to ~1.5 return when the goal is removed: zeroing does not
+        merely delete a directive, it relocates the trunk to a never-trained
+        operating point. ⚠ A HIGH value is not on its own a pathology — the
+        goal-free `feudal_film_zerogoal` control sits at 0.56-0.61. What marks
+        the pathology is the gap between the modulated and unmodulated trunk.
+
+    ``worker_goal_action_delta``
+        RMS(mu(obs, w) - mu(obs, roll(w))) / RMS(mu(obs, w)): the END-TO-END
+        behavioural sensitivity. The three above are internal and could in
+        principle be absorbed downstream; this one asks whether the goal changes
+        what the agent does. The re-pairing is a HALF-BATCH roll, i.e. a goal
+        from an unrelated (timestep, env, agent) — NOT the agent-axis roll of
+        `eval_gap_permuted`, which degenerates to a no-op on a manager that has
+        collapsed to one team direction. That difference is the point: this
+        series stays meaningful on exactly the arms where the permutation nulls
+        stop being informative.
+
+    All four are FORWARD-ONLY on arrays `ppo_update` already holds: one apply
+    with the `diagnostics` collection mutable, plus one more on a rolled goal.
+    Ungated, like every other manager diagnostic — gating would make future runs
+    non-comparable with these.
+
+    REFERENCE VALUES, measured on the trained `mjx_12a_3o_trunc_1024` arms
+    (3 seeds each, on-policy rollout, this exact function)::
+
+        arm                     gain_rms   shift_ratio  saturation  act_delta
+        feudal_film   (a=0)    0.72-0.76    0.164-0.166  0.50-0.52  0.91-1.09
+        feudal_film_n05        0.90-1.06    0.187-0.211  0.53-0.54  1.22-1.33
+        feudal_film_local      2.30-2.57    0.174-0.198  0.49-0.66  0.99-1.14
+        feudal_film_n01_local  3.89-5.22    0.249-0.306  0.75-0.85  0.63-1.28
+        feudal_film_zerogoal   0.000        0.000        0.56-0.61  0.000
+
+    The last row is a POSITIVE CONTROL and it is exact, not approximate: on a
+    `zero_goal` arm the worker zeroes the goal inside the module and FiLM's
+    gamma/beta Dense layers are bias-free, so `gamma(0) = beta(0) = 0` and all
+    three goal-driven metrics must read **exactly 0.0**. Anything else means the
+    metrics are reading something other than the live modulation. (`saturation`
+    is correctly nonzero there — it is a property of the trunk, not of the goal.)
+
+    Read against those: every centralized arm has `eval_gap_zeroed` ~ 0 while
+    running a gain that swings +-75% and an action delta near 1.0. "The worker
+    ignores the goal" is not available as an explanation for those runs.
+
+    Args:
+        actor_ts: the worker's TrainState (`apply_fn` + `params`).
+        obs: ``(..., obs_dim)``, flattened agent-major by the caller.
+        goal: ``(..., goal_dim)`` pooled goals, paired row-for-row with `obs`.
+    """
+    obs = obs.reshape(-1, obs.shape[-1])
+    goal = goal.reshape(-1, goal.shape[-1])
+    stride = max(1, obs.shape[0] // _FILM_METRIC_ROWS)
+    obs, goal = obs[::stride], goal[::stride]
+
+    out, state = actor_ts.apply_fn(
+        actor_ts.params, obs, goal, mutable=["diagnostics"]
+    )
+    sown = state["diagnostics"]
+    # Each FiLM layer sows a 1-tuple per call.
+    def _layer(i, key):
+        return jnp.concatenate(sown[f"film_{i}"][key], axis=-1)
+
+    rms = lambda x: jnp.sqrt(jnp.mean(x**2))
+    n_films = 2
+
+    # gamma is dimensionless and `post` feeds a fraction, so both pool across
+    # layers cleanly. `shift_ratio` does NOT: the two layers' preactivations
+    # differ in scale (measured ~4.5x on the trained arms, layer 1 being the
+    # larger), so a ratio of RMS over the concatenated blocks is dominated by
+    # whichever layer is bigger — the same denominator trap documented twice for
+    # `_goal_column_ratio`. Average the per-layer ratios instead, so each layer
+    # is compared against its own scale and weighted equally.
+    gain = jnp.concatenate([_layer(i, "gain") for i in range(n_films)], axis=-1)
+    post = jnp.concatenate([_layer(i, "post") for i in range(n_films)], axis=-1)
+    shift_ratio = jnp.mean(
+        jnp.stack(
+            [
+                rms(_layer(i, "shift")) / (rms(_layer(i, "pre")) + 1e-8)
+                for i in range(n_films)
+            ]
+        )
+    )
+
+    # Continuous heads return (mean, log_std); discrete return logits alone.
+    mean_of = lambda y: y[0] if isinstance(y, tuple) else y
+    # HALF-BATCH roll on the strided rows: each observation is re-paired with a
+    # goal from an unrelated (timestep, env, agent). Deliberately NOT the
+    # agent-axis roll `eval_gap_permuted` uses — that one degenerates when the
+    # manager has collapsed to one team direction (swapping teammates' goals
+    # then changes nothing), which would make a low reading ambiguous between
+    # "the worker is insensitive" and "the goals were already identical". A
+    # half-batch shift is maximally decorrelated and is the same fixed,
+    # rng-free rearrangement every update, so the series is comparable over time.
+    other = jnp.roll(goal, goal.shape[0] // 2, axis=0)
+    rolled = mean_of(actor_ts.apply_fn(actor_ts.params, obs, other))
+    real = mean_of(out)
+
+    return {
+        "worker_film_gain_rms": rms(gain),
+        "worker_film_shift_ratio": shift_ratio,
+        "worker_tanh_saturation": jnp.mean(jnp.abs(jnp.tanh(post)) > _SATURATED),
+        "worker_goal_action_delta": rms(real - rolled) / (rms(real) + 1e-8),
+    }
 
 
 # ---------------------------------------------------------------------------
