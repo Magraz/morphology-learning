@@ -107,7 +107,9 @@ def make_train(config: MAPPOConfig, env):
     # every gap is exactly 0.0 and the diagnostic reports "the goals make no
     # difference" while having measured nothing.
     default_eval_variants = (
-        ("real", "permuted", "zeroed") if config.eval_goal_variants else ("real",)
+        ("real", "permuted", "constant", "zeroed")
+        if config.eval_goal_variants
+        else ("real",)
     )
     if config.eval_goal_variants:
         from algorithms.feudal_mappo_jax.manager import _check_permutable
@@ -585,6 +587,7 @@ def make_train(config: MAPPOConfig, env):
         rng: jax.Array,
         variants: tuple = None,
         detail: bool = False,
+        constant_goal: jax.Array = None,
     ):
         """Deterministic parallel-episode evaluation (PolicyEvaluator parity).
 
@@ -597,6 +600,12 @@ def make_train(config: MAPPOConfig, env):
             permuted      agent i gets agent i-shift's goal  -> tests the ASSIGNMENT
             env_permuted  agent i gets its slot's goal from another env
                           -> tests STATE-CONDITIONING (offline probe only)
+            constant      ONE fixed direction for every agent, env and step
+                          -> tests whether the goal carries CONTENT at all, as
+                          opposed to being a constant bias the worker has merely
+                          co-adapted to. Without it a large `zeroed` gap reads as
+                          a healthy, strongly-used goal channel in precisely the
+                          case where the manager is decorative.
             zeroed        no directive at all -> tests goal conditioning per se
 
         The gaps against `real` are the only direct measurement of whether the
@@ -620,9 +629,18 @@ def make_train(config: MAPPOConfig, env):
                 block (so existing callers are unchanged); ``True`` returns
                 ``(rewards, lengths)``, each ``(V, n_eval_episodes)``, for a
                 paired per-episode statistic.
+            constant_goal: ``(goal_dim,)`` direction for the ``constant``
+                variant, normally ``mean_goal_direction(traj.pooled_goal)`` off
+                the rollout that immediately preceded this eval. TRACED, not
+                static, so it costs no recompile as it drifts between evals.
+                Required only when ``"constant"`` is in `variants`; omitting it
+                there raises at trace time rather than silently substituting
+                something arbitrary.
         """
         variants = variants or default_eval_variants
-        transforms = _goal_transform_variants(config.goal_permute_shift, 0)
+        transforms = _goal_transform_variants(
+            config.goal_permute_shift, 0, constant_goal
+        )
         n_variants, n_eps = len(variants), config.n_eval_episodes
         total = n_variants * n_eps
 

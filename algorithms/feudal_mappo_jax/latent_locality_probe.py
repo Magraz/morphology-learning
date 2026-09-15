@@ -182,6 +182,40 @@ def block_response_wrt_positions(env, manager, params, env_states, delta=0.25):
 # ---------------------------------------------------------------------------
 
 
+def unsupported_env_reason(env):
+    """Why these probes cannot run on this env — or ``None`` if they can.
+
+    Both latent probes are **MJX-only**, in two independent ways that are easy
+    to miss because neither is declared anywhere:
+
+    * ``collect_states`` builds the manager's centralized input as
+      ``obs.reshape(b, -1)``, i.e. it ASSUMES ``global_state == concat(obs)``.
+      That holds only for an env with no ``global_state`` hook. On SMAX the real
+      global state is a 72-dim world state at ``3m`` against 195 dims of
+      concatenated observations, so a `local_global*` arm dies on a shape error
+      inside ``f_percept_0`` and a `centralized` one would be measured on an
+      input it was never trained on.
+    * the callers invert that same assumption to recover per-agent observations
+      (``gs.reshape(N, obs_dim)``), which is meaningless for the world state.
+    * ``collect_states`` also hardcodes ``discrete=False`` when sampling, so a
+      discrete-action env (SMAX) would be driven by a Gaussian head it does not
+      have, and it ignores action masking entirely.
+
+    Making these probes work on SMAX means storing `obs` alongside
+    ``env.global_state(state)`` rather than deriving one from the other, and
+    threading ``env.discrete``/``avail_actions`` through the rollout.
+    """
+    if hasattr(env, "global_state"):
+        return (
+            f"env has its own global_state hook ({int(env.global_state_dim)} dims "
+            f"vs {int(env.n_agents * env.observation_dim)} of concatenated obs); "
+            "collect_states assumes global_state == concat(obs)"
+        )
+    if getattr(env, "discrete", False):
+        return "env has a discrete action space; collect_states hardcodes discrete=False"
+    return None
+
+
 def collect_states(runner, manager, m_params, worker, w_params, key,
                    n_envs, n_samples, stride, keep_env_states=False):
     """Roll the trained hierarchy, snapshotting every `stride`-th step.
@@ -200,6 +234,9 @@ def collect_states(runner, manager, m_params, worker, w_params, key,
     from algorithms.feudal_mappo_jax.worker import bind_goal
 
     env = runner.env
+    reason = unsupported_env_reason(env)
+    if reason is not None:
+        raise NotImplementedError(f"latent probes do not support this env: {reason}")
     N, obs_dim, act_dim = env.n_agents, env.observation_dim, env.action_dim
     horizon, goal_dim = runner.config.goal_horizon, runner.config.goal_dim
     v_reset, v_step = jax.vmap(env.reset), jax.vmap(env.step)

@@ -19,7 +19,16 @@ destroys exactly one property, so the real-minus-null gap isolates that property
     real                 y                y             (the reference)
     permuted             n                y             value of the ASSIGNMENT
     env_permuted         y                n             value of STATE-CONDITIONING
-    zeroed               n                n             value of goal conditioning
+    constant             n                n             value of the goal's CONTENT
+    zeroed              (absent)                        value of goal conditioning
+
+``constant`` and ``zeroed`` both destroy pairing and conditioning, and the
+difference between them is the whole point: ``constant`` still hands the worker
+a goal-shaped vector of the usual magnitude, so it separates "the manager's
+output carries information" from "the worker has co-adapted to a bias whose
+removal is merely off-distribution". ``real ~ constant >> zeroed`` is the
+degenerate outcome that every other diagnostic here reports as a healthy,
+strongly-used goal channel.
 
 READ ``env_permuted`` FIRST. A manager that has degenerated into a fixed
 per-agent code (an agent-ID label with no dependence on `s_t`) scores a LARGE
@@ -58,6 +67,10 @@ assignment relative to a manager trained to emit permuted goals.
                                positive.
     R_perm < R_zero            a wrong goal is worse than none: actively
                                misleading directives.
+    R_real ~ R_const >> R_zero the manager is DECORATIVE: one frozen vector
+                               reproduces it. Note this presents as a large
+                               `gap_zeroed`, i.e. as the headline SUCCESS
+                               condition, unless `constant` is read too.
 
 A collapsed-goal manager ALSO gives gap ~ 0, because the permutation is then
 nearly the identity. That is correct but ambiguous alone, so ``goal_perm_cos``
@@ -86,6 +99,11 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The variant names are shared with `trainer.eval_fn` and the metric-key
+# suffixes; importing rather than re-listing them is what stops the three
+# drifting (adding `constant` touched all three at once).
+from algorithms.feudal_mappo_jax.manager import GOAL_VARIANTS  # noqa: E402
 
 
 def _compose(batch: str, model: str, trial: str):
@@ -147,24 +165,59 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
       and the tree carries ``f_percept_0``/``goal_head``.
     * ``"local"``: ``f_Mspace`` is ``(manager_hidden, goal_dim)`` — one SHARED
       per-agent projection — and the tree carries ``f_enc_0``/``f_gpre``/
-      ``f_goalhead`` instead. Dividing by ``n_agents`` here would silently
-      produce ``goal_dim // n_agents`` and the reload would fail (or, worse for a
-      width that happens to divide, load a different network than trained).
+      ``f_goalhead`` instead, with NO ``f_percept_*``. Dividing by ``n_agents``
+      here would silently produce ``goal_dim // n_agents`` and the reload would
+      fail (or, worse for a width that happens to divide, load a different
+      network than trained).
+    * ``"local_global"``: as ``"local"``, but ``f_percept_*`` is present TOO (it
+      feeds the goal path only). So those two are separated by the PAIR
+      ``(f_enc_0, f_percept_0)``, not by either one alone.
+    * ``"local_private"``: ``f_enc_0`` as well, but there is NO ``f_Mspace`` at
+      all — the projection is the stacked per-agent ``f_Mspace_agent_kernel`` of
+      shape ``(n_agents, manager_hidden, goal_dim)``, and the goal path is
+      ``goal_head_agent_kernel`` rather than ``f_gpre``/``f_goalhead``. Checked
+      FIRST, because it shares ``f_enc_0`` with the other two and reading
+      ``f_Mspace`` would raise rather than mis-infer.
+    * ``"local_global_private"``: as ``"local_private"``, but ``f_percept_*`` is
+      present TOO. So the ``f_Mspace_agent_kernel`` branch must ALSO split on
+      ``f_percept_0`` — the ``private`` and ``global`` axes are independent, and
+      returning ``"local_private"`` for a tree that carries ``f_percept_*`` would
+      build a manager whose target tree is missing those leaves, i.e. a
+      ``from_bytes`` failure rather than a silent mis-load. Loud, but still
+      wrong, and it fails at the arm you were trying to measure.
     """
     from flax.serialization import msgpack_restore
 
     tree = msgpack_restore(path.read_bytes())
     mgr = tree["manager"]["params"]
     actor = tree["actor"]["params"]["MAPPOActor_0"]
+    hidden_dim = int(actor["Dense_0"]["kernel"].shape[1])
+
+    percept = "f_percept_0" in mgr
+    if "f_Mspace_agent_kernel" in mgr:
+        # (n_agents, manager_hidden, goal_dim)
+        w = mgr["f_Mspace_agent_kernel"]
+        return {
+            "goal_dim": int(w.shape[2]),
+            "manager_hidden_dim": int(w.shape[1]),
+            "hidden_dim": hidden_dim,
+            "manager_latent": (
+                "local_global_private" if percept else "local_private"
+            ),
+        }
+
     local = "f_enc_0" in mgr
+    latent = (
+        ("local_global" if percept else "local") if local else "centralized"
+    )
     return {
         "goal_dim": int(mgr["f_Mspace"]["kernel"].shape[1])
         // (1 if local else int(n_agents)),
         "manager_hidden_dim": int(
             mgr["f_enc_0" if local else "f_percept_0"]["kernel"].shape[1]
         ),
-        "hidden_dim": int(actor["Dense_0"]["kernel"].shape[1]),
-        "manager_latent": "local" if local else "centralized",
+        "hidden_dim": hidden_dim,
+        "manager_latent": latent,
     }
 
 
@@ -234,12 +287,12 @@ def _print_arm(batch, model, shift, entries):
         return vals.mean(), sem
 
     print("    returns   ", end="")
-    for v in ("real", "permuted", "env_permuted", "zeroed"):
+    for v in GOAL_VARIANTS:
         m, s = agg(f"return_mean_{v}")
         print(f"{v}={m:7.1f}+-{s:5.1f}  ", end="")
     print()
     print("    ep_len    ", end="")
-    for v in ("real", "permuted", "env_permuted", "zeroed"):
+    for v in GOAL_VARIANTS:
         m, _ = agg(f"length_{v}")
         print(f"{v}={m:6.1f}  ", end="")
     print()
@@ -249,7 +302,11 @@ def _print_arm(batch, model, shift, entries):
         print(
             f"    trial {e['trial']}: "
             f"perm {_fmt_gap(e, 'permuted')}   "
-            f"env {_fmt_gap(e, 'env_permuted')}   "
+            f"env {_fmt_gap(e, 'env_permuted')}"
+        )
+        print(
+            f"    {'':>7}  "
+            f"const {_fmt_gap(e, 'constant')}   "
             f"zero {_fmt_gap(e, 'zeroed')}"
         )
 
@@ -260,6 +317,7 @@ def _print_arm(batch, model, shift, entries):
         ("goal_perm_cos", "goal_perm_cos"),
         ("goal_direction_count_raw", "dir_count_raw"),
         ("goal_direction_count_pooled", "dir_count_pooled"),
+        ("goal_concentration", "goal_concentration (1=frozen)"),
     ]:
         m, s = agg(key)
         print(f"    {label:32s} {m:+8.4f} +- {s:.4f}")
@@ -339,7 +397,7 @@ def main():
                     bad = [
                         (e["trial"], v, e[f"gap_{v}"])
                         for e in per_shift[s]
-                        for v in ("permuted", "env_permuted", "zeroed")
+                        for v in GOAL_VARIANTS[1:]
                         if e[f"gap_{v}"] != 0.0
                     ]
                     if bad:

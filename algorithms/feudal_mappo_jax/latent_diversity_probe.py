@@ -9,7 +9,10 @@ import argparse, numpy as np, jax, jax.numpy as jnp
 from flax.serialization import msgpack_restore
 
 from algorithms.feudal_mappo_jax.goal_dependence_probe import _checkpoint_path, _runner
-from algorithms.feudal_mappo_jax.latent_locality_probe import collect_states
+from algorithms.feudal_mappo_jax.latent_locality_probe import (
+    collect_states,
+    unsupported_env_reason,
+)
 from algorithms.feudal_mappo_jax.manager import (
     GLOBAL_LATENTS,
     LOCAL_LATENTS,
@@ -45,6 +48,11 @@ for batch in a.batches.split(","):
     if path is None: print(f"{batch}/{model}: no ckpt"); continue
     runner = _runner(batch, model, a.trial, quiet=True)
     env = runner.env; N, obs_dim = env.n_agents, env.observation_dim
+    reason = unsupported_env_reason(env)
+    if reason is not None:
+        # MJX-only, in ways that are silent rather than obvious — see the helper.
+        print(f"{batch}/{model}: SKIPPED — {reason}")
+        continue
     cfg = runner.config
     tree = msgpack_restore(path.read_bytes())
     mp = jax.tree.map(jnp.asarray, {"params": tree["manager"]["params"]})
@@ -56,22 +64,10 @@ for batch in a.batches.split(","):
         zero_goal=cfg.zero_goal, worker_fusion=cfg.worker_fusion)
     states, _ = collect_states(runner, manager, mp, worker, wp,
         jax.random.PRNGKey(0), a.n_envs, a.n_samples, 32, keep_env_states=False)
-    # states: (S, N*obs_dim) flattened joint obs.
-    #
-    # NOTE this un-flattening assumes `global_state == obs.reshape(-1)`, i.e. an
-    # env with NO `global_state` hook (every MJX env). On an env that has one
-    # (SMAX: a 72-dim world state at 3m, against 3*obs_dim of concatenated
-    # observations) the reshape is meaningless, so refuse rather than print
-    # confident numbers about the wrong array.
+    # states: (S, N*obs_dim) flattened joint obs. The un-flattening below assumes
+    # `global_state == obs.reshape(-1)`; `unsupported_env_reason` (checked before
+    # the rollout, above) is what guarantees that.
     S = np.asarray(states)
-    if S.shape[1] != N * obs_dim:
-        print(
-            f"{batch}/{model}: global_state is {S.shape[1]}-dim but "
-            f"N*obs_dim is {N * obs_dim} — this env has its own global_state "
-            "hook, which `collect_states` does not store observations alongside. "
-            "Skipping (the probe would reshape the world state into fake obs)."
-        )
-        continue
     obs = S.reshape(S.shape[0], N, obs_dim)
     P = mp["params"]
     def dense(x, name): return x @ np.asarray(P[name]["kernel"]) + np.asarray(P[name]["bias"])

@@ -24,6 +24,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax.serialization import from_bytes, to_bytes
 
+from algorithms.feudal_mappo_jax.manager import (
+    goal_concentration,
+    mean_goal_direction,
+)
 from algorithms.feudal_mappo_jax.mappo import create_train_state
 from algorithms.feudal_mappo_jax.trainer import (
     RunnerState,
@@ -355,11 +359,14 @@ class Feudal_MAPPO_JAX_Runner:
         )
 
         # Goal-ablation variants ride the SAME scan as the real eval (one call,
-        # V*n_eval_episodes vmapped width), so they cost ~+2% of wall rather
-        # than the ~+18.7% three sequential evals would. `eval_fn` returns the
-        # real block's mean unchanged, so the `reward` series is untouched.
+        # V*n_eval_episodes vmapped width), so they cost far less than running
+        # them as separate sequential scans. NOT free, though: measured on
+        # `mjx_16a_4o_512/feudal`, 3 variants cost 1.91x one eval (~+8.5% wall
+        # on a production run), so the 4th block here is worth budgeting for.
+        # `eval_fn` returns the real block's mean unchanged, so the `reward`
+        # series is untouched.
         eval_variants = (
-            ("real", "permuted", "zeroed")
+            ("real", "permuted", "constant", "zeroed")
             if self.config.eval_goal_variants
             else ("real",)
         )
@@ -379,11 +386,14 @@ class Feudal_MAPPO_JAX_Runner:
             )
             for key in (
                 "eval_reward_permuted",
+                "eval_reward_constant",
                 "eval_reward_zeroed",
                 "eval_gap_permuted",
+                "eval_gap_constant",
                 "eval_gap_zeroed",
                 "eval_len_real",
                 "eval_len_permuted",
+                "eval_len_constant",
                 "eval_len_zeroed",
             )
         }
@@ -415,18 +425,26 @@ class Feudal_MAPPO_JAX_Runner:
                 # reset keys, so the gaps below are paired per episode and carry
                 # no reset variance.
                 eval_rng, eval_key = jax.random.split(eval_rng)
+                # The `constant` block needs one vector to stand in for the whole
+                # manager. Taken from the rollout that JUST ran, so it is an
+                # in-distribution direction for the current policy and costs no
+                # extra forward pass. It drifts slowly between evals (it is a
+                # mean over n_steps*n_envs*n_agents goals), which is why the
+                # offline probe re-derives it rather than reading this series
+                # when an exactly reproducible number is wanted.
                 ev_rewards, ev_lengths = eval_fn(
                     runner_state.train_state,
                     eval_key,
                     variants=eval_variants,
                     detail=True,
+                    constant_goal=mean_goal_direction(trajectory.pooled_goal),
                 )
                 ev_rewards = np.asarray(ev_rewards)
                 ev_lengths = np.asarray(ev_lengths)
                 by_variant = dict(zip(eval_variants, ev_rewards))
                 eval_reward = float(by_variant["real"].mean())
                 ablation_series["eval_len_real"] = float(ev_lengths[0].mean())
-                for variant in ("permuted", "zeroed"):
+                for variant in ("permuted", "constant", "zeroed"):
                     if variant not in by_variant:
                         continue
                     idx = eval_variants.index(variant)
@@ -928,7 +946,17 @@ class Feudal_MAPPO_JAX_Runner:
         """Deterministic evaluation of the saved policy (PolicyEvaluator parity)."""
         train_state = self._load_train_state()
         _, _, _, eval_fn, _ = make_train(self.config, self.env)
-        reward = float(eval_fn(train_state, jax.random.PRNGKey(self.rng_seed + 1)))
+        # `("real",)` explicitly, not the config default: this path wants the
+        # scalar return and nothing else, and the default now includes the
+        # `constant` block, which needs a direction this call has no rollout to
+        # derive. Also 4x cheaper.
+        reward = float(
+            eval_fn(
+                train_state,
+                jax.random.PRNGKey(self.rng_seed + 1),
+                variants=("real",),
+            )
+        )
         print(f"Mean eval episode return: {reward:.2f}")
         return reward
 
@@ -1005,10 +1033,25 @@ class Feudal_MAPPO_JAX_Runner:
                 make_train(cfg, self.env) if make_train_out is None else make_train_out
             )
 
-            # --- behavioural: one scan, all four variants, shared reset keys ---
+            # --- one rollout, reused by BOTH measurements below ---
+            # It has to come first: the `constant` variant needs a direction to
+            # stand in for the manager, and `mean_goal_direction` over this
+            # rollout's pooled goals is it. Deriving it here rather than reading
+            # the live `eval_*_constant` series is what makes the offline number
+            # exactly reproducible from the checkpoint alone.
+            runner_state = init_fn(jax.random.PRNGKey(self.rng_seed))
+            runner_state = runner_state._replace(train_state=train_state)
+            _, trajectory, _, _ = collect_fn(runner_state)
+            constant_goal = mean_goal_direction(trajectory.pooled_goal)
+
+            # --- behavioural: one scan, every variant, shared reset keys ---
             key = jax.random.PRNGKey(self.rng_seed + 1)
             rewards, lengths = eval_fn(
-                train_state, key, variants=GOAL_VARIANTS, detail=True
+                train_state,
+                key,
+                variants=GOAL_VARIANTS,
+                detail=True,
+                constant_goal=constant_goal,
             )
             rewards, lengths = np.asarray(rewards), np.asarray(lengths)
             per_variant = dict(zip(GOAL_VARIANTS, rewards))
@@ -1028,10 +1071,7 @@ class Feudal_MAPPO_JAX_Runner:
                 entry[f"gap_{v}"] = diff.mean().item()
                 entry[f"gap_{v}_ci"] = _paired_bootstrap_ci(diff)
 
-            # --- latent: d_cos against the same nulls, off one rollout ---
-            runner_state = init_fn(jax.random.PRNGKey(self.rng_seed))
-            runner_state = runner_state._replace(train_state=train_state)
-            _, trajectory, _, _ = collect_fn(runner_state)
+            # --- latent: d_cos against the same nulls, off that rollout ---
             done_a = jnp.broadcast_to(
                 trajectory.done.astype(jnp.float32)[..., None],
                 trajectory.goal.shape[:-1],
@@ -1053,6 +1093,15 @@ class Feudal_MAPPO_JAX_Runner:
             entry["goal_direction_count_raw"] = _direction_count(trajectory.goal)
             entry["goal_direction_count_pooled"] = _direction_count(
                 trajectory.pooled_goal
+            )
+            # How close the manager already is to the `constant` variant: the
+            # norm of the (row-normalized) mean pooled goal, 1.0 = one frozen
+            # direction. Read it NEXT TO `gap_constant` — a small gap at a low
+            # concentration would be the interesting case (varied goals that
+            # nonetheless do not matter), while a small gap at ~1.0 just says the
+            # manager had already collapsed to the constant it is compared with.
+            entry["goal_concentration"] = float(
+                goal_concentration(trajectory.pooled_goal)
             )
             results["by_shift"][int(shift)] = entry
 

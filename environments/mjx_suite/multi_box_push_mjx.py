@@ -190,7 +190,7 @@ class MultiBoxPushMJX:
 
         self.velocity_norm = self.world_width / 10.0
         self.neighbor_detection_range = 3.0
-        self.sector_sensor_radius = self.world_width / 3.0
+        self.sector_sensor_radius = self.world_width / 2.0
         self.lidar_range = self.sector_sensor_radius
         self.comm_radius = self.world_width / 3.0
         self.force_multiplier = _FORCE_MULTIPLIER

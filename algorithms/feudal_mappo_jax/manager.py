@@ -916,27 +916,122 @@ def zero_goals(goal: jnp.ndarray) -> jnp.ndarray:
     return jnp.zeros_like(goal)
 
 
-def _goal_transform_variants(shift: int, env_axis: int):
+def mean_goal_direction(goals: jnp.ndarray) -> jnp.ndarray:
+    """The single unit direction that best summarizes a batch of goals.
+
+    Rows are normalized BEFORE averaging, so a row's weight is its direction and
+    not its length. That matters for the pooled ``w_t``: ``||w_t||`` ramps
+    ``1 -> c`` over the first ``goal_horizon`` steps of every episode (the ring
+    fills up), so a raw mean would under-weight exactly the early-episode goals.
+
+    ``||mean_goal_direction(g)||`` is 1 by construction, but the norm of the
+    UNnormalized mean is the quantity worth reading alongside it: 1.0 means the
+    manager emits one frozen direction and 0.0 means the goals cover the sphere.
+    Measured on the trained ``mjx_12a_3o_trunc_1024/feudal_film_n01_local`` arm
+    it is 0.96/0.58/0.86 across the three seeds — which is what the ``constant``
+    variant below exists to price.
+    """
+    return _unit(_mean_unit_goal(goals))
+
+
+def goal_concentration(goals: jnp.ndarray) -> jnp.ndarray:
+    """How close the manager already is to emitting ONE frozen direction.
+
+    ``||mean of the row-normalized goals||``, in [0, 1]: 1.0 is a single frozen
+    direction and 0.0 is goals spread evenly over the sphere. It is the
+    un-normalized half of :func:`mean_goal_direction`, kept as one code path so
+    the concentration cannot drift from the direction the ``constant`` variant
+    actually substitutes.
+
+    Read it NEXT TO ``gap_constant``. A small gap at a LOW concentration is the
+    informative case — genuinely varied goals that nonetheless do not matter. A
+    small gap at ~1.0 says only that the manager had already collapsed onto the
+    constant it is being compared with, which is a weaker (though still damning)
+    statement.
+    """
+    return jnp.linalg.norm(_mean_unit_goal(goals))
+
+
+def _mean_unit_goal(goals: jnp.ndarray) -> jnp.ndarray:
+    """Mean of the row-normalized goals over every leading axis, ``(goal_dim,)``."""
+    flat = goals.reshape(-1, goals.shape[-1])
+    return jnp.mean(_unit(flat), axis=0)
+
+
+def constant_goals(goal: jnp.ndarray, direction: jnp.ndarray) -> jnp.ndarray:
+    """Replace every goal with ONE fixed direction — the same for every agent,
+    env and timestep.
+
+    The variant the other three cannot express. ``permuted`` and
+    ``env_permuted`` are rearrangements, so they preserve the goal marginal and
+    isolate one property each; ``zeroed`` removes the directive entirely. None of
+    them separates the two readings of a large ``gap_zeroed``:
+
+      (a) the goal carries information the worker uses, or
+      (b) the goal is a near-CONSTANT vector whose mere PRESENCE the worker has
+          co-adapted to, so removing it is a large off-distribution perturbation
+          that carries no information at all.
+
+    Under (b) the manager is decorative while every collapse metric and the
+    zeroed gap both read as a healthy, strongly-used goal channel. Replacing the
+    manager with a frozen vector prices exactly that: ``constant ~ real`` means
+    the manager's entire time- and agent-varying output is worth nothing, and
+    ``real > constant`` is the first evidence in this suite that the goal's
+    CONTENT does work.
+
+    The per-row NORM of ``goal`` is preserved and only the direction is
+    replaced, so the variant is a pure direction intervention under
+    ``normalize_pooled_goal=False`` too (under ``True`` the worker discards the
+    magnitude and the two are identical).
+
+    ``direction`` is data, not a rearrangement of `goal`, so it has to come from
+    somewhere: both call sites take it from
+    :func:`mean_goal_direction` over a rollout's ``pooled_goal``. A random
+    direction is NOT a substitute — it is a fourth thing (measured on that same
+    arm: return 5.8 against 291 for the real goal and 263 for this variant), so
+    it would answer "is the worker robust to noise" rather than "is the manager
+    doing anything".
+    """
+    return _unit(direction) * jnp.linalg.norm(goal, axis=-1, keepdims=True)
+
+
+def _goal_transform_variants(shift: int, env_axis: int, constant=None):
     """Build the variant name -> transform map for one call site.
 
     Single source of truth for the variant NAMES, which are simultaneously the
     eval-block labels, the metric-key suffixes and the offline probe's CLI
     strings. Defining them in one place is what stops those three drifting.
     """
+    def _needs_direction(_g):
+        raise ValueError(
+            "the 'constant' goal variant needs a direction, and there is no "
+            "sensible default: it is DATA (one vector standing in for the whole "
+            "manager), not a rearrangement of the goals like the other variants. "
+            "Pass `constant=` here, or `constant_goal=` to `eval_fn`, computed "
+            "with `mean_goal_direction(trajectory.pooled_goal)`."
+        )
+
     return {
         "real": lambda g: g,
         "permuted": lambda g: permute_agent_goals(g, shift),
         "env_permuted": lambda g: permute_env_goals(g, env_axis, shift),
+        "constant": (
+            _needs_direction
+            if constant is None
+            else (lambda g: constant_goals(g, constant))
+        ),
         "zeroed": zero_goals,
     }
 
 
-GOAL_VARIANTS = ("real", "permuted", "env_permuted", "zeroed")
+GOAL_VARIANTS = ("real", "permuted", "env_permuted", "constant", "zeroed")
 """Every defined goal-ablation variant, in reading order.
 
-The live eval path uses the first, second and fourth; ``env_permuted`` is
-offline-only (the live series is read as a trend, but an offline number has to
-be interpretable in isolation, which is exactly where it is needed).
+Ordered by how much they destroy: pairing (``permuted``), state-conditioning
+(``env_permuted``), all goal content but not its presence (``constant``), then
+everything (``zeroed``). ``env_permuted`` is offline-only — the live series is
+read as a trend, whereas an offline number has to be interpretable in isolation,
+which is exactly where it is needed.
 """
 
 

@@ -58,8 +58,9 @@ def mjx_data_impl(data):
     return getattr(data, "_impl", data)
 
 
-def geom_index_maps(mj_model, n_agents, n_objects, agent_geom="g_agent_{}",
-                    object_geom="g_box_{}"):
+def geom_index_maps(
+    mj_model, n_agents, n_objects, agent_geom="g_agent_{}", object_geom="g_box_{}"
+):
     """``(agent_of_geom, object_of_geom)`` lookups for contact attribution.
 
     Each is a length-``ngeom`` int array mapping a geom id to its agent/object
@@ -117,7 +118,8 @@ class MJXObservationBuilder:
         self.agent_radius = float(agent_radius)
         self.force_multiplier = float(force_multiplier)
         self.sector_sensor_radius = float(
-            self.world_width / 3.0 if sector_sensor_radius is None
+            self.world_width / 2.0
+            if sector_sensor_radius is None
             else sector_sensor_radius
         )
         self.lidar_range = float(
@@ -271,8 +273,9 @@ class MJXObservationBuilder:
         vec = rel[jnp.arange(self.n_agents), nearest] / self.world_width
         return jnp.where(sensed[:, None], vec, 0.0)
 
-    def goal_distances(self, agent_pos, goal_coord=None, goal_axis="y",
-                       goal_radius=0.0, from_pos=None):
+    def goal_distances(
+        self, agent_pos, goal_coord=None, goal_axis="y", goal_radius=0.0, from_pos=None
+    ):
         """(A,) signed distance to the goal center along the goal axis.
 
         ``goal_coord`` is the target center's coordinate *on that axis*; ``None``
@@ -321,9 +324,9 @@ class MJXObservationBuilder:
         """
         origins3 = jnp.pad(agent_pos, ((0, 0), (0, 1)))  # (A, 3), z = 0
         offset = self.agent_radius + LIDAR_EPS
-        start = (
-            origins3[:, None, :] + self.lidar_dirs[None, :, :] * offset
-        ).reshape(-1, 3)
+        start = (origins3[:, None, :] + self.lidar_dirs[None, :, :] * offset).reshape(
+            -1, 3
+        )
         vecs = jnp.broadcast_to(
             self.lidar_dirs[None], (self.n_agents, self.n_lidar_rays, 3)
         ).reshape(-1, 3)

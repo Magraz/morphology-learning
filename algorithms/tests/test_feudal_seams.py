@@ -28,8 +28,11 @@ import pytest
 
 from algorithms.feudal_mappo_jax.manager import (
     GLOBAL_LATENTS,
+    GOAL_VARIANTS,
     LOCAL_LATENTS,
     PRIVATE_LATENTS,
+    constant_goals,
+    mean_goal_direction,
     pool_goals,
 )
 from algorithms.feudal_mappo_jax.mappo import build_manager
@@ -889,6 +892,12 @@ def test_normalize_pooled_goal_false_reproduces_the_raw_sum():
 # ---------------------------------------------------------------------------
 
 
+# One arbitrary unit direction, for tests that only need the `constant` variant
+# to be WELL-FORMED rather than on-policy. The real call sites derive it with
+# `mean_goal_direction` over a rollout.
+_A_DIRECTION = jnp.eye(GOAL_DIM)[0]
+
+
 def _eval_state(**overrides):
     """A config + initialized train state, for the eval-variant tests."""
     config = _config(**overrides)
@@ -909,7 +918,8 @@ def test_real_eval_variant_is_unchanged():
     _, _, train_state, eval_fn = _eval_state()
     key = jax.random.PRNGKey(4)
 
-    batched = float(eval_fn(train_state, key))          # 3 variants, one scan
+    # The config default is all four blocks, so it needs a `constant` direction.
+    batched = float(eval_fn(train_state, key, constant_goal=_A_DIRECTION))
     alone = float(eval_fn(train_state, key, variants=("real",)))
     assert batched == alone, (batched, alone)
 
@@ -924,7 +934,7 @@ def test_eval_variants_share_reset_keys():
     """
     config = _config()
     n_eps = config.n_eval_episodes
-    variants = ("real", "permuted", "zeroed")
+    variants = GOAL_VARIANTS
     keys = jnp.tile(jax.random.split(jax.random.PRNGKey(4), n_eps), (len(variants), 1))
     obs, _ = jax.vmap(StubEnv().reset)(keys)
 
@@ -1018,6 +1028,114 @@ def test_permutation_stays_within_its_env():
     # The wrong implementation (roll after the agent-major flatten) is caught:
     wrong = jnp.roll(goals.reshape(-1, GOAL_DIM), 1, axis=0).reshape(goals.shape)
     assert not jnp.array_equal(wrong, rolled)
+
+
+def test_constant_variant_is_one_direction_at_the_original_magnitudes():
+    """`constant` must replace the DIRECTION and nothing else.
+
+    Preserving each row's norm is what keeps the variant a pure direction
+    intervention under `normalize_pooled_goal=False`, where the worker does see
+    ||w_t||. Under `True` the magnitude is discarded and the two coincide — so
+    this property is invisible on the default config and has to be pinned here
+    rather than noticed in a run.
+    """
+    goals = jax.random.normal(jax.random.PRNGKey(11), (N_ENVS, N_AGENTS, GOAL_DIM))
+    goals = goals * jnp.linspace(0.1, 10.0, N_ENVS)[:, None, None]  # varied norms
+    out = constant_goals(goals, _A_DIRECTION)
+
+    dirs = out / jnp.linalg.norm(out, axis=-1, keepdims=True)
+    assert jnp.allclose(dirs, _A_DIRECTION, atol=1e-5), "not one shared direction"
+    assert jnp.allclose(
+        jnp.linalg.norm(out, axis=-1), jnp.linalg.norm(goals, axis=-1), atol=1e-4
+    ), "row norms not preserved"
+
+    # The direction need not arrive normalized.
+    scaled = constant_goals(goals, 7.5 * _A_DIRECTION)
+    assert jnp.allclose(scaled, out, atol=1e-4)
+
+
+def test_mean_goal_direction_weighs_directions_not_lengths():
+    """Rows are normalized BEFORE averaging.
+
+    ``||w_t||`` ramps 1 -> c over the first `goal_horizon` steps of every
+    episode, so a raw mean would systematically under-weight early-episode
+    goals — i.e. the constant would be drawn from a biased sample of the very
+    distribution it is standing in for.
+    """
+    a, b = jnp.eye(GOAL_DIM)[0], jnp.eye(GOAL_DIM)[1]
+    # `b` is 100x longer, but there are equally many of each direction.
+    goals = jnp.stack([a, 100.0 * b])[:, None, :]
+    d = mean_goal_direction(goals)
+
+    assert jnp.allclose(jnp.linalg.norm(d), 1.0, atol=1e-4)
+    assert jnp.allclose(d @ a, d @ b, atol=1e-3), "length-weighted, not direction-weighted"
+
+    # A genuinely collapsed manager gives concentration 1.0 ...
+    collapsed = jnp.broadcast_to(a, (5, N_AGENTS, GOAL_DIM))
+    assert jnp.allclose(mean_goal_direction(collapsed), a, atol=1e-4)
+
+
+def test_constant_variant_needs_a_direction():
+    """Requesting `constant` without one must RAISE, not substitute something.
+
+    `constant` is the only variant that is not a rearrangement of the goals it
+    is given, so there is no default that is not a silent choice. A zero or
+    random fallback would still produce a well-shaped gap — and a random
+    direction measures something else entirely (robustness to noise, not whether
+    the manager is decorative).
+    """
+    _, _, train_state, eval_fn = _eval_state()
+    with pytest.raises(ValueError, match="needs a direction"):
+        eval_fn(train_state, jax.random.PRNGKey(12), variants=("constant",))
+
+
+def test_constant_variant_coincides_with_real_for_a_zero_goal_worker():
+    """The probe's stop-the-line control, extended to the new variant.
+
+    On a `feudal_zerogoal` arm the worker zeroes the goal INSIDE the module, so
+    every transform applied outside it is a no-op and every measured gap must be
+    exactly 0.0 — `constant` included. Adding a variant that the control does
+    not cover would leave a block whose harness bugs nothing detects.
+    """
+    _, _, zg_train_state, zg_eval_fn = _eval_state(zero_goal=True)
+    key = jax.random.PRNGKey(13)
+
+    rewards, _ = zg_eval_fn(
+        zg_train_state,
+        key,
+        variants=GOAL_VARIANTS,
+        detail=True,
+        constant_goal=_A_DIRECTION,
+        )
+    for i, v in enumerate(GOAL_VARIANTS[1:], start=1):
+        assert jnp.array_equal(rewards[0], rewards[i]), f"{v} gap is not exactly 0.0"
+
+
+def test_constant_variant_equals_real_when_the_manager_has_collapsed():
+    """If the manager already emits one frozen direction, `constant` IS `real`.
+
+    The semantics the whole diagnostic rests on: a small `gap_constant` means
+    the manager's output is worth no more than a frozen vector. This pins the
+    limiting case end-to-end through `eval_fn` — equality here is what makes a
+    NON-zero gap elsewhere attributable to the goals actually varying.
+    """
+    _, _, train_state, eval_fn = _eval_state()
+    key = jax.random.PRNGKey(14)
+
+    # Force the collapse the variant is designed to detect, by replacing the
+    # manager's goals with one direction before the variant transform runs.
+    collapsed, _ = eval_fn(
+        train_state, key, variants=("constant", "constant"), detail=True,
+        constant_goal=_A_DIRECTION,
+    )
+    assert jnp.array_equal(collapsed[0], collapsed[1])
+
+    # ... and `constant` must NOT be a no-op on a manager that is not collapsed:
+    real, _ = eval_fn(train_state, key, variants=("real",), detail=True)
+    assert not jnp.array_equal(real[0], collapsed[0]), (
+        "constant made no difference at all — either the manager is already "
+        "frozen on this direction, or the transform is not being applied"
+    )
 
 
 # ---------------------------------------------------------------------------

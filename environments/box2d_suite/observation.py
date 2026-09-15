@@ -36,7 +36,7 @@ class ObservationManager:
         self.env = env
 
         # Scale sector sensor radius proportionally to world size
-        self.sector_sensor_radius = self.env.world_width / 3.0
+        self.sector_sensor_radius = self.env.world_width / 2.0
 
     def _agent_object_distance(self, agent_pos, obj, obj_pos):
         """Compute the surface distance between an agent position and an object."""

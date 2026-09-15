@@ -1402,12 +1402,42 @@ The method: permute goals along one axis, which preserves the goal distribution
 **exactly** and destroys exactly one property, so the real-minus-null gap
 isolates that property. Two axes, and they answer different questions:
 
-| variant | agent pairing | state conditioning | a gap measures |
-|---|---|---|---|
-| `real` | ✓ | ✓ | (reference) |
-| `permuted` (agent axis) | ✗ | ✓ | value of the **assignment** |
-| `env_permuted` (env axis) | ✓ | ✗ | value of **state-conditioning** |
-| `zeroed` | ✗ | ✗ | value of goal conditioning at all |
+| variant | agent pairing | state conditioning | goal present | a gap measures |
+|---|---|---|---|---|
+| `real` | ✓ | ✓ | ✓ | (reference) |
+| `permuted` (agent axis) | ✗ | ✓ | ✓ | value of the **assignment** |
+| `env_permuted` (env axis) | ✓ | ✗ | ✓ | value of **state-conditioning** |
+| `constant` (one frozen vector) | ✗ | ✗ | ✓ | value of the goal's **content** |
+| `zeroed` | ✗ | ✗ | ✗ | value of goal conditioning at all |
+
+⚠ **`constant` is NOT a permutation, and that is the point.** The other three
+rearrange or delete the manager's own goals; `constant` substitutes **one fixed
+direction** for every agent, env and timestep (`manager.constant_goals`,
+direction from `manager.mean_goal_direction` over a rollout's `pooled_goal`). It
+exists because `constant` and `zeroed` differ in exactly one bit — whether the
+worker still receives a goal-shaped vector of the usual magnitude — and that bit
+separates the two readings of a large `gap_zeroed`:
+
+* the goal carries information the worker uses, or
+* the goal is a near-constant vector whose **presence** the worker co-adapted
+  to, so removing it is a large off-distribution perturbation carrying no
+  information at all.
+
+Under the second the manager is **decorative** while every collapse metric and
+the zeroed gap read as a healthy, strongly-used goal channel — i.e. the
+degenerate case presents as the headline success condition. `real ≈ constant ≫
+zeroed` is that case; `real > constant` is the first evidence in this suite that
+the goal's content does work. The per-row **norm is preserved** and only the
+direction replaced, so the variant stays a pure direction intervention under
+`normalize_pooled_goal=False` too. A *random* direction is a fourth thing
+(robustness to noise, not "is the manager doing anything") and is not a
+substitute — measured on `feudal_film_n01_local` trial 0, a fixed random
+direction returns **5.8** against 291 real and 263 constant.
+Read `goal_concentration` (offline probe; ‖mean of the row-normalized pooled
+goals‖, 1.0 = one frozen direction) next to `gap_constant`: a small gap at a
+*low* concentration is the interesting finding (varied goals that nonetheless do
+not matter), while a small gap at ≈1.0 only says the manager had already
+collapsed onto the constant it is being compared with.
 
 ⚠ **READ THE ENV NULL FIRST — the ordering is the finding.** A manager that has
 degenerated into a fixed per-agent code (an agent-ID label with no dependence on
@@ -1433,8 +1463,10 @@ of `goals`, so real and null share one mask — pinned by
 `V × n_eval_episodes` vmapped width, with `jnp.tile`d reset keys so episode *j*
 of every block starts from a bit-identical state (the gap is therefore a
 **paired** statistic that carries no reset variance).
-Series: `eval_reward_permuted`, `eval_reward_zeroed`, `eval_gap_permuted`,
-`eval_gap_zeroed`, `eval_len_{real,permuted,zeroed}`. The `reward` series is
+Series: `eval_reward_{permuted,constant,zeroed}`,
+`eval_gap_{permuted,constant,zeroed}`, `eval_len_{real,permuted,constant,zeroed}`.
+The live default is `("real", "permuted", "constant", "zeroed")`;
+`env_permuted` stays offline-only. The `reward` series is
 still exactly the `real` block, so every existing plot and pickle is unaffected
 (`test_real_eval_variant_is_unchanged` pins the bit-equality).
 `eval_len_*` exists because boundary contact *terminates* in these envs — without
@@ -1448,6 +1480,16 @@ batched scan is NOT ~free.** Clean A/B on `mjx_16a_4o_512/feudal` (983k steps,
 |---|---|---|
 | `eval_goal_variants: false` (32 envs) | 9.58 s | 1.00x |
 | `eval_goal_variants: true` (3 x 32 = 96 envs) | 18.26 s | **1.91x** |
+
+⚠ **The 4th block (`constant`, added 2026-09-14) is FREE — measured, and it is
+not a rounding error.** Re-measured on `mjx_12a_3o_trunc_1024/feudal_film_n01_local/0`
+at `n_eval_episodes=32`, 8 warm reps each, median: **1 variant 7.76 s, 3
+variants 12.40 s (1.60x), 4 variants 11.54 s (1.49x)** — four blocks are
+consistently *cheaper* than three. Almost certainly because 4 x 32 = **128** is a
+power of two and 96 is not, so XLA picks a better tiling. Two things follow: the
+`constant` diagnostic costs nothing to keep on, and if the batched eval ever
+needs trimming, drop to 2 blocks (64 envs) rather than 3. Do not extrapolate the
+1.91x figure linearly in the number of variants — it is not linear.
 
 So three variants cost **1.91x** one eval — better than the ~3x of three
 sequential scans, but far from free. Against the production reference
@@ -1469,9 +1511,12 @@ swapped with; ≈1 ⇒ the permutation changed nothing) is what separates the tw
 
 **Positive control, and the stop-the-line check:** on a `feudal_zerogoal` arm the
 worker zeroes the goal *inside* the module, so all variants coincide and every
-gap must be **exactly 0.0 bitwise**. Anything else means the harness is wrong and
-no other number is worth reading. (Verified: all 6 zerogoal arms measured so far
-report exactly 0.0.) This works because `_unit(0) == 0` and `goal_embed_dim`'s
+gap must be **exactly 0.0 bitwise** — `constant` included, and the probe's
+control now iterates `GOAL_VARIANTS[1:]` so a newly-added variant cannot slip
+past it. Anything else means the harness is wrong and no other number is worth
+reading. (Verified: all 6 zerogoal arms measured so far report exactly 0.0, and
+re-verified for all 5 variants on the three `mjx_12a_3o_trunc_1024/
+feudal_film_zerogoal` seeds.) This works because `_unit(0) == 0` and `goal_embed_dim`'s
 Dense is bias-free, so an externally-zeroed pooled goal *is* `zero_goal=True` —
 which is also why the ablation is applied to the goal outside the module: the
 param tree stays shape-identical and checkpoints remain interchangeable.
@@ -1514,6 +1559,62 @@ MUJOCO_GL=egl uv run python -m algorithms.feudal_mappo_jax.goal_dependence_probe
     --batches mjx_16a_4o_trunc_1024 --models feudal,feudal_zerogoal \
     --trials 0,1,2 --n-eval-episodes 64 --shifts 1
 ```
+
+#### MEASURED 2026-09-14 — `mjx_12a_3o_trunc_1024`: the goal channel can be LIVE and DECORATIVE at once
+
+The finding that produced the `constant` variant. `feudal_film_n01_local` is the
+best feudal arm in that batch and the one that looks like it is still climbing
+(late-run slopes +30.8 / +10.8 / −8.9 return per 1e7 steps across seeds, against
+−3.6 / −7.3 / +0.5 for `mlp`). It is neither of the two obvious explanations:
+
+* **not "the goal channel is off"** — `zeroed` drops it from ~206 to **1.5**, the
+  largest goal-dependence in the batch. Under FiLM `zeroed` is *exactly* the
+  unmodulated trunk (γ/β bias-free), so the trained policy lives entirely in the
+  modulated regime;
+* **not "good per-agent goals"** — all 12 agents get one direction
+  (`goal_direction_count` 1.45 against the random-direction baseline **8.93**,
+  inter-agent cos 0.58–0.94), `permuted` is free, `env_permuted` is free, and
+  replacing the goal with the per-env mean over agents is free.
+
+**`constant` is what named it**: one frozen vector recovers **95%** of the return
+(206.4 → 195.3 over 3 seeds; per-trial gaps +17.2 / +22.2 / −6.3, only one CI
+excluding 0). `goal_concentration` is **0.78** — the manager had already very
+nearly collapsed to that constant. So the manager's entire time- and
+agent-varying output is worth ~nothing, while every collapse metric plus a
++280 `gap_zeroed` read as a strongly-used goal channel. A dose–response confirms
+the dependence is co-adaptation to that *specific* direction rather than
+goal-following (trial 0, return vs cosine-to-real): `1.00 → 291`, `0.95 → 288`,
+`0.78 → 287`, `0.49 → 250`, `0.20 → 78`, random `0.01 → 5.8`, zeroed `1.5`.
+
+**Mechanism: goal-dependence needs `local` AND `intrinsic_coef > 0`.** Under
+`centralized` the worker ignores the goal at every alpha; under `local` the
+dependence is monotone in alpha, and so is the collapse
+(`real` / `zeroed` / `goal_direction_count`, means over 3 seeds):
+
+| α | centralized | local |
+|---|---|---|
+| 0.00 | 151.9 / 151.6 / 8.99 | 105.2 / 172.3 / 1.79 |
+| 0.01 | 169.5 / 173.3 / 8.94 | 106.3 / 58.3 / 1.45 |
+| 0.10 | 140.0 / 148.3 / 9.02 | **203.7 / 1.4 / 1.45** |
+| 0.50 | 83.9 / 82.7 / 9.20 | 65.7 / 0.1 / 1.95 |
+
+`local` makes `s_i` a pure function of `obs_i`, so `d_cos(s_i(t)−s_i(t−k), g_i)`
+is finally something agent *i* controls — but manager and worker share that
+cosine as an objective, and the cheapest joint solution is degenerate: the
+manager freezes on one direction and the worker drives its own observation along
+it. At α=0 the goal is actively harmful (zeroing **helps** by +67); at α=0.5 the
+intrinsic gradient eats the task. α=0.1 is where the lock-in is strong and the
+task survives — which is why that arm looks best and why it is not evidence for
+hierarchy.
+
+⚠ **It still loses to every goal-free control**: `feudal_film_zerogoal_dilated`
+293.7, `mlp` 272.3, `feudal_film_zerogoal` 248.9, `feudal_film_n01_local` 203.7.
+The best arm in the batch is the one whose goals are provably disconnected.
+
+⚠ **Consequence for the acceptance criterion in `conf/model/feudal_film.yaml`**
+(`gap_zeroed ≈ 0` **and** `gap_permuted > 0`): a large `gap_zeroed` is *not*
+progress on its own. `gap_zeroed` large + `gap_permuted ≈ 0` + `gap_constant ≈ 0`
+is the degenerate outcome, and only `constant` separates it from the target one.
 
 #### MEASURED 2026-09-06 — all 20 trained arms (5 env groups × 4 models × 3 trials, 64 episodes)
 
@@ -1916,13 +2017,27 @@ magnitude story alone does not explain them.
       `local_global` branch built `core_in` **without** `z`, so `y` and every goal
       number it printed for those arms came from a forward pass the checkpoint
       never computed. Fixed (shared `with_global` helper) for both global variants.
-    - ⚠ **Neither latent probe works on SMAX arms, at any latent.**
-      `latent_locality_probe.py` and `latent_diversity_probe.py` both derive
-      per-agent observations by un-flattening the stored global state
-      (`gs.reshape(N, obs_dim)`), valid only when the env has **no**
-      `global_state` hook. The diversity probe now skips such arms with a message
-      instead of reshaping a 72-dim world state into fake observations; measuring
-      them needs `collect_states` to store `obs` alongside `global_state`.
+    - ⚠ **Neither latent probe works on SMAX arms, at any latent — now declared
+      rather than discovered.** Both are MJX-only in *two* undeclared ways, and
+      the shared `collect_states` (`latent_locality_probe.py`) is where both
+      live: it builds the manager's centralized input as `obs.reshape(b, -1)`,
+      i.e. it **assumes** `global_state == concat(obs)`, and it hardcodes
+      `discrete=False` when sampling. The callers then invert the same assumption
+      to recover per-agent observations (`gs.reshape(N, obs_dim)`). On SMAX the
+      real global state is 72 dims at `3m` against 195 of concatenated obs, so a
+      `local_global*` arm died on a raw `ScopeParamShapeError` inside
+      `f_percept_0` and a `centralized` one would have been silently measured on
+      an input it never trained on. New helper
+      `latent_locality_probe.unsupported_env_reason(env)` names the reason;
+      `collect_states` **raises** on it (single choke point, so neither probe can
+      bypass it) and `latent_diversity_probe.py` checks it *before* the rollout
+      and skips with a message. Verified: the SMAX arm now prints
+      `SKIPPED — env has its own global_state hook (72 dims vs 195 …)`, and the
+      MJX arms are unaffected (`mjx_12a_3o_trunc_1024` reproduces the recorded
+      1.04/1.62 for `local` and 9.12/8.76 for `centralized`). Measuring SMAX arms
+      needs `collect_states` to store `obs` alongside `env.global_state(state)`
+      rather than deriving one from the other, and to thread
+      `env.discrete`/`avail_actions` through the rollout.
     - **Verified**: the four pre-existing latents are **bit-identical** to the
       pre-change code (0.0 max diff on every param leaf, `goal` and `s`, both
       cores — checked against a reverted copy of the module loaded side by side);

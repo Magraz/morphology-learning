@@ -46,9 +46,17 @@
 # follow the goal, so the second likely needs the objective side too -- and the
 # n01/n05 data says the current intrinsic reward is not it.
 #
+# ⚠ A LARGE gap_zeroed IS NOT PROGRESS TOWARD THIS — read gap_constant too
+# (added 2026-09-14). `mjx_12a_3o_trunc_1024/feudal_film_n01_local` scores
+# gap_zeroed +280 with gap_permuted ~ 0, and one FROZEN vector recovers 95% of
+# its return: the worker had co-adapted to a constant modulation, so the goal
+# channel is maximally live and completely decorative at once. The degenerate
+# outcome and the headline success condition look identical without the
+# `constant` block. See CLAUDE.md, "MEASURED 2026-09-14".
+#
 # Free pre-flight check, before spending a run: at init the FiLM layers are
-# exactly identity, so all four eval variants must return BITWISE-identical
-# values (same positive control as feudal_zerogoal).
+# exactly identity, so every eval variant must return BITWISE-identical values
+# (same positive control as feudal_zerogoal).
 #
 #   uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o_trunc_1024 \
 #       model=feudal_film trial_id=0

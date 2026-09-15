@@ -32,6 +32,10 @@ MODELS = {
 }
 METRICS = (
     "reward", "eval_reward_zeroed", "eval_gap_zeroed", "eval_gap_permuted",
+    # `eval_gap_constant` is the one that separates "the goals carry content"
+    # from "the worker co-adapted to a constant bias" — a large eval_gap_zeroed
+    # reads as the former in both cases. See CLAUDE.md, "MEASURED 2026-09-14".
+    "eval_reward_constant", "eval_gap_constant",
     "d_cos_mean", "d_cos_gap_agent", "d_cos_gap_env", "d_cos_var",
     "intrinsic_reward", "intrinsic_reward_abs", "alpha_current",
     "adv_ext_std_raw", "adv_int_std_raw", "explained_variance",
