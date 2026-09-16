@@ -73,7 +73,8 @@ def test_displayed_pairs_are_spread_over_episode(
     original_scatter = Axes.scatter
 
     def record_scatter(ax, x, y, **kwargs):
-        displayed.append(np.column_stack((x, y)))
+        if kwargs.get("marker") in ("o", "*"):
+            displayed.append(np.column_stack((x, y)))
         return original_scatter(ax, x, y, **kwargs)
 
     monkeypatch.setattr(Axes, "scatter", record_scatter)
@@ -91,6 +92,85 @@ def test_data_pairs_requires_positive_integer(tmp_path, data_pairs):
     with pytest.raises(ValueError, match="data_pairs"):
         save_goal_plot(np.zeros((2, 1, 2)), np.zeros((3, 1, 2)), 1,
                        tmp_path / "goals.png", 0, data_pairs=data_pairs)
+
+
+@pytest.mark.parametrize("horizon", [1, 3])
+def test_trajectory_windows_and_arrows_follow_states(monkeypatch, tmp_path, horizon):
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from algorithms.feudal_mappo_jax.goal_visualization import _project_goal_episode
+
+    rng = np.random.default_rng(7)
+    goals = rng.normal(size=(8, 2, 2))
+    latents = rng.normal(size=(9, 2, 2))
+    targets, states, _ = _project_goal_episode(goals, latents, horizon)
+    paths, arrows = [], []
+    original_plot, original_quiver = Axes.plot, Axes.quiver
+
+    def record_plot(ax, x, y, **kwargs):
+        paths.append(np.column_stack((x, y)))
+        return original_plot(ax, x, y, **kwargs)
+
+    def record_quiver(ax, x, y, u, v, **kwargs):
+        arrows.append((np.column_stack((x, y)), np.column_stack((u, v))))
+        return original_quiver(ax, x, y, u, v, **kwargs)
+
+    monkeypatch.setattr(Axes, "plot", record_plot)
+    monkeypatch.setattr(Axes, "quiver", record_quiver)
+    monkeypatch.setattr(Figure, "savefig", lambda *args, **kwargs: None)
+    save_goal_plot(goals, latents, horizon, tmp_path / "goals.png", 0, data_pairs=2)
+
+    assert len(paths) == 4  # Separate windows for each agent; no connecting gaps.
+    assert len(arrows) == 2
+    for agent in range(2):
+        for pair, end in enumerate((4, 8)):
+            start = end - horizon
+            path = paths[2 * agent + pair]
+            np.testing.assert_allclose(path, states[start:end + 1, agent])
+            # In 2D, the joint PCA must preserve state steps AND goal vectors.
+            np.testing.assert_allclose(
+                np.linalg.norm(np.diff(path, axis=0), axis=-1),
+                np.linalg.norm(np.diff(latents[start:end + 1, agent], axis=0), axis=-1),
+            )
+            assert np.linalg.norm(targets[start, agent] - path[0]) == pytest.approx(
+                np.linalg.norm(goals[start, agent])
+            )
+        origins, directions = arrows[agent]
+        expected_paths = paths[2 * agent:2 * agent + 2]
+        np.testing.assert_allclose(origins, np.concatenate([p[:-1] for p in expected_paths]))
+        np.testing.assert_allclose(origins + directions,
+                                   np.concatenate([p[1:] for p in expected_paths]))
+
+
+def test_alignment_labels_use_full_dimensions_and_identify_their_trajectory(monkeypatch, tmp_path):
+    from matplotlib.figure import Figure
+
+    goals = np.zeros((4, 3, 3))
+    goals[:, :2, 2] = 1
+    latents = np.zeros((5, 3, 3))
+    # Agent 1 goes along then against the goal in the third dimension.
+    latents[:, 0, 2] = [0, 1, 2, 1, 0]
+    # Agent 2 goes perpendicular, then has zero net displacement.
+    latents[:, 1, 0] = [0, 50, 100, 100, 100]
+    # Agent 3 moves but has no goal direction.
+    latents[:, 2, 1] = [0, 50, 100, 150, 200]
+    _, reached, _ = project_goal_outcomes(goals, latents, 2)
+    labels = []
+
+    def capture_figure(fig, *args, **kwargs):
+        labels.append([(text.get_text(), text.xy) for text in fig.axes[0].texts
+                       if "cos=" in text.get_text()])
+
+    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    save_goal_plot(goals, latents, 2, tmp_path / "goals.png", 0, data_pairs=2)
+    expected_scores = [("+1.00", "-1.00"), ("+0.00", "N/A"), ("N/A", "N/A")]
+    assert len(labels) == 3
+    for agent, scores in enumerate(expected_scores):
+        assert len(labels[agent]) == 2
+        for pair, start in enumerate((0, 2)):
+            text, position = labels[agent][pair]
+            assert text == f"t={start}–{start + 2}\ncos={scores[pair]}"
+            np.testing.assert_allclose(position, reached[start, agent])
 
 
 @pytest.mark.parametrize("kind", ["mjx", "macro", "env_renderer"])

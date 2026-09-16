@@ -26,6 +26,7 @@ Demo / smoke test::
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import Any
 
 import environments.smax._compat  # noqa: F401  — MUST precede the jaxmarl import
@@ -62,6 +63,50 @@ class SMAXState:
     # Carried rather than recomputed so `global_state` can never drift from the obs it
     # is paired with. (n_world,) float32.
     world_state: jax.Array
+
+
+def use_bundled_ffmpeg() -> bool:
+    """Point matplotlib's animation writer at the ffmpeg `imageio-ffmpeg` ships.
+
+    jaxmarl's ``Visualizer.animate`` calls ``ani.save(fname)`` with no ``writer=``,
+    so matplotlib uses ``rcParams["animation.writer"]`` — which defaults to
+    ``"ffmpeg"`` and is resolved through ``rcParams["animation.ffmpeg_path"]``,
+    itself defaulting to the bare name ``"ffmpeg"`` looked up on ``PATH``. With no
+    system ffmpeg that lookup fails and matplotlib prints::
+
+        MovieWriter ffmpeg unavailable; using Pillow instead.
+
+    ``imageio-ffmpeg`` is **already a hard dependency** (``pyproject.toml``) and
+    vendors a static ffmpeg binary, so the fix needs no new package and no root —
+    which matters on the HPC nodes, where ``apt install ffmpeg`` is not an option.
+
+    ⚠ This is about the encoder, NOT about render speed. The dominant cost is
+    jaxmarl redrawing the whole scene per frame (``init_render`` clears the axes,
+    re-adds a Circle + text per unit, and does ``figure.savefig(..., format="raw")``),
+    and ``SMAXVisualizer.expand_state_seq`` multiplies the frame count by
+    ``world_steps_per_env_step`` (8), so one 200-step episode is **1600** such
+    frames. Do not expect enabling ffmpeg to make ``view=true`` fast.
+
+    Idempotent and best-effort: returns True if matplotlib can use ffmpeg
+    afterwards, False if it will keep falling back to Pillow (which still works).
+    """
+    import matplotlib
+    from matplotlib import animation
+
+    if animation.writers.is_available("ffmpeg"):
+        return True  # a system ffmpeg is on PATH — leave it alone
+    try:
+        import imageio_ffmpeg
+    except ImportError:
+        return False
+    try:
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return False
+    if not os.path.isfile(exe):
+        return False
+    matplotlib.rcParams["animation.ffmpeg_path"] = exe
+    return animation.writers.is_available("ffmpeg")
 
 
 def _inner(env_state):
@@ -271,6 +316,7 @@ class SMAXAdapter:
         """
         from jaxmarl.viz.visualizer import SMAXVisualizer
 
+        use_bundled_ffmpeg()
         SMAXVisualizer(self._env, state_seq).animate(view=False, save_fname=str(path))
 
     def to_action_dict(self, actions: jnp.ndarray) -> dict:
