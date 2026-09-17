@@ -19,6 +19,7 @@ processes.
 Run: ``uv run pytest algorithms/tests/test_feudal_seams.py -q``
 """
 
+import warnings
 from typing import NamedTuple
 
 import jax
@@ -29,6 +30,7 @@ import pytest
 from algorithms.feudal_mappo_jax.manager import (
     GLOBAL_LATENTS,
     GOAL_VARIANTS,
+    LATENTS,
     LOCAL_LATENTS,
     PRIVATE_LATENTS,
     constant_goals,
@@ -627,7 +629,9 @@ def test_intrinsic_stream_is_separate_and_exact():
     hands essentially the whole gradient to r^I. They are only allowed to meet in
     `ppo_update`, after each has been normalized to unit std.
     """
-    from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward
+    from algorithms.feudal_mappo_jax.manager import (
+        worker_intrinsic_reward_aligned,
+    )
 
     alpha = 0.5
     traj0 = _collect(_config(intrinsic_coef=0.0))[3]
@@ -653,8 +657,13 @@ def test_intrinsic_stream_is_separate_and_exact():
     done_a = jnp.broadcast_to(
         traj0.done[..., None].astype(jnp.float32), traj0.state_latent.shape[:-1]
     )
-    r_int = worker_intrinsic_reward(
-        traj0.state_latent, traj0.goal, HORIZON, done=done_a
+    # NOTE this is a WIRING test, not a semantics one: it calls the same helper
+    # the collector calls, so it pins that the stream is assembled once, into its
+    # own field, unscaled — and nothing about whether the helper is right. The
+    # timing semantics are pinned separately below, against hand-computed values.
+    r_int = worker_intrinsic_reward_aligned(
+        traj1.state_latent, traj1.next_state_latent, traj1.goal, HORIZON,
+        done=done_a,
     )
     # The stored stream is r^I plus its own truncation bootstrap (taken against
     # V^I in-scan), and nothing else — in particular it is NOT scaled by alpha
@@ -668,6 +677,285 @@ def test_intrinsic_stream_is_separate_and_exact():
     # r^I is a mean of cosines, so it is bounded; a violation means the mask
     # denominator or the averaging is wrong.
     assert float(jnp.max(jnp.abs(r_int))) <= 1.0 + 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Intrinsic reward TIMING.
+#
+# `r^I_t` must score the outcome of `a_t`. The paper's literal form ends its
+# displacement at the PRE-action latent `s_t`, so every term is fixed before
+# `a_t` is sampled while the extrinsic reward on the same transition IS that
+# action's consequence; the two streams scored different actions.
+#
+# These tests compute their expected values BY HAND from a latent that is
+# literally a position, so they constrain the semantics rather than the wiring.
+# The existing `test_intrinsic_stream_is_separate_and_exact` calls the same
+# helper the collector calls and therefore cannot fail for a wrong definition —
+# that is the trap this block exists to avoid, not to repeat.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def rollout_alpha():
+    """A rollout with the intrinsic path LIVE.
+
+    The shared `rollout` fixture runs at the default alpha=0, where the whole
+    intrinsic path is a STATIC no-op: `next_state_latent` is the scalar
+    placeholder and V^I returns zeros, so every assertion below would pass
+    vacuously on it. That is the no-op working, and it is checked separately.
+    """
+    config = _config(intrinsic_coef=0.5)
+    env, rs, new_rs, traj, boot, update_fn = _collect(config)
+    return config, env, rs, new_rs, traj, boot, update_fn
+
+
+_EAST = jnp.array([1.0, 0.0])
+_NORTH = jnp.array([0.0, 1.0])
+_WEST = jnp.array([-1.0, 0.0])
+
+
+def _traj4(x):
+    """(T, N, 2) -> (T, 1, N, 2): the (T, n_envs, n_agents, dim) layout."""
+    return jnp.asarray(x)[:, None]
+
+
+def _positions(moves):
+    """Per-step displacements -> (pre-action latents, successor latents).
+
+    The "env" here is a point whose latent IS its position, so the displacement
+    the reward measures is exactly the action taken. That is what makes the
+    expected values below hand-computable.
+    """
+    pos = jnp.concatenate([jnp.zeros_like(moves[:1]), jnp.cumsum(moves, axis=0)])
+    return pos[:-1], pos[1:]
+
+
+def test_intrinsic_reward_credits_the_action_on_its_own_transition():
+    """c=1, eastward goal: east / north / west score +1 / 0 / -1 AT step t.
+
+    The headline property. Under the old indexing all three agents score the
+    same thing, because the reward never saw the action.
+    """
+    from algorithms.feudal_mappo_jax.manager import (
+        worker_intrinsic_reward,
+        worker_intrinsic_reward_aligned,
+    )
+
+    moves = jnp.stack([_EAST, _NORTH, _WEST])          # 3 agents, one step
+    s = _traj4(jnp.zeros((1, 3, 2)))
+    s_plus = _traj4(moves[None])
+    g = _traj4(jnp.broadcast_to(_EAST, (1, 3, 2)))
+
+    r = worker_intrinsic_reward_aligned(s, s_plus, g, 1)
+    assert np.allclose(np.asarray(r[0, 0]), [1.0, 0.0, -1.0], atol=1e-5), r[0, 0]
+
+    # And the old form is blind to all of it: same three agents, same answer.
+    legacy = worker_intrinsic_reward(s, g, 1)
+    assert float(jnp.abs(legacy).max()) == 0.0
+
+
+def test_the_first_action_of_an_episode_earns_a_reward():
+    """`k=0` is always valid, so step 0 is scored; the old form paid it 0."""
+    from algorithms.feudal_mappo_jax.manager import (
+        worker_intrinsic_reward,
+        worker_intrinsic_reward_aligned,
+    )
+
+    moves = jnp.broadcast_to(_EAST, (4, 1, 2))
+    s, s_plus = _positions(moves)
+    g = jnp.broadcast_to(_EAST, (4, 1, 2))
+    r = worker_intrinsic_reward_aligned(_traj4(s), _traj4(s_plus), _traj4(g), 3)
+    assert float(r[0, 0, 0]) == pytest.approx(1.0, abs=1e-5)
+    assert float(worker_intrinsic_reward(_traj4(s), _traj4(g), 3)[0, 0, 0]) == 0.0
+
+
+def test_longer_horizon_matches_a_hand_computed_trajectory():
+    """c=3 over east, east, north — every origin, goal index and the denominator.
+
+    r[2] averages three terms, all ending at the successor of a_2 = north:
+      k=0  d_cos((0,1), north)         = 0
+      k=1  d_cos((1,1), north)         = 1/sqrt(2)
+      k=2  d_cos((2,1), east)          = 2/sqrt(5)
+    """
+    from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward_aligned
+
+    moves = jnp.stack([_EAST, _EAST, _NORTH])[:, None]      # (3, 1 agent, 2)
+    s, s_plus = _positions(moves)
+    g = jnp.stack([_EAST, _NORTH, _EAST])[:, None]
+    r = worker_intrinsic_reward_aligned(_traj4(s), _traj4(s_plus), _traj4(g), 3)
+
+    expected = (0.0 + 1.0 / np.sqrt(2.0) + 2.0 / np.sqrt(5.0)) / 3.0
+    assert float(r[2, 0, 0]) == pytest.approx(expected, abs=1e-5)
+
+
+def test_the_episode_ending_action_is_paid_against_its_terminal_successor():
+    """The one transition a shift-based implementation CANNOT reach.
+
+    `done[t]` is excluded from the mask, so the action that ends the episode is
+    still scored — against the successor it actually produced, captured before
+    the reset. Deriving the endpoint by shifting the stored latents pays 0 there
+    instead, which is a standing bonus for terminating: the same shape as the
+    `boundary_truncates` failure the MJX env removed for exactly that reason.
+    """
+    from algorithms.feudal_mappo_jax.intrinsic_timing_probe import (
+        legacy_shift_approximation,
+    )
+    from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward_aligned
+
+    moves = jnp.broadcast_to(_EAST, (4, 1, 2))
+    s, s_plus = _positions(moves)
+    g = jnp.broadcast_to(_EAST, (4, 1, 2))
+    done = jnp.zeros((4, 1, 1)).at[1].set(1.0)              # episode ends after t=1
+
+    r = worker_intrinsic_reward_aligned(
+        _traj4(s), _traj4(s_plus), _traj4(g), 3, done=done
+    )
+    assert float(r[1, 0, 0]) == pytest.approx(1.0, abs=1e-5), (
+        "the episode-ending action was not credited for its terminal successor"
+    )
+    shifted = legacy_shift_approximation(_traj4(s), _traj4(g), 3, done=done)
+    assert float(shifted[1, 0, 0]) == 0.0, (
+        "the shift approximation is supposed to be the thing that pays 0 here — "
+        "if it does not, this test no longer demonstrates the difference"
+    )
+
+
+def test_a_reset_cannot_leak_into_the_next_episodes_reward():
+    """A teleporting reset creates no reward: pre-done origins are masked out.
+
+    The distances are chosen so that leakage would be unmissable — an unmasked
+    `k=1` term would score ~+0.70 against the true +1.00, dragging the mean to
+    ~0.85.
+    """
+    from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward_aligned
+
+    s = jnp.array([[[0.0, 0.0]], [[100.0, 100.0]]])         # (T=2, N=1, 2)
+    s_plus = jnp.array([[[1.0, 0.0]], [[100.0, 101.0]]])    # east, then north
+    g = jnp.stack([_EAST, _NORTH])[:, None]
+    done = jnp.zeros((2, 1, 1)).at[0].set(1.0)              # reset between them
+
+    r = worker_intrinsic_reward_aligned(
+        _traj4(s), _traj4(s_plus), _traj4(g), 3, done=done
+    )
+    # Exactly the k=0 term, and nothing else: no origin from the old episode.
+    assert float(r[1, 0, 0]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_the_reward_inputs_receive_no_gradient():
+    """r^I is DATA. A gradient here would let the manager raise the worker's
+    reward by moving the yardstick, and would backprop the worker's objective
+    into the manager — which FuN rules out explicitly."""
+    from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward_aligned
+
+    moves = jnp.broadcast_to(_EAST, (4, 1, 2))
+    s, s_plus = _positions(moves)
+    g = jnp.broadcast_to(_NORTH, (4, 1, 2))
+
+    def total(a, b, c):
+        return worker_intrinsic_reward_aligned(
+            _traj4(a), _traj4(b), _traj4(c), 3
+        ).sum()
+
+    for grad in jax.grad(total, argnums=(0, 1, 2))(s, s_plus, g):
+        assert float(jnp.abs(grad).max()) == 0.0
+
+
+@pytest.mark.parametrize("latent", list(LATENTS))
+@pytest.mark.parametrize("core", ["mlp", "dilated_lstm"])
+def test_latent_only_is_exactly_the_full_forwards_latent(core, latent):
+    """`latent_only=True` is the same `s`, not a cheaper approximation.
+
+    It is what the collector uses to encode the action's successor. `s` is
+    feedforward and upstream of the core in every latent variant, so skipping
+    the core and the goal head changes nothing about `s` — and means the
+    successor read touches no carry and emits no directive, which is why the
+    "do not perturb the live hierarchy" requirement is structural here rather
+    than a discipline someone has to remember.
+    """
+    manager, params, carry = _local_manager(core, latent=latent)
+    obs = jax.random.normal(jax.random.PRNGKey(3), (N_AGENTS, OBS_DIM))
+    gs = obs.reshape(-1)
+
+    full_carry, _, s_full = manager.apply(params, carry, gs, obs)
+    s_only = manager.apply(params, carry, gs, obs, latent_only=True)
+    assert jnp.array_equal(s_only, s_full), f"{core}/{latent}: latent_only drifted"
+
+    # Interleaving latent-only reads cannot move the recurrent carry.
+    for _ in range(3):
+        manager.apply(params, carry, gs, obs, latent_only=True)
+    again_carry, _, _ = manager.apply(params, carry, gs, obs)
+    assert jax.tree.all(
+        jax.tree.map(lambda a, b: bool(jnp.array_equal(a, b)), full_carry, again_carry)
+    ) if core == "dilated_lstm" else again_carry is None
+
+
+def test_next_state_latent_is_the_true_successor_not_the_reset(rollout_alpha):
+    """The ordering trap, asserted in both directions.
+
+    `_restart_done` REBINDS `next_obs`/`next_env_state` in place, so encoding
+    the successor after it would silently store the freshly reset episode's
+    latent and manufacture a reward out of the teleport. Every other check in
+    this file would still pass.
+
+    Both directions are needed. Where no reset happened the successor is exactly
+    what the next transition observed, so `next_state_latent[t]` must EQUAL
+    `state_latent[t+1]` — which also proves the collector's `latent_only` read
+    agrees with the full manager forward in situ. Where a reset happened they
+    must DIFFER, because the reset intervened; if they matched, the encode has
+    moved below the cond.
+    """
+    _, _, _, _, traj, _, _ = rollout_alpha
+    nsl = np.asarray(traj.next_state_latent[:-1])
+    sl = np.asarray(traj.state_latent[1:])
+    done = np.asarray(traj.done[:-1]).astype(bool)
+    assert done.any() and (~done).any(), "need both cases in one rollout"
+
+    # f32 reassociation between two call sites inside one jit, not a semantic
+    # gap — the same artifact the module docstring records for the local latents.
+    assert np.abs(nsl[~done] - sl[~done]).max() < 1e-6, (
+        "successor latent != the next transition's own latent on a step with no "
+        "reset — the collector is not encoding the state it stepped into"
+    )
+    assert np.abs(nsl[done] - sl[done]).max() > 1e-3, (
+        "successor latent == the POST-RESET latent on a done step: the encode "
+        "has moved below `_restart_done`"
+    )
+
+
+def test_the_final_rollout_action_gets_its_outcome(rollout_alpha):
+    """No transition is dropped, including the one with no successor stored.
+
+    A shift-derived endpoint has nothing to put at `T-1` and must pay 0 there.
+    """
+    _, _, _, _, traj, _, _ = rollout_alpha
+    assert float(jnp.abs(traj.next_state_latent[-1]).max()) > 0.0
+    assert float(jnp.abs(traj.intrinsic_reward[-1]).max()) > 1e-6
+
+
+def test_the_intrinsic_truncation_bootstrap_is_added_exactly_once(rollout_alpha):
+    """`gamma * V^I(s_next)` rides on truncated steps only, and only once."""
+    _, _, _, _, traj, _, _ = rollout_alpha
+    boot = np.asarray(traj.intrinsic_bootstrap)
+    done = np.asarray(traj.done).astype(bool)
+    # The stub env truncates (never terminates), so done == truncated here.
+    assert np.abs(boot[~done]).max() == 0.0, "bootstrap paid off a non-truncated step"
+    assert np.abs(boot[done]).max() > 0.0, "truncated steps got no bootstrap"
+
+
+def test_alpha_zero_stores_a_placeholder_successor_latent():
+    """alpha=0 stays a STATIC no-op: no encode, and no (T,E,N,D) buffer for it.
+
+    Same idiom as `action_mask` — at production width that buffer is ~50 MB of
+    unused zeros, on top of the `goal`/`state_latent` pair that already
+    dominates the manager BPTT's peak memory.
+    """
+    traj0 = _collect(_config(intrinsic_coef=0.0))[3]
+    traj1 = _collect(_config(intrinsic_coef=0.5))[3]
+    assert traj0.next_state_latent.shape == (N_STEPS,)
+    assert traj1.next_state_latent.shape == traj1.state_latent.shape
+    # ...and the rollout itself is untouched: the encode consumes no RNG.
+    assert jnp.array_equal(traj0.action, traj1.action)
+    assert jnp.array_equal(traj0.reward, traj1.reward)
+    assert jnp.array_equal(traj0.state_latent, traj1.state_latent)
 
 
 def test_alpha_zero_builds_no_intrinsic_critic():
@@ -1951,3 +2239,278 @@ def test_every_latent_is_distinguishable_from_the_checkpoint_alone(tmp_path):
         assert dims["manager_hidden_dim"] == config.manager_hidden_dim, (
             expected, dims["manager_hidden_dim"]
         )
+
+
+# ---------------------------------------------------------------------------
+# The pure-intrinsic worker arm
+# (conf/model/feudal_film_intrinsic_only_local_private.yaml)
+#
+# `worker_objective: intrinsic_only` drops the extrinsic advantage from the
+# ACTOR's objective, so the worker's only job is to follow the manager's goals.
+# These pin the seams where that is silent: a no-op guarantee for every existing
+# arm, the actual independence from the extrinsic stream, the fact that alpha
+# cannot anneal the objective away, and the four config guards.
+# ---------------------------------------------------------------------------
+
+
+def _actor_params_after_update(config, progress=0.0):
+    """Post-update actor params for a config, from a fixed seed."""
+    _, _, new_rs, traj, boot, update_fn = _collect(config)
+    updated_rs, _ = update_fn(new_rs, traj, boot, jnp.float32(progress))
+    return updated_rs.train_state.actor_ts.params
+
+
+def test_mixed_objective_is_the_default_and_is_unchanged():
+    """The no-op guarantee: every existing arm must be bit-identical.
+
+    `worker_objective` defaults to "mixed", and stating it explicitly must be
+    the same computation — otherwise adding this knob silently moved 84 trained
+    arms' objective.
+    """
+    assert MAPPOConfig().worker_objective == "mixed"
+
+    implicit = _actor_params_after_update(_config(intrinsic_coef=0.5))
+    explicit = _actor_params_after_update(
+        _config(intrinsic_coef=0.5, worker_objective="mixed")
+    )
+    jax.tree.map(
+        lambda a, b: np.testing.assert_array_equal(np.asarray(a), np.asarray(b)),
+        implicit,
+        explicit,
+    )
+
+
+def test_intrinsic_only_drops_the_extrinsic_advantage():
+    """The arm's whole claim, stated as an invariance.
+
+    Scaling the stored EXTRINSIC reward by 1000x must leave the actor exactly
+    where it was — the extrinsic stream is not in its objective at all. The same
+    scaling on the INTRINSIC stream must move it, or the test would also pass
+    for an actor that simply gets no gradient.
+
+    (Only the actor: the extrinsic critic still regresses that return and will
+    move, which is deliberate — see `..._still_trains_the_worker_critic`.)
+    """
+    config = _config(
+        intrinsic_coef=1.0,
+        intrinsic_anneal="none",
+        worker_objective="intrinsic_only",
+    )
+    _, _, new_rs, traj, boot, update_fn = _collect(config)
+
+    base = update_fn(new_rs, traj, boot, jnp.float32(0.0))[0].train_state.actor_ts.params
+
+    scaled_ext = update_fn(
+        new_rs,
+        traj._replace(reward=traj.reward * 1000.0, value=traj.value * 1000.0),
+        boot._replace(worker=boot.worker * 1000.0),
+        jnp.float32(0.0),
+    )[0].train_state.actor_ts.params
+    jax.tree.map(
+        lambda a, b: np.testing.assert_array_equal(np.asarray(a), np.asarray(b)),
+        base,
+        scaled_ext,
+    )
+
+    # Positive control: the intrinsic stream IS in the objective. Shift rather
+    # than scale — normalization divides a pure scale straight back out (that is
+    # what `test_alpha_is_a_gradient_fraction...` pins), so a scale would be a
+    # no-op here too and would not distinguish "used" from "ignored".
+    perturbed_int = update_fn(
+        new_rs,
+        traj._replace(intrinsic_reward=traj.intrinsic_reward[::-1]),
+        boot,
+        jnp.float32(0.0),
+    )[0].train_state.actor_ts.params
+    moved = any(
+        jax.tree.leaves(
+            jax.tree.map(
+                lambda a, b: bool(jnp.any(a != b)), base, perturbed_int
+            )
+        )
+    )
+    assert moved, (
+        "the actor is insensitive to the intrinsic stream too — it is getting no "
+        "gradient at all, not an intrinsic-only one"
+    )
+
+
+def test_intrinsic_only_ignores_alpha_so_the_anneal_cannot_delete_the_objective():
+    """alpha is not a coefficient here, at any point in training.
+
+    `adv_int` is already unit-std, so an alpha factor would be a uniform rescale
+    that the default `intrinsic_anneal: "linear"` would drive to EXACTLY 0 —
+    silently deleting the worker's whole objective while every logged loss stayed
+    healthy. `run.py` forbids the schedule; this pins that the VALUE is inert
+    too, so the guard is belt-and-braces rather than the only thing standing
+    between the arm and a dead second half.
+    """
+    kw = dict(intrinsic_anneal="none", worker_objective="intrinsic_only")
+    small = _actor_params_after_update(_config(intrinsic_coef=0.1, **kw))
+    large = _actor_params_after_update(_config(intrinsic_coef=1.0, **kw))
+    jax.tree.map(
+        lambda a, b: np.testing.assert_allclose(
+            np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-6
+        ),
+        small,
+        large,
+    )
+
+    # ...and the same params whether we are at the start or the end of training.
+    end = _actor_params_after_update(_config(intrinsic_coef=1.0, **kw), progress=1.0)
+    jax.tree.map(
+        lambda a, b: np.testing.assert_allclose(
+            np.asarray(a), np.asarray(b), rtol=1e-6, atol=1e-6
+        ),
+        large,
+        end,
+    )
+
+
+def test_intrinsic_only_still_trains_the_worker_critic_and_the_manager():
+    """Only the ACTOR's advantage changes; nothing else is switched off.
+
+    The extrinsic critic is deliberately kept trained: it keeps the param tree
+    shape-identical to the matched `mixed` control (so checkpoints stay
+    interchangeable, the same reason `zero_goal` zeroes at the input) and keeps
+    `explained_variance` a live cross-arm diagnostic. The manager is what holds
+    all the task pressure here, so it must move too.
+    """
+    config = _config(
+        intrinsic_coef=1.0,
+        intrinsic_anneal="none",
+        worker_objective="intrinsic_only",
+    )
+    _, _, new_rs, traj, boot, update_fn = _collect(config)
+    updated_rs, losses = update_fn(new_rs, traj, boot, jnp.float32(0.0))
+
+    for name in ("critic_ts", "manager_ts", "manager_critic_ts"):
+        before = getattr(new_rs.train_state, name).params
+        after = getattr(updated_rs.train_state, name).params
+        assert any(
+            jax.tree.leaves(
+                jax.tree.map(lambda a, b: bool(jnp.any(a != b)), before, after)
+            )
+        ), f"{name} did not move under intrinsic_only"
+
+    assert "explained_variance" in losses
+
+    # Shape-identical to the mixed arm => checkpoints remain interchangeable.
+    mixed_rs = _collect(_config(intrinsic_coef=1.0, intrinsic_anneal="none"))[2]
+    jax.tree.map(
+        lambda a, b: (_ for _ in ()).throw(AssertionError((a.shape, b.shape)))
+        if a.shape != b.shape
+        else None,
+        new_rs.train_state.actor_ts.params,
+        mixed_rs.train_state.actor_ts.params,
+    )
+
+
+def test_the_logged_weights_say_which_objective_ran():
+    """`alpha_current` alone is misleading under intrinsic_only (it is inert).
+
+    The pair `adv_ext_weight` / `adv_int_weight` are the coefficients that
+    actually multiply the two normalized streams, so the stats record what the
+    objective WAS without the reader having to know the rule.
+    """
+    _, _, rs_m, traj_m, boot_m, upd_m = _collect(
+        _config(intrinsic_coef=0.5, intrinsic_anneal="none")
+    )
+    _, mixed = upd_m(rs_m, traj_m, boot_m, jnp.float32(0.0))
+    assert float(mixed["adv_ext_weight"]) == pytest.approx(1.0)
+    assert float(mixed["adv_int_weight"]) == pytest.approx(0.5)
+
+    _, _, rs_i, traj_i, boot_i, upd_i = _collect(
+        _config(
+            intrinsic_coef=0.5,
+            intrinsic_anneal="none",
+            worker_objective="intrinsic_only",
+        )
+    )
+    _, only = upd_i(rs_i, traj_i, boot_i, jnp.float32(0.0))
+    assert float(only["adv_ext_weight"]) == pytest.approx(0.0)
+    assert float(only["adv_int_weight"]) == pytest.approx(1.0)
+
+
+def test_unknown_worker_objective_raises():
+    with pytest.raises(ValueError, match="worker_objective"):
+        _collect(_config(worker_objective="bogus"))
+
+
+def test_intrinsic_only_requires_a_live_intrinsic_stream():
+    """At alpha=0 no r^I exists, so the actor would train on a zero advantage."""
+    with pytest.raises(ValueError, match="intrinsic_coef"):
+        _collect(
+            _config(
+                intrinsic_coef=0.0,
+                intrinsic_anneal="none",
+                worker_objective="intrinsic_only",
+            )
+        )
+
+
+def test_intrinsic_only_rejects_an_anneal_schedule():
+    """A schedule on a factor that is not in the expression reads as a lie."""
+    with pytest.raises(ValueError, match="intrinsic_anneal"):
+        _collect(
+            _config(
+                intrinsic_coef=1.0,
+                intrinsic_anneal="linear",
+                worker_objective="intrinsic_only",
+            )
+        )
+
+
+def test_intrinsic_only_warns_on_a_non_local_latent_but_still_runs():
+    """Warn, do not block — and neither extreme.
+
+    r^I is the worker's ENTIRE objective here, and under `centralized` it is not
+    agent-local (measured diag share of d s[i]/d obs_j = 0.0631 against a uniform
+    1/N of 0.0625), so each worker would optimize a team-aggregate signal it does
+    not control. That is worth shouting about, but the combination is also the
+    direct contrast that TESTS whether locality is what matters, so it must stay
+    runnable on purpose.
+    """
+    from algorithms.feudal_mappo_jax.mappo import validate_worker_objective
+
+    base = dict(
+        intrinsic_coef=1.0,
+        intrinsic_anneal="none",
+        worker_objective="intrinsic_only",
+    )
+    with pytest.warns(RuntimeWarning, match="not agent-local"):
+        validate_worker_objective(_config(manager_latent="centralized", **base))
+
+    # A local latent must be silent, or the warning is noise that gets filtered.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for latent in LOCAL_LATENTS:
+            validate_worker_objective(_config(manager_latent=latent, **base))
+
+    # And it really does run: the warning is not a disguised abort.
+    with pytest.warns(RuntimeWarning):
+        _, _, new_rs, traj, boot, update_fn = _collect(
+            _config(manager_latent="centralized", **base)
+        )
+    update_fn(new_rs, traj, boot, jnp.float32(0.0))
+
+
+def test_zero_goal_is_still_rejected_under_intrinsic_only():
+    """No new guard — the existing zero_goal check must already cover it.
+
+    A zero-goal worker cannot see the goals, so making them its ONLY objective is
+    the most uninterpretable arm in the stack. It is caught by run.py's
+    pre-existing `zero_goal && intrinsic_coef != 0` rule, which intrinsic_only
+    forces the second half of; this pins that so a refactor of that guard cannot
+    quietly open the hole.
+    """
+    config = _config(
+        intrinsic_coef=1.0,
+        intrinsic_anneal="none",
+        worker_objective="intrinsic_only",
+        zero_goal=True,
+    )
+    assert config.zero_goal and config.intrinsic_coef != 0.0, (
+        "intrinsic_only no longer implies the condition run.py's zero_goal guard "
+        "keys on — that arm needs its own guard now"
+    )

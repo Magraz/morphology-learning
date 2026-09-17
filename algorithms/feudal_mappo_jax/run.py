@@ -28,7 +28,10 @@ from algorithms.feudal_mappo_jax.manager import (
     goal_concentration,
     mean_goal_direction,
 )
-from algorithms.feudal_mappo_jax.mappo import create_train_state
+from algorithms.feudal_mappo_jax.mappo import (
+    create_train_state,
+    validate_worker_objective,
+)
 from algorithms.feudal_mappo_jax.trainer import (
     RunnerState,
     global_state_dim,
@@ -266,6 +269,7 @@ class Feudal_MAPPO_JAX_Runner:
             normalize_pooled_goal=self.model_params.normalize_pooled_goal,
             zero_goal=self.model_params.zero_goal,
             worker_fusion=self.model_params.worker_fusion,
+            worker_objective=self.model_params.worker_objective,
         )
 
         # Fail loudly rather than open. A zero-goal worker cannot see the goals,
@@ -288,6 +292,11 @@ class Feudal_MAPPO_JAX_Runner:
                 "model=feudal_zerogoal."
             )
 
+        # Every worker_objective rule lives in ONE function, shared with
+        # `trainer.make_train`, so the two cannot drift. It raises on the
+        # incoherent combinations and warns on a non-local manager latent.
+        validate_worker_objective(self.config)
+
         print(
             f"FeUdal MAPPO | env={environment} | n_envs={self.config.n_envs} | "
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
@@ -297,8 +306,22 @@ class Feudal_MAPPO_JAX_Runner:
         print(
             f"  manager: core={self.config.manager_core} "
             f"goal_dim={self.config.goal_dim} c={self.config.goal_horizon} "
-            f"hidden={self.config.manager_hidden_dim} | "
+            f"hidden={self.config.manager_hidden_dim} "
+            f"latent={self.config.manager_latent} | "
             f"alpha(intrinsic)={self.config.intrinsic_coef}"
+        )
+        # Say what the WORKER is optimizing. Under 'intrinsic_only' alpha is
+        # inert, so the line above would otherwise be the only intrinsic
+        # information printed and would read as if alpha were weighting anything.
+        print(
+            f"  worker: fusion={self.config.worker_fusion} "
+            f"objective={self.config.worker_objective}"
+            + (
+                "  (adv = adv_int only — extrinsic advantage NOT in the actor "
+                "loss; all task pressure is the manager's)"
+                if self.config.worker_objective == "intrinsic_only"
+                else "  (adv = adv_ext + alpha*adv_int)"
+            )
         )
 
     def train(self):
@@ -1046,6 +1069,13 @@ class Feudal_MAPPO_JAX_Runner:
             # evaluates a different function. Record what was actually used.
             "normalize_pooled_goal": bool(config.normalize_pooled_goal),
             "zero_goal": bool(config.zero_goal),
+            # Training-only (it never touches the forward pass), so unlike
+            # `normalize_pooled_goal` it cannot make this eval measure a
+            # different function. Recorded for provenance: it changes what the
+            # gaps below MEAN — under 'intrinsic_only' the worker is defined to
+            # depend on the goals, so every gap is large by construction and none
+            # of them grades the arm.
+            "worker_objective": str(config.worker_objective),
             "goal_dim": int(config.goal_dim),
             "goal_horizon": int(config.goal_horizon),
             "n_agents": int(self.env.n_agents),

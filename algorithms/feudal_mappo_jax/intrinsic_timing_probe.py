@@ -1,54 +1,68 @@
-"""Does the `r^I` timing misalignment actually change the worker's update?
+"""How much did fixing the `r^I` timing actually change the worker's update?
 
-THE CLAIM (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4). `trainer._env_step`
-stores the PRE-action latent as ``state_latent[t]``, and
-``worker_intrinsic_reward`` builds
+THE DEFECT, now FIXED (`manager.worker_intrinsic_reward_aligned`, wired in
+`trainer._apply_intrinsic_reward`). `trainer._env_step` stored the PRE-action
+latent as ``state_latent[t]``, and ``worker_intrinsic_reward`` built
 
     r^I_t = 1/c * sum_{i=1..c} d_cos(s_t - s_{t-i}, g_{t-i})
 
-onto the transition carrying action ``a_t``. Every term is fixed before ``a_t``
-is sampled, so **r^I_t is exactly independent of a_t** — while ``reward[t]`` on
-that same transition IS ``a_t``'s consequence. The two streams score different
-actions. The aligned version scores the successor the action actually produced:
+onto the transition carrying ``a_t``. Every term is fixed before ``a_t`` is
+sampled, so r^I_t was exactly independent of ``a_t`` — while ``reward[t]`` on
+that same transition IS ``a_t``'s consequence. The two streams scored different
+actions. Production now scores the successor the action actually produced:
 
-    r^I_t(aligned) = 1/c * sum_{i=1..c} d_cos(s_{t+1} - s_{t+1-i}, g_{t+1-i})
+    r^I_t = mean_{k=0..c-1} d_cos(s_plus_t - s_{t-k}, g_{t-k})
 
-WHY THIS IS NOT OBVIOUSLY FATAL, which is why it needs measuring rather than
-arguing. GAE does not use `r^I_t` alone: `A_t = sum_j (gamma*lambda)^j delta_{t+j}`,
-so `a_t`'s influence still reaches `A_t` through `r^I_{t+1}` onward — delayed one
-step and attenuated by `gamma*lambda ~ 0.94`, i.e. ~6%. If that is all that
-happens, the bug is cosmetic. Two things could make it worse: the misalignment
-also shifts the `_same_episode` masking relative to the action, and the last
-action's outcome is dropped from the stored latent sequence entirely.
+with ``s_plus_t`` the latent of the true successor, captured before the reset.
 
-WHAT IS MEASURED. The decision-relevant quantity is not the reward, it is the
-**update**. At the first PPO epoch the importance ratio is exactly 1 (pinned by
-`test_feudal_seams.py`), so the actor's gradient is exactly
+WHY THIS WAS NEVER OBVIOUSLY FATAL, and why the probe still exists. GAE does not
+use `r^I_t` alone: `A_t = sum_j (gamma*lambda)^j delta_{t+j}`, so `a_t`'s
+influence still reached `A_t` through `r^I_{t+1}` onward — delayed one step and
+attenuated by `gamma*lambda ~ 0.94`. Measured, that is essentially all that
+happened: 0.08 / 1.2 / 3.6 degrees of gradient rotation at alpha 0.01 / 0.1 /
+0.5, against 0.68 / 6.7 / 26.3 for the intrinsic term's own effect. So the fix
+is ~13% of what `r^I` is already doing, and it is NOT why positive-alpha arms
+lose to alpha=0. It was made for the boundary, not the magnitude: any endpoint
+derived by shifting the stored latents must pay 0 on the action that ENDS an
+episode, which is a standing bonus for terminating.
+
+WHAT IS MEASURED. Not the reward — the **update**. At the first PPO epoch the
+importance ratio is exactly 1 (pinned by `test_feudal_seams.py`), so the actor's
+gradient is exactly
 
     grad = sum_t A_t * grad_theta log pi(a_t | s_t, w_t)
 
-with `A = normalize(A_ext) + alpha * normalize(A_int)`. We build that gradient
-twice on the SAME trajectory, the same params and the same critic — once with
-the current `r^I` and once with the aligned one — and report the cosine between
-them. That isolates the timing and nothing else.
+with `A = normalize(A_ext) + alpha * normalize(A_int)`. That gradient is built
+THREE ways on the SAME trajectory, same params, same critics, and the cosines
+between them reported:
 
-  cos ~ 1.0   the fix would not move the update; the bug is cosmetic.
-  cos << 1.0  the two indexings ask the worker for different things.
+  LEGACY      the pre-fix reward (endpoint `s_t`).
+  SHIFT       `legacy_shift_approximation` — the estimate this probe used before
+              the fix existed. Exact in the interior (`r_corrected[t] ==
+              r_legacy[t+1]`), 0 at every boundary transition.
+  CORRECTED   production: the real pre-reset successor latent.
 
-Reported alongside it, to make a cos ~ 1 interpretable rather than vacuous:
+legacy-vs-CORRECTED is what the fix did. shift-vs-CORRECTED is the part a shift
+could never have delivered, i.e. terminal-action credit alone. A legacy-vs-
+CORRECTED angle far above the recorded 0.08/1.2/3.6 deg is a signal that the
+implementation is wrong — most likely the successor encoded below
+`_restart_done` — rather than a discovery.
 
-* ``cos(grad_ext, grad_current)`` — the scale the cosine lives on. If the
-  intrinsic term barely moves the update at this alpha, a high real-vs-aligned
-  cosine says "alpha is small", not "the timing is fine".
-* ``corr(A_int_current, A_int_aligned)`` — the same question one level up, before
-  the extrinsic stream dilutes it.
-* ``corr(r^I_current, r^I_aligned)`` and the one-step autocorrelation of the
-  stream — a slowly varying `r^I` is nearly its own shift, which would make the
-  misalignment harmless FOR THAT REASON and is worth distinguishing.
-* an EXACTNESS check that `r^I_t` does not depend on `a_t` under the current
-  indexing: re-run the same state with a different action and confirm the
-  stream's entry at `t` is bitwise unchanged while the extrinsic reward moves.
-  This converts the structural claim into a demonstration.
+Reported alongside, to keep a high cosine interpretable rather than vacuous:
+
+* ``cos(grad_ext, grad_legacy)`` — the scale the cosines live on. If the
+  intrinsic term barely moves the update at this alpha, everything else is high
+  for that reason alone.
+* ``corr(A_int_legacy, A_int_corrected)`` — the same question one level up,
+  before the extrinsic stream dilutes it.
+* ``corr(r^I)`` between arms, and the stream's one-step autocorrelation — a
+  slowly varying `r^I` is nearly its own shift, which makes the misalignment
+  harmless FOR THAT REASON and is worth distinguishing.
+* a CAUSAL check that the corrected `r^I_t` depends on `a_t`: the env is stepped
+  from one state under two different actions and the resulting rewards compared.
+  (The old version of this check edited a stored action while holding the stored
+  states fixed, which cannot show causal dependence — the legacy reward is a
+  function of (s, g) alone, so it was bitwise unchanged by construction.)
 
 Usage::
 
@@ -59,6 +73,9 @@ Usage::
 Note the probe reads `alpha` from the arm's config and uses it as-is; the shipped
 schedule anneals alpha to 0 over training, so the cosine at a late checkpoint is
 reported at the CONFIGURED alpha, i.e. the strongest case for the bug mattering.
+Run it at an EARLY checkpoint too: the reason the misalignment is nearly harmless
+is `r^I`'s lag-1 autocorrelation (0.53-0.73 on trained nets), and a manager still
+moving fast may not have it.
 """
 
 import argparse
@@ -68,21 +85,33 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def aligned_intrinsic_reward(states, goals, horizon, done=None):
-    """`r^I` scoring the SUCCESSOR latent against the goals active for the action.
+def legacy_shift_approximation(states, goals, horizon, done=None):
+    """`r^I` realigned by SHIFTING the stored latents — the pre-fix approximation.
 
-    The fix §4 asks for, implemented as a whole-trajectory function so it can be
-    compared against the shipped one on identical data.
+    Kept, and deliberately renamed away from "aligned", because it is no longer
+    the corrected reward: it is the **third arm** of the comparison, and the gap
+    between it and the real fix is the one quantity that isolates terminal-action
+    credit.
 
-    ``worker_intrinsic_reward(states, goals, c)[t]`` scores
-    ``s_t - s_{t-i}`` against ``g_{t-i}``. Shifting the *states* forward by one
-    (so index t reads `s_{t+1}`) while leaving the goals where they are gives
-    ``d_cos(s_{t+1} - s_{t+1-i}, g_{t+1-i})`` — the displacement `a_t` actually
-    caused, scored against the directives that were live when it was chosen.
+    Shifting the states forward by one (so index `t` reads `s_{t+1}`) while
+    leaving the goals in place gives ``d_cos(s_{t+1} - s_{t+1-i}, g_{t+1-i})``,
+    which is **exactly** the corrected reward in the interior: working the
+    indices through, ``r_corrected[t] == r_legacy[t+1]``. That identity is why
+    the gradient rotations this probe measured before the fix existed are a
+    sound estimate of what the fix does.
 
-    The last entry has no successor in the stored trajectory. It is masked to 0
-    rather than reusing `s_T`, which would score a displacement of zero and pay a
-    spurious ~0 cosine; `§4` names this dropped final outcome explicitly.
+    What it cannot reproduce is the boundary, in two places:
+
+    * at a `done` step the shifted mask covers ``done[t]`` itself, so **every**
+      term is masked and the episode-ENDING action is paid 0 — a standing bonus
+      for terminating, the same shape as the `boundary_truncates` failure the MJX
+      env removed. (`states[t+1]` would be the freshly RESET latent there, so
+      paying 0 is the conservative reading, not a fixable indexing detail.)
+    * the last stored step has no successor at all and is masked to 0 rather than
+      reusing `s_T`, which would score a zero displacement.
+
+    On a 1024-step `trunc` episode at `n_steps=1048` that is ~2 transitions of
+    1048; on the ~43-step boundary-terminating baseline arm it is ~2.4% of them.
     """
     from algorithms.feudal_mappo_jax.manager import worker_intrinsic_reward
 
@@ -136,6 +165,7 @@ def main():
         goal_ring_reset,
         goal_ring_write,
         worker_intrinsic_reward,
+        worker_intrinsic_reward_aligned,
     )
     from algorithms.feudal_mappo_jax.mappo import build_manager, compute_gae
     from algorithms.feudal_mappo_jax.network import evaluate_action, sample_action
@@ -208,25 +238,54 @@ def main():
                     )
                     nobs, nstate, r, term, trunc, info = v_step(env_state, a)
                     done = jnp.logical_or(term, trunc)
+                    # The successor latent, read BEFORE the restart below. This
+                    # is the endpoint of the corrected reward and the only thing
+                    # a shift cannot reconstruct; encoding it after the restart
+                    # would measure the reset instead.
+                    s_plus = manager.apply(
+                        mp, None, nobs.reshape(E, -1), nobs, latent_only=True
+                    )
+                    # Restart finished envs, as trainer._env_step does. The probe
+                    # used to run on past terminal states, so the boundary — the
+                    # whole subject of the corrected reward — was never
+                    # exercised. (This consumes an extra rng split per step, so
+                    # action sequences differ from the pre-fix probe.)
+                    rng, rk = jax.random.split(rng)
+                    robs, rstate = v_reset(jax.random.split(rk, E))
+
+                    def _sel(fresh, cur):
+                        d = done.reshape((-1,) + (1,) * (cur.ndim - 1))
+                        return jnp.where(d, fresh, cur)
+
+                    nobs = _sel(robs, nobs)
+                    nstate = jax.tree.map(_sel, rstate, nstate)
                     # AFTER `w_t` was consumed, matching trainer.py:358 — the
                     # ring reset must not retroactively change the goal the
                     # action was sampled from.
                     ring = goal_ring_reset(ring, done)
                     return (nobs, nstate, m_carry, ring, rng), (
-                        obs, gs, s_lat, goal, pooled, a, lp, r, done
+                        obs, gs, s_lat, s_plus, goal, pooled, a, lp, r, done
                     )
 
                 rng, sk = jax.random.split(rng)
                 _, out = jax.lax.scan(
                     step, (obs, env_state, m_carry, ring, sk), jnp.arange(T)
                 )
-                obs_t, gs_t, s_t, g_t, pooled_t, act_t, lp_t, rew_t, done_t = out
+                (obs_t, gs_t, s_t, sp_t, g_t, pooled_t, act_t, lp_t, rew_t,
+                 done_t) = out
 
                 done_a = jnp.broadcast_to(
                     done_t[..., None].astype(jnp.float32), s_t.shape[:-1]
                 )
+                # LEGACY = the pre-fix production reward (endpoint `s_t`).
+                # SHIFT   = the old approximation to the fix (endpoint `s_{t+1}`
+                #           from the stored array, boundaries dropped).
+                # CORRECTED = production today: the real pre-reset successor.
                 r_cur = worker_intrinsic_reward(s_t, g_t, c, done=done_a)
-                r_ali = aligned_intrinsic_reward(s_t, g_t, c, done=done_a)
+                r_shift = legacy_shift_approximation(s_t, g_t, c, done=done_a)
+                r_ali = worker_intrinsic_reward_aligned(
+                    s_t, sp_t, g_t, c, done=done_a
+                )
 
                 # --- Advantages, through the REAL GAE, same critics both ways.
                 v_ext = jax.vmap(jax.vmap(lambda x: critic.apply(cp, x)))(gs_t)
@@ -249,7 +308,7 @@ def main():
                     )
                     return a
 
-                a_cur, a_ali = adv_of(r_cur), adv_of(r_ali)
+                a_cur, a_ali, a_shift = adv_of(r_cur), adv_of(r_ali), adv_of(r_shift)
 
                 def norm(x):
                     return (x - x.mean()) / (x.std() + 1e-8)
@@ -258,6 +317,7 @@ def main():
                 A_ext = norm(adv_ext)
                 A_cur = A_ext + alpha * norm(a_cur)
                 A_ali = A_ext + alpha * norm(a_ali)
+                A_shift = A_ext + alpha * norm(a_shift)
 
                 # --- The update direction, at ratio == 1 (first PPO epoch).
                 def pg(params, A):
@@ -269,37 +329,93 @@ def main():
                         return -(lp_new * A).mean()
                     return _flat_grad(jax.grad(loss)(params))
 
-                g_cur, g_ali, g_ext = pg(wp, A_cur), pg(wp, A_ali), pg(wp, A_ext)
+                g_cur, g_ali = pg(wp, A_cur), pg(wp, A_ali)
+                g_ext, g_shift = pg(wp, A_ext), pg(wp, A_shift)
 
-                # --- Exactness: r^I_t must not move when a_t changes.
-                rng, pk = jax.random.split(rng)
-                alt = act_t.at[0].set(
-                    jax.random.normal(pk, act_t[0].shape)
-                )
-                # Only the stored ACTION changes here; s/g are unchanged, so the
-                # current stream is bitwise identical by construction. The point
-                # is to show the extrinsic side is not.
-                same = bool(
-                    jnp.array_equal(
-                        worker_intrinsic_reward(s_t, g_t, c, done=done_a), r_cur
+                # --- Action dependence, measured by STEPPING THE ENV.
+                # Editing a stored action while holding the stored states fixed
+                # cannot establish causal dependence: the legacy reward is a
+                # function of (s, g) alone, so it is bitwise unchanged by
+                # construction and that comparison is vacuous. Instead: roll a
+                # short prefix, then branch the SAME state on two different
+                # actions and read what each earns on its own transition.
+                def _prefix(n):
+                    rngp = jax.random.PRNGKey(7)
+                    obs_p, st_p = v_reset(jax.random.split(rngp, E))
+                    mc = manager.initialize_carry(jax.random.PRNGKey(8), (E,))
+                    rg = jnp.zeros((c, E, N, cfg.goal_dim))
+                    S, G, branch = [], [], None
+                    for t in range(n):
+                        mc, goal, s_lat = manager.apply(
+                            mp, mc, obs_p.reshape(E, -1), obs_p
+                        )
+                        rg = goal_ring_write(rg, goal, t)
+                        a, _ = sample_action(
+                            jax.random.fold_in(rngp, t),
+                            bind_goal(worker.apply, goal_ring_pool(rg)),
+                            wp, obs_p, discrete,
+                        )
+                        S.append(s_lat)
+                        G.append(goal)
+                        if t == n - 1:
+                            branch = (st_p, a)
+                            break
+                        obs_p, st_p = v_step(st_p, a)[:2]
+                    return jnp.stack(S), jnp.stack(G), branch
+
+                S_p, G_p, (st_b, a_b) = _prefix(c)
+
+                def _last_reward_under(action):
+                    nobs = v_step(st_b, action)[0]
+                    sp = manager.apply(
+                        mp, None, nobs.reshape(E, -1), nobs, latent_only=True
                     )
+                    # Only index -1 is read, and it depends on endpoints[-1]
+                    # alone, so the earlier endpoints are irrelevant filler.
+                    sp_seq = jnp.concatenate([jnp.zeros_like(S_p[:-1]), sp[None]])
+                    return worker_intrinsic_reward_aligned(S_p, sp_seq, G_p, c)[-1]
+
+                alt = (a_b + 1) % env.action_dim if discrete else -a_b
+                moved = float(
+                    jnp.abs(_last_reward_under(a_b) - _last_reward_under(alt)).max()
                 )
+                # The legacy form never reads a successor, so its value at that
+                # index is the same number for both branches — structurally, not
+                # empirically.
+                legacy_same = True
+
+                boundary = int(done_t.sum()) + 1  # done steps + the final step
 
                 print(f"\n=== {batch}/{model}/{trial}  alpha={alpha}  c={c}  T={T} E={E}")
-                print(f"  r^I  corr(current, aligned)        {_corr(r_cur, r_ali):+.4f}")
-                print(f"  r^I  lag-1 autocorrelation         {_corr(r_cur[:-1], r_cur[1:]):+.4f}")
-                print(f"  A^I  corr(current, aligned)        {_corr(a_cur, a_ali):+.4f}")
-                print(f"  grad cos(current, aligned)         {_cos(g_cur, g_ali):+.6f}")
-                print(f"  grad cos(extrinsic-only, current)  {_cos(g_ext, g_cur):+.6f}")
-                print(f"     (that second line is the SCALE: if it is ~1.0 the")
-                print(f"      intrinsic term barely moves the update at this alpha,")
-                print(f"      and the first line is high for that reason alone.)")
-                print(f"  |grad| current/aligned/ext-only    "
+                print(f"  dones in rollout / boundary transitions   "
+                      f"{int(done_t.sum())} / {boundary} of {T * E}")
+                print("  -- reward streams")
+                print(f"  r^I  corr(legacy, corrected)        {_corr(r_cur, r_ali):+.4f}")
+                print(f"  r^I  corr(shift-approx, corrected)  {_corr(r_shift, r_ali):+.4f}")
+                print(f"  r^I  lag-1 autocorrelation          {_corr(r_cur[:-1], r_cur[1:]):+.4f}")
+                print(f"  A^I  corr(legacy, corrected)        {_corr(a_cur, a_ali):+.4f}")
+                print("  -- the update direction (ratio == 1, first PPO epoch)")
+                print(f"  grad cos(legacy, CORRECTED)         {_cos(g_cur, g_ali):+.6f}")
+                print(f"  grad cos(legacy, shift-approx)      {_cos(g_cur, g_shift):+.6f}")
+                print(f"  grad cos(shift-approx, CORRECTED)   {_cos(g_shift, g_ali):+.6f}")
+                print(f"  grad cos(extrinsic-only, legacy)    {_cos(g_ext, g_cur):+.6f}")
+                print("     (that last line is the SCALE: if it is ~1.0 the")
+                print("      intrinsic term barely moves the update at this alpha,")
+                print("      and the others are high for that reason alone.)")
+                print("     EXPECTED: legacy-vs-corrected ~= legacy-vs-shift, since")
+                print("      the two agree everywhere but the boundary. A much")
+                print("      LARGER gap than the recorded 0.08/1.2/3.6 deg at")
+                print("      alpha 0.01/0.1/0.5 means the implementation is wrong")
+                print("      (most likely the successor encoded after the reset),")
+                print("      not that the bug was bigger than measured.")
+                print(f"  |grad| legacy/corrected/ext-only    "
                       f"{float(jnp.linalg.norm(g_cur)):.4e} / "
                       f"{float(jnp.linalg.norm(g_ali)):.4e} / "
                       f"{float(jnp.linalg.norm(g_ext)):.4e}")
-                print(f"  r^I_t independent of a_t (exact)   {same}")
-                print(f"  mean |r^I| current/aligned         "
+                print("  -- causal dependence on a_t (env stepped, not restored)")
+                print(f"  corrected r^I_t moves by            {moved:.4e}")
+                print(f"  legacy r^I_t reads no successor     {legacy_same}")
+                print(f"  mean |r^I| legacy/corrected         "
                       f"{float(jnp.abs(r_cur).mean()):.4f} / "
                       f"{float(jnp.abs(r_ali).mean()):.4f}")
 

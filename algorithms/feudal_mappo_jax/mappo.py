@@ -19,6 +19,7 @@ Parity notes (vs. the torch implementation):
 - ``explained_variance`` is the same pre-update diagnostic vanilla computes.
 """
 
+import warnings
 from typing import NamedTuple, Tuple
 
 import jax
@@ -263,6 +264,71 @@ def compute_gae(
 # ---------------------------------------------------------------------------
 
 
+WORKER_OBJECTIVES = ("mixed", "intrinsic_only")
+
+
+def validate_worker_objective(config: MAPPOConfig) -> None:
+    """Check `worker_objective` and the settings it makes incoherent.
+
+    ONE copy, called from both ``trainer.make_train`` (so any path that builds a
+    config directly — tests included — is covered) and ``run.py`` (so a launched
+    run fails at construction rather than at the first update). Two copies of
+    these rules is exactly how a guard rots.
+
+    Raises on the three combinations that would train happily and log healthy
+    numbers while measuring nothing; *warns* on the fourth, which is a legitimate
+    deliberate ablation but an expensive accident.
+    """
+    if config.worker_objective not in WORKER_OBJECTIVES:
+        raise ValueError(
+            f"worker_objective={config.worker_objective!r} is not one of "
+            f"{WORKER_OBJECTIVES}. Caught at build time so a typo fails before a "
+            "run is launched."
+        )
+    if config.worker_objective != "intrinsic_only":
+        return
+
+    # `intrinsic_coef != 0` is the STATIC gate that builds V^I, captures
+    # `next_state_latent` and computes r^I at all. At 0 the worker's entire
+    # objective would be a zero advantage.
+    if config.intrinsic_coef == 0.0:
+        raise ValueError(
+            "worker_objective='intrinsic_only' requires intrinsic_coef != 0: at "
+            "alpha=0 no intrinsic stream is built, so the worker would train on "
+            "a zero advantage. Set intrinsic_coef=1.0 — its VALUE is inert here, "
+            "it only has to be nonzero."
+        )
+    # alpha does not appear in this objective's advantage (adv_int is already
+    # unit-std), so a schedule on it is not merely redundant: the default
+    # "linear" reaching 0 reads as "the worker's objective annealed away", which
+    # is precisely what it does NOT do.
+    if config.intrinsic_anneal != "none":
+        raise ValueError(
+            "worker_objective='intrinsic_only' requires intrinsic_anneal='none', "
+            f"got {config.intrinsic_anneal!r}. alpha is not a coefficient under "
+            "this objective (adv = adv_int, no alpha), so an anneal schedule "
+            "would be inert while reading as if it were decaying the worker's "
+            "objective to zero."
+        )
+
+    # A warning, not a raise: this combination is the direct contrast that tests
+    # whether locality is what matters, so it must stay runnable on purpose.
+    if config.manager_latent not in LOCAL_LATENTS:
+        warnings.warn(
+            "worker_objective='intrinsic_only' with "
+            f"manager_latent={config.manager_latent!r}: r^I is the worker's "
+            "ENTIRE objective here, but this latent is not agent-local — "
+            "measured over 12 trained arms, the diagonal share of d s[i]/d obs_j "
+            "is 0.0631 against a uniform 1/N of 0.0625, i.e. agent i's own "
+            "intrinsic reward moves as much when a TEAMMATE moves as when it "
+            "does. Every worker would then be optimizing a team-aggregate signal "
+            f"it does not control. Prefer a latent in {LOCAL_LATENTS} "
+            "(e.g. 'local_private').",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def _annealed_alpha(config: MAPPOConfig, progress: jnp.ndarray) -> jnp.ndarray:
     """alpha at this point in training. `progress` is a traced scalar in [0, 1].
 
@@ -312,6 +378,14 @@ def ppo_update(
     turns on, since the raw streams differ in magnitude by 300-600x during early
     training (see ``types.Params.intrinsic_coef``).
 
+    Under ``config.worker_objective == "intrinsic_only"`` the extrinsic stream is
+    dropped from the ACTOR's objective entirely (``adv = adv_int``, no alpha) so
+    the worker's only job is to follow the manager's goals. The extrinsic GAE,
+    the worker critic's regression and ``explained_variance`` all still run — the
+    critic is kept trained so the param tree stays shape-identical to the
+    ``"mixed"`` arm (checkpoints remain interchangeable) and so the extrinsic
+    return stays a live diagnostic. See ``types.Model_Params.worker_objective``.
+
     Args:
         train_state: current FeudalTrainState
         rng: PRNG key
@@ -330,6 +404,13 @@ def ppo_update(
     # Static python flag: at alpha == 0 none of the intrinsic machinery below is
     # traced at all, so that path is byte-identical to the pre-intrinsic code.
     use_intrinsic = config.intrinsic_coef != 0.0
+    # Static python flag: "intrinsic_only" drops the extrinsic advantage from the
+    # ACTOR's objective, so the worker's only job is to follow the manager's
+    # goals. Everything else (the extrinsic GAE, the worker critic's regression,
+    # `explained_variance`) is untouched — see the branch at the mixing site.
+    # Validated once at build time by `validate_worker_objective`, called from
+    # both `trainer.make_train` and `run.py` — not re-checked here.
+    intrinsic_only = config.worker_objective == "intrinsic_only"
     if progress is None:
         progress = jnp.float32(0.0)
     alpha_t = _annealed_alpha(config, progress)
@@ -384,11 +465,27 @@ def ppo_update(
             int_returns - trajectory.value_int, ddof=1
         ) / (jnp.var(int_returns, ddof=1) + 1e-8)
         adv_int = _normalize(int_advantages)
-        # Both terms are unit-std here, so alpha_t is exactly the mixing ratio of
-        # the two gradient directions.
-        adv = adv + alpha_t * adv_int
+        if intrinsic_only:
+            # The worker's ONLY objective is the manager's goals. No alpha
+            # factor: adv_int is already unit-std, so alpha would be a uniform
+            # rescale of the entire actor gradient — and under the default
+            # `intrinsic_anneal: "linear"` it would reach exactly 0, deleting the
+            # objective outright while every logged loss stayed healthy. run.py
+            # requires intrinsic_anneal="none" here so nothing reads as if a
+            # schedule were running.
+            adv = adv_int
+        else:
+            # Both terms are unit-std here, so alpha_t is exactly the mixing
+            # ratio of the two gradient directions.
+            adv = adv + alpha_t * adv_int
         int_metrics = {
             "alpha_current": alpha_t,
+            # The coefficients that ACTUALLY multiply the two normalized streams
+            # in the line above. `alpha_current` alone is misleading under
+            # "intrinsic_only", where it is inert — logging the pair means the
+            # stats say what the objective was without having to know the rule.
+            "adv_ext_weight": jnp.float32(0.0 if intrinsic_only else 1.0),
+            "adv_int_weight": jnp.float32(1.0) if intrinsic_only else alpha_t,
             # The RAW (pre-normalization) advantage scales of the two streams.
             # This pair is the diagnostic that reads the defect this whole path
             # exists to fix: it shows the magnitude gap that the per-stream

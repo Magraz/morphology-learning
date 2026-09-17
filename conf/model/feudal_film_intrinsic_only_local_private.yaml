@@ -1,0 +1,95 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# PURE-INTRINSIC WORKER: the worker's ONLY objective is to follow the manager's
+# goals. `worker_objective: intrinsic_only` drops the extrinsic advantage from
+# the actor's policy gradient entirely:
+#
+#     mixed (every other arm):  adv = adv_ext + alpha_t * adv_int
+#     this arm:                 adv = adv_int
+#
+# All task pressure therefore sits with the MANAGER, whose transition policy
+# gradient is already weighted by the extrinsic advantage under `manager_gamma`.
+# Task return can only be reached THROUGH the goal channel — the classic
+# Dayan-Hinton feudal contract, and the one configuration in which the hierarchy
+# is load-bearing by construction.
+#
+# WHY THIS ARM EXISTS. Under `mixed`, every measurement says the goals are
+# decorative: `eval_gap_permuted` ~ 0 on 40 of 45 non-control trials, `gap_zeroed`
+# systematically NEGATIVE (zeroing the goal IMPROVES 15 of 16 trained arms), and
+# the best arm in the `mjx_12a_3o_trunc_1024` batch is `feudal_film_zerogoal_dilated`
+# (293.7), whose goals are provably disconnected. The opposite extreme — a worker
+# that can do nothing BUT follow — has never been run.
+#
+# WHY `local_private`, and why it is a PRECONDITION rather than a preference.
+# r^I scores `d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i])`, so whatever `s[i]` responds
+# to is what agent i gets paid for. Measured 2026-09-09 over 12 trained arms, the
+# `centralized` latent is not agent-local at ALL: the diagonal share of the block
+# Jacobian `d s[i]/d obs_j` is 0.0631 against a uniform 1/N of 0.0625 (a
+# block-diagonal manager reads 1.0). Under `mixed` that is a confound; under
+# `intrinsic_only` it is fatal, because the worker's WHOLE loss would then be a
+# team-aggregate signal no individual worker controls. `local_private` is the only
+# latent measured to have both properties this arm needs: locality (diag share
+# exactly 1.0) and restored goal-row diversity (`s` 8.72, `g` 9.24, against
+# `local`'s 1.0-2.9 / 1.5-1.7). `run.py` WARNS — it does not block — if this is
+# overridden to a non-local latent.
+#
+# ⚠ alpha IS NOT A COEFFICIENT HERE. `adv_int` is already unit-std, so the
+# expression carries no alpha at all. `intrinsic_coef: 1.0` only has to be
+# NONZERO: it is the static gate that builds V^I, captures `next_state_latent`
+# and computes r^I in the first place (run.py raises at 0.0). And
+# `intrinsic_anneal` MUST be `none` — the default `linear` would decay a factor
+# that is not in the expression, reading as "the objective annealed away" while
+# doing nothing; run.py raises on anything else.
+#
+# ⚠ THE PRIMARY RISK, and it is self-sealing. Manager and worker share `d_cos` as
+# an objective and can climb it THROUGH THE ENVIRONMENT (no gradient crosses FuN's
+# detach). Measured on `feudal_film_n01_local`, they do exactly that: the manager
+# freezes on one direction and the worker drives its own observation along it —
+# `goal_direction_count` 1.45 against a random-direction baseline of 8.93, task
+# return 1.4. With `intrinsic_only` there is nothing else in the worker's
+# gradient, so that degenerate joint solution is OPTIMAL FOR THE WORKER. The
+# counter-pressure is that the manager's PG is weighted by the extrinsic
+# advantage, so the manager is not free to collapse; the residual feedback risk is
+# that a perfectly obedient worker drives `d_cos -> 1` everywhere, `d_cos_var -> 0`,
+# and the manager's own gradient flattens.
+#
+# WATCH, IN THIS ORDER, ACROSS THE WHOLE RUN (`local`'s collapse landed by ~10M
+# steps and was permanent):
+#   1. `d_cos_var`            — must stay off the floor (<~1e-3 => cosine constant)
+#   2. `goal_direction_count` — against the random baseline N^2/(N + N(N-1)/goal_dim),
+#                               = 8.93 at N=12 / goal_dim=32
+#   3. `state_latent_erank`   — <~1.5 => rank-1 latent collapse
+#   4. only then, return
+#
+# ⚠ THE GOAL-DEPENDENCE PROBE CANNOT GRADE THIS ARM. `gap_zeroed`, `gap_constant`
+# and `gap_permuted` will all be large BY CONSTRUCTION — the worker is defined to
+# depend on the goals — and so will `d_cos_mean`. The three-condition acceptance
+# test in `feudal_film.yaml` is therefore vacuous here. Acceptance is the
+# BETWEEN-ARM return comparison, which CLAUDE.md already names as the only test
+# that can rule an arm IN:
+#
+#   vs feudal_film_local_private  — does removing the worker's own task gradient
+#                                   help or hurt? (the matched, one-key control)
+#   vs feudal_film_zerogoal       — does it beat the goal-free floor?
+#   vs mlp (algorithm=mappo_jax)  — does it beat flat MAPPO? (272 / 295 on the 12a groups)
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_intrinsic_only_local_private \
+#       trial_id=0
+defaults:
+  - feudal_film_local_private
+  - _self_
+
+model_params:
+  worker_objective: intrinsic_only
+
+params:
+  # Inert as a magnitude — only its nonzero-ness matters (see above).
+  intrinsic_coef: 1.0
+  # Required: alpha does not appear in this objective's advantage.
+  intrinsic_anneal: none

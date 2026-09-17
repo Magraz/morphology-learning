@@ -1560,6 +1560,85 @@ MUJOCO_GL=egl uv run python -m algorithms.feudal_mappo_jax.goal_dependence_probe
     --trials 0,1,2 --n-eval-episodes 64 --shifts 1
 ```
 
+#### MEASURED 2026-09-17 — `mjx_12a_4o_4444_512`: goals can be COHERENCE-CRITICAL and WORTHLESS at once
+
+The finding that added `gap_zeroed > 0` as a third acceptance condition. Env
+group: 12 agents / 4 objects, `variant: trunc`, `coupling_def: [4,4,4,4]`
+(sums to 16 > 12, so deliveries are forced sequential), and `params.n_steps: 512`
+against the env's `max_steps: 1024`. `feudal_n01_local_private` — concat fusion,
+`manager_latent: local_private`, alpha=0.1 — *looks* like it beats the baselines
+there. It does not, twice over.
+
+**(a) The matched control ties it exactly.** `plotting/config.yaml` listed
+`feudal_film_zerogoal` but not `feudal_zerogoal`; the arm is **concat**, so
+`feudal_zerogoal` is its fusion-matched goal-free control. Probe, 64 paired
+deterministic episodes, 3 seeds:
+
+| arm | real | permuted | env_permuted | constant | zeroed |
+|---|---|---|---|---|---|
+| `feudal_n01_local_private` | **281.4 ± 72.1** | 257.3 | 260.3 | 240.3 | 283.8 |
+| `feudal_zerogoal` (matched) | **281.1 ± 67.2** | — | — | — | — |
+| `feudal_film_zerogoal` (plotted) | 208.8 ± 52.5 | — | — | — | — |
+| `feudal_n01` (centralized latent) | 159.9 ± 6.7 | 162.9 | 168.1 | 159.7 | 170.6 |
+
+**(b) The `_1024` sibling inverts the ranking, because 512 BREAKS THE BASELINES.**
+`mjx_12a_4o_4444_1024` is the identical arm set at `n_steps: 1048`:
+
+| arm | @1024 | @512 | Δ |
+|---|---|---|---|
+| `mlp` | **433.0 ± 13.1** | 230.0 ± 51.6 | −203 |
+| `feudal_zerogoal` | **426.3 ± 9.4** | 278.8 ± 115.5 | −148 |
+| `feudal_film_zerogoal` | **438.0 ± 4.7** | 216.7 ± 101.6 | −221 |
+| `feudal_n01_local_private` | **144.8 ± 20.2** | 276.5 ± 117.1 | **+132** |
+
+Seed SD explodes 5–20x at 512 (4.7 → 101.6). ⚠ **It is NOT mainly the truncated
+episode window**, which was the obvious hypothesis (`collect_fn` resets every env
+at the top of every rollout and scans exactly `n_steps`, so at 512 training never
+sees steps 512–1023 — the trap this file records for `mjx_16a_4o_multi_goal`).
+Measured by running both trained `mlp` policies on identical reset keys (32
+episodes) and splitting the return by segment:
+
+| | steps 0–511 (both trained here) | steps 512–1023 (512-policy never trained here) | total |
+|---|---|---|---|
+| trained @ `n_steps=1048` | 309.2 | 126.9 | 436.1 |
+| trained @ `n_steps=512` | 179.1 | 52.6 | 231.7 |
+| deficit | **130.1 (64%)** | 74.3 (36%) | 204.4 |
+
+**64% of the deficit is inside the window the 512 policy trained on** — it is a
+worse policy everywhere, not a good one falling off a cliff at step 512. The
+window effect is real but minority (the 512 policy keeps 58% of the 1024
+policy's return in the trained half, 41% in the untrained half). That leaves the
+halved per-update batch (512x32 = 16384 env-steps vs 1048x32 = 33536, hence 6103
+updates instead of 2980) as the remaining candidate. **Unseparated:** the clean
+test is `n_steps=512` with `env.n_envs=64`, which restores the batch while
+keeping the truncated window.
+
+**(c) The goals are USED, state-conditioned, agent-specific — and worth zero
+return.** Every collapse detector on this arm is the healthiest in the codebase:
+the env null gate **passes** (`d_cos_gap_env` +0.081 against `d_cos_mean` +0.110,
+i.e. 73%), `d_cos_gap_agent` ≈ `d_cos_mean`, `goal_direction_count` 8.98 against
+the random-direction baseline of **8.93** at N=12/`goal_dim`=32 (so
+`local_private` really did fix the row collapse that `local` caused),
+`goal_concentration` **0.129** (nowhere near the 0.78 of the decorative
+`mjx_12a_3o` case), `goal_perm_cos` −0.013, and the `feudal_zerogoal` positive
+control reports exactly 0.0 on all five variants. Read the returns instead:
+
+* **`zeroed` 283.8 ≥ `real` 281.4** — the correct goal buys **nothing** over no
+  goal at all (`gap_zeroed` = −2.4);
+* `permuted` 257.3 / `env_permuted` 260.3 — any *incoherent* goal costs ≈20–24;
+* `constant` 240.3 — a frozen direction costs 41.
+
+Both nulls cost about the same, which is the signature of a **coherence
+requirement, not an information channel**: `local_private` builds `s_i` from
+`obs_i`, so `g_i` partly re-encodes what the worker already sees, and
+contradicting it is an off-distribution hit. So `gap_permuted` here measures
+**damage from incoherence**, not value from the assignment — and this arm
+satisfies the old two-condition acceptance test (`gap_zeroed ≈ 0` **and**
+`gap_permuted > 0`, positive in all 3 seeds) while being exactly as good as its
+goal-free control. That is why the test now requires `gap_zeroed > 0`.
+
+⚠ `feudal_n05_local_private` seed 1 is **missing** from the 512 batch (n=2).
+
 #### MEASURED 2026-09-14 — `mjx_12a_3o_trunc_1024`: the goal channel can be LIVE and DECORATIVE at once
 
 The finding that produced the `constant` variant. `feudal_film_n01_local` is the
@@ -1611,10 +1690,12 @@ hierarchy.
 293.7, `mlp` 272.3, `feudal_film_zerogoal` 248.9, `feudal_film_n01_local` 203.7.
 The best arm in the batch is the one whose goals are provably disconnected.
 
-⚠ **Consequence for the acceptance criterion in `conf/model/feudal_film.yaml`**
-(`gap_zeroed ≈ 0` **and** `gap_permuted > 0`): a large `gap_zeroed` is *not*
-progress on its own. `gap_zeroed` large + `gap_permuted ≈ 0` + `gap_constant ≈ 0`
-is the degenerate outcome, and only `constant` separates it from the target one.
+⚠ **Consequence for the acceptance criterion in `conf/model/feudal_film.yaml`:**
+a large `gap_zeroed` is *not* progress on its own. `gap_zeroed` large +
+`gap_permuted ≈ 0` + `gap_constant ≈ 0` is the degenerate outcome, and only
+`constant` separates it from the target one. (This is one half of why that
+criterion is now **three** conditions rather than two; the other half is the
+`mjx_12a_4o_4444_512` measurement below.)
 
 #### MEASURED 2026-09-06 — all 20 trained arms (5 env groups × 4 models × 3 trials, 64 episodes)
 
@@ -1710,12 +1791,37 @@ Details that are load-bearing rather than stylistic:
   the nonlinearity can worsen it; zero-init means it *starts* at the goal-free
   36%, and `1 + tanh(γ)` ∈ [0, 2] is the fallback bound if it drifts.
 
-**Acceptance test is the probe, and it needs BOTH:** `gap_zeroed ≈ 0` (the goal
-stopped costing return) **and** `gap_permuted > 0` with a paired CI excluding 0
-(the pairing started mattering). The concat arms have the opposite of both today.
-Expect FiLM alone to deliver only the first — at `intrinsic_coef=0` nothing in
-the worker's objective asks it to follow the goal, and the `n01`/`n05` data says
-the current intrinsic reward is not the answer either. Verified end-to-end
+**Acceptance test is the probe, and it needs ALL THREE** (every gap is
+`real − variant`; each needs a paired CI excluding 0):
+
+| condition | what it captures | what its failure looks like |
+|---|---|---|
+| `gap_zeroed > 0` | the goal channel **earns** return against no goal at all | `≈ 0`: deleting the channel is free, so it is worth nothing |
+| `gap_constant > 0` | that return comes from the goal's **content**, not a frozen vector | `≈ 0`: the worker co-adapted to a bias; the manager is decorative |
+| `gap_permuted > 0` | and specifically from the per-agent **assignment** | `≈ 0`: the worker uses content but not who-gets-what |
+
+The concat arms fail all three today. Expect FiLM alone to move `gap_zeroed` off
+its negative value at best — at `intrinsic_coef=0` nothing in the worker's
+objective asks it to follow the goal, and the `n01`/`n05` data says the current
+intrinsic reward is not the answer either.
+
+⚠ **`gap_zeroed > 0` is the THIRD condition, added 2026-09-17, and it replaces
+the weaker `gap_zeroed ≈ 0` this file asked for before.** That waypoint was
+written against the 2026-09-06 failure where the goal *cost* return (zeroing it
+improved 15 of 16 arms), so "stopped costing" was the thing to reach — but
+`≈ 0` means `real ≈ zeroed`, i.e. **deleting the channel is free**, which a
+useful channel cannot be. The counterexample that passes the old two-condition
+test and is still worth nothing is measured below
+(`mjx_12a_4o_4444_512/feudal_n01_local_private`).
+
+⚠ **Three necessary conditions are still not sufficient.** Every variant is an
+off-distribution perturbation of an already-trained policy, so by the asymmetry
+above a positive gap is **weak** evidence and a zero gap is **strong negative**
+evidence. The probe reports what the trained policy is *sensitive to*; it cannot
+show the mechanism bought anything. The decisive test is the **between-arm** one
+— the arm's return against `feudal_zerogoal` trained from scratch on the same
+env group and seeds. Use the probe to rule arms **out** cheaply; cite the
+between-arm gap to rule one **in**. Verified end-to-end
 (train + resume + aligned stats); 6 new seam tests, 52 passing overall.
 
 ⚠ **A `conf/model/*.yaml` WITHOUT `# @package _global_` is SILENTLY INERT — it
@@ -2076,20 +2182,81 @@ magnitude story alone does not explain them.
   usefully differentiable); even a perfectly obs-local manager scores < 1.0 there.
 - ⚠ **This is necessary, not sufficient, and it is only observable at `alpha > 0`.**
   `intrinsic_coef` ships at 0.0, so nothing currently running depends on `r^I`.
-- **The `r^I` timing misalignment is REAL but SMALL — measured 2026-09-14, and it
-  demotes a warning this file used to carry.** `trainer._env_step` stores the
-  *pre-action* `state_latent[t]`, so `r^I_t = 1/c Σ_i d_cos(s_t − s_{t−i},
-  g_{t−i})` is built entirely from quantities fixed **before `a_t` is sampled** —
-  i.e. `r^I_t` is *exactly* independent of the action on its own transition
-  (verified bitwise), while `reward[t]` on that same transition **is** `a_t`'s
-  consequence. The two streams score different actions
-  (`plans/feudal_goal_reward_diagnosis_2026-09-09.md` §4).
-  `algorithms/feudal_mappo_jax/intrinsic_timing_probe.py` measures what that
-  costs the **update**, which is the decision-relevant quantity: it rebuilds the
-  actor's first-epoch gradient (where the PPO ratio is exactly 1, so the gradient
-  is exactly `Σ_t A_t ∇log π`) on one trajectory, same params and same critics,
-  under both indexings, and reports the angle between them. Over 13 trained arms
-  (both 12a env groups × α ∈ {0.01, 0.1, 0.5} × 3 seeds):
+- **`r^I` is TRANSITION-ALIGNED — fixed 2026-09-16 (plan:
+  `plans/feudal_intrinsic_reward_timing_fix_2026-09-16.md`). The measurements
+  below are what the fix was worth, and they are the reason it is hygiene rather
+  than a result.** The training path is now
+  `manager.worker_intrinsic_reward_aligned`:
+  `r^I_t = mean_{k=0..c−1} d_cos(s⁺_t − s_{t−k}, g_{t−k})`, where `s⁺_t` =
+  `Transition.next_state_latent` is the latent of the successor `a_t` actually
+  produced, captured in `_env_step` **before** `_restart_done` rebinds
+  `next_obs`. So `r^I_t` scores `a_t`, as `reward[t]` on that transition already
+  did. ⚠ Encoding that latent *after* the reset cond is the one mistake that
+  leaves every other check passing — it scores the teleport; pinned by
+  `test_next_state_latent_is_the_true_successor_not_the_reset`, which asserts
+  equality with `state_latent[t+1]` off done steps and inequality on them.
+  - **Until then** `trainer._env_step` stored the *pre-action* `state_latent[t]`
+    and `r^I_t = 1/c Σ_i d_cos(s_t − s_{t−i}, g_{t−i})` was built entirely from
+    quantities fixed **before `a_t` was sampled** — exactly independent of the
+    action on its own transition (verified bitwise), while `reward[t]` was that
+    action's consequence. The two streams scored different actions
+    (`plans/feudal_goal_reward_diagnosis_2026-09-09.md` §4). The paper's literal
+    form survives as `manager.worker_intrinsic_reward` for the diagnostic only —
+    **do not wire it back into the trainer.** Both are one call into the shared
+    `_intrinsic_window`, differing in the endpoint and the offset range, so the
+    episode-masking algebra cannot drift between them.
+  - **Why it was worth doing anyway, given the table below: the BOUNDARY, not the
+    magnitude.** Any endpoint derived by *shifting* the stored latents is exact
+    in the interior (`r_new[t] == r_old[t+1]`, verified to 0.0) but must pay
+    `r^I = 0` on the action that **ends** an episode — a standing bonus for
+    terminating, the same shape as the `boundary_truncates` failure the MJX env
+    removed. ~0.2% of transitions on a 1024-step `trunc` arm, ~2.4% on the
+    ~43-step boundary-terminating baseline. Explicit successor capture is what
+    covers those; a shift cannot.
+  - **Cost, measured** (`mjx_12a_3o_trunc_1024`, n_steps=1048, n_envs=32, α=0.1,
+    warm median of 7): collect **2.581 s → 2.562 s**, i.e. nothing — the extra
+    encoder is a latent-only forward (`FeudalManager.__call__(...,
+    latent_only=True)`, which skips the core and the goal head because `s` is
+    upstream of the core in **every** latent variant, so it touches no carry and
+    consumes no RNG). Peak GPU **1652 → 1751 MiB** (+6%), the new
+    `(T,E,N,goal_dim)` buffer.
+  - **α=0 is a STATIC no-op and is verified bit-identical to the pre-change
+    code** (git-worktree A/B on the CPU stub env: all 18 rollout fields, all 23
+    loss/metric keys and all 95 post-update param/optimizer leaves at 0.0 max
+    diff). The parameter tree is unchanged, so **existing checkpoints load** —
+    re-verified by loading trained `feudal_film` and `feudal_film_n01_local`
+    manager params and confirming `latent_only` is bitwise the full forward's
+    `s`. `next_state_latent` is a scalar placeholder at α=0 (the `action_mask`
+    idiom).
+  - **Post-fix probe reading** (`feudal_film_n01`/`n05` trial 0, T=128): the
+    legacy-vs-corrected gradient cosine is **0.999951 / 0.998870** (≈0.57° and
+    2.7°) and legacy-vs-shift is 0.999934 / 0.998776 — i.e. the fix landed where
+    the table predicted, which is the implementation check. `corr(r^I legacy,
+    corrected)` = **0.7213** against a lag-1 autocorrelation of **0.7210**, the
+    mechanism stated below reproduced exactly. Causal dependence now demonstrated
+    by **stepping the env** under two actions from one state (Δr^I ≈ 0.72); the
+    old check edited a stored action while holding the stored states fixed, which
+    could not show dependence — the legacy reward is a function of `(s, g)`
+    alone. ⚠ At `--n-steps 128` against `max_steps: 1024` **no episode ends**, so
+    the boundary arm is not exercised; use `--n-steps 1100`.
+  - ⚠ **And with the boundary exercised, the terminal-credit correction is
+    invisible in the gradient** (`--n-steps 1100 --n-envs 4`, 4 dones = 5 of 4400
+    transitions): shift-vs-corrected reads **0.999998**, legacy-vs-corrected
+    0.999947. That is the honest reading and it does **not** undercut the reason
+    for the change — a per-transition gradient cosine measures how much the
+    update moves *now*, not the incentive a systematic zero on the
+    episode-ending action creates over a run, which is what the
+    `boundary_truncates` episode showed can be self-sealing. Expect a larger
+    share on the ~43-step boundary-terminating baseline arm (~2.4% of
+    transitions vs 0.11% here); **unmeasured there.**
+
+  **What the fix was worth**, measured 2026-09-14 *before* it landed.
+  `algorithms/feudal_mappo_jax/intrinsic_timing_probe.py` measures what the
+  misalignment cost the **update**, which is the decision-relevant quantity: it
+  rebuilds the actor's first-epoch gradient (where the PPO ratio is exactly 1, so
+  the gradient is exactly `Σ_t A_t ∇log π`) on one trajectory, same params and
+  same critics, under both indexings, and reports the angle between them. Over 13
+  trained arms (both 12a env groups × α ∈ {0.01, 0.1, 0.5} × 3 seeds):
 
   | α | gradient rotation from **fixing the timing** | rotation the **intrinsic term itself** causes |
   |---|---|---|
@@ -2097,8 +2264,9 @@ magnitude story alone does not explain them.
   | 0.1 | **1.2°** | 6.7° |
   | 0.5 | **3.6°** | 26.3° |
 
-  So the fix is ~13% of the effect `r^I` is already having, and **it is not why
-  the α>0 arms fail.** The mechanism is measurable, not hand-waved: GAE
+  So the fix was ~13% of the effect `r^I` is already having, and **it is not why
+  the α>0 arms fail** — do not expect the correction to move return, and do not
+  read a change in the α>0 arms as its consequence. The mechanism is measurable, not hand-waved: GAE
   integrates over `1/(1 − γλ) = 16.8` steps at γ=0.99/λ=0.95, and `r^I` has lag-1
   autocorrelation **0.53–0.73**, so shifting it one step leaves the advantage
   **0.986–0.998** correlated even though the raw reward streams correlate only
@@ -2107,9 +2275,13 @@ magnitude story alone does not explain them.
   `local` measurement above are valid, not confounded; (2) `V^I` is not the
   problem either — `intrinsic_explained_variance` reads **0.96–0.99** on these
   arms, often above the extrinsic critic's, so the history-dependence of `r^I` is
-  recoverable from the current state. ⚠ Measured at *trained* checkpoints at the
-  *configured* (pre-anneal) α, i.e. the strongest case for it mattering; a
-  full-trajectory claim would need the same probe early in training. Acceptance for the latent change itself
+  recoverable from the current state — which is why the intrinsic critic's inputs
+  were deliberately left alone by the timing fix. ⚠ Measured at *trained*
+  checkpoints at the *configured* (pre-anneal) α, i.e. the strongest case for it
+  mattering; a full-trajectory claim would need the same probe early in training,
+  and that is the one regime where the correction could matter more than recorded
+  (the whole mechanism rests on an autocorrelation measured on trained nets).
+  **Still unrun.** Acceptance for the latent change itself
   is **structural** (diag share 1.0); a return claim needs competitive extrinsic
   return against matched active-goal/alpha=0 and zero-goal controls, and per the
   diagnosis note a high cosine or a positive permutation gap does not meet that bar.
@@ -2165,7 +2337,7 @@ reaches 0.97 after 1e8 steps. Judge `V^M` on a real-length run, not a smoke.
 are masked out, and `mjx_16a_4o` episodes are short (~43 steps, boundary contact
 terminates), so a large `c` starves the manager. Watch it when changing `c`.
 
-- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (92 tests, CPU stub
+- **Seam tests**: `algorithms/tests/test_feudal_seams.py` (123 tests, CPU stub
   env, no MJX — fast and *deterministic*, unlike an MJX rollout). They pin the
   joints where a mistake is silent: the in-scan ring equals the `pool_goals`
   oracle including done-masking; the stored goals are reproducible by re-scanning
@@ -2332,6 +2504,108 @@ normalization to unit std, and meet only in `ppo_update` as
   losses. Note `train_reward` is the **rollout** team reward; the `reward` series
   remains the deterministic **eval** return.
 
+### Pure-intrinsic worker (`worker_objective: intrinsic_only`) — wired, UNRUN
+
+`model_params.worker_objective` selects what the **worker's** policy gradient
+optimizes. `"mixed"` (default) is the original and is **byte-identical** to the
+pre-change code; `"intrinsic_only"` drops the extrinsic advantage from the actor
+entirely, so the worker's only job is to follow the manager's goals:
+
+```
+mixed (every other arm):  adv = adv_ext + alpha_t * adv_int
+intrinsic_only:           adv = adv_int
+```
+
+All task pressure then sits with the **manager**, whose transition PG is already
+weighted by the extrinsic advantage under `manager_gamma` — so task return can
+only be reached *through* the goal channel. That is the classic Dayan–Hinton
+feudal contract and the one configuration in which the hierarchy is load-bearing
+by construction. It exists because under `mixed` every measurement says the goals
+are decorative (`eval_gap_permuted` ≈ 0 on 40 of 45 non-control trials,
+`gap_zeroed` systematically **negative**, and the best arm in
+`mjx_12a_3o_trunc_1024` is `feudal_film_zerogoal_dilated` at 293.7, whose goals
+are provably disconnected). The opposite extreme had never been run.
+
+- **Only the actor's advantage changes.** The extrinsic GAE, the worker critic's
+  regression and `explained_variance` all still run. The critic is deliberately
+  kept trained: the param tree stays **shape-identical** to the matched `mixed`
+  control (so checkpoints remain interchangeable — the same reason `zero_goal`
+  zeroes at the *input*), and the extrinsic return stays a live diagnostic
+  (measured on the smoke run: EV climbs 0.22 → 0.94 while the actor never sees it).
+- **⚠ alpha is NOT a coefficient here, and that is a trap with a guard.**
+  `adv_int` is already unit-std, so an alpha factor would be a uniform rescale of
+  the whole actor gradient — which the shipped `intrinsic_anneal: linear` would
+  drive to **exactly 0**, silently deleting the worker's entire objective over the
+  second half of a run while every logged loss stayed healthy (the self-sealing
+  shape of the `boundary_truncates` and `VARIANTS`-enum bugs). The expression
+  therefore carries no alpha at all, and the arm **raises** unless
+  `intrinsic_anneal: none`. `intrinsic_coef` must still be **nonzero** — it is the
+  static gate that builds V^I, captures `next_state_latent` and computes `r^I` at
+  all — but its *value* is inert, so the group ships `1.0`.
+- **All four rules live in one function**, `mappo.validate_worker_objective`,
+  called from **both** `trainer.make_train` (so the seam tests and any direct-
+  config path are covered) and `run.py.__init__` (so a launched run fails at
+  construction). Three **raise** (unknown value; `intrinsic_coef == 0`;
+  `intrinsic_anneal != "none"`); the fourth **warns** — a non-local
+  `manager_latent`, membership tested against the existing `manager.LOCAL_LATENTS`
+  tuple rather than a hardcoded list.
+- **⚠ The latent is a PRECONDITION, not a preference.** `r^I` scores
+  `d_cos(s_t[i] − s_{t−k}[i], g_{t−k}[i])`, so whatever `s[i]` responds to is what
+  agent *i* is paid for. Under `centralized` that is **not agent-local at all**
+  (measured diag share of `d s[i]/d obs_j` = 0.0631 against a uniform 1/N of
+  0.0625), which is a confound under `mixed` and **fatal** here — the worker's
+  whole loss would be a team-aggregate signal it does not control.
+  `local_private` is the only latent measured to have both locality (diag share
+  exactly 1.0) and restored row diversity (`s` 8.72, `g` 9.24). Hence the single
+  shipped arm, `conf/model/feudal_film_intrinsic_only_local_private.yaml`
+  (`defaults: [feudal_film_local_private, _self_]`, i.e. one key apart from its
+  own control). The combination stays *runnable* on a non-local latent because it
+  is the direct contrast that tests whether locality is what matters.
+- **⚠ THE PRIMARY RISK, and it is self-sealing.** Manager and worker share `d_cos`
+  as an objective and can climb it **through the environment** (no gradient
+  crosses FuN's detach). Measured on `feudal_film_n01_local` they do exactly that:
+  the manager freezes on one direction and the worker drives its own observation
+  along it — `goal_direction_count` 1.45 against a random baseline of 8.93, task
+  return 1.4. With `intrinsic_only` there is nothing else in the worker's
+  gradient, so that degenerate joint solution is **optimal for the worker**. The
+  counter-pressure is that the manager's PG is weighted by the extrinsic
+  advantage, so the manager is not free to collapse; the residual feedback risk is
+  that a perfectly obedient worker drives `d_cos → 1` everywhere, `d_cos_var → 0`,
+  and the manager's own gradient flattens. **Watch, in this order, across the
+  WHOLE run** (`local`'s collapse landed by ~10M steps and was permanent):
+  `d_cos_var` (≲1e-3 ⇒ cosine constant) → `goal_direction_count` (vs 8.93 at
+  N=12/`goal_dim`=32) → `state_latent_erank` (≲1.5) → only then return.
+- **⚠ THE GOAL-DEPENDENCE PROBE CANNOT GRADE THIS ARM.** `gap_zeroed`,
+  `gap_constant` and `gap_permuted` will all be large **by construction** (the
+  worker is *defined* to depend on the goals), and so will `d_cos_mean`. The
+  three-condition acceptance test in `conf/model/feudal_film.yaml` is therefore
+  vacuous here. Acceptance is the **between-arm** return comparison, which this
+  file already names as the only test that can rule an arm *in*: vs
+  `feudal_film_local_private` (the matched one-key control), vs
+  `feudal_film_zerogoal` (the goal-free floor), vs `mlp` (flat MAPPO, 272 / 295 on
+  the 12a groups). `worker_objective` is recorded in
+  `evaluate_goal_dependence`'s provenance dict for that reason.
+- **New stats keys `adv_ext_weight` / `adv_int_weight`** — the coefficients that
+  actually multiply the two normalized streams (`1.0`/`alpha_t` under `mixed`,
+  `0.0`/`1.0` under `intrinsic_only`). They exist because `alpha_current` alone is
+  **misleading** here: it is logged and inert. (New keys are safe on resume —
+  `TrainingStatsTracker.to_dict()` left-pads short series with NaN.)
+- **Verified end-to-end** on `mjx_12a_3o_trunc_1024`: composition resolves
+  (`worker_objective: intrinsic_only`, `worker_fusion: film`, `manager_latent:
+  local_private`), all three raising guards fire before launch, the warning fires
+  and still runs, train + **resume** work, and the checkpoint carries `film_0` +
+  `f_Mspace_agent_kernel` (i.e. the intended arm trained). Smoke stats at 268k
+  steps: `adv_ext_weight` 0.0, `adv_int_weight` 1.0, `intrinsic_reward_abs`
+  0.10→0.13 (**not** identically 0.0 — the `# @package _global_` tell),
+  `d_cos_var` 0.033→0.051, `goal_direction_count` 8.87→9.00. 11 new seam tests;
+  **144 pass** across `test_feudal_seams.py` + `test_smax_seams.py`.
+- **⚠ No training result.** Every number above is a mechanism check. Plan:
+  `plans/feudal_pure_intrinsic_worker_2026-09-17.md`.
+  ```
+  uv run python train.py algorithm=feudal_mappo_jax env=mjx_12a_3o_trunc_1024 \
+      model=feudal_film_intrinsic_only_local_private trial_id=0
+  ```
+
 ### Recurrent manager (`manager_core: dilated_lstm`) — works end-to-end
 
 ```
@@ -2406,12 +2680,55 @@ older JaxMARL dict-API path existed in commit `f074a3a` and was deleted in `e786
 predates the truncation bootstrap, eval, checkpointing and the whole feudal stack, so it
 was **not** resurrected.)
 
-- **`jaxmarl` is a dependency again** (`pyproject.toml`), and it needs
-  `environments/smax/_compat.py` — jaxmarl calls `jax.tree_map`/`jax.tree_leaves`,
-  removed from the top level in JAX 0.9.x (this repo runs 0.10.2). ⚠ **An import smoke
-  test does NOT prove the shim is unnecessary**: `import jaxmarl`, `jaxmarl.make(...)`
-  and `env.reset(key)` all succeed without it; only a call that walks a pytree
-  (`step_env`, `get_avail_actions`) raises. Import `_compat` **before** jaxmarl.
+- **`jaxmarl` is a dependency again** (`pyproject.toml`), pinned **`>=0.2.0`**, and that
+  floor is load-bearing — see the next bullet. `environments/smax/_compat.py` restores
+  the `jax.tree_map`/`jax.tree_leaves` aliases removed from JAX's top level in 0.9.x
+  (this repo runs 0.10.2). It is **inert under 0.2.0** — a source-wide grep of the
+  installed package finds **0** references to any removed `jax.tree_*` alias — but it is
+  guarded (`if not hasattr`) and idempotent, so it is kept as insurance and costs
+  nothing. Delete it only if the `>=0.2.0` floor is enforced some other way. ⚠ If you
+  ever drop back to a 0.0.x jaxmarl, note that **an import smoke test does NOT prove the
+  shim is unnecessary**: `import jaxmarl`, `jaxmarl.make(...)` and `env.reset(key)` all
+  succeed without it; only a call that walks a pytree (`step_env`, `get_avail_actions`)
+  raises. Import `_compat` **before** jaxmarl.
+- **⚠ THE `jaxmarl>=0.2.0` FLOOR IS A CORRECTNESS PIN, and `>=0.0.2` silently resolved
+  to a 2023 release (found 2026-09-15).** jaxmarl 0.0.3–0.1.0 hard-pin
+  `jax==0.4.17.*` / `jaxlib==0.4.17.*`, which jax 0.10.2 cannot satisfy, so uv
+  backtracked past all of them to **0.0.2 (Nov 2023)** rather than failing. 0.2.0
+  requires only `jax>=0.4.25` and resolves cleanly. The two disagree on SMAX's per-unit
+  observation features:
+
+  | | `unit_features` (before the 6 unit-type bits) | per unit |
+  |---|---|---|
+  | 0.0.2 | `health, position_x, position_y, last_action, weapon_cooldown` | 11 |
+  | >=0.0.3 | `health, position_x, position_y, last_movement_x, last_movement_y, last_targeted, weapon_cooldown` | 13 |
+
+  `own_features` is **unchanged**, so `state_size = (own+2)*n_units` and `action_dim`
+  match across versions and **only `obs_size` moves**: at `10m_vs_11m` (20 other units)
+  270 vs **230**, at `3s5z` 205 vs 175, at `5m_vs_6m` 140 vs 120, at `3m` 75 vs 65.
+  - **How it presents**: loading a checkpoint trained under the other version raises a
+    bare `flax.errors.ScopeParamShapeError` at the first layer that eats raw `obs` —
+    `manager/f_enc_0` for the `local*` latents (which is *before* the actor, so the
+    error names the manager and looks like a latent/model-group problem), or the FiLM
+    actor's `Dense_0` otherwise. The `global_state_dim` and `action_dim` agreeing
+    exactly is the tell that the **scenario is right and only jaxmarl differs**.
+  - **The dangerous direction is training, not loading.** From scratch nothing crashes:
+    the run trains happily on a narrower observation and its curves are simply not
+    comparable to any arm trained elsewhere. Before this was found, `smax_3m/feudal` and
+    `smax_3m/feudal_film_local_global` had been trained locally at obs 65 while every
+    `smax_10m_vs_11m` / `smax_3s5z` / `smax_5m_vs_6m` arm came off the cluster at
+    270 / 205 / 140. **Those two `smax_3m` arms are dead** — retrain them under 0.2.0.
+  - Diagnose from the checkpoint, which cannot lie: `actor/params/.../Dense_0/kernel` is
+    `(obs_dim, hidden)` under `worker_fusion: film` and `(obs_dim + goal_dim, hidden)`
+    under concat; `critic/params/Dense_0/kernel` is `(global_state_dim, 2*hidden)`.
+    Solve `obs = u*(n_allies-1+n_enemies) + o` and `gs = (o+2)*n_units` for `u` — 13 is
+    a >=0.0.3 checkpoint, 11 is 0.0.2.
+  - Unrelated but found the same way: `smax_3s5z/mlp` and `smax_5m_vs_6m/mlp` hold
+    **concat-feudal** checkpoints (the actor tree has `MAPPOActor_0` and `Dense_0` is
+    `obs+goal_dim` wide), not flat `mappo_jax` actors — i.e. they are
+    `algorithm=feudal_mappo_jax model=mlp` runs that overwrote the baseline directory,
+    exactly the footgun flagged below. They are **not** baselines. `smax_3m/mlp` is a
+    genuine flat actor.
 - **Four contract mismatches the adapter reconciles**, each of which is silent if got
   wrong:
   1. **`step_env`, not `step`.** `MultiAgentEnv.step` auto-resets on done; the collector
@@ -2512,6 +2829,41 @@ is imported before JAX initializes, i.e. it depends on pytest collection order.
   collector's `tree.map` reset-select.
 - End-to-end (train / resume / evaluate / view) verified on both stacks at `3m`, plus
   `5m_vs_6m` on the flat stack.
+
+### Rendering (`view=true`) — colors, cost, and the ffmpeg writer
+
+`SMAXAdapter.render_episode` hands the episode to jaxmarl's `SMAXVisualizer`, which
+draws **strictly by unit index**: allies `0 .. num_allies-1` are **blue**
+(`cornflowerblue` while being shot at), enemies `num_allies ..` are **green**
+(`limegreen` likewise); a gray square is a bullet interpolated shooter -> target, the
+white letter in each circle is the unit-type shorthand (`m`/`M`/`s`/`Z`/`z`/`h`), and
+the circle radius is the unit type's, not its health. Under `HeuristicEnemySMAX`
+`self.agents` is the **allies only**, so **blue is the policy being rendered** and green
+is the built-in scripted enemy. ⚠ The shot-highlighting is one-sided: `init_render`
+builds `attacked_agents` by looping `self.agents`, which on the wrapper is allies only,
+so the lighter shade and the bullets only ever show **your** team's fire. Positions,
+deaths and the blue/green split are correct regardless.
+
+- **`view=true` is slow, and the encoder is not why.** `SMAXVisualizer.expand_state_seq`
+  multiplies the frame count by `world_steps_per_env_step` (**8**), so one 200-step
+  episode is **1600** frames, and every frame re-runs `init_render` — `ax.clear()`, a
+  fresh `Circle` + `text` per unit, then `figure.savefig(buff, format="raw")`. Measured
+  **0.23 s/frame** (11.0 s for 48 frames at `3m`), i.e. **~6 min per full episode**, and
+  `_view_with_env_renderer` renders 3 of them. Budget ~20 min, and do not wrap it in a
+  short `timeout` — a `timeout 1500` cut one off mid-episode-2 and reported the
+  misleading exit code 124.
+- **`use_bundled_ffmpeg()` (module-level in `smax_env.py`, called by `render_episode`)
+  silences `MovieWriter ffmpeg unavailable; using Pillow instead.`** jaxmarl's
+  `Visualizer.animate` calls `ani.save(fname)` with **no `writer=`**, so matplotlib uses
+  `rcParams["animation.writer"]` (default `"ffmpeg"`) resolved via
+  `rcParams["animation.ffmpeg_path"]` (default the bare name `"ffmpeg"`, looked up on
+  `PATH`). There is no system ffmpeg here, so it fell back to Pillow. The helper points
+  that rcParam at the static binary **`imageio-ffmpeg` already vendors** — that package
+  is a hard dependency in `pyproject.toml`, so this needs no new package and no root,
+  which is what makes it work on the HPC nodes too. Idempotent, best-effort (returns
+  False and leaves the Pillow fallback in place if anything is missing), and it defers
+  to a real system ffmpeg when one is on `PATH`. ⚠ It changes the **encoder only** —
+  per the measurement above it does **not** make rendering meaningfully faster.
 
 ### Config notes
 

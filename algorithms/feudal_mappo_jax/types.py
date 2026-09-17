@@ -191,6 +191,36 @@ class Model_Params:
     # whose direction the worker never learned to use.
     # NOT checkpoint-compatible with "concat" (different first-Dense input width).
     worker_fusion: str = "concat"
+    # What the WORKER's policy gradient optimizes.
+    #   "mixed" (default, original): adv = adv_ext + alpha_t * adv_int, i.e. the
+    #       worker carries its own task gradient and the manager's goals are an
+    #       auxiliary pressure on top of it.
+    #   "intrinsic_only": adv = adv_int. The worker's ONLY objective is to follow
+    #       the manager's goals; all task pressure sits with the manager, whose
+    #       transition PG is already weighted by the extrinsic advantage under
+    #       manager_gamma. This is the classic Dayan-Hinton feudal contract, and
+    #       it makes the goal channel load-bearing by construction.
+    #
+    # WHY: under "mixed" every measurement says the goals are decorative —
+    # eval_gap_permuted ~ 0 on 40 of 45 non-control trials, gap_zeroed
+    # systematically NEGATIVE (zeroing the goal IMPROVES 15 of 16 trained arms),
+    # and the best arm in the mjx_12a_3o batch is feudal_film_zerogoal_dilated,
+    # whose goals are provably disconnected. The opposite extreme is untested.
+    #
+    # ⚠ alpha is NOT a coefficient here. adv_int is already unit-std, so under
+    # "intrinsic_only" the expression carries no alpha at all — multiplying by it
+    # would be a uniform rescale of the whole actor gradient that the shipped
+    # `intrinsic_anneal: "linear"` would decay to EXACTLY 0 by the end of
+    # training, silently deleting the worker's entire objective while every
+    # logged loss stayed healthy. run.py therefore requires
+    # intrinsic_anneal="none" and intrinsic_coef != 0 for this objective.
+    #
+    # ⚠ Pair it with a LOCAL manager latent. r^I scores s_t[i] - s_{t-k}[i], and
+    # under manager_latent="centralized" that is not agent-local at all
+    # (measured diag share of d s[i]/d obs_j = 0.0631 against a uniform 1/N of
+    # 0.0625), so the worker's WHOLE loss would be a team-aggregate signal it
+    # does not control. run.py warns on the combination.
+    worker_objective: str = "mixed"
 
 
 @dataclass
@@ -254,6 +284,8 @@ class MAPPOConfig:
     normalize_pooled_goal: bool = True
     zero_goal: bool = False
     worker_fusion: str = "concat"
+    # See Model_Params.worker_objective — "mixed" (default) or "intrinsic_only".
+    worker_objective: str = "mixed"
 
 
 class Transition(NamedTuple):
@@ -302,9 +334,26 @@ class Transition(NamedTuple):
     # the vector `sample_action` saw, and recomputation would drift once the
     # manager's params move.
     pooled_goal: jax.Array
-    # The manager's latent state `s`, (n_envs, n_agents, goal_dim). Data for the
-    # intrinsic reward; recomputed differentiably inside the manager update.
+    # The manager's latent state `s` at ACT time — i.e. BEFORE this transition's
+    # action, built from `obs`/`global_state` above. (n_envs, n_agents, goal_dim).
+    # It must stay the pre-action latent: `manager_update` recomputes exactly it,
+    # differentiably, from the stored state, and the goal-reproducibility seam
+    # test pins that equality.
     state_latent: jax.Array
+    # The latent of the successor this transition's action ACTUALLY produced,
+    # read BEFORE the auto-reset overwrites it. Same shape as `state_latent`; a
+    # scalar placeholder when intrinsic_coef == 0 (the `action_mask` idiom — a
+    # real (T,E,N,goal_dim) buffer of unused zeros costs ~50 MB at production
+    # width).
+    #
+    # This is the ENDPOINT of the intrinsic reward, and the reason it is stored
+    # rather than derived. `state_latent[t+1]` is NOT it: at a done step that
+    # slot holds the latent of the freshly RESET episode, and at the last step of
+    # the rollout it does not exist. Deriving the endpoint by shifting therefore
+    # has to pay 0 on the episode-ending action, which is a standing bonus for
+    # terminating — the same shape as the `boundary_truncates` failure the MJX
+    # env removed. Explicit capture is what covers those transitions.
+    next_state_latent: jax.Array
     # V^M at act time, (n_envs,) | (n_envs, n_agents) — mirrors `value`.
     manager_value: jax.Array
     # The manager's own reward stream: the extrinsic reward plus a truncation

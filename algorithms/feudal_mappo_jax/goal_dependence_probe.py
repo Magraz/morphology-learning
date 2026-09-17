@@ -71,6 +71,24 @@ assignment relative to a manager trained to emit permuted goals.
                                reproduces it. Note this presents as a large
                                `gap_zeroed`, i.e. as the headline SUCCESS
                                condition, unless `constant` is read too.
+    R_real ~ R_zero            the channel is WORTH NOTHING: deleting it is
+       but R_real > R_perm     free. A positive permutation gap alongside this
+       and R_real > R_const    is COHERENCE damage, not value from the
+                               assignment -- the worker was co-adapted to a goal
+                               consistent with its own observation, and any
+                               incoherent goal (wrong agent, wrong state, or
+                               frozen) is an off-distribution hit. Measured on
+                               mjx_12a_4o_4444_512/feudal_n01_local_private
+                               (2026-09-17), which ties its matched
+                               feudal_zerogoal control 281.4 vs 281.1.
+
+ACCEPTANCE (conf/model/feudal_film.yaml, CLAUDE.md) therefore needs ALL THREE of
+``gap_zeroed > 0``, ``gap_constant > 0`` and ``gap_permuted > 0``, each with a
+paired CI excluding 0: the channel must EARN return, from the goal's CONTENT,
+and specifically from the per-agent ASSIGNMENT. Necessary, not sufficient --
+every variant perturbs an already-trained policy off-distribution, so use this
+probe to rule arms OUT cheaply and the between-arm comparison against
+``feudal_zerogoal`` to rule one IN.
 
 A collapsed-goal manager ALSO gives gap ~ 0, because the permutation is then
 nearly the identity. That is correct but ambiguous alone, so ``goal_perm_cos``

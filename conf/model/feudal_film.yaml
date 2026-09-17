@@ -37,14 +37,45 @@
 # input width obs_dim + goal_dim (56), FiLM's is obs_dim (40). This arm trains
 # from scratch and writes to results/<env>/feudal_film/.
 #
-# ACCEPTANCE TEST is the same probe. Success is BOTH:
-#   * gap_zeroed ~ 0      (the goal stopped costing return), and
-#   * gap_permuted > 0 with a paired CI excluding 0 (the pairing started
-#     mattering).
-# Today the concat arms have the opposite of both. Expect FiLM alone to deliver
-# the first: at intrinsic_coef=0 nothing in the worker's objective asks it to
-# follow the goal, so the second likely needs the objective side too -- and the
-# n01/n05 data says the current intrinsic reward is not it.
+# ACCEPTANCE TEST is the same probe. Every gap is `real - variant`. Success is
+# ALL THREE, each with a paired CI excluding 0:
+#   * gap_zeroed   > 0  the goal channel EARNS return against no goal at all;
+#   * gap_constant > 0  that return comes from the goal's CONTENT, not from a
+#                       frozen vector the worker co-adapted to;
+#   * gap_permuted > 0  and specifically from the per-agent ASSIGNMENT.
+# Today the concat arms fail all three. Expect FiLM alone to move gap_zeroed off
+# its negative value at best: at intrinsic_coef=0 nothing in the worker's
+# objective asks it to follow the goal, so the other two likely need the
+# objective side too -- and the n01/n05 data says the current intrinsic reward
+# is not it.
+#
+# ⚠ gap_zeroed > 0 IS THE THIRD CONDITION, ADDED 2026-09-17, and it replaces the
+# weaker `gap_zeroed ~ 0` this file used to ask for. That waypoint was written
+# against the 2026-09-06 failure where the goal COST return (zeroing it improved
+# 15 of 16 arms), so "stopped costing" was the thing to reach. But ~0 means
+# `real ~ zeroed`, i.e. deleting the channel is FREE -- which a useful channel
+# cannot be. Measured counterexample that passes the old two-condition test and
+# is still worth nothing: mjx_12a_4o_4444_512/feudal_n01_local_private, 64 paired
+# episodes --
+#     real 281.4 | zeroed 283.8 | permuted 257.3 | env_permuted 260.3 |
+#     constant 240.3
+# gap_permuted +22 and gap_constant +41 (both positive in all 3 seeds) while
+# gap_zeroed is -2.4. Deleting the goal is free; CORRUPTING it costs ~20-40, and
+# both nulls cost about the same. That is a COHERENCE requirement, not an
+# information channel: manager_latent=local_private builds s_i from obs_i, so
+# g_i partly re-encodes what the worker already sees and contradicting it is
+# just an off-distribution hit. gap_permuted there measures damage from
+# incoherence, not value from the assignment -- and the arm ties its matched
+# control feudal_zerogoal outright (281.4 vs 281.1).
+#
+# ⚠ THREE NECESSARY CONDITIONS ARE STILL NOT SUFFICIENT. Every variant is an
+# off-distribution perturbation of an already-trained policy, so by the same
+# asymmetry recorded in CLAUDE.md a positive gap is WEAK evidence and a zero gap
+# is STRONG negative evidence. The probe can only report what the trained policy
+# is sensitive to; it cannot tell you the mechanism bought anything. The
+# decisive test is the BETWEEN-ARM one -- this arm's return against
+# feudal_zerogoal trained from scratch on the same env group and seeds. Run the
+# probe to rule arms OUT cheaply; cite the between-arm gap to rule one IN.
 #
 # ⚠ A LARGE gap_zeroed IS NOT PROGRESS TOWARD THIS — read gap_constant too
 # (added 2026-09-14). `mjx_12a_3o_trunc_1024/feudal_film_n01_local` scores

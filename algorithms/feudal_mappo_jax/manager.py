@@ -246,7 +246,8 @@ class FeudalManager(nn.Module):
             ``"local_global_private"`` (both). See "Latent locality".
 
     Call:
-        ``__call__(carry, global_state, obs=None) -> (carry, goal, state_latent)``
+        ``__call__(carry, global_state, obs=None, latent_only=False)
+        -> (carry, goal, state_latent)``
 
         ``global_state`` is ``(..., n_agents * obs_dim)``; `goal` and
         `state_latent` are both ``(..., n_agents, goal_dim)`` and `goal` is
@@ -254,6 +255,18 @@ class FeudalManager(nn.Module):
         passes through, so the signature is the same for both cores.
         ``obs`` is ``(..., n_agents, obs_dim)`` and is REQUIRED by
         ``latent="local"``; the centralized branch ignores it entirely.
+
+        ``latent_only=True`` returns **`state_latent` alone** and skips the core
+        and the goal head. `s` is strictly upstream of the core in every latent
+        variant (see the diagram below), so this is the same `s` the full call
+        returns — bit-identical, not an approximation. It exists for
+        ``trainer._env_step``, which needs the latent of the action's successor
+        as the endpoint of the intrinsic reward and has no use for a second
+        goal: skipping the core means that read touches no carry, emits no
+        directive and consumes no RNG, so it cannot perturb the live hierarchy
+        by construction rather than by discipline. `carry` is ignored and may be
+        ``None``; the param tree is unchanged (``init`` always runs the full
+        path, and ``apply`` simply leaves the downstream params unread).
 
     Latent locality (``latent``)
     ----------------------------
@@ -483,7 +496,13 @@ class FeudalManager(nn.Module):
         return jnp.einsum(eq, x, w) + b
 
     @nn.compact
-    def __call__(self, carry, global_state: jnp.ndarray, obs: jnp.ndarray = None):
+    def __call__(
+        self,
+        carry,
+        global_state: jnp.ndarray,
+        obs: jnp.ndarray = None,
+        latent_only: bool = False,
+    ):
         self._check_core()
         self._check_latent()
 
@@ -534,6 +553,20 @@ class FeudalManager(nn.Module):
             s = self._dense(self.n_agents * self.goal_dim, 1.0, "f_Mspace")(z)
             s = s.reshape(z.shape[:-1] + (self.n_agents, self.goal_dim))
             lead = z.shape[:-1]
+
+        if latent_only:
+            # Everything below is the GOAL path (core -> goal head). `s` is
+            # already final: it is feedforward and upstream of the core in every
+            # latent, which is exactly the property FuN needs (`s` is a function
+            # of the current state alone, with no history) and what makes this
+            # early return exact rather than a cheaper approximation.
+            #
+            # A python-level `if` on a static flag, so the traced graph contains
+            # only the branch taken. Under `apply` the downstream params are
+            # simply not read; `init` always runs the full path, so the
+            # parameter tree — and therefore every existing checkpoint — is
+            # untouched.
+            return s
 
         # f_Mrnn consumes `s`, not `z` — this is load-bearing, see the module
         # docstring: it is what keeps `f_Mspace` trainable once the transition
@@ -1091,6 +1124,58 @@ def transition_cosine(
     return cos, jnp.broadcast_to(valid, cos.shape)
 
 
+def _intrinsic_window(
+    endpoints: jnp.ndarray,
+    states: jnp.ndarray,
+    goals: jnp.ndarray,
+    offsets: jnp.ndarray,
+    done: Optional[jnp.ndarray],
+    fn_name: str,
+) -> jnp.ndarray:
+    """Shared body of both ``r^I`` variants — they differ ONLY in two tokens.
+
+    Computes the masked mean over `offsets` of
+    ``d_cos(endpoints_t - states_{t-k}, goals_{t-k})``. A term counts when its
+    origin exists (``t >= k``) and lies in the same episode as step `t`, i.e. no
+    done falls in ``[t-k, t)`` — ``done[t]`` itself is EXCLUDED, so the action
+    that ends an episode still earns credit against its own terminal successor.
+    The denominator is the number of valid terms (never a fixed `c`), so the
+    first steps of an episode are not diluted.
+
+    Factored out because the legacy and transition-aligned rewards are the same
+    windowed cosine read with a different endpoint and a different offset range.
+    Written twice they would be two copies of the episode-masking algebra that
+    ``_check_done`` and ``_same_episode`` exist to keep exactly right, free to
+    drift apart on the next edit.
+
+    **Both arguments are detached, unconditionally**: this is a reward, and a
+    reward is data. Leaving `s` or `g` attached would let the manager raise the
+    worker's reward by editing the yardstick rather than by issuing useful
+    goals, and would additionally backpropagate the worker's objective into the
+    manager — which FuN rules out because it *"would deprive Manager's goals `g`
+    of any semantic meaning, making them just internal latent variables."*
+    """
+    _check_done(done, states.shape[:-1], fn_name)
+
+    endpoints = jax.lax.stop_gradient(endpoints)
+    states = jax.lax.stop_gradient(states)
+    goals = jax.lax.stop_gradient(goals)
+
+    T = states.shape[0]
+    steps = jnp.arange(T)
+
+    def one_offset(k):
+        src = jnp.maximum(steps - k, 0)
+        delta = endpoints - jnp.take(states, src, axis=0)
+        cos = cosine_similarity(delta, jnp.take(goals, src, axis=0))
+        in_range = (steps >= k).astype(jnp.float32)
+        mask = _align(in_range, cos) * _same_episode(done, src, steps, T)
+        return cos * mask, mask
+
+    cos, mask = jax.vmap(one_offset)(offsets)
+    return jnp.sum(cos, axis=0) / jnp.maximum(jnp.sum(mask, axis=0), 1.0)
+
+
 def worker_intrinsic_reward(
     states: jnp.ndarray,
     goals: jnp.ndarray,
@@ -1100,36 +1185,73 @@ def worker_intrinsic_reward(
     """FuN's intrinsic reward, ``r^I_t = 1/c * sum_{i=1..c} d_cos(s_t - s_{t-i}, g_{t-i})``.
 
     The worker's own reward for having followed the manager's recent directives.
-    Averaged over the `i` that are actually in range (and in the same episode), so
-    the first steps of an episode are not diluted; ``r^I_0`` is 0 by construction.
 
-    **Both arguments are detached, unconditionally**: this is a reward, and a
-    reward is data. Leaving `s` or `g` attached here would let the manager raise
-    the worker's reward by editing the yardstick rather than by issuing useful
-    goals, and would additionally backpropagate the worker's objective into the
-    manager — which FuN rules out because it *"would deprive Manager's goals `g`
-    of any semantic meaning, making them just internal latent variables."*
+    ⚠ **NOT the training path any more** — use
+    :func:`worker_intrinsic_reward_aligned`. This form's endpoint is the
+    PRE-action latent `s_t`, so every term is fixed before `a_t` is sampled and
+    ``r^I_t`` is exactly independent of the action it is stored beside, while
+    the extrinsic reward on that same transition IS that action's consequence.
+    Kept because it is still the object the timing diagnostic compares against
+    (``intrinsic_timing_probe``), and because it is the literal statement of the
+    paper's equation; it must not be wired back into ``trainer``.
 
     Shapes match :func:`transition_cosine`; returns ``(T, ...)``.
     """
-    _check_done(done, states.shape[:-1], "worker_intrinsic_reward")
+    return _intrinsic_window(
+        states,
+        states,
+        goals,
+        jnp.arange(1, horizon + 1),
+        done,
+        "worker_intrinsic_reward",
+    )
 
-    states = jax.lax.stop_gradient(states)
-    goals = jax.lax.stop_gradient(goals)
 
-    T = states.shape[0]
-    steps = jnp.arange(T)
+def worker_intrinsic_reward_aligned(
+    states: jnp.ndarray,
+    next_states: jnp.ndarray,
+    goals: jnp.ndarray,
+    horizon: int,
+    done: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """``r^I`` scoring the successor that action ``a_t`` ACTUALLY produced::
 
-    def one_offset(i):
-        src = jnp.maximum(steps - i, 0)
-        delta = states - jnp.take(states, src, axis=0)
-        cos = cosine_similarity(delta, jnp.take(goals, src, axis=0))
-        in_range = (steps >= i).astype(jnp.float32)
-        mask = _align(in_range, cos) * _same_episode(done, src, steps, T)
-        return cos * mask, mask
+        r^I_t = mean_{k=0..c-1} d_cos(s_plus_t - s_{t-k}, g_{t-k})
 
-    cos, mask = jax.vmap(one_offset)(jnp.arange(1, horizon + 1))
-    return jnp.sum(cos, axis=0) / jnp.maximum(jnp.sum(mask, axis=0), 1.0)
+    where ``next_states[t]`` is the latent of transition `t`'s successor, read
+    BEFORE any reset. This is the training path.
+
+    Against :func:`worker_intrinsic_reward` two things change and nothing else:
+    the endpoint becomes the successor instead of the pre-action latent, and the
+    offsets run ``0..c-1`` instead of ``1..c`` (the `k=0` term,
+    ``d_cos(s_plus_t - s_t, g_t)``, is the displacement `a_t` alone caused, and
+    is what makes the first action of an episode earn a reward at all). In the
+    interior this is exactly the old reward shifted one step, ``r_new[t] ==
+    r_old[t+1]``; what a shift cannot reproduce is the boundary, and that is the
+    point. An implementation that cannot see past the reset must pay 0 on the
+    episode-ENDING action, which is a standing bonus for terminating — the same
+    shape as the ``boundary_truncates`` failure the MJX env removed for exactly
+    that reason.
+
+    ``next_states`` must be the pre-reset successor of transition `t`'s own
+    episode; given that, the mask needs no separate test on the endpoint.
+    """
+    if next_states.shape != states.shape:
+        raise ValueError(
+            "worker_intrinsic_reward_aligned: `next_states` must have the same "
+            f"shape as `states`, got {tuple(next_states.shape)} vs "
+            f"{tuple(states.shape)}. It is the per-transition successor latent "
+            "(trainer stores it as Transition.next_state_latent), NOT a shifted "
+            "copy of `states`."
+        )
+    return _intrinsic_window(
+        next_states,
+        states,
+        goals,
+        jnp.arange(0, horizon),
+        done,
+        "worker_intrinsic_reward_aligned",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1403,32 @@ if __name__ == "__main__":
     r_d = worker_intrinsic_reward(s_seq, g_seq, c, done=done)
     assert float(r_d[4]) == 0.0, r_d  # nothing in-episode to look back at
     assert jnp.all(jnp.isfinite(r_d))
+
+    # --- the TRANSITION-ALIGNED reward (the training path) -------------------
+    # Same trajectory, but the endpoint is the successor of each step rather
+    # than the step's own latent.
+    s_plus = jnp.concatenate([s_seq[1:], s_seq[-1:] + g_fix[0] / c])
+    r_a = worker_intrinsic_reward_aligned(s_seq, s_plus, g_seq, c)
+    # Still moving exactly on-goal, so every step scores 1 — INCLUDING step 0,
+    # which the un-aligned form pays 0 because its window is empty there.
+    assert jnp.allclose(r_a, 1.0, atol=1e-5), r_a
+    assert float(r_i[0]) == 0.0 and float(r_a[0]) > 0.99
+    # Interior identity: the aligned reward is the old one shifted by a step.
+    # This is why the pre-fix timing measurements bound what the fix does, and
+    # why the only NEW content is the boundary.
+    assert jnp.allclose(r_a[:-1], r_i[1:], atol=1e-6)
+    # The episode-ending action is credited against its terminal successor;
+    # `done[t]` is excluded from its own mask.
+    r_ad = worker_intrinsic_reward_aligned(s_seq, s_plus, g_seq, c, done=done)
+    assert float(r_ad[3]) > 0.99, r_ad  # done fires at t=3
+    assert float(r_ad[4]) > 0.99, r_ad  # ...and the next episode starts scoring
+    # `next_states` is the per-transition successor, not a shifted copy: a
+    # mismatched shape must raise rather than broadcast into nonsense.
+    try:
+        worker_intrinsic_reward_aligned(s_seq, s_plus[:-1], g_seq, c)
+        raise AssertionError("aligned reward accepted a mis-shaped successor")
+    except ValueError:
+        pass
     print("[6] pool/transition/intrinsic semantics   OK")
 
     # [7] handshake with the worker ------------------------------------------

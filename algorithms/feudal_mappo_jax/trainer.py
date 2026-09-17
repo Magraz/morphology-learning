@@ -29,7 +29,7 @@ from algorithms.feudal_mappo_jax.manager import (
     goal_ring_pool,
     goal_ring_reset,
     goal_ring_write,
-    worker_intrinsic_reward,
+    worker_intrinsic_reward_aligned,
 )
 from algorithms.feudal_mappo_jax.mappo import (
     FeudalTrainState,
@@ -37,6 +37,7 @@ from algorithms.feudal_mappo_jax.mappo import (
     create_train_state,
     manager_update,
     ppo_update,
+    validate_worker_objective,
 )
 from algorithms.feudal_mappo_jax.worker import bind_goal
 
@@ -100,6 +101,11 @@ def make_train(config: MAPPOConfig, env):
             "feudal_mappo_jax implements the shared-actor path only "
             "(parameter_sharing=true); use mappo_vanilla for independent actors"
         )
+
+    # What the WORKER optimizes. Validated HERE, not only in run.py, so every
+    # path that builds a MAPPOConfig directly (the seam tests, the probes) gets
+    # the same guards — and so the rules have exactly one home.
+    validate_worker_objective(config)
 
     # Goal-ablation eval variants (see `eval_fn`). Validate the shift HERE, at
     # build time, rather than at the first eval hundreds of updates in: a shift
@@ -217,6 +223,30 @@ def make_train(config: MAPPOConfig, env):
             train_state.intrinsic_critic_ts.params, global_state
         )
 
+    # Placeholder for `next_state_latent` when the intrinsic path is off, the
+    # same idiom `action_mask` uses: `lax.scan` stacks it to (n_steps,) instead
+    # of carrying a (n_steps, n_envs, n_agents, goal_dim) buffer of unused zeros
+    # (~50 MB at T=1048/E=32/N=12/goal_dim=32).
+    _latent_placeholder = jnp.zeros(())
+
+    def _manager_latent(train_state, global_state, obs):
+        """`s` alone, skipping the core and the goal head.
+
+        The endpoint of the intrinsic reward (see `_apply_intrinsic_reward`). `s`
+        is feedforward and upstream of the core in every latent variant, so this
+        is bit-identical to `_manager_forward(...)[2]` on the same input while
+        touching no carry, emitting no directive and consuming no RNG — the
+        successor read cannot perturb the live hierarchy by construction. `carry`
+        is passed as None to make that explicit.
+        """
+        return train_state.manager_ts.apply_fn(
+            train_state.manager_ts.params,
+            None,
+            global_state,
+            obs,
+            latent_only=True,
+        )
+
     def _manager_forward(train_state, m_carry, global_state, obs):
         # `obs` is only read by manager_latent="local" (a shared per-agent
         # encoder); the centralized branch ignores it, so those runs are
@@ -316,6 +346,19 @@ def make_train(config: MAPPOConfig, env):
             config.gamma * trunc_f[:, None] * _values_int(train_state, next_gs)
         )
 
+        # The intrinsic reward's ENDPOINT: the latent of the successor `actions`
+        # actually produced. Read HERE, for the same reason `next_gs` is — the
+        # `_restart_done` cond below REBINDS `next_obs`/`next_env_state` in
+        # place, so encoding after it would silently score the freshly reset
+        # state and manufacture a reward out of the teleport. This is the one
+        # ordering mistake that would leave every other check in this file
+        # passing.
+        next_state_latent = (
+            _manager_latent(train_state, next_gs, next_obs)
+            if use_intrinsic
+            else _latent_placeholder
+        )
+
         # The manager's stream is the RAW extrinsic reward: scalar under a dense
         # env, per-agent under difference rewards — which is exactly the condition
         # `n_manager_outputs` keys off, so V^M's head width always matches the
@@ -389,6 +432,7 @@ def make_train(config: MAPPOConfig, env):
             goal=goal,
             pooled_goal=pooled_goal,
             state_latent=state_latent,
+            next_state_latent=next_state_latent,
             manager_value=manager_values,
             manager_reward=manager_reward,
             # Filled post-scan (r^I looks backwards over `goal_horizon` steps);
@@ -443,9 +487,20 @@ def make_train(config: MAPPOConfig, env):
         Follows the same post-collect-rewrite pattern as
         ``_apply_aligned_rewards``: r^I_t looks *backwards* over `c` steps, so it
         is a whole-trajectory quantity that cannot be produced inside the scan.
-        ``worker_intrinsic_reward`` detaches both arguments — this is a reward,
-        i.e. data, and leaving it attached would also backprop the worker's
-        objective into the manager, which FuN explicitly rules out.
+        ``worker_intrinsic_reward_aligned`` detaches all of its arguments — this
+        is a reward, i.e. data, and leaving it attached would also backprop the
+        worker's objective into the manager, which FuN explicitly rules out.
+
+        **Transition-aligned**: the cosine's endpoint is
+        ``next_state_latent[t]``, the latent of the successor `a_t` actually
+        produced, so r^I_t scores that action. The paper's literal form
+        (``worker_intrinsic_reward``, endpoint `s_t`) is fixed entirely before
+        `a_t` is sampled, which put the two reward streams on different actions.
+        The correction is worth roughly a 1 degree rotation of the worker's
+        update at alpha=0.1 (``intrinsic_timing_probe``) — the reason to make it
+        is not that magnitude but the boundary: any endpoint derived by shifting
+        the stored latents has to pay 0 on the action that ENDS an episode,
+        which is a standing bonus for terminating.
 
         **It is written to its own field, NOT added to `reward`.** The two
         streams stay separate all the way to ``ppo_update``, where each is run
@@ -463,8 +518,12 @@ def make_train(config: MAPPOConfig, env):
             trajectory.done[..., None].astype(jnp.float32),
             trajectory.state_latent.shape[:-1],
         )
-        r_int = worker_intrinsic_reward(
-            trajectory.state_latent, trajectory.goal, horizon, done=done_a
+        r_int = worker_intrinsic_reward_aligned(
+            trajectory.state_latent,
+            trajectory.next_state_latent,
+            trajectory.goal,
+            horizon,
+            done=done_a,
         )  # (T, E, N)
         # The truncation bootstrap was computed in-scan against V^I (it needs the
         # pre-reset successor state); add it here, where the stream is formed.

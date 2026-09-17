@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - _self_
+
+model_params:
+  worker_objective: intrinsic_only
+
+params:
+  # Inert as a magnitude — only its nonzero-ness matters (see above).
+  intrinsic_coef: 1.0
+  # Required: alpha does not appear in this objective's advantage.
+  intrinsic_anneal: none
