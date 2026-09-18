@@ -27,10 +27,12 @@ from flax.serialization import from_bytes, to_bytes
 from algorithms.feudal_mappo_jax.manager import (
     goal_concentration,
     mean_goal_direction,
+    training_goal_variants,
 )
 from algorithms.feudal_mappo_jax.mappo import (
     create_train_state,
     validate_worker_objective,
+    validate_worker_encoder,
 )
 from algorithms.feudal_mappo_jax.trainer import (
     RunnerState,
@@ -270,6 +272,7 @@ class Feudal_MAPPO_JAX_Runner:
             zero_goal=self.model_params.zero_goal,
             worker_fusion=self.model_params.worker_fusion,
             worker_objective=self.model_params.worker_objective,
+            worker_encoder=self.model_params.worker_encoder,
         )
 
         # Fail loudly rather than open. A zero-goal worker cannot see the goals,
@@ -296,6 +299,10 @@ class Feudal_MAPPO_JAX_Runner:
         # `trainer.make_train`, so the two cannot drift. It raises on the
         # incoherent combinations and warns on a non-local manager latent.
         validate_worker_objective(self.config)
+        # Likewise for `worker_encoder`: raises when the arm cannot be built (no
+        # `f_enc` on a centralized latent) or would apply a stale gradient
+        # (n_manager_epochs > 1), warns on concat fusion and on intrinsic_only.
+        validate_worker_encoder(self.config)
 
         print(
             f"FeUdal MAPPO | env={environment} | n_envs={self.config.n_envs} | "
@@ -388,10 +395,8 @@ class Feudal_MAPPO_JAX_Runner:
         # on a production run), so the 4th block here is worth budgeting for.
         # `eval_fn` returns the real block's mean unchanged, so the `reward`
         # series is untouched.
-        eval_variants = (
-            ("real", "permuted", "constant", "zeroed")
-            if self.config.eval_goal_variants
-            else ("real",)
+        eval_variants = training_goal_variants(
+            self.env.n_agents, self.config.eval_goal_variants
         )
         # Carried forward between evals exactly as `eval_reward` is, and
         # appended EVERY iteration — appending only on eval iterations would
@@ -711,11 +716,13 @@ class Feudal_MAPPO_JAX_Runner:
         )
         from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
-        from algorithms.feudal_mappo_jax.worker import bind_goal
+        from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
         from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
+        # Static: does the worker read the manager's encoder instead of raw obs?
+        share_encoder = self.config.worker_encoder != "none"
         discrete = getattr(self.env, "discrete", False)
         # The macro env's state is the base EnvState, so the renderers (which
         # expect a MultiBoxPushMJX) run on the wrapped base env.
@@ -748,11 +755,21 @@ class Feudal_MAPPO_JAX_Runner:
 
         @jax.jit
         def policy_fn(obs, pooled_goal):
+            # Under a shared encoder the worker eats f_enc(obs), not obs. Rendering
+            # it on raw obs would show a different policy than the one that
+            # trained — here it would also be a shape error, but the point is that
+            # `view()` must run the whole hierarchy, for the same reason it runs
+            # the manager rather than feeding the worker an invented goal.
+            worker_obs = (
+                encode_obs(manager.apply, train_state.manager_ts.params, obs)
+                if share_encoder
+                else obs
+            )
             actions, _ = sample_action(
                 jax.random.PRNGKey(0),
                 bind_goal(train_state.actor_ts.apply_fn, pooled_goal),
                 train_state.actor_ts.params,
-                obs,
+                worker_obs,
                 discrete=discrete,
                 deterministic=True,
             )
@@ -906,10 +923,12 @@ class Feudal_MAPPO_JAX_Runner:
         )
         from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
-        from algorithms.feudal_mappo_jax.worker import bind_goal
+        from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
         from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
 
         train_state = self._load_train_state()
+        # Static: does the worker read the manager's encoder instead of raw obs?
+        share_encoder = self.config.worker_encoder != "none"
         n_agents = self.env.n_agents
         obs_dim = self.env.observation_dim
         manager = build_manager(self.config, n_agents)
@@ -928,11 +947,18 @@ class Feudal_MAPPO_JAX_Runner:
 
         @jax.jit
         def policy_fn(obs, pooled_goal, mask):
+            # Flatten first, then encode — the same order as the training path, so
+            # the rendered policy is bitwise the trained one.
+            worker_obs = obs.reshape(n_agents, obs_dim)
+            if share_encoder:
+                worker_obs = encode_obs(
+                    manager.apply, train_state.manager_ts.params, worker_obs
+                )
             actions, _ = sample_action(
                 jax.random.PRNGKey(0),
                 bind_goal(train_state.actor_ts.apply_fn, pooled_goal),
                 train_state.actor_ts.params,
-                obs.reshape(n_agents, obs_dim),
+                worker_obs,
                 discrete=True,
                 deterministic=True,
                 action_mask=mask.reshape(n_agents, -1),

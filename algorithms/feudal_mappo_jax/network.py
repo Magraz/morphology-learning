@@ -84,11 +84,13 @@ class MAPPOCritic(nn.Module):
     `n_outputs` > 1 gives a per-agent value head: one value per agent from the
     same global state, needed when the env emits per-agent rewards (difference
     rewards), since each agent then has its own return to predict. `n_outputs=1`
-    (default) keeps the original single-scalar critic exactly.
+    (default) keeps the original single-scalar critic exactly. Set
+    `keep_output_axis=True` for per-agent values, including a single agent.
     """
 
     hidden_dim: int = 256
     n_outputs: int = 1
+    keep_output_axis: bool = False
 
     @nn.compact
     def __call__(self, global_state: jnp.ndarray):
@@ -109,7 +111,7 @@ class MAPPOCritic(nn.Module):
             kernel_init=nn.initializers.orthogonal(1.0),
             bias_init=nn.initializers.constant(0.0),
         )(x)
-        if self.n_outputs == 1:
+        if self.n_outputs == 1 and not self.keep_output_axis:
             return jnp.squeeze(value, axis=-1)
         return value  # (..., n_outputs) — one value per agent
 

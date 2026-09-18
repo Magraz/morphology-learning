@@ -312,6 +312,30 @@ def bind_goal(worker_apply_fn, goal: jnp.ndarray):
     return apply
 
 
+def encode_obs(manager_apply_fn, manager_params, obs: jnp.ndarray) -> jnp.ndarray:
+    """Run the manager's shared per-agent encoder `f_enc` over `obs`.
+
+    THE single home of the ``worker_encoder="shared"`` forward. Eleven sites apply
+    the worker — the rollout, the eval scan, ``ppo_update``, both ``view()`` policy
+    fns, the FiLM diagnostics and four probes — and a hand-copied encode at any one
+    of them would silently evaluate a different network than the one that trained.
+    That is the same failure the pooled-goal storage rule and the goal-ring helpers
+    exist to prevent, so it gets the same treatment: one function, called
+    everywhere, including from the tests.
+
+    `obs` may carry any leading shape; `f_enc` is applied per agent, so the
+    trailing axis is all that matters. **Callers that also flatten agent-major
+    should flatten FIRST and encode the ``(rows, obs_dim)`` array**: ``ppo_update``
+    encodes at that rank, and matching it keeps the two bitwise equal rather than
+    merely close, which is what preserves "the PPO ratio is exactly 1" as an
+    equality instead of a tolerance.
+
+    Returns `(..., manager_hidden_dim)` — FuN's `z_t`, the representation the paper
+    feeds to both the manager and the worker.
+    """
+    return manager_apply_fn(manager_params, None, None, obs, encoder_only=True)
+
+
 def init_worker(
     rng: jax.Array,
     obs_dim: int,

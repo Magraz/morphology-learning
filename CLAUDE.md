@@ -146,6 +146,25 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   launchers still reference the removed `run_trial.py` and must be updated to
   `train.py` before use.
 
+## Single-agent FeUdal runs
+
+`mjx_1a_3o_111_1024` is a valid sequential-delivery task: its one agent can
+push each box with `coupling_def: [1, 1, 1]`. The coupling sum warning is
+informational. FeUdal training skips the agent-permuted eval block when
+`n_agents == 1`, retaining the real, constant and zeroed blocks.
+`manager.training_goal_variants` supplies the same selection to the trainer and
+runner. Agent-permutation cosine metrics (`d_cos_null_agent`,
+`d_cos_gap_agent`, `goal_perm_cos`) are NaN because there is no other agent to
+swap with. Environment-permutation metrics remain available when `n_envs > 1`;
+they likewise become NaN for a singleton env axis. Direct requests for an
+identity permutation still raise, including invalid shifts on larger axes.
+The worker and intrinsic critics retain their trailing agent axis for one
+agent (`MAPPOCritic.keep_output_axis`), as does the manager critic under
+per-agent rewards. Otherwise the singleton output was squeezed, causing
+truncation bootstraps to broadcast `(n_envs, 1)` rewards to `(n_envs, n_envs)`
+and fail at the first advantage calculation. Team manager values stay scalar.
+`debug=true` disables JAX compilation; use `debug=false` for training speed.
+
 ## Box2D suite observations
 
 All `environments/box2d_suite` envs share `ObservationManager.get_observation`

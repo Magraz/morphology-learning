@@ -104,11 +104,12 @@ class StubEnv:
     action_dim = ACTION_DIM
     discrete = False
     reward_mode = "dense"
+    per_agent_rewards = False
     max_steps = EPISODE_LEN
 
     def _obs(self, state):
-        base = jnp.arange(N_AGENTS * OBS_DIM, dtype=jnp.float32).reshape(
-            N_AGENTS, OBS_DIM
+        base = jnp.arange(self.n_agents * OBS_DIM, dtype=jnp.float32).reshape(
+            self.n_agents, OBS_DIM
         )
         return jnp.sin(base + state.t + state.seed)
 
@@ -126,6 +127,8 @@ class StubEnv:
         terminated = jnp.array(False)
         truncated = state.t >= EPISODE_LEN
         info = {"task_reward": reward}
+        if self.per_agent_rewards:
+            reward = jnp.full((self.n_agents,), reward)
         return obs, state, reward, terminated, truncated, info
 
 
@@ -394,6 +397,86 @@ def test_agent_permutation_rejects_degenerate_shifts():
     # A legitimate shift still works on both axes.
     assert permute_agent_goals(goals, 1).shape == goals.shape
     assert permute_env_goals(goals, 0, 1).shape == goals.shape
+
+
+@pytest.mark.parametrize("n_agents,n_envs", [(1, N_ENVS), (N_AGENTS, 1), (1, 1)])
+def test_singleton_permutation_metrics_are_unavailable(n_agents, n_envs):
+    from algorithms.feudal_mappo_jax.mappo import manager_cosine_metrics
+
+    shape = (N_STEPS, n_envs, n_agents, GOAL_DIM)
+    k_s, k_g = jax.random.split(jax.random.PRNGKey(9))
+    s = jax.random.normal(k_s, shape)
+    goal = jax.random.normal(k_g, shape)
+    metrics = manager_cosine_metrics(
+        s, goal, HORIZON, jnp.zeros(shape[:-1]), jnp.ones(shape[:-1])
+    )
+    unavailable = set()
+    if n_agents == 1:
+        unavailable.update(("d_cos_null_agent", "d_cos_gap_agent", "goal_perm_cos"))
+    if n_envs == 1:
+        unavailable.update(("d_cos_null_env", "d_cos_gap_env"))
+    for name, value in metrics.items():
+        if name in unavailable:
+            assert np.isnan(value), name
+        else:
+            assert np.isfinite(value), name
+
+
+@pytest.mark.parametrize(
+    "eval_goal_variants,intrinsic_coef,per_agent_rewards",
+    [(True, 0.1, False), (False, 0.1, False), (True, 0.0, False), (True, 0.1, True)],
+)
+def test_single_agent_collect_update_and_eval(
+    eval_goal_variants, intrinsic_coef, per_agent_rewards
+):
+    """Single-agent training works with intrinsic reward and either eval mode."""
+    config = _config(
+        intrinsic_coef=intrinsic_coef, eval_goal_variants=eval_goal_variants,
+        per_agent_rewards=per_agent_rewards,
+    )
+    env = StubEnv()
+    env.n_agents = 1
+    env.per_agent_rewards = per_agent_rewards
+    init_fn, collect_fn, update_fn, eval_fn, _ = make_train(config, env)
+    initial = init_fn(jax.random.PRNGKey(0))
+    state, trajectory, last_value, _ = collect_fn(initial)
+    assert trajectory.reward.shape == trajectory.value.shape == (N_STEPS, N_ENVS, 1)
+    assert trajectory.intrinsic_reward.shape == trajectory.value_int.shape == (
+        N_STEPS, N_ENVS, 1
+    )
+    assert last_value.worker.shape == last_value.worker_int.shape == (N_ENVS, 1)
+    state, losses = update_fn(state, trajectory, last_value)
+    unavailable = {"d_cos_null_agent", "d_cos_gap_agent", "goal_perm_cos"}
+    for name, value in losses.items():
+        if name in unavailable:
+            assert np.isnan(value), name
+        else:
+            assert np.isfinite(value), name
+    for leaf in jax.tree_util.tree_leaves(state.train_state):
+        assert np.isfinite(leaf).all()
+    assert any(
+        not np.array_equal(before, after)
+        for before, after in zip(
+            jax.tree_util.tree_leaves(initial.train_state.actor_ts.params),
+            jax.tree_util.tree_leaves(state.train_state.actor_ts.params),
+        )
+    )
+
+    key = jax.random.PRNGKey(1)
+    constant = mean_goal_direction(trajectory.pooled_goal)
+    rewards, lengths = eval_fn(
+        state.train_state, key, detail=True, constant_goal=constant
+    )
+    assert rewards.shape == lengths.shape == (
+        3 if eval_goal_variants else 1, config.n_eval_episodes
+    )
+    assert np.isfinite(rewards).all()
+    assert np.all(lengths == env.max_steps)
+    real = eval_fn(state.train_state, key, variants=("real",), detail=True)[0]
+    np.testing.assert_allclose(rewards[0], real[0], atol=1e-6)
+    # Explicitly requesting an impossible permutation must still fail.
+    with pytest.raises(ValueError, match="identity"):
+        eval_fn(state.train_state, key, variants=("real", "permuted"))
 
 
 def test_transition_cosine_valid_is_independent_of_goals():

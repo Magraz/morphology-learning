@@ -124,6 +124,27 @@ GLOBAL_LATENTS = ("local_global", "local_global_private")
 LOCAL_LATENTS = ("local", "local_global", "local_private", "local_global_private")
 LATENTS = ("centralized",) + LOCAL_LATENTS
 
+#: Every accepted value of ``Model_Params.worker_encoder`` — whether the worker
+#: reads the manager's per-agent encoder ``f_enc`` instead of the raw observation.
+#:
+#: ``"none"`` (default) is the historical behaviour and is gated by python-level
+#: static ``if``s everywhere, so it is byte-identical to the code before this knob
+#: existed. ``"shared"`` is FuN's own topology: in the paper one ``f_percept``
+#: feeds BOTH the manager and the worker, and the worker's gradient shapes it. The
+#: worker here consumes ``f_enc(obs_i)`` (``manager_hidden_dim`` wide) in place of
+#: ``obs_i``, and its PPO gradient reaches ``f_enc`` — no ``stop_gradient``.
+#:
+#: Only the ``LOCAL_LATENTS`` have an ``f_enc`` to share: ``centralized`` has
+#: ``f_percept`` over the *global* state, which is neither per-agent nor
+#: observation-width. ``validate_worker_encoder`` enforces that.
+#:
+#: ⚠ A ``"shared_detached"`` middle rung (one ``stop_gradient`` on ``h``) is
+#: deliberately NOT here. It would separate "the worker eats a bottleneck of its
+#: own obs" from "the worker shapes the manager's perception", which the two
+#: shipped values conflate; adding it is one tuple entry plus one
+#: ``jax.lax.stop_gradient``. Worth having before attributing any return gap.
+WORKER_ENCODERS = ("none", "shared")
+
 
 def block_orthogonal(n_blocks: int):
     """Init for a stacked per-agent projection ``(n_blocks, d_in, d_out)``.
@@ -502,9 +523,25 @@ class FeudalManager(nn.Module):
         global_state: jnp.ndarray,
         obs: jnp.ndarray = None,
         latent_only: bool = False,
+        encoder_only: bool = False,
     ):
         self._check_core()
         self._check_latent()
+
+        if latent_only and encoder_only:
+            raise ValueError(
+                "latent_only and encoder_only are mutually exclusive: they name "
+                "two different early returns (`s` after f_Mspace vs `h` after "
+                "f_enc). Pass exactly one."
+            )
+        if encoder_only and self.latent not in LOCAL_LATENTS:
+            raise ValueError(
+                f"encoder_only needs a latent in {LOCAL_LATENTS}, got "
+                f"{self.latent!r}: only those build the per-agent encoder `f_enc` "
+                "that the worker can share. The centralized branch has `f_percept` "
+                "over the flattened GLOBAL state instead, which is neither "
+                "per-agent nor observation-width, so there is nothing to return."
+            )
 
         is_local = self.latent in LOCAL_LATENTS
         # The two axes of the local family, read independently so the 2x2 is a
@@ -527,6 +564,24 @@ class FeudalManager(nn.Module):
             # agent is what makes d s[i]/d obs_j structurally zero for j != i.
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_0")(obs))
             h = nn.tanh(self._dense(self.hidden_dim, np.sqrt(2), "f_enc_1")(h))
+
+            if encoder_only:
+                # FuN's `z_t = f_percept(x_t)`, the representation the paper feeds
+                # to BOTH the manager and the worker. `worker_encoder="shared"`
+                # routes the worker's observation through here instead of letting
+                # it build its own features from raw obs.
+                #
+                # The return sits INSIDE this branch, not beside `latent_only`
+                # below: by then the centralized path has already run and `h` does
+                # not exist at all. Placing it here makes "local latents only" a
+                # structural property rather than a promise.
+                #
+                # Same static-flag discipline as `latent_only`: a python-level
+                # `if`, so the traced graph holds only the branch taken, `init`
+                # still runs the full path, and the parameter tree — hence every
+                # existing checkpoint — is untouched.
+                return h
+
             if is_private:
                 # PER-AGENT projection. `h` is already local (the encoder ran on
                 # obs_i alone), so `d s[i]/d obs_j` is still exactly zero for
@@ -1026,6 +1081,15 @@ def constant_goals(goal: jnp.ndarray, direction: jnp.ndarray) -> jnp.ndarray:
     doing anything".
     """
     return _unit(direction) * jnp.linalg.norm(goal, axis=-1, keepdims=True)
+
+
+def training_goal_variants(n_agents: int, enabled: bool = True) -> tuple[str, ...]:
+    """Live eval variants; swapping agents is undefined for a single agent."""
+    if not enabled:
+        return ("real",)
+    if n_agents == 1:
+        return ("real", "constant", "zeroed")
+    return ("real", "permuted", "constant", "zeroed")
 
 
 def _goal_transform_variants(shift: int, env_axis: int, constant=None):

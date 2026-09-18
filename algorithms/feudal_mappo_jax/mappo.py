@@ -32,8 +32,12 @@ from algorithms.feudal_mappo_jax.network import (
     MAPPOCritic,
     evaluate_action,
 )
-from algorithms.feudal_mappo_jax.manager import LOCAL_LATENTS, FeudalManager
-from algorithms.feudal_mappo_jax.worker import bind_goal, init_worker
+from algorithms.feudal_mappo_jax.manager import (
+    LOCAL_LATENTS,
+    WORKER_ENCODERS,
+    FeudalManager,
+)
+from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs, init_worker
 
 
 class FeudalTrainState(NamedTuple):
@@ -118,9 +122,24 @@ def create_train_state(
 
     # The worker takes the raw goal width: `goal_embed_dim` (if set) is applied by
     # an internal bias-free Dense, so the module's input signature is goal_dim.
+    #
+    # Under `worker_encoder="shared"` the worker's OBSERVATION input is the
+    # manager's encoder output, not the raw obs, so its first Dense is
+    # manager_hidden_dim wide. `init_worker` infers that width purely from the
+    # shape of its dummy, so this one line is the whole change — and putting it
+    # here keeps both msgpack load paths in lockstep automatically, since each
+    # rebuilds its target tree through this function.
+    #
+    # ⚠ It also makes the ACTOR tree depend on `manager_hidden_dim`, which
+    # previously had no effect on the actor at all. A resume with a drifted
+    # manager_hidden_dim now fails on `actor` as well as `manager` — loudly, which
+    # is what we want, but it is new.
+    worker_obs_dim = (
+        config.manager_hidden_dim if config.worker_encoder != "none" else obs_dim
+    )
     worker, actor_params = init_worker(
         rng_actor,
-        obs_dim=obs_dim,
+        obs_dim=worker_obs_dim,
         goal_dim=config.goal_dim,
         action_dim=action_dim,
         hidden_dim=config.hidden_dim,
@@ -130,7 +149,13 @@ def create_train_state(
         zero_goal=config.zero_goal,
         worker_fusion=config.worker_fusion,
     )
-    critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs)
+    # One agent still needs an agent axis: squeezing (E, 1) to (E,) would
+    # broadcast the truncation bootstrap against (E, 1) rewards into (E, E).
+    keep_worker_axis = n_critic_outputs == n_agents
+    critic = MAPPOCritic(
+        hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs,
+        keep_output_axis=keep_worker_axis,
+    )
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))
 
     manager = build_manager(config, n_agents)
@@ -147,7 +172,8 @@ def create_train_state(
         rng_manager, manager_carry, jnp.zeros(global_state_dim), manager_dummy_obs
     )
     manager_critic = MAPPOCritic(
-        hidden_dim=2 * config.hidden_dim, n_outputs=n_manager_outputs
+        hidden_dim=2 * config.hidden_dim, n_outputs=n_manager_outputs,
+        keep_output_axis=config.per_agent_rewards,
     )
     manager_critic_params = manager_critic.init(
         rng_manager_critic, jnp.zeros(global_state_dim)
@@ -160,7 +186,8 @@ def create_train_state(
     intrinsic_critic_params = None
     if config.intrinsic_coef != 0.0:
         intrinsic_critic = MAPPOCritic(
-            hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs
+            hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs,
+            keep_output_axis=keep_worker_axis,
         )
         intrinsic_critic_params = intrinsic_critic.init(
             rng_intrinsic_critic, jnp.zeros(global_state_dim)
@@ -324,6 +351,90 @@ def validate_worker_objective(config: MAPPOConfig) -> None:
             "does. Every worker would then be optimizing a team-aggregate signal "
             f"it does not control. Prefer a latent in {LOCAL_LATENTS} "
             "(e.g. 'local_private').",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def validate_worker_encoder(config: MAPPOConfig) -> None:
+    """Check `worker_encoder` and the settings it makes incoherent.
+
+    ONE copy, called from both ``trainer.make_train`` and ``run.py``, for exactly
+    the reason :func:`validate_worker_objective` is — two copies of a guard is how
+    a guard rots.
+
+    Two raises are structural (the arm cannot be built), one is about gradient
+    staleness, and two warnings mark combinations that must stay runnable because
+    they are the direct contrasts the ablation exists to draw.
+    """
+    if config.worker_encoder not in WORKER_ENCODERS:
+        raise ValueError(
+            f"worker_encoder={config.worker_encoder!r} is not one of "
+            f"{WORKER_ENCODERS}. Caught at build time so a typo fails before a "
+            "run is launched."
+        )
+    if config.worker_encoder == "none":
+        return
+
+    # Only the local latents build `f_enc`. `centralized` has `f_percept` over the
+    # flattened GLOBAL state — not per-agent, not observation-width — so there is
+    # literally no tensor to hand the worker.
+    if config.manager_latent not in LOCAL_LATENTS:
+        raise ValueError(
+            f"worker_encoder={config.worker_encoder!r} requires a manager_latent "
+            f"in {LOCAL_LATENTS}, got {config.manager_latent!r}: only those build "
+            "the per-agent encoder `f_enc` that the worker shares. The "
+            "centralized branch has `f_percept` over the flattened global state, "
+            "which is neither per-agent nor observation-width."
+        )
+
+    # The worker's contribution to `f_enc` is ONE full-batch gradient, taken at the
+    # actor params the rollout used. `manager_update` adds it to the transition
+    # PG's gradient and takes a single Adam step. With more manager epochs that
+    # same cotangent would be re-added at epoch 1, 2, ... — parameter points it was
+    # never computed at. Silent: every logged loss stays finite and healthy.
+    if config.n_manager_epochs != 1:
+        raise ValueError(
+            f"worker_encoder={config.worker_encoder!r} requires "
+            f"n_manager_epochs=1, got {config.n_manager_epochs}. The worker's "
+            "encoder gradient is computed once per update at one parameter point; "
+            "replaying it across manager epochs applies a gradient of a function "
+            "evaluated where the parameters no longer are. (n_manager_epochs > 1 "
+            "is already uncorrected off-policy for the transition PG itself.)"
+        )
+
+    # A warning, not a raise: the arm runs and is interpretable on its own terms,
+    # it just stops being comparable to the rest of the goal-influence series.
+    if config.worker_fusion == "concat":
+        warnings.warn(
+            f"worker_encoder={config.worker_encoder!r} with "
+            "worker_fusion='concat': the goal is one block of a concatenated "
+            "input, so widening that input from obs_dim to manager_hidden_dim "
+            f"({config.hidden_dim} -> {config.manager_hidden_dim}) cuts the "
+            "goal's share of layer-1 preactivation variance at init from ~9.8% "
+            "to ~1%. normalize_pooled_goal's whole calibration was derived on the "
+            "narrow geometry, and `worker_goal_column_ratio` cannot be read "
+            "across the two. Prefer worker_fusion='film', where the goal reaches "
+            "the policy through bias-free zero-init FiLM layers whose input is "
+            "the goal, so the observation's width is irrelevant to it.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # Also a warning: "does true perceptual sharing rescue the intrinsic-only
+    # contract?" is a question the ablation is for, and a raise would foreclose it.
+    if config.worker_objective == "intrinsic_only":
+        warnings.warn(
+            f"worker_encoder={config.worker_encoder!r} with "
+            "worker_objective='intrinsic_only': `transition_cosine` detaches the "
+            "cosine's TARGET arm precisely to stop gradient reaching `s` (FuN: "
+            "'the dependence of s on theta is ignored... this avoids trivial "
+            "solutions'). The worker's gradient into `f_enc` is subject to no "
+            "such rule, and under this objective the worker's entire update "
+            "direction is proportional to adv_int — correlated with the very "
+            "quantity that detach protects. The trivial-solution channel is "
+            "re-opened from the other side, across updates rather than within "
+            "one. Watch d_cos_var and goal_direction_count across the WHOLE run.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -536,6 +647,144 @@ def ppo_update(
     )
     n_minibatches = total_ts // ts_minibatch_size
 
+    # --- shared-encoder plumbing -------------------------------------------------
+    # Hoisted out of BOTH scans on purpose. `ppo_update` never moves the manager —
+    # `_epoch_step` only `_replace`s the actor/critic states, and `manager_update`
+    # runs afterwards — so these are provably constant for the whole function.
+    # Reading them here rather than off the scan carry makes that syntactically
+    # obvious and keeps a traced value out of the inner scan.
+    share_encoder = config.worker_encoder != "none"  # static
+    manager_params = train_state.manager_ts.params
+    manager_apply = train_state.manager_ts.apply_fn
+
+    def _worker_obs(manager_p, raw_obs):
+        """The worker's observation input: raw, or the manager's encoding of it.
+
+        Encoded at the ALREADY-FLATTENED ``(rows, obs_dim)`` rank, which is why
+        ``trainer._actor_forward`` also flattens before it encodes: a different
+        leading shape can select a different XLA matmul kernel, and the two paths
+        would then agree to ~1e-6 rather than bitwise — silently weakening "the
+        PPO ratio is exactly 1" from an equality into a tolerance, for nothing.
+        """
+        return encode_obs(manager_apply, manager_p, raw_obs) if share_encoder else raw_obs
+
+    def _batch(ids):
+        """Gather one (mini)batch, flattened agent-major.
+
+        Row ``k = m*n_agents + i`` is agent ``i`` of timestep ``m`` in EVERY
+        component — obs, goal, action, log-prob, advantage, active and legal-action
+        masks all use the identical reshape, which is what keeps each agent paired
+        with its own directive.
+        """
+        n_flat = ids.shape[0] * n_agents
+        active_pa = active_ts[ids]
+        return dict(
+            obs=obs_ts[ids].reshape(n_flat, obs_dim),
+            goal=pg_ts[ids].reshape(n_flat, goal_dim),
+            actions=act_ts[ids].reshape(n_flat, *act_ts.shape[2:]),
+            old_lp=lp_ts[ids].reshape(n_flat),
+            # Same mask the actions were sampled under — without it the ratio
+            # compares two different distributions and PPO's weight is meaningless.
+            mask=mask_ts[ids].reshape(n_flat, -1) if use_mask else None,
+            active_pa=active_pa,
+            active=active_pa.reshape(n_flat),
+            # per_agent: each agent carries its own advantage, agent-major like
+            # obs. Otherwise the env-level advantage is broadcast (identical per
+            # agent).
+            adv=(
+                adv_ts[ids].reshape(n_flat)
+                if per_agent
+                else jnp.repeat(adv_ts[ids], n_agents)
+            ),
+            gs=gs_ts[ids],
+            returns=ret_ts[ids],
+        )
+
+    def _surrogate(actor_params, manager_p, actor_apply, mb):
+        """PPO clipped surrogate + entropy over one batch.
+
+        ONE body, called by the per-minibatch actor step AND by the encoder-
+        gradient pass below, so the two provably optimize the same objective. Two
+        copies would let the encoder be trained on a gradient of something the
+        worker is not actually maximizing — and nothing logged would say so.
+
+        `bind_goal` freezes the stored conditioning into the worker's apply_fn,
+        restoring the flat (params, obs) signature `evaluate_action` expects — no
+        forked evaluation path. Using the STORED pooled goal (not a recomputed
+        one) is what keeps the importance ratio valid.
+        """
+        log_probs, entropy = evaluate_action(
+            bind_goal(actor_apply, mb["goal"]),
+            actor_params,
+            _worker_obs(manager_p, mb["obs"]),
+            mb["actions"],
+            discrete,
+            action_mask=mb["mask"],
+        )
+        ratio = jnp.exp(log_probs - mb["old_lp"])
+        surr1 = ratio * mb["adv"]
+        surr2 = jnp.clip(
+            ratio, 1.0 - config.eps_clip, 1.0 + config.eps_clip
+        ) * mb["adv"]
+        # Mask offline agents out of the policy gradient (their proposed skill was
+        # never executed). All-ones => plain mean.
+        denom = jnp.maximum(mb["active"].sum(), 1.0)
+        policy_loss = -(jnp.minimum(surr1, surr2) * mb["active"]).sum() / denom
+        entropy_loss = -(entropy * mb["active"]).sum() / denom
+        total = policy_loss + config.ent_coef * entropy_loss
+        return total, (policy_loss, entropy_loss)
+
+    # The worker's contribution to the SHARED encoder: one gradient of the same
+    # surrogate, w.r.t. the manager's params, taken at the actor params the rollout
+    # acted under — i.e. BEFORE any PPO step. `manager_update` adds it to the
+    # transition PG's gradient and takes a single Adam step.
+    #
+    # Three properties make this the right form, and each rules out an alternative
+    # that looks simpler:
+    #
+    #   * At the pre-PPO actor params the importance ratio is exactly 1, so
+    #     `surr1 == surr2`, the clip is provably inactive and `min` is a no-op.
+    #     The gradient reduces to `-mean(adv * dlog pi)` — plain REINFORCE with a
+    #     GAE baseline, structurally the SAME form as the manager's own
+    #     `-mean(adv * d d_cos)`. Two full-batch means, same batch, same advantage,
+    #     same parameter point, summed. Accumulating across PPO's own minibatch
+    #     steps instead would mix gradients taken at 40-odd different actor
+    #     iterates, which is not the gradient of anything.
+    #   * It is scale-commensurate with the manager's term by construction, with no
+    #     dependence on `n_minibatches` — which would otherwise become a silent
+    #     weight on how much authority the worker has over the shared encoder.
+    #   * `ppo_update` does NOT apply it. The manager staying frozen here is what
+    #     keeps `manager_update`'s recompute equal to the rollout's goals, and what
+    #     keeps the epoch-0 ratio exactly 1. Both are pinned by seam tests.
+    #
+    # Computed in CHUNKS at fixed parameters, not as one call: chunk size matches
+    # PPO's own minibatch, so peak activation memory is unchanged (a single
+    # full-batch forward+backward through a manager_hidden_dim-wide encoder over
+    # T*E*N rows is ~n_minibatches times the peak of one PPO step). Equal-size
+    # chunks make the mean of the per-chunk means exactly the full-batch mean, so
+    # this is the same number, not an approximation. The trailing partial batch is
+    # dropped, as PPO's own partition already does.
+    if share_encoder:
+        a_params, a_apply = train_state.actor_ts.params, train_state.actor_ts.apply_fn
+
+        def _enc_chunk(acc, mb_idx):
+            ids = mb_idx * ts_minibatch_size + jnp.arange(ts_minibatch_size)
+            g = jax.grad(
+                lambda mp: _surrogate(a_params, mp, a_apply, _batch(ids))[0]
+            )(manager_params)
+            return jax.tree.map(jnp.add, acc, g), None
+
+        enc_grads, _ = jax.lax.scan(
+            _enc_chunk,
+            jax.tree.map(jnp.zeros_like, manager_params),
+            jnp.arange(n_minibatches),
+        )
+        enc_grads = jax.tree.map(lambda x: x / n_minibatches, enc_grads)
+    else:
+        # A valid empty pytree, the same idiom `intrinsic_critic_ts` uses at
+        # alpha=0 — it rides every downstream signature for free.
+        enc_grads = None
+
     def _epoch_step(carry, _epoch_idx):
         train_state, rng = carry
         rng, shuffle_rng = jax.random.split(rng)
@@ -546,55 +795,14 @@ def ppo_update(
             start = mb_idx * ts_minibatch_size
             mb_ids = jax.lax.dynamic_slice(perm, (start,), (ts_minibatch_size,))
 
-            n_flat = ts_minibatch_size * n_agents
-            mb_obs = obs_ts[mb_ids].reshape(n_flat, obs_dim)
-            mb_goal = pg_ts[mb_ids].reshape(n_flat, goal_dim)
-            mb_actions = act_ts[mb_ids].reshape(n_flat, *act_ts.shape[2:])
-            mb_old_lp = lp_ts[mb_ids].reshape(n_flat)
-            # Agent-major flattening matches mb_obs; (mb, n_agents) form for the
-            # per-agent critic. All-ones => the masked means are exact plain means.
-            mb_active_pa = active_ts[mb_ids]
-            mb_active = mb_active_pa.reshape(n_flat)
-            # Same mask the actions were sampled under — without it the ratio
-            # compares two different distributions and PPO's weight is meaningless.
-            mb_mask = mask_ts[mb_ids].reshape(n_flat, -1) if use_mask else None
-            if per_agent:
-                # Each agent carries its own advantage. `.reshape(-1)` is
-                # agent-major within a timestep, matching mb_obs' flattening.
-                mb_adv = adv_ts[mb_ids].reshape(n_flat)
-            else:
-                # env-level advantage broadcast to each agent (identical per agent)
-                mb_adv = jnp.repeat(adv_ts[mb_ids], n_agents)
-            mb_gs = gs_ts[mb_ids]
-            mb_returns = ret_ts[mb_ids]
+            mb = _batch(mb_ids)
+            mb_active_pa = mb["active_pa"]
+            mb_gs = mb["gs"]
+            mb_returns = mb["returns"]
 
             # --- Actor loss ---
             def actor_loss_fn(actor_params):
-                # `bind_goal` freezes the stored conditioning into the worker's
-                # apply_fn, restoring the flat (params, obs) signature
-                # `evaluate_action` expects — no forked evaluation path. Using
-                # the STORED pooled goal (not a recomputed one) is what keeps the
-                # importance ratio valid.
-                log_probs, entropy = evaluate_action(
-                    bind_goal(actor_ts.apply_fn, mb_goal),
-                    actor_params,
-                    mb_obs,
-                    mb_actions,
-                    discrete,
-                    action_mask=mb_mask,
-                )
-                ratio = jnp.exp(log_probs - mb_old_lp)
-                surr1 = ratio * mb_adv
-                surr2 = jnp.clip(
-                    ratio, 1.0 - config.eps_clip, 1.0 + config.eps_clip
-                ) * mb_adv
-                # Mask offline agents out of the policy gradient (their proposed
-                # skill was never executed). All-ones => plain mean.
-                denom = jnp.maximum(mb_active.sum(), 1.0)
-                policy_loss = -(jnp.minimum(surr1, surr2) * mb_active).sum() / denom
-                entropy_loss = -(entropy * mb_active).sum() / denom
-                total = policy_loss + config.ent_coef * entropy_loss
-                return total, (policy_loss, entropy_loss)
+                return _surrogate(actor_params, manager_params, actor_ts.apply_fn, mb)
 
             (_, (policy_loss, entropy_loss)), actor_grads = jax.value_and_grad(
                 actor_loss_fn, has_aux=True
@@ -693,20 +901,95 @@ def ppo_update(
     if config.worker_fusion == "film":
         mean_losses.update(
             _film_goal_metrics(
-                train_state.actor_ts, trajectory.obs, trajectory.pooled_goal
+                train_state.actor_ts,
+                trajectory.obs,
+                trajectory.pooled_goal,
+                # These metrics apply the WORKER, so under a shared encoder they
+                # must feed it the same thing the policy eats. Left on raw obs
+                # this is not a wrong number, it is a trace-time shape error at
+                # the default fusion of both shared-encoder arms.
+                encode=(lambda o: _worker_obs(manager_params, o)) if share_encoder else None,
             )
         )
     else:
         mean_losses["worker_goal_column_ratio"] = _goal_column_ratio(
-            train_state.actor_ts.params, obs_dim
+            train_state.actor_ts.params,
+            # The width of the worker's OBSERVATION block, which under sharing is
+            # the encoder's, not the env's. Passing the raw obs_dim here would not
+            # raise: the kernel is then WIDER than obs_dim (manager_hidden_dim +
+            # goal_width), so the concat-only guard does not fire and the function
+            # silently slices an "obs block" and a "goal block" that are neither.
+            config.manager_hidden_dim if share_encoder else obs_dim,
         )
     if not use_intrinsic:
         # The per-minibatch placeholder carries no information at alpha=0; drop
         # it so the stats keys stay exactly what they were.
         mean_losses.pop("intrinsic_value_loss", None)
     mean_losses.update(int_metrics)
+    if share_encoder:
+        # Who is actually shaping the shared representation. The structural risk of
+        # this arm is that the worker's PPO gradient swamps the manager's transition
+        # PG — which reaches `f_enc` only through the cosine's GOAL arm, the target
+        # arm being detached — leaving `f_enc` as the worker's trunk that the
+        # manager happens to read. The companion `manager_encoder_grad_norm` and
+        # `worker_manager_encoder_grad_cos` are logged by `manager_update`, which is
+        # where the manager's own gradient exists.
+        mean_losses["worker_encoder_grad_norm"] = _encoder_grad_norm(enc_grads)
 
-    return train_state, mean_losses
+    return train_state, mean_losses, enc_grads
+
+
+def _encoder_subtree(grads):
+    """The `f_enc_*` leaves of a manager gradient/param tree, flattened.
+
+    The worker only ever reads `f_enc`, so `jax.grad` returns exact zeros on every
+    other manager leaf (it instantiates a full cotangent). Restricting the norm to
+    `f_enc` anyway keeps the diagnostic meaningful if that ever stops being true —
+    and makes the "and nothing else" seam test cheap to write.
+    """
+    params = grads.get("params", grads)
+    return [v for k, v in params.items() if k.startswith("f_enc")]
+
+
+def _encoder_grad_norm(grads) -> jnp.ndarray:
+    """L2 norm of the `f_enc` block of a manager gradient tree."""
+    if grads is None:
+        return jnp.float32(0.0)
+    leaves = jax.tree.leaves(_encoder_subtree(grads))
+    if not leaves:
+        return jnp.float32(0.0)
+    return jnp.sqrt(sum(jnp.sum(x**2) for x in leaves))
+
+
+def _encoder_grad_cosine(a, b) -> jnp.ndarray:
+    """Cosine between two gradient trees, restricted to the `f_enc` block.
+
+    Restricted on purpose: `b` (the worker's) is exactly zero outside `f_enc`, so a
+    whole-tree cosine would be diluted by the manager's own goal-path gradient and
+    would drift toward 0 for reasons that say nothing about the shared encoder.
+    """
+    la = jax.tree.leaves(_encoder_subtree(a))
+    lb = jax.tree.leaves(_encoder_subtree(b))
+    if not la or not lb:
+        return jnp.float32(0.0)
+    dot = sum(jnp.sum(x * y) for x, y in zip(la, lb))
+    na = jnp.sqrt(sum(jnp.sum(x**2) for x in la))
+    nb = jnp.sqrt(sum(jnp.sum(y**2) for y in lb))
+    return dot / (na * nb + 1e-12)
+
+
+def _clip_tree(grads, max_norm: float):
+    """Scale `grads` down so its global L2 norm is at most `max_norm`.
+
+    The same rule as ``optax.clip_by_global_norm``, applied by hand because it has
+    to run on ONE addend before the sum rather than on the manager's whole
+    gradient — see the call site for why that distinction is load-bearing.
+    Stateless, so it needs no slot in the train state.
+    """
+    leaves = jax.tree.leaves(grads)
+    norm = jnp.sqrt(sum(jnp.sum(x**2) for x in leaves))
+    scale = jnp.minimum(1.0, max_norm / (norm + 1e-6))
+    return jax.tree.map(lambda x: x * scale, grads)
 
 
 def _goal_column_ratio(actor_params, obs_dim: int) -> jnp.ndarray:
@@ -780,7 +1063,7 @@ a head slice would systematically over-weight the ramp).
 """
 
 
-def _film_goal_metrics(actor_ts, obs, goal) -> dict:
+def _film_goal_metrics(actor_ts, obs, goal, encode=None) -> dict:
     """How hard does the manager's directive actually drive a FiLM worker?
 
     The FiLM counterpart of :func:`_goal_column_ratio`, and the series that stops
@@ -866,11 +1149,20 @@ def _film_goal_metrics(actor_ts, obs, goal) -> dict:
         actor_ts: the worker's TrainState (`apply_fn` + `params`).
         obs: ``(..., obs_dim)``, flattened agent-major by the caller.
         goal: ``(..., goal_dim)`` pooled goals, paired row-for-row with `obs`.
+        encode: under ``worker_encoder="shared"``, the manager's encoder applied to
+            the subsampled rows. These metrics apply the WORKER, so they must feed
+            it what the policy eats; on raw obs the first Dense's width would not
+            even match and this would be a trace-time error, not a wrong number.
+            ``None`` (default) leaves every non-shared arm byte-identical.
     """
     obs = obs.reshape(-1, obs.shape[-1])
     goal = goal.reshape(-1, goal.shape[-1])
     stride = max(1, obs.shape[0] // _FILM_METRIC_ROWS)
     obs, goal = obs[::stride], goal[::stride]
+    # After the subsample, so the encoder runs on _FILM_METRIC_ROWS rows rather
+    # than the whole trajectory.
+    if encode is not None:
+        obs = encode(obs)
 
     out, state = actor_ts.apply_fn(
         actor_ts.params, obs, goal, mutable=["diagnostics"]
@@ -1047,10 +1339,10 @@ def manager_cosine_metrics(
     permutation changed nothing and a zero gap says only that the goals were
     already identical (cross-check against ``goal_direction_count``).
 
-    Both nulls are forward-only on arrays the caller has already materialized —
-    no network forward, no backward pass — so this is unconditional, matching
-    every other manager diagnostic. Gating it would make future runs
-    non-comparable.
+    Both nulls are forward-only on arrays the caller has already materialized.
+    A singleton agent or env axis has no permutation null: its metrics are NaN
+    (unavailable), while the real cosine and the other axis are still measured.
+    Invalid shifts on axes with multiple entries continue to raise.
 
     Args:
         s: ``(T, n_envs, n_agents, goal_dim)`` latent states.
@@ -1082,22 +1374,26 @@ def manager_cosine_metrics(
     # `test_transition_cosine_valid_is_independent_of_goals`.
     mask = valid * active
 
-    # env axis is 1 here: the manager path's goals are (T, n_envs, n_agents, D).
-    goal_agent = permute_agent_goals(goal, shift)
-    goal_env = permute_env_goals(goal, 1, shift)
-    cos_null_agent, _ = transition_cosine(
-        s, goal_agent, horizon, done=done_a, detach_states=True
-    )
-    cos_null_env, _ = transition_cosine(
-        s, goal_env, horizon, done=done_a, detach_states=True
-    )
-
     cos_mean = _masked_mean(cos, mask)
-    null_agent = _masked_mean(cos_null_agent, mask)
-    null_env = _masked_mean(cos_null_env, mask)
+    null_agent = null_env = perm_cos_mean = jnp.asarray(jnp.nan, dtype=cos.dtype)
 
-    unit = goal / (jnp.linalg.norm(goal, axis=-1, keepdims=True) + 1e-6)
-    perm_cos = jnp.sum(unit * permute_agent_goals(unit, shift), axis=-1)
+    if goal.shape[-2] > 1:
+        goal_agent = permute_agent_goals(goal, shift)
+        cos_null_agent, _ = transition_cosine(
+            s, goal_agent, horizon, done=done_a, detach_states=True
+        )
+        null_agent = _masked_mean(cos_null_agent, mask)
+        unit = goal / (jnp.linalg.norm(goal, axis=-1, keepdims=True) + 1e-6)
+        perm_cos = jnp.sum(unit * permute_agent_goals(unit, shift), axis=-1)
+        perm_cos_mean = _masked_mean(perm_cos, mask)
+
+    # env axis is 1 here: the manager path's goals are (T, n_envs, n_agents, D).
+    if goal.shape[1] > 1:
+        goal_env = permute_env_goals(goal, 1, shift)
+        cos_null_env, _ = transition_cosine(
+            s, goal_env, horizon, done=done_a, detach_states=True
+        )
+        null_env = _masked_mean(cos_null_env, mask)
 
     return {
         "d_cos_mean": cos_mean,
@@ -1110,7 +1406,7 @@ def manager_cosine_metrics(
         "d_cos_null_env": null_env,
         "d_cos_gap_agent": cos_mean - null_agent,
         "d_cos_gap_env": cos_mean - null_env,
-        "goal_perm_cos": _masked_mean(perm_cos, mask),
+        "goal_perm_cos": perm_cos_mean,
     }
 
 
@@ -1121,6 +1417,7 @@ def manager_update(
     config: MAPPOConfig,
     manager_module,
     n_agents: int,
+    enc_grads=None,
 ) -> Tuple[FeudalTrainState, dict]:
     """FuN's transition policy gradient for the manager, plus V^M's regression.
 
@@ -1279,6 +1576,33 @@ def manager_update(
         (pg_loss, (cos, valid, mask, goal, s)), m_grads = jax.value_and_grad(
             manager_loss_fn, has_aux=True
         )(manager_ts.params)
+
+        # --- the worker's share of the SHARED encoder (worker_encoder="shared") ---
+        # Two losses write to `f_enc`, so their gradients are summed at the one
+        # parameter point both were evaluated at and take a single Adam step.
+        #
+        # ⚠ The encoder term is clipped SEPARATELY first, and that is not a detail.
+        # The manager's optimizer is `chain(clip_by_global_norm(grad_clip), adam)`
+        # and that clip is GLOBAL over the whole manager tree: summing an unclipped
+        # encoder gradient in would make the clip fire more often and, when it
+        # fires, rescale the manager's own transition PG by a factor set by how
+        # hard the worker happened to push this update. The arm would quietly
+        # become "manager PG, attenuated by the worker" while `manager_pg_loss`
+        # kept logging a healthy number — the failure mode this file catalogues
+        # twice already for `worker_goal_column_ratio`. Clipping the addition to
+        # the same budget on its own leaves the PG's own norm untouched whenever
+        # the PG alone is under the clip, which is the common case.
+        #
+        # A second `apply_gradients` instead of a sum would be worse still: optax's
+        # Adam MOVES a leaf with a zero gradient, because `mu` is nonzero from the
+        # previous update and `count` increments for the whole tree — so every
+        # non-encoder manager parameter would drift.
+        if enc_grads is not None:
+            enc_scaled = _clip_tree(enc_grads, config.grad_clip)
+            enc_norm = _encoder_grad_norm(enc_scaled)
+            pg_enc_norm = _encoder_grad_norm(m_grads)
+            enc_cos = _encoder_grad_cosine(m_grads, enc_scaled)
+            m_grads = jax.tree.map(jnp.add, m_grads, enc_scaled)
         manager_ts = manager_ts.apply_gradients(grads=m_grads)
 
         # --- collapse diagnostics (see the helpers above) ---
@@ -1303,6 +1627,16 @@ def manager_update(
             "state_pairwise_cos": _mean_pairwise_cosine(_agent_gram(s)),
             "state_latent_erank": _effective_rank(s),
         }
+        if enc_grads is not None:
+            # Who shapes `f_enc`. Read the COSINE first: norms alone are
+            # misleading under Adam, whose step is scale-invariant in the limit,
+            # so "the worker's norm is 10x" does not by itself mean the worker
+            # wins. A persistently negative cosine means the two objectives are
+            # pulling the shared representation apart, which is the thing this arm
+            # can fail at while every other series stays healthy.
+            metrics["manager_encoder_grad_norm"] = pg_enc_norm
+            metrics["worker_encoder_grad_norm_clipped"] = enc_norm
+            metrics["worker_manager_encoder_grad_cos"] = enc_cos
         return manager_ts, metrics
 
     manager_ts, epoch_metrics = jax.lax.scan(

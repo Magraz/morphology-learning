@@ -221,6 +221,34 @@ class Model_Params:
     # 0.0625), so the worker's WHOLE loss would be a team-aggregate signal it
     # does not control. run.py warns on the combination.
     worker_objective: str = "mixed"
+    # Whether the worker shares the manager's perceptual encoder (FuN's f_percept).
+    #   "none" (default, original): the worker eats the raw local observation and
+    #       builds its own features. A STATIC no-op — every branch is a
+    #       python-level `if`, so this value is byte-identical to the code before
+    #       the knob existed.
+    #   "shared": the worker's observation input is REPLACED by f_enc(obs_i), the
+    #       manager's shared per-agent encoder output (manager_hidden_dim wide),
+    #       and the worker's PPO gradient flows back INTO f_enc — no stop_gradient.
+    #       This is FuN's own topology: one z_t = f_percept(x_t) feeding both the
+    #       manager and the worker, with both gradients shaping it.
+    #
+    # WHY: the manager->worker channel is where this stack measurably fails, and a
+    # shared representation is the structural difference from FuN that has never
+    # been tested. Under "none" the worker must learn, from a scalar PPO gradient
+    # alone, what directions in a space built by a network it shares NOTHING with
+    # are supposed to mean.
+    #
+    # ⚠ Requires a LOCAL manager_latent — only those build the per-agent `f_enc`.
+    # ⚠ Requires n_manager_epochs == 1: the worker's encoder gradient is computed
+    #   once per update at one parameter point, and replaying it across manager
+    #   epochs would apply it at parameters it was not computed at.
+    # ⚠ Pair with worker_fusion="film". Under "concat" the 256-wide encoder drops
+    #   the goal's share of layer-1 preactivation variance from ~9.8% to ~1%, so
+    #   the arm stops being comparable to any other on the goal-influence axis.
+    # ⚠ NOT checkpoint-compatible with "none": the worker's first Dense has input
+    #   width manager_hidden_dim (256) instead of obs_dim (40). That kernel shape
+    #   is also the tell — unlike the yaml, it cannot lie about what trained.
+    worker_encoder: str = "none"
 
 
 @dataclass
@@ -286,6 +314,9 @@ class MAPPOConfig:
     worker_fusion: str = "concat"
     # See Model_Params.worker_objective — "mixed" (default) or "intrinsic_only".
     worker_objective: str = "mixed"
+    # See Model_Params.worker_encoder — "none" (default) or "shared" (FuN's
+    # f_percept topology: the worker reads f_enc(obs_i) and trains it too).
+    worker_encoder: str = "none"
 
 
 class Transition(NamedTuple):

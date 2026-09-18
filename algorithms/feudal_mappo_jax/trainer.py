@@ -29,6 +29,7 @@ from algorithms.feudal_mappo_jax.manager import (
     goal_ring_pool,
     goal_ring_reset,
     goal_ring_write,
+    training_goal_variants,
     worker_intrinsic_reward_aligned,
 )
 from algorithms.feudal_mappo_jax.mappo import (
@@ -38,8 +39,9 @@ from algorithms.feudal_mappo_jax.mappo import (
     manager_update,
     ppo_update,
     validate_worker_objective,
+    validate_worker_encoder,
 )
-from algorithms.feudal_mappo_jax.worker import bind_goal
+from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
 
 # Back-compat alias for `run.py`, which imports the flat-stack name.
 ActorCriticTrainState = FeudalTrainState
@@ -106,18 +108,20 @@ def make_train(config: MAPPOConfig, env):
     # path that builds a MAPPOConfig directly (the seam tests, the probes) gets
     # the same guards — and so the rules have exactly one home.
     validate_worker_objective(config)
+    # Whether the worker shares the manager's perceptual encoder. Same reasoning:
+    # one home for the rules, reachable from every path that builds a config.
+    validate_worker_encoder(config)
+    share_encoder = config.worker_encoder != "none"  # static
 
     # Goal-ablation eval variants (see `eval_fn`). Validate the shift HERE, at
     # build time, rather than at the first eval hundreds of updates in: a shift
     # that is a multiple of n_agents makes the permutation the identity, so
     # every gap is exactly 0.0 and the diagnostic reports "the goals make no
     # difference" while having measured nothing.
-    default_eval_variants = (
-        ("real", "permuted", "constant", "zeroed")
-        if config.eval_goal_variants
-        else ("real",)
+    default_eval_variants = training_goal_variants(
+        n_agents, config.eval_goal_variants
     )
-    if config.eval_goal_variants:
+    if "permuted" in default_eval_variants:
         from algorithms.feudal_mappo_jax.manager import _check_permutable
 
         _check_permutable(
@@ -174,6 +178,13 @@ def make_train(config: MAPPOConfig, env):
         obs, so row k = b_i*n_agents + a pairs agent a's obs with agent a's goal.
         Getting these two out of step would silently train every agent on a
         neighbour's directive. The action mask flattens the same way.
+
+        Under `worker_encoder="shared"` the flattened obs is routed through the
+        manager's encoder before it reaches the worker. The encode happens AFTER
+        the flatten, deliberately: `ppo_update` encodes at that same
+        `(rows, obs_dim)` rank, and matching it makes the two bitwise equal rather
+        than merely close — which is what keeps "the PPO ratio is exactly 1" an
+        equality rather than a tolerance.
         """
         b = obs.shape[0]
         mask_flat = (
@@ -181,6 +192,13 @@ def make_train(config: MAPPOConfig, env):
             if action_mask is not None
             else None
         )
+        worker_obs = obs.reshape(b * n_agents, obs_dim)
+        if share_encoder:
+            worker_obs = encode_obs(
+                train_state.manager_ts.apply_fn,
+                train_state.manager_ts.params,
+                worker_obs,
+            )
         actions_flat, log_probs_flat = sample_action(
             rng,
             bind_goal(
@@ -188,7 +206,7 @@ def make_train(config: MAPPOConfig, env):
                 pooled_goal.reshape(b * n_agents, goal_dim),
             ),
             train_state.actor_ts.params,
-            obs.reshape(b * n_agents, obs_dim),
+            worker_obs,
             discrete,
             deterministic=deterministic,
             action_mask=mask_flat,
@@ -614,11 +632,24 @@ def make_train(config: MAPPOConfig, env):
         """
         train_state, rng = runner_state
         rng, update_rng = jax.random.split(rng)
-        # Worker (PPO) and manager (transition PG) touch disjoint parameters and
-        # both read the frozen trajectory, so the order is immaterial. The
-        # manager runs second so its diagnostics describe the goals the worker
-        # was actually just updated against.
-        train_state, losses = ppo_update(
+        # ⚠ THE ORDER IS LOAD-BEARING under `worker_encoder="shared"`, where the
+        # two stop touching disjoint parameters — they share `f_enc`.
+        #
+        # `ppo_update` must run FIRST and must not move the manager. It computes
+        # the worker's gradient w.r.t. the shared encoder and hands it back
+        # unapplied; `manager_update` sums it into the transition PG's gradient
+        # and takes the single Adam step. Move the manager before `ppo_update` and
+        # the epoch-0 importance ratio stops being exactly 1; apply the encoder
+        # gradient inside `ppo_update` and `manager_update`'s recompute no longer
+        # reproduces the goals the rollout emitted, i.e. the manager is optimized
+        # for a policy that never acted — silently, with every loss finite.
+        # `test_manager_ts_does_not_move_during_ppo_update` pins the cause.
+        #
+        # At `worker_encoder="none"` (the default) `enc_grads` is None and the two
+        # really are disjoint, so the order is immaterial as it always was; the
+        # manager still runs second so its diagnostics describe the goals the
+        # worker was just updated against.
+        train_state, losses, enc_grads = ppo_update(
             train_state,
             update_rng,
             trajectory,
@@ -635,6 +666,7 @@ def make_train(config: MAPPOConfig, env):
             config,
             manager,
             n_agents,
+            enc_grads=enc_grads,
         )
         return RunnerState(train_state=train_state, rng=rng), {**losses, **m_losses}
 
