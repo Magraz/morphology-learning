@@ -11,3 +11,4 @@ params:
   intrinsic_coef: 1.0
   # Required: alpha does not appear in this objective's advantage.
   intrinsic_anneal: none
+  ent_coef: 0.1
