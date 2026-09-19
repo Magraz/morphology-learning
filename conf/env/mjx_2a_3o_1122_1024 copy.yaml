@@ -7,7 +7,7 @@ env:
   # The per-update batch scales with it: params.n_steps * n_envs env-steps.
   n_envs: 32
   n_agents: 2
-  n_objects: 3
+  n_objects: 4
   reward_mode: dense
   variant: trunc
   coupling_def: [1,1,2,2]
