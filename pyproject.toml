@@ -16,6 +16,17 @@ dependencies = [
     # in the HPC nodelist). The cu12 build supports Volta through Hopper, i.e.
     # every GPU this project targets, so one env covers all nodes.
     "jax[cuda12]>=0.5.3",
+    # ⚠ The floor MUST stay >=0.2.0, and it is a correctness pin, not a preference.
+    # jaxmarl 0.0.3-0.1.0 hard-pin `jax==0.4.17.*` / `jaxlib==0.4.17.*`, which this
+    # repo's jax (0.10.2) cannot satisfy, so a floor of `>=0.0.2` silently backtracks
+    # all the way to 0.0.2 (Nov 2023) instead of failing. 0.2.0 requires only
+    # `jax>=0.4.25` and resolves cleanly. The two releases disagree on SMAX's
+    # per-unit observation features — 0.0.2 has 5 (`last_action`), >=0.0.3 has 7
+    # (`last_movement_x/y`, `last_targeted`) — so obs_dim differs (270 vs 230 at
+    # 10m_vs_11m) while `global_state_dim` and `action_dim` match exactly. Nothing
+    # crashes when training from scratch; you just silently train on a different
+    # observation than every checkpoint trained elsewhere. See CLAUDE.md § SMAX.
+    "jaxmarl>=0.2.0",
     "matplotlib>=3.10.8",
     "mujoco-mjx>=3.10.0",
     "mvlearn>=0.4.1",
