@@ -27,12 +27,13 @@
 env:
   environment: multi_box_push_mjx
   n_envs: 32
-  n_agents: 16
+  n_agents: 6
   n_objects: 4
   reward_mode: dense
 
   variant: trunc
   use_global_state: true
+  coupling_def: [4,3,3,2]
 
 params:
   n_steps: 1024
