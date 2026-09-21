@@ -63,7 +63,8 @@ for batch in a.batches.split(","):
         goal_embed_dim=cfg.goal_embed_dim, normalize_pooled_goal=cfg.normalize_pooled_goal,
         zero_goal=cfg.zero_goal, worker_fusion=cfg.worker_fusion)
     states, _ = collect_states(runner, manager, mp, worker, wp,
-        jax.random.PRNGKey(0), a.n_envs, a.n_samples, 32, keep_env_states=False)
+        jax.random.PRNGKey(0), a.n_envs, a.n_samples, 32, keep_env_states=False,
+        worker_encoder=cfg.worker_encoder)
     # states: (S, N*obs_dim) flattened joint obs. The un-flattening below assumes
     # `global_state == obs.reshape(-1)`; `unsupported_env_reason` (checked before
     # the rollout, above) is what guarantees that.

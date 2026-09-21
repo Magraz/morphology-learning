@@ -8,13 +8,14 @@ Functional JAX API (gymnax-style), fully ``jit``/``vmap``-able; no auto-reset
 (on ``terminated | truncated`` the caller resets)::
 
     env = MultiBoxPushMJX(n_agents=9, n_objects=3)
-    obs, state = jax.jit(env.reset)(key)                       # obs (A, 40)
+    obs, state = jax.jit(env.reset)(key)                       # obs (A, 48)
     obs, state, reward, terminated, truncated, info = jax.jit(env.step)(state, actions)
 
 Parity with the Box2D env:
 
-- obs: the shared 40-dim ``OBS_DIM`` layout from ``mjx_suite/observation.py``
-  (``MJXObservationBuilder``); this env supplies only the qpos layout
+- obs: the shared 40-dim layout from ``mjx_suite/observation.py`` followed by
+  eight agent-sector counts / 4 at indices 40:48 (``MJXObservationBuilder``).
+  This env supplies the qpos layout
   (``_agent_pos``/``_agent_vel``/``_box_pose``) and its goal band.
 - reward: shaping toward the top target band + one-time +100 per delivered box
   (``"sparse"`` drops the shaping); terminate on all-delivered or a wall touch.
@@ -105,7 +106,6 @@ from environments.box2d_suite.utils import (
     resolve_coupling,
 )
 from environments.mjx_suite.observation import (
-    OBS_DIM,
     MJXObservationBuilder,
     geom_index_maps,
 )
@@ -122,6 +122,23 @@ _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
 _DEFAULT_DRIFT_SPEED = 0.5
+
+# --- compact global state (opt-in via `use_global_state`; see `_compact_global_state`)
+# These two widths ARE the layout: `global_state_dim` is derived from them and the
+# builder itself uses them, so the declared width and the emitted width cannot
+# disagree. The layout is FROZEN once an arm trains — `gs_dim` is baked into every
+# `models_*.msgpack`, so changing the feature set means a NEW env group, not an edit.
+GLOBAL_STATE_VERSION = 1
+GLOBAL_STATE_AGENT_FEATURES = 4  # x, y, vx, vy
+GLOBAL_STATE_BOX_FEATURES = 6  # x, y, goal_dist, delivered, touch_frac, coupling_frac
+
+
+def compact_global_state_dim(n_agents: int, n_objects: int) -> int:
+    """Width of `MultiBoxPushMJX._compact_global_state` for this env size."""
+    return (
+        int(n_agents) * GLOBAL_STATE_AGENT_FEATURES
+        + int(n_objects) * GLOBAL_STATE_BOX_FEATURES
+    )
 
 
 class VARIANTS(StrEnum):
@@ -156,6 +173,7 @@ class MultiBoxPushMJX:
         max_steps: int = 1024,
         reward_mode: str = "dense",
         variant: str = None,
+        use_global_state: bool = False,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
@@ -188,9 +206,9 @@ class MultiBoxPushMJX:
         self.world_center_y = self.world_height // 2
         self.boundary_thickness = 0.5
 
-        self.velocity_norm = self.world_width / 10.0
+        self.velocity_norm = _FORCE_MULTIPLIER / (_AGENT_DAMPING * _AGENT_MASS)
         self.neighbor_detection_range = 3.0
-        self.sector_sensor_radius = self.world_width / 2.0
+        self.sector_sensor_radius = self.world_width / 3.0
         self.lidar_range = self.sector_sensor_radius
         self.comm_radius = self.world_width / 3.0
         self.force_multiplier = _FORCE_MULTIPLIER
@@ -311,13 +329,38 @@ class MultiBoxPushMJX:
             lidar_range=self.lidar_range,
             agent_of_geom=agent_of_geom,
             object_of_geom=object_of_geom,
+            include_agent_sector_counts=True,
         )
 
         self._agent_spawn_grid = self._make_spawn_grid()
         self._box_spawn_slots = self._make_box_slots()
 
-        self.observation_dim = OBS_DIM
+        self.observation_dim = self.obs_builder.obs_dim
         self.action_dim = 2
+
+        # --- opt-in compact global state -------------------------------------
+        # Read `global_state_enabled` in tests/logging/__repr__ — never `hasattr`.
+        # The hook is bound into the INSTANCE dict rather than declared on the
+        # class because `hasattr(env, "global_state")` is the trainers' only
+        # switch (mappo_jax/trainer.py: `global_state_dim` + `make_train`), and a
+        # class-level method would flip EVERY existing MJX arm from
+        # gs_dim = obs_dim*n_agents to this width — making every saved
+        # `models_*.msgpack` fail `from_bytes` and every past result incomparable.
+        self.global_state_enabled = bool(use_global_state)
+        if self.global_state_enabled:
+            self.global_state_dim = compact_global_state_dim(n_agents, n_objects)
+            self.global_state = self._compact_global_state
+            # Abstract evaluation: no FLOPs, no MJX compile, but it still proves
+            # the declared width is the width `_compact_global_state` emits.
+            probe_state = jax.eval_shape(
+                self.reset, jax.ShapeDtypeStruct((2,), jnp.uint32)
+            )[1]
+            shp = jax.eval_shape(self._compact_global_state, probe_state)
+            if shp.shape != (self.global_state_dim,):
+                raise RuntimeError(
+                    f"global_state width mismatch: declared {self.global_state_dim}, "
+                    f"emitted {shp.shape}"
+                )
 
     # ------------------------------------------------------------------ model
 
@@ -483,6 +526,75 @@ class MultiBoxPushMJX:
         q = data.qpos[self._box_qadr]  # (O, 3)
         return q[:, :2], q[:, 2]  # positions (O, 2), yaws (O,)
 
+    def _box_goal_distance(self, box_pos: jnp.ndarray) -> jnp.ndarray:
+        """(O,) SIGNED distance from each box to the goal band, along the goal axis.
+
+        Signed (negative once a box is past the band centre), matching Box2D. One
+        definition shared by the reward shaping in `_task_reward` and the compact
+        global state, so the two cannot drift. `MultiBoxMultiGoalPushMJX._goal_dist`
+        is the same-shaped analogue for the per-box concentric rings.
+        """
+        return self.target_y - box_pos[:, 1]
+
+    def _compact_global_state(self, state: EnvState) -> jnp.ndarray:
+        """`(global_state_dim,)` compact world state for one UNBATCHED `EnvState`.
+
+        Bound as `env.global_state` only when `use_global_state=True` (see
+        `__init__`). Layout, agent-major then box-major::
+
+            agents (A, 4): (pos - centre) / (W, H),  vel / velocity_norm
+            boxes  (O, 6): (pos - centre) / (W, H),  goal_dist / H,
+                           delivered, touch_count / A, coupling / A
+
+        Every block is normalized with the env's own constants so none enters the
+        critic's first Tanh at a different scale — the defect measured for
+        `normalize_pooled_goal`, where a 5x-scaled block took 91.6% of layer-1
+        preactivation variance. Positions are centred before scaling (roughly
+        zero-mean). The goal divisor is `world_height`, exactly what the
+        observation path uses for its y-axis `goal_distance`, so the two channels
+        are the same quantity measured from the box rather than from the agent.
+
+        Note `goal_dist` is affine in the box-y feature here (the band is fixed),
+        i.e. redundant in THIS env; it is carried because it costs `O` dims and
+        keeps the layout portable to the per-box-goal envs, where it is not.
+        `delivered` is NOT redundant — delivery latches, so a box pushed back out
+        of the band keeps paying nothing while its position says otherwise.
+        """
+        d = state.data
+        agent_pos = self._agent_pos(d)  # (A, 2)
+        agent_vel = self._agent_vel(d)  # (A, 2)
+        box_pos, box_yaw = self._box_pose(d)  # (O, 2), (O,)
+        touch = self._touch_matrix(agent_pos, box_pos, box_yaw)  # (A, O) bool
+
+        # Recomputed from `data`, NOT read off `state.prev_box_goal_dist`: that
+        # field is named "prev", and `macro_wrapper.state_from_snapshot` copies it
+        # verbatim, so relying on it happening to be in sync invites a silent
+        # one-step skew later.
+        goal_dist = self._box_goal_distance(box_pos)  # (O,)
+
+        # Built explicitly as f32: `world_center_x` is `world_width // 2`, an int.
+        centre = jnp.asarray(
+            [self.world_center_x, self.world_center_y], dtype=jnp.float32
+        )
+        extent = jnp.asarray([self.world_width, self.world_height], dtype=jnp.float32)
+
+        agents = jnp.concatenate(
+            [(agent_pos - centre) / extent, agent_vel / self.velocity_norm], axis=-1
+        )  # (A, 4)
+
+        boxes = jnp.concatenate(
+            [
+                (box_pos - centre) / extent,
+                (goal_dist / self.world_height)[:, None],
+                state.delivered[:, None].astype(jnp.float32),
+                (touch.sum(axis=0) / self.n_agents)[:, None].astype(jnp.float32),
+                (jnp.asarray(self._coupling, jnp.float32) / self.n_agents)[:, None],
+            ],
+            axis=-1,
+        )  # (O, 6)
+
+        return jnp.concatenate([agents.ravel(), boxes.ravel()])
+
     def _touch_matrix(self, agent_pos, box_pos, box_yaw) -> jnp.ndarray:
         """(A, O) bool — agent within radius + eps of a (rotated) box surface."""
         return self.obs_builder.touch_matrix(
@@ -557,7 +669,7 @@ class MultiBoxPushMJX:
     # ------------------------------------------------------------------ obs
 
     def _get_obs(self, data, delivered=None) -> jnp.ndarray:
-        """(A, OBS_DIM) — the shared Box2D-suite layout, built by obs_builder.
+        """(A, 48) — shared 40-dim layout followed by eight agent-sector counts.
 
         ``delivered`` (O,) bool excludes already-delivered boxes from
         ``nearest_box_vec`` so agents stop being drawn to a box parked in the
@@ -667,7 +779,7 @@ class MultiBoxPushMJX:
         boundary_hit = jnp.any((agent_pos < lo) | top_right_boundary_hit)
 
         # reward: shaping toward the band + one-time delivery bonus
-        dist = self.target_y - box_pos[:, 1]  # (O,) signed, matches Box2D
+        dist = self._box_goal_distance(box_pos)  # (O,) signed, matches Box2D
         shaping = jnp.sum((state.prev_box_goal_dist - dist) * (~state.delivered))
         in_band = (jnp.abs(box_pos[:, 0] - self.target_x) <= self.target_half_w) & (
             jnp.abs(box_pos[:, 1] - self.target_y) <= self.target_half_h
@@ -863,6 +975,74 @@ def _face_positions(box_xy, half: float, n: int) -> np.ndarray:
             )
         )
     return np.asarray(out)
+
+
+def _check_global_state(n_agents: int, n_objects: int, n_envs: int):
+    """Assertion suite for the opt-in compact global state.
+
+    Mirrors the `--check-drift` idiom: it constructs the env the way training
+    does (`use_global_state=True`), so it cannot desync from the shipped layout.
+    """
+    print(f"=== global-state checks ({n_agents}a/{n_objects}o) ===")
+
+    off = MultiBoxPushMJX(n_agents=n_agents, n_objects=n_objects)
+    assert not hasattr(off, "global_state"), "hook must be OFF by default"
+    assert not hasattr(MultiBoxPushMJX, "global_state"), "must not be a class method"
+    print("[1] default-off: no hook on the instance or the class            OK")
+
+    env = MultiBoxPushMJX(n_agents=n_agents, n_objects=n_objects, use_global_state=True)
+    expected = compact_global_state_dim(n_agents, n_objects)
+    _, states = jax.vmap(env.reset)(jax.random.split(jax.random.PRNGKey(0), n_envs))
+    gs = jax.jit(jax.vmap(env.global_state))(states)
+    assert env.global_state_dim == expected, (env.global_state_dim, expected)
+    assert gs.shape == (n_envs, expected), gs.shape
+    concat = n_agents * env.observation_dim
+    print(
+        f"[2] width: gs_dim={expected} (vs {concat} concat-obs, "
+        f"{concat / expected:.1f}x narrower)                OK"
+    )
+
+    one = jax.tree.map(lambda x: x[0], states)
+    flat = np.asarray(env.global_state(one))
+    centre = np.array([env.world_center_x, env.world_center_y], np.float32)
+    extent = np.array([env.world_width, env.world_height], np.float32)
+    agents = flat[: n_agents * GLOBAL_STATE_AGENT_FEATURES].reshape(
+        n_agents, GLOBAL_STATE_AGENT_FEATURES
+    )
+    np.testing.assert_allclose(
+        agents[:, :2] * extent + centre,
+        np.asarray(env._agent_pos(one.data)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    boxes = flat[n_agents * GLOBAL_STATE_AGENT_FEATURES :].reshape(
+        n_objects, GLOBAL_STATE_BOX_FEATURES
+    )
+    box_pos, _ = env._box_pose(one.data)
+    np.testing.assert_allclose(
+        boxes[:, :2] * extent + centre, np.asarray(box_pos), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        boxes[:, 2] * env.world_height,
+        np.asarray(env._box_goal_distance(box_pos)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    print("[3] layout round-trips to world units                            OK")
+
+    step = jax.jit(jax.vmap(env.step))
+    v_gs = jax.jit(jax.vmap(env.global_state))
+    key = jax.random.PRNGKey(1)
+    worst = 0.0
+    for _ in range(100):
+        key, sub = jax.random.split(key)
+        _, states, *_ = step(states, jax.random.normal(sub, (n_envs, n_agents, 2)))
+        g = v_gs(states)
+        assert bool(jnp.isfinite(g).all()), "non-finite global state"
+        worst = max(worst, float(jnp.abs(g).max()))
+    assert worst < 3.0, f"a block is off-scale: max |gs| = {worst:.3f}"
+    print(f"[4] scale over 100 steps: max |gs| = {worst:.3f} (< 3.0)           OK")
+    print("all global-state checks passed")
 
 
 def _check_drift(n_agents: int, n_objects: int, n_envs: int):  # noqa: C901
@@ -1253,7 +1433,17 @@ if __name__ == "__main__":
         help="run the box-drift assertion suite instead of the demo rollout "
         "(needs jit, so it ignores --debug)",
     )
+    parser.add_argument(
+        "--check-global-state",
+        action="store_true",
+        help="run the compact global-state assertion suite instead of the demo "
+        "rollout (needs jit, so it ignores --debug)",
+    )
     args = parser.parse_args()
+
+    if args.check_global_state:
+        _check_global_state(args.n_agents, args.n_objects, args.n_envs)
+        raise SystemExit(0)
 
     if args.check_drift:
         _check_drift(args.n_agents, args.n_objects, args.n_envs)
@@ -1274,7 +1464,7 @@ if __name__ == "__main__":
 
     key = jax.random.PRNGKey(0)
     obs, state = reset(key)
-    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
+    assert obs.shape == (args.n_agents, env.observation_dim), obs.shape
     print(f"obs shape OK: {obs.shape}")
 
     # --- scripted sanity rollout: everyone pushes box 0 into the band ---

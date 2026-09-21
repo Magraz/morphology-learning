@@ -40,12 +40,10 @@ from environments.mjx_suite.macro_skills import (
     null_action,
 )
 from environments.mjx_suite.multi_box_push_mjx import EnvState, MultiBoxPushMJX
-from environments.mjx_suite.observation import OBS_DIM
 
 # Commitment features appended to the base observation: one-hot skill + the two
 # scalars that define the async setting.
 COMMITMENT_FEAT_DIM = N_SKILLS + 2
-MACRO_OBS_DIM = OBS_DIM + COMMITMENT_FEAT_DIM
 
 # SyncMacroMJX reward modes (see the class docstring). The base env's own
 # "dense"/"difference_rewards" pass straight through; these are computed by the
@@ -90,7 +88,9 @@ class AsyncMacroMJX:
         self.d_max = int(d_max)
         self.stagger = bool(stagger)
         self.augment_obs = bool(augment_obs)
-        self.obs_dim = MACRO_OBS_DIM if augment_obs else OBS_DIM
+        self.obs_dim = self.env.observation_dim + (
+            COMMITMENT_FEAT_DIM if augment_obs else 0
+        )
 
     @property
     def is_synchronous(self) -> bool:
@@ -100,7 +100,7 @@ class AsyncMacroMJX:
     # ------------------------------------------------------------ internals
 
     def _obs(self, base_obs: jnp.ndarray, mstate: MacroState) -> jnp.ndarray:
-        """Append the commitment features to the shared 40-dim observation."""
+        """Append the commitment features to the base environment observation."""
         if not self.augment_obs:
             return base_obs
         commitment = jnp.concatenate(
@@ -295,7 +295,7 @@ class SyncMacroMJX:
     whose mid-rollout auto-reset already ``v_reset``/``tree.map``-s over it.
 
     The action is a per-agent **discrete** skill index; the observation is the
-    shared 40-dim ``OBS_DIM`` (no commitment features — every agent re-decides
+    base environment's observation (no commitment features — every agent re-decides
     every macro step, so ``remaining``/``elapsed`` carry no information).
     """
 
@@ -375,13 +375,25 @@ class SyncMacroMJX:
 
         # Interface the mappo_jax trainer/runner reads off the env (matching the
         # attribute names of MultiBoxPushMJX): discrete skill selection.
-        self.observation_dim = OBS_DIM
+        self.observation_dim = self.env.observation_dim
         self.action_dim = N_SKILLS
         self.discrete = True
         # One macro step consumes macro_len low-level steps, so an episode of
         # base.max_steps low-level steps is ceil(base.max_steps / macro_len)
         # decisions — the horizon eval/view scan over.
         self.max_steps = -(-self.env.max_steps // self.macro_len)
+
+        # This wrapper re-declares its metadata explicitly and has NO __getattr__,
+        # so a `global_state` hook on the base env does not propagate: the trainers
+        # would silently fall back to concat-obs while the config claimed a compact
+        # state. Refuse rather than train the wrong thing. Forwarding it later is
+        # ~5 lines over `base_state()` (which already unwraps StaggeredMacroState).
+        if hasattr(self.env, "global_state"):
+            raise NotImplementedError(
+                "SyncMacroMJX does not forward the base env's global_state hook; "
+                "the macro arm would silently train on concat-obs. Forward it via "
+                "base_state() before enabling env.use_global_state on a macro group."
+            )
 
     # ------------------------------------------------------------ internals
 
@@ -912,8 +924,11 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(0)
     step = jax.jit(async_env.step)
     obs, state = jax.jit(async_env.reset)(key)
-    assert obs.shape == (args.n_agents, MACRO_OBS_DIM), obs.shape
-    print(f"obs {obs.shape} (base {OBS_DIM} + commitment {COMMITMENT_FEAT_DIM}) OK")
+    assert obs.shape == (args.n_agents, async_env.obs_dim), obs.shape
+    print(
+        f"obs {obs.shape} (base {base.observation_dim} "
+        f"+ commitment {COMMITMENT_FEAT_DIM}) OK"
+    )
 
     # --- async rollout: decision points must be staggered ---
     t0 = time.time()
@@ -963,7 +978,7 @@ if __name__ == "__main__":
     obs, vstate = v_reset(keys)
     proposed = jax.random.randint(key, (args.n_envs, args.n_agents), 0, N_SKILLS)
     obs, vstate, r, term, trunc, info = v_step(vstate, proposed)
-    assert obs.shape == (args.n_envs, args.n_agents, MACRO_OBS_DIM), obs.shape
+    assert obs.shape == (args.n_envs, args.n_agents, async_env.obs_dim), obs.shape
     print(f"vmap({args.n_envs}) OK: obs {obs.shape}, reward {r.shape}")
 
     # ---------------------------------------------------------------------- #
@@ -972,7 +987,7 @@ if __name__ == "__main__":
     print("\n=== SyncMacroMJX (options / one step == one macro decision) ===")
     macro_len = 10
     sync_macro = SyncMacroMJX(base, macro_len=macro_len)
-    assert sync_macro.observation_dim == OBS_DIM
+    assert sync_macro.observation_dim == base.observation_dim
     assert sync_macro.action_dim == N_SKILLS and sync_macro.discrete
     print(
         f"obs_dim={sync_macro.observation_dim} action_dim={sync_macro.action_dim} "
@@ -985,7 +1000,7 @@ if __name__ == "__main__":
 
     t0 = time.time()
     obs, state = m_reset(key)
-    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
+    assert obs.shape == (args.n_agents, sync_macro.observation_dim), obs.shape
 
     # Each call advances the physics by macro_len low-level steps and returns one
     # transition. Reward is the summed team reward over the window.
@@ -1041,7 +1056,7 @@ if __name__ == "__main__":
     obs, vstate = vm_reset(keys)
     proposed = jax.random.randint(key, (args.n_envs, args.n_agents), 0, N_SKILLS)
     obs, vstate, r, term, trunc, info = vm_step(vstate, proposed)
-    assert obs.shape == (args.n_envs, args.n_agents, OBS_DIM), obs.shape
+    assert obs.shape == (args.n_envs, args.n_agents, sync_macro.observation_dim), obs.shape
     assert r.shape == (args.n_envs,), r.shape
     print(f"vmap({args.n_envs}) OK: obs {obs.shape}, reward {r.shape}")
     print("SyncMacroMJX smoke test passed.")
@@ -1119,7 +1134,7 @@ if __name__ == "__main__":
     s_reset, s_step = jax.jit(stag.reset), jax.jit(stag.step)
     obs, st = s_reset(key)
     assert isinstance(st, StaggeredMacroState)
-    assert obs.shape == (args.n_agents, OBS_DIM), obs.shape
+    assert obs.shape == (args.n_agents, stag.observation_dim), obs.shape
     onset = np.asarray(st.onset)
     phases = (onset % macro_len).tolist()
     print(f"onset(low-level)={onset.tolist()} phases={phases}")
@@ -1146,7 +1161,7 @@ if __name__ == "__main__":
     obs, vst = v_sreset(keys)
     proposed = jax.random.randint(key, (args.n_envs, args.n_agents), 0, N_SKILLS)
     obs, vst, r, term, trunc, info = v_sstep(vst, proposed)
-    assert obs.shape == (args.n_envs, args.n_agents, OBS_DIM), obs.shape
+    assert obs.shape == (args.n_envs, args.n_agents, stag.observation_dim), obs.shape
     assert r.shape == (args.n_envs,) and info["active"].shape == (
         args.n_envs, args.n_agents)
     print(f"vmap({args.n_envs}) OK: obs {obs.shape}, active {info['active'].shape}")

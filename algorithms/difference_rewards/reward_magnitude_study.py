@@ -46,7 +46,6 @@ from environments.mjx_suite.macro_wrapper import (
     SyncMacroMJX,
 )
 from environments.mjx_suite.multi_box_push_mjx import MultiBoxPushMJX
-from environments.mjx_suite.observation import OBS_DIM
 
 RESULTS = Path("experiments/results/macro_mjx_16a_4o/mlp")
 N_AGENTS = 16
@@ -56,7 +55,7 @@ HIDDEN_DIM = 168  # conf/model/mlp.yaml
 
 
 # --------------------------------------------------------------------------- io
-def load_actor_params(trial_dir: Path):
+def load_actor_params(trial_dir: Path, observation_dim: int):
     """Restore the actor params for one trial from its msgpack checkpoint.
 
     Mirrors ``MAPPO_JAX_Runner._load_train_state``: prefers ``models_finished``,
@@ -70,8 +69,8 @@ def load_actor_params(trial_dir: Path):
     actor = MAPPOActor(action_dim=N_SKILLS, hidden_dim=HIDDEN_DIM, discrete=True)
     critic = MAPPOCritic(hidden_dim=2 * HIDDEN_DIM, n_outputs=1)
     target = {
-        "actor": actor.init(jax.random.PRNGKey(0), jnp.zeros(OBS_DIM)),
-        "critic": critic.init(jax.random.PRNGKey(1), jnp.zeros(OBS_DIM * N_AGENTS)),
+        "actor": actor.init(jax.random.PRNGKey(0), jnp.zeros(observation_dim)),
+        "critic": critic.init(jax.random.PRNGKey(1), jnp.zeros(observation_dim * N_AGENTS)),
     }
     with open(path, "rb") as f:
         loaded = from_bytes(target, f.read())
@@ -257,7 +256,9 @@ def main():
         per_trial = []
         key = jax.random.PRNGKey(args.seed)
         for trial in trials:
-            _, actor_params, ckpt = load_actor_params(RESULTS / trial)
+            _, actor_params, ckpt = load_actor_params(
+                RESULTS / trial, sync_dense.observation_dim
+            )
             key, sub = jax.random.split(key)
             keys = jax.random.split(sub, args.n_rollouts)
             stats = collect_trial(run_all(actor_params, keys))

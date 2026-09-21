@@ -154,6 +154,7 @@ class Feudal_MAPPO_JAX_Runner:
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
+                use_global_state=env_config.get("use_global_state", False),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
             self.env = MultiBoxMultiGoalPushMJX(
@@ -309,6 +310,13 @@ class Feudal_MAPPO_JAX_Runner:
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
             f"reward_mode={self.env.reward_mode} | "
             f"backend={jax.default_backend()}"
+        )
+        # Nothing validates the `env:` block (CLAUDE.md), so a misspelled or
+        # misindented `use_global_state` would train the plain baseline under a
+        # name asserting otherwise. Print what actually resolved.
+        print(
+            f"  centralized input: gs_dim={global_state_dim(self.env)} "
+            f"(env hook: {hasattr(self.env, 'global_state')})"
         )
         print(
             f"  manager: core={self.config.manager_core} "
@@ -744,14 +752,27 @@ class Feudal_MAPPO_JAX_Runner:
         manager = build_manager(self.config, self.env.n_agents)
         horizon, goal_dim = self.config.goal_horizon, self.config.goal_dim
 
+        # The centralized input must be built the way the trainer built it, or a
+        # hook-on arm feeds a concat-obs vector into a manager whose first layer
+        # was sized for the compact state — a bare ScopeParamShapeError at render
+        # time, and under manager_latent="centralized" that vector is the
+        # manager's ONLY input. Mirrors `trainer.global_state_fn`, unbatched.
+        if hasattr(self.env, "global_state"):
+            _view_gs = jax.jit(self.env.global_state)
+        else:
+            def _view_gs(state):
+                return None
+
         @jax.jit
-        def manager_fn(m_carry, obs):
-            # `obs` is (n_agents, obs_dim) here (unbatched). It is passed twice
-            # on purpose: flattened as the global state, and per-agent for
-            # manager_latent="local". The centralized branch ignores the second.
-            return manager.apply(
-                train_state.manager_ts.params, m_carry, obs.reshape(-1), obs
-            )
+        def manager_fn(m_carry, obs, gs):
+            # `obs` is (n_agents, obs_dim) here (unbatched), and is passed
+            # per-agent for manager_latent="local"; the centralized branch reads
+            # `gs`. Without an env hook `gs` is the flattened obs, as before.
+            return manager.apply(train_state.manager_ts.params, m_carry, gs, obs)
+
+        def _global_state_for(state, obs):
+            gs = _view_gs(state)
+            return obs.reshape(-1) if gs is None else gs
 
         @jax.jit
         def policy_fn(obs, pooled_goal):
@@ -782,7 +803,7 @@ class Feudal_MAPPO_JAX_Runner:
                 jnp.zeros((horizon, self.env.n_agents, goal_dim)),
             )
 
-        def _advance_goal(m_carry, goal_hist, t, obs):
+        def _advance_goal(m_carry, goal_hist, t, obs, state):
             """One manager decision + ring write; returns the pooled goal w_t.
 
             Uses the SAME `goal_ring_*` helpers as the training and eval scans —
@@ -792,7 +813,9 @@ class Feudal_MAPPO_JAX_Runner:
             reimplementation would drift silently: a wrong slot index or a stale
             pool renders perfectly happily, just as a different policy.
             """
-            m_carry, goal, latent = manager_fn(m_carry, obs)
+            m_carry, goal, latent = manager_fn(
+                m_carry, obs, _global_state_for(state, obs)
+            )
             episode_goals.append(np.asarray(goal))
             episode_latents.append(np.asarray(latent))
             goal_hist = goal_ring_write(goal_hist, goal, t)
@@ -832,7 +855,7 @@ class Feudal_MAPPO_JAX_Runner:
                     # The manager decides on the macro boundary, alongside the
                     # worker's skill choice.
                     m_carry, goal_hist, pooled = _advance_goal(
-                        m_carry, goal_hist, t, obs
+                        m_carry, goal_hist, t, obs, state
                     )
                     skills = policy_fn(obs, pooled)
                     for _ in range(self.env.macro_len):  # low-level steps
@@ -851,7 +874,7 @@ class Feudal_MAPPO_JAX_Runner:
                 for t in range(self.env.max_steps):
                     _draw(state, obs)
                     m_carry, goal_hist, pooled = _advance_goal(
-                        m_carry, goal_hist, t, obs
+                        m_carry, goal_hist, t, obs, state
                     )
                     obs, state, _, terminated, truncated, info = step_fn(
                         state, policy_fn(obs, pooled)
@@ -863,7 +886,9 @@ class Feudal_MAPPO_JAX_Runner:
                         break
             # Include s_T from the final observation, without resetting the env
             # or advancing the policy. Macro horizons count policy decisions.
-            _, _, final_latent = manager_fn(m_carry, obs)
+            _, _, final_latent = manager_fn(
+                m_carry, obs, _global_state_for(state, obs)
+            )
             episode_latents.append(np.asarray(final_latent))
             save_goal_plot(
                 episode_goals, episode_latents, horizon,

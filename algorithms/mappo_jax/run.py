@@ -105,6 +105,7 @@ class MAPPO_JAX_Runner:
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
+                use_global_state=env_config.get("use_global_state", False),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
             self.env = MultiBoxMultiGoalPushMJX(
@@ -209,6 +210,13 @@ class MAPPO_JAX_Runner:
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
             f"reward_mode={self.env.reward_mode} | "
             f"backend={jax.default_backend()}"
+        )
+        # Nothing validates the `env:` block (CLAUDE.md), so a misspelled or
+        # misindented `use_global_state` would train the plain baseline under a
+        # name asserting otherwise. Print what actually resolved.
+        print(
+            f"  centralized input: gs_dim={global_state_dim(self.env)} "
+            f"(env hook: {hasattr(self.env, 'global_state')})"
         )
 
     def train(self):

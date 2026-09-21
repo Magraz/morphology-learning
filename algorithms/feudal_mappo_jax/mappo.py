@@ -1589,9 +1589,20 @@ def manager_update(
         # hard the worker happened to push this update. The arm would quietly
         # become "manager PG, attenuated by the worker" while `manager_pg_loss`
         # kept logging a healthy number — the failure mode this file catalogues
-        # twice already for `worker_goal_column_ratio`. Clipping the addition to
-        # the same budget on its own leaves the PG's own norm untouched whenever
-        # the PG alone is under the clip, which is the common case.
+        # twice already for `worker_goal_column_ratio`.
+        #
+        # ⚠ The pre-clip BOUNDS this coupling; it does not remove it. The clip is
+        # global, so the encoder addend still contributes to the norm that scales
+        # every leaf, even though it is zero on all of them. What the pre-clip
+        # buys is SATURATION: the encoder can add at most `grad_clip` of norm, so
+        # the displacement of the manager's own PG stops growing with the worker's
+        # gradient. Measured on the CPU stub, worst relative displacement of a
+        # non-`f_enc` parameter: 0.0 at |enc|=0, 1.9e-07 at 1e-3, 1.2e-05 at 1.0,
+        # and still 1.2e-05 at 1e6 — six more orders of magnitude for no further
+        # effect. Unclipped it would instead grow without bound, which is the
+        # defect this routing exists to prevent.
+        # `test_the_worker_gradient_cannot_scale_the_managers_own_pg_step` pins
+        # the saturation, which is the real guarantee.
         #
         # A second `apply_gradients` instead of a sum would be worse still: optax's
         # Adam MOVES a leaf with a zero gradient, because `mu` is nonzero from the

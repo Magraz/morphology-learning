@@ -1,0 +1,69 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# FuN's shared perceptual module, on the `local` latent.
+#
+# `feudal_film_local` + `worker_encoder: shared`, i.e. exactly one key apart from
+# its own matched control. The worker's observation input is REPLACED by
+# `f_enc(obs_i)` — the manager's shared per-agent encoder output — and the
+# worker's PPO gradient flows back INTO `f_enc`. That is FuN's own topology: one
+# `z_t = f_percept(x_t)` feeding both the manager and the worker, shaped by both
+# gradients. This repo has always kept the two separate (manager.py's "Deliberate
+# deviations" block), and the deviation had never been tested.
+#
+# WHY NOW: the manager->worker channel is where this stack measurably fails.
+# `eval_gap_permuted` ~ 0 on 40 of 45 non-control trials, `gap_zeroed` is
+# systematically NEGATIVE, and the best arm in mjx_12a_3o_trunc_1024 is
+# `feudal_film_zerogoal_dilated` — whose goals are provably disconnected. One live
+# explanation is that the worker must learn, from a scalar PPO gradient alone,
+# what directions in a space built by a network it shares NOTHING with mean.
+#
+# ⚠ THE ARM CHANGES TWO THINGS AT ONCE versus its control: (a) the worker's input
+# becomes a manager_hidden_dim-wide encoding of its own obs, and (b) the worker
+# now trains `f_enc`. A return gap is therefore not attributable to perceptual
+# sharing alone — the same objection this repo raises against `feudal_a0` as an
+# isolate of "hierarchy vs flat". The middle rung that separates them is one
+# `jax.lax.stop_gradient` (a `"shared_detached"` value); consider adding it before
+# spending GPU time on conclusions.
+#
+# ⚠ NOT CHECKPOINT-COMPATIBLE with any existing feudal arm: the worker's
+# `MAPPOActor_0/Dense_0/kernel` is (manager_hidden_dim, hidden_dim) = (256, 168)
+# instead of (obs_dim, hidden_dim) = (40, 168). That shape is also the tell —
+# unlike the yaml, a checkpoint cannot lie about what trained.
+#
+# ⚠ The worker compresses 256 -> 168. `manager_hidden_dim` and the worker's
+# `hidden_dim` are one knob in FuN and two unrelated defaults here. Left as-is
+# deliberately: setting manager_hidden_dim: 168 would change a SECOND key versus
+# the control.
+#
+# WHAT TO WATCH, in this order, across the WHOLE run (`local`'s goal collapse
+# landed by ~10M steps and was permanent):
+#   worker_manager_encoder_grad_cos  persistently negative => the two objectives
+#                                    are pulling the shared encoder apart
+#   worker_encoder_grad_norm vs manager_encoder_grad_norm  read the COSINE first;
+#                                    Adam is scale-invariant in the limit, so a
+#                                    larger norm does not by itself mean the
+#                                    worker wins
+#   goal_direction_count             vs the random-direction baseline
+#                                    N^2/(N + N(N-1)/goal_dim) = 8.93 at
+#                                    N=12/goal_dim=32
+#   worker_tanh_saturation           the encoded input is tanh-bounded and 6.4x
+#                                    wider than raw obs
+# The scientific risk this arm carries alone: if `f_enc` collapses the way
+# `local`'s `s` did (participation ratio 1.03-2.89 of 12), the worker's ENTIRE
+# observation collapses with it and a return regression is uninterpretable. Run
+# `latent_diversity_probe` on `h`, not just on `s`/`g`.
+#
+# Acceptance is the BETWEEN-ARM return comparison against `feudal_film_local` on
+# the same env group and seeds — not the goal-dependence probe, which can rule an
+# arm out but never in.
+defaults:
+  - feudal_film_local
+  - _self_
+
+model_params:
+  worker_encoder: shared

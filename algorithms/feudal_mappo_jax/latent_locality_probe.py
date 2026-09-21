@@ -209,7 +209,9 @@ def unsupported_env_reason(env):
         return (
             f"env has its own global_state hook ({int(env.global_state_dim)} dims "
             f"vs {int(env.n_agents * env.observation_dim)} of concatenated obs); "
-            "collect_states assumes global_state == concat(obs)"
+            "collect_states assumes global_state == concat(obs). For an MJX arm "
+            "built with `use_global_state: true`, measure the hook-OFF twin group "
+            "instead — it differs in exactly that one key"
         )
     if getattr(env, "discrete", False):
         return "env has a discrete action space; collect_states hardcodes discrete=False"
@@ -217,7 +219,8 @@ def unsupported_env_reason(env):
 
 
 def collect_states(runner, manager, m_params, worker, w_params, key,
-                   n_envs, n_samples, stride, keep_env_states=False):
+                   n_envs, n_samples, stride, keep_env_states=False,
+                   worker_encoder="none"):
     """Roll the trained hierarchy, snapshotting every `stride`-th step.
 
     Returns ``(global_states, env_states_or_None)``. Done envs are restarted the
@@ -225,6 +228,7 @@ def collect_states(runner, manager, m_params, worker, w_params, key,
     distribution stays on-policy instead of freezing on whatever ended the
     episode.
     """
+    from algorithms.feudal_mappo_jax.worker import encode_obs
     from algorithms.feudal_mappo_jax.manager import (
         goal_ring_pool,
         goal_ring_reset,
@@ -249,11 +253,19 @@ def collect_states(runner, manager, m_params, worker, w_params, key,
         ring = goal_ring_write(ring, goal, t)
         pooled = goal_ring_pool(ring)
         b = obs.shape[0]
+        # Under `worker_encoder="shared"` the worker eats the manager's encoder
+        # output, not raw obs — and its first Dense is manager_hidden_dim wide, so
+        # feeding raw obs here is a shape error rather than a wrong number. Encode
+        # AFTER the flatten, as the trainer does, so the probe drives bitwise the
+        # policy that trained.
+        worker_obs = obs.reshape(b * N, obs_dim)
+        if worker_encoder != "none":
+            worker_obs = encode_obs(manager.apply, m_params, worker_obs)
         action, _ = sample_action(
             a_rng,
             bind_goal(worker.apply, pooled.reshape(b * N, goal_dim)),
             w_params,
-            obs.reshape(b * N, obs_dim),
+            worker_obs,
             discrete=False,
             deterministic=True,
         )
@@ -430,6 +442,7 @@ def main():
                 runner, manager, m_params, worker, w_params,
                 jax.random.PRNGKey(0), args.n_envs, args.n_samples, args.stride,
                 keep_env_states=(args.wrt == "positions"),
+                worker_encoder=cfg.worker_encoder,
             )
 
             head = (

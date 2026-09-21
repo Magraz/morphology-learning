@@ -2597,3 +2597,393 @@ def test_zero_goal_is_still_rejected_under_intrinsic_only():
         "intrinsic_only no longer implies the condition run.py's zero_goal guard "
         "keys on — that arm needs its own guard now"
     )
+
+
+# ---- shared perceptual encoder (worker_encoder) ------------------------------
+#
+# FuN feeds ONE `z_t = f_percept(x_t)` to both the manager and the worker, and
+# both gradients shape it. `worker_encoder="shared"` is that topology: the
+# worker's observation input is replaced by `f_enc(obs_i)` and its PPO gradient
+# reaches `f_enc`. The seams below are the ones where a mistake is silent.
+
+
+def _shared_config(**overrides):
+    """A runnable shared-encoder config: FiLM fusion on a local latent.
+
+    `local_private` because it is the only latent measured to have both locality
+    and restored row diversity; FiLM because under concat the encoder's width
+    would collapse the goal's share of layer-1 variance (the guard warns).
+    """
+    cfg = dict(
+        worker_encoder="shared",
+        manager_latent="local_private",
+        worker_fusion="film",
+    )
+    cfg.update(overrides)
+    return _config(**cfg)
+
+
+def _enc_only_tree(params, value):
+    """A manager-shaped tree holding `value` on `f_enc*` and 0 everywhere else."""
+    return jax.tree_util.tree_map_with_path(
+        lambda path, x: (
+            jnp.full_like(x, value)
+            if any("f_enc" in str(k) for k in path)
+            else jnp.zeros_like(x)
+        ),
+        params,
+    )
+
+
+def _ppo_update(config, train_state, traj, boot, seed=1):
+    from algorithms.feudal_mappo_jax.mappo import ppo_update
+
+    return ppo_update(
+        train_state,
+        jax.random.PRNGKey(seed),
+        traj,
+        boot.worker,
+        config,
+        False,
+        last_value_int=boot.worker_int,
+        progress=jnp.float32(0.0),
+    )
+
+
+def test_worker_encoder_is_off_by_default_and_changes_nothing():
+    """The default must be byte-identical to the code before the knob existed.
+
+    `_surrogate`/`_batch` refactored the DEFAULT path to share a body with the
+    encoder-gradient pass, so "none" is not trivially unchanged — it is unchanged
+    only if that refactor preserved every operation. Compared post-update, i.e.
+    after the arrays have been through the whole minibatch scan.
+    """
+    implicit = _config()
+    explicit = _config(worker_encoder="none")
+    assert implicit.worker_encoder == "none"
+
+    out = []
+    for cfg in (implicit, explicit):
+        _, _, new_rs, traj, boot, update_fn = _collect(cfg)
+        rs, losses = update_fn(new_rs, traj, boot, jnp.float32(0.0))
+        out.append((rs.train_state, losses))
+
+    for a, b in zip(jax.tree.leaves(out[0][0]), jax.tree.leaves(out[1][0])):
+        assert jnp.array_equal(a, b)
+    # And the encoder diagnostics must not appear at all — a NaN or a 0.0 in the
+    # stats would make every pre-existing run look like it had the knob.
+    for key in out[0][1]:
+        assert "encoder_grad" not in key, f"{key} leaked into a worker_encoder='none' run"
+
+
+def test_manager_ts_does_not_move_during_ppo_update():
+    """`ppo_update` computes the encoder gradient but must NOT apply it.
+
+    This pins the CAUSE of the two invariants below rather than two of its
+    symptoms. If someone later "simplifies" the routing by applying the encoder
+    gradient inside `ppo_update`, the epoch-0 ratio stops being exactly 1 AND
+    `manager_update`'s recompute stops reproducing the rollout's goals — i.e. the
+    manager would be optimized for a policy that never acted, silently, with every
+    loss finite. This test fails first and says why.
+    """
+    config = _shared_config()
+    _, _, new_rs, traj, boot, _ = _collect(config)
+    before = new_rs.train_state.manager_ts
+    out_ts, _, enc_grads = _ppo_update(config, new_rs.train_state, traj, boot)
+
+    assert enc_grads is not None, "shared encoder must return a gradient to hand on"
+    for a, b in zip(
+        jax.tree.leaves(before.params), jax.tree.leaves(out_ts.manager_ts.params)
+    ):
+        assert jnp.array_equal(a, b), "ppo_update moved the manager's params"
+    for a, b in zip(
+        jax.tree.leaves(before.opt_state), jax.tree.leaves(out_ts.manager_ts.opt_state)
+    ):
+        assert jnp.array_equal(a, b), "ppo_update moved the manager's optimizer state"
+
+
+def test_the_worker_gradient_cannot_scale_the_managers_own_pg_step():
+    """The worker's influence on the manager's OTHER parameters SATURATES.
+
+    The manager's optimizer is `chain(clip_by_global_norm(grad_clip), adam)` and
+    that clip is GLOBAL over the whole manager tree. So the two addends are NOT
+    perfectly isolated even when the encoder term is zero on every other leaf:
+    its contribution to the global norm changes the clip's scale, and that scale
+    multiplies every leaf. Pre-clipping the encoder addend to `grad_clip` caps how
+    much norm it can contribute, so the displacement SATURATES instead of growing
+    with the worker's gradient.
+
+    Measured on this stub (worst relative displacement of a non-`f_enc` param):
+
+        |enc| = 0      ->  0.0 exactly
+        |enc| = 1e-3   ->  1.9e-07
+        |enc| = 1.0    ->  1.2e-05
+        |enc| = 1e6    ->  1.2e-05   <- six more orders of magnitude, no change
+
+    The saturation is the invariant, and it is what the pre-clip buys. WITHOUT it
+    the displacement would grow without bound: a large worker gradient would
+    inflate the global norm, the clip would fire hard, and the manager's own
+    transition PG would be attenuated by a factor set by how hard the worker
+    happened to push — while `manager_pg_loss` kept logging a healthy number.
+    """
+    from algorithms.feudal_mappo_jax.mappo import build_manager, manager_update
+
+    config = _shared_config()
+    _, _, new_rs, traj, boot, _ = _collect(config)
+    manager = build_manager(config, N_AGENTS)
+    ts = new_rs.train_state
+
+    def _worst_relative_displacement(enc_grads):
+        ref, _ = manager_update(
+            ts, traj, boot.manager, config, manager, N_AGENTS, enc_grads=None
+        )
+        out, _ = manager_update(
+            ts, traj, boot.manager, config, manager, N_AGENTS, enc_grads=enc_grads
+        )
+        worst = 0.0
+        for path, leaf in jax.tree_util.tree_leaves_with_path(ref.manager_ts.params):
+            name = "/".join(str(k) for k in path)
+            if "f_enc" in name:
+                continue
+            other = out.manager_ts.params
+            for k in path:
+                other = other[k.key] if hasattr(k, "key") else other[k.idx]
+            scale = float(jnp.max(jnp.abs(leaf))) + 1e-12
+            worst = max(worst, float(jnp.max(jnp.abs(leaf - other))) / scale)
+        return worst
+
+    params = ts.manager_ts.params
+    # An all-zero addend must be an EXACT no-op: it changes no leaf and no norm.
+    assert _worst_relative_displacement(_enc_only_tree(params, 0.0)) == 0.0
+
+    unit = _worst_relative_displacement(_enc_only_tree(params, 1.0))
+    absurd = _worst_relative_displacement(_enc_only_tree(params, 1e6))
+
+    assert unit < 1e-3, f"even a unit encoder gradient displaces the PG by {unit:.2e}"
+    assert absurd < 1e-3, f"an absurd encoder gradient displaces the PG by {absurd:.2e}"
+    # The load-bearing assertion: 1e6x the gradient buys no more displacement.
+    assert absurd <= max(unit * 2.0, 1e-9), (
+        f"displacement grew with the worker's gradient ({unit:.2e} -> {absurd:.2e}) "
+        "— the encoder addend is not being clipped before the sum, so the global "
+        "clip is letting the worker rescale the manager's transition PG"
+    )
+
+
+@pytest.mark.parametrize("latent", LOCAL_LATENTS)
+def test_the_worker_gradient_reaches_f_enc_and_only_f_enc(latent):
+    """`enc_grads` is nonzero on `f_enc*` and EXACTLY zero on every other leaf.
+
+    `jax.grad` returns a fully instantiated cotangent, so the tree matches the
+    manager's params leaf-for-leaf and the untouched leaves are true zeros — that
+    is what makes `jax.tree.map(jnp.add, m_grads, enc_grads)` structurally safe.
+    Parametrized over every local latent so `local_private`'s stacked per-agent
+    projections are covered too.
+    """
+    config = _shared_config(manager_latent=latent)
+    _, _, new_rs, traj, boot, _ = _collect(config)
+    _, _, enc_grads = _ppo_update(config, new_rs.train_state, traj, boot)
+
+    touched = False
+    for path, leaf in jax.tree_util.tree_leaves_with_path(enc_grads):
+        name = "/".join(str(k) for k in path)
+        if "f_enc" in name:
+            touched = touched or bool(jnp.any(leaf != 0.0))
+        else:
+            assert jnp.all(leaf == 0.0), f"{latent}: worker gradient leaked into {name}"
+    assert touched, f"{latent}: the worker's gradient never reached f_enc"
+
+
+@pytest.mark.parametrize("n_epochs,n_minibatches", [(1, 1), (1, 3), (2, 2), (3, 1)])
+def test_the_encoder_gradient_is_one_full_batch_gradient(n_epochs, n_minibatches):
+    """It must not depend on PPO's own epoch/minibatch counts.
+
+    The encoder gradient is ONE gradient of the surrogate at the pre-PPO actor
+    params, merely computed in chunks to cap activation memory. Equal-size chunks
+    make the mean of the per-chunk means exactly the full-batch mean, so changing
+    how the batch is partitioned cannot move it. If it ever does, the arm has
+    silently acquired `n_minibatches` as a weight on how much authority the worker
+    has over the shared representation — a hyperparameter nobody reads as one.
+    """
+    ref_cfg = _shared_config(n_epochs=1, n_minibatches=2)
+    _, _, ref_rs, ref_traj, ref_boot, _ = _collect(ref_cfg)
+    _, _, ref_grads = _ppo_update(ref_cfg, ref_rs.train_state, ref_traj, ref_boot)
+
+    cfg = _shared_config(n_epochs=n_epochs, n_minibatches=n_minibatches)
+    _, _, new_rs, traj, boot, _ = _collect(cfg)
+    _, _, grads = _ppo_update(cfg, new_rs.train_state, traj, boot)
+
+    for path, leaf in jax.tree_util.tree_leaves_with_path(ref_grads):
+        name = "/".join(str(k) for k in path)
+        if "f_enc" not in name:
+            continue
+        other = grads
+        for k in path:
+            other = other[k.key] if hasattr(k, "key") else other[k.idx]
+        assert jnp.allclose(leaf, other, rtol=1e-4, atol=1e-7), (
+            f"{name}: encoder gradient moved with (n_epochs={n_epochs}, "
+            f"n_minibatches={n_minibatches}); max diff "
+            f"{float(jnp.max(jnp.abs(leaf - other)))}"
+        )
+
+
+def test_ppo_ratio_is_exactly_one_under_a_shared_encoder():
+    """The update conditions the worker on exactly what the rollout did.
+
+    Under sharing this additionally pins the FLATTEN-THEN-ENCODE order: both
+    `trainer._actor_forward` and `ppo_update` encode the already-flattened
+    `(rows, obs_dim)` array, so the two perform the identical contraction. Encode
+    before the flatten instead and different leading shapes can select different
+    XLA kernels, degrading this equality to ~1e-6 for no reason — hence the tight
+    tolerance, which is the thing that would catch it.
+    """
+    from algorithms.feudal_mappo_jax.worker import encode_obs
+
+    config = _shared_config()
+    _, _, new_rs, traj, _, _ = _collect(config)
+    actor_ts = new_rs.train_state.actor_ts
+    manager_ts = new_rs.train_state.manager_ts
+    n_flat = N_ENVS * N_AGENTS
+
+    for t in (0, N_STEPS // 2, N_STEPS - 1):
+        worker_obs = encode_obs(
+            manager_ts.apply_fn,
+            manager_ts.params,
+            traj.obs[t].reshape(n_flat, OBS_DIM),
+        )
+        log_probs, _ = evaluate_action(
+            bind_goal(actor_ts.apply_fn, traj.pooled_goal[t].reshape(n_flat, GOAL_DIM)),
+            actor_ts.params,
+            worker_obs,
+            traj.action[t].reshape(n_flat, ACTION_DIM),
+            False,
+        )
+        ratio = jnp.exp(log_probs - traj.log_prob[t].reshape(n_flat))
+        assert jnp.allclose(ratio, 1.0, atol=1e-6), (
+            f"step {t}: ratio deviates from 1 under a shared encoder "
+            f"(max |ratio-1| = {float(jnp.max(jnp.abs(ratio - 1.0)))})"
+        )
+
+
+@pytest.mark.parametrize("latent", LOCAL_LATENTS)
+def test_encoder_only_is_exactly_the_full_forwards_encoder(latent):
+    """`encoder_only=True` returns the same `h` the full forward computes.
+
+    An early return that merely approximates the encoder would make the worker
+    train on one representation and the manager read another, with nothing
+    logged to say so. Recomputed by hand from the params dict rather than by
+    calling the module a second way, so the test cannot pass by sharing a bug.
+    """
+    from algorithms.feudal_mappo_jax.mappo import build_manager
+
+    config = _shared_config(manager_latent=latent)
+    manager = build_manager(config, N_AGENTS)
+    key = jax.random.PRNGKey(3)
+    obs = jax.random.normal(key, (N_ENVS, N_AGENTS, OBS_DIM))
+    gs = obs.reshape(N_ENVS, -1)
+    carry = manager.initialize_carry(jax.random.PRNGKey(0), (N_ENVS,))
+    params = manager.init(jax.random.PRNGKey(1), carry, gs, obs)
+
+    h = manager.apply(params, None, None, obs, encoder_only=True)
+
+    p = params["params"]
+    expect = jnp.tanh(obs @ p["f_enc_0"]["kernel"] + p["f_enc_0"]["bias"])
+    expect = jnp.tanh(expect @ p["f_enc_1"]["kernel"] + p["f_enc_1"]["bias"])
+    assert jnp.allclose(h, expect, atol=1e-6)
+    assert h.shape == (N_ENVS, N_AGENTS, config.manager_hidden_dim)
+
+    # ...and the flag must not perturb the parameter tree, so every existing
+    # checkpoint still loads.
+    plain = manager.init(jax.random.PRNGKey(1), carry, gs, obs)
+    assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(plain)
+
+
+def test_encoder_only_raises_on_a_centralized_latent():
+    """`centralized` has `f_percept` over the GLOBAL state — nothing to share."""
+    from algorithms.feudal_mappo_jax.mappo import build_manager
+
+    config = _config(manager_latent="centralized")
+    manager = build_manager(config, N_AGENTS)
+    obs = jnp.zeros((N_ENVS, N_AGENTS, OBS_DIM))
+    gs = obs.reshape(N_ENVS, -1)
+    params = manager.init(jax.random.PRNGKey(1), None, gs, obs)
+    with pytest.raises(ValueError, match="encoder_only"):
+        manager.apply(params, None, None, obs, encoder_only=True)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        (dict(worker_encoder="bogus"), "worker_encoder"),
+        (dict(worker_encoder="shared", manager_latent="centralized"), "manager_latent"),
+        (
+            dict(
+                worker_encoder="shared",
+                manager_latent="local_private",
+                n_manager_epochs=3,
+            ),
+            "n_manager_epochs",
+        ),
+    ],
+)
+def test_validate_worker_encoder_rejects_incoherent_settings(overrides, match):
+    """Caught at build time, so a bad arm fails before a run is launched."""
+    with pytest.raises(ValueError, match=match):
+        _collect(_config(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        (dict(worker_fusion="concat"), "concat"),
+        (
+            dict(
+                worker_objective="intrinsic_only",
+                intrinsic_coef=1.0,
+                intrinsic_anneal="none",
+            ),
+            "detach",
+        ),
+    ],
+)
+def test_validate_worker_encoder_warns_without_blocking(overrides, match):
+    """Two combinations stay runnable on purpose — they are direct contrasts.
+
+    `concat` is comparable to nothing else on the goal-influence axis but is still
+    a legitimate fusion ablation; `intrinsic_only` re-opens FuN's trivial-solution
+    channel from the side the detach rule does not cover, which is exactly the
+    question that arm asks. Following the precedent `validate_worker_objective`
+    set for an expensive-accident-but-deliberate setting.
+    """
+    with pytest.warns(RuntimeWarning, match=match):
+        _collect(_shared_config(**overrides))
+
+
+@pytest.mark.parametrize(
+    "fusion,width", [("film", "hidden"), ("concat", "hidden_plus_goal")]
+)
+def test_shared_encoder_widens_the_workers_first_dense_to_the_encoder(fusion, width):
+    """The worker eats `manager_hidden_dim`, not `obs_dim` — the checkpoint tell.
+
+    Unlike the yaml, a checkpoint cannot lie about what trained, and this kernel
+    shape is how you tell a shared-encoder arm from its control after the fact.
+    It is also why the two are NOT checkpoint-compatible.
+    """
+    import warnings
+
+    config = _shared_config(worker_fusion=fusion)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        _, rs, _, _, _, _ = _collect(config)
+    kernel = rs.train_state.actor_ts.params["params"]["MAPPOActor_0"]["Dense_0"][
+        "kernel"
+    ]
+    expected = config.manager_hidden_dim + (0 if width == "hidden" else GOAL_DIM)
+    assert kernel.shape[0] == expected
+
+    _, raw_rs, _, _, _, _ = _collect(_config(worker_fusion=fusion))
+    raw = raw_rs.train_state.actor_ts.params["params"]["MAPPOActor_0"]["Dense_0"][
+        "kernel"
+    ]
+    assert raw.shape[0] != kernel.shape[0], (
+        "shared and raw encoders must not be checkpoint-compatible"
+    )

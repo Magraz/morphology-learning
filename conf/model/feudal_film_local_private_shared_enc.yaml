@@ -1,0 +1,34 @@
+# @package _global_
+#
+# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
+# nests these keys under the `model` node, where nothing reads them, and the run
+# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# FuN's shared perceptual module, on the `local_private` latent.
+#
+# `feudal_film_local_private` + `worker_encoder: shared` — exactly one key apart
+# from its own matched control. See `feudal_film_local_shared_enc.yaml` for the
+# full rationale, the two-things-at-once caveat, the checkpoint incompatibility
+# and the watch list; everything there applies here unchanged.
+#
+# WHY THIS IS THE PAIR TO RUN FIRST. `local_private` is the only latent measured
+# to have BOTH locality (diag share of d s[i]/d obs_j exactly 1.0) and restored
+# row diversity (`s` 8.72, `g` 9.24 against the 8.93 random baseline), where plain
+# `local` collapses the 12 agents onto ~1.5 distinct goal directions. Since this
+# arm makes `f_enc` the worker's entire observation, a latent that is already
+# known to collapse its downstream projections is the harder case to interpret —
+# `local` is the informative contrast, not the primary.
+#
+# Note the interaction worth watching: under `private` the per-agent projections
+# `W_i` sit BELOW the shared encoder, so `f_enc` is now the one component written
+# by both the manager and the worker while everything agent-specific stays the
+# manager's alone. If the worker's gradient dominates `f_enc`, `local_private`'s
+# row diversity has to be manufactured entirely by `W_i` from a representation
+# optimized for the policy rather than for the goals.
+defaults:
+  - feudal_film_local_private
+  - _self_
+
+model_params:
+  worker_encoder: shared

@@ -76,7 +76,7 @@ class Params:
     # the worker's gradient permanently pointing at a task-irrelevant objective,
     # biasing the converged policy. Decaying to 0 makes the endpoint optimal for
     # the true objective while keeping the early exploration pressure.
-    intrinsic_anneal: str = "linear"
+    intrinsic_anneal: str = "none"
     # ---- goal-usefulness diagnostics ----
     # Number of deterministic episodes per eval. This USED to be an invisible
     # MAPPOConfig default of 5 that nothing ever set, so every `reward` point in
@@ -122,8 +122,12 @@ class Model_Params:
     # `s` stays a pure function of obs, so r^I stays clean, while goal generation
     # regains state the observations do not carry.
     #
-    # Which to use: for every MJX env `global_state` IS obs.reshape(E, -1), so
-    # "local" loses nothing and "local_global" is redundant. Use "local_global"
+    # Which to use: on an MJX env built WITHOUT `use_global_state` (the default)
+    # `global_state` IS obs.reshape(E, -1), so "local" loses nothing and
+    # "local_global" is redundant. With `use_global_state: true` that stops being
+    # true — the compact state carries exact world-frame positions, `delivered`
+    # and live touch counts that the egocentric observations do not, so
+    # "local_global" becomes meaningful on MJX too. Use "local_global"
     # on SMAX, where `env.global_state` is NOT recoverable from the observations
     # — get_obs zeroes out any unit beyond the viewer's sight range, and at t=0
     # 100% of enemies are invisible to every ally (measured on 3m/5m_vs_6m/2s3z/
@@ -331,7 +335,7 @@ class Transition(NamedTuple):
     """
 
     obs: jax.Array  # (n_envs, n_agents, obs_dim)
-    global_state: jax.Array  # (n_envs, n_agents * obs_dim)
+    global_state: jax.Array  # (n_envs, trainer.global_state_dim(env))
     action: jax.Array  # (n_envs, n_agents, action_dim)
     reward: jax.Array  # (n_envs,) team | (n_envs, n_agents) per-agent
     done: jax.Array  # (n_envs,) terminated | truncated

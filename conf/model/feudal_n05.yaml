@@ -16,4 +16,4 @@ defaults:
 
 params:
   intrinsic_coef: 0.5
-  intrinsic_anneal: linear
+  intrinsic_anneal: none

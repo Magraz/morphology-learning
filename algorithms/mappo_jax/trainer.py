@@ -44,8 +44,9 @@ def global_state_dim(env) -> int:
     """Width of the centralized critic's input for `env`.
 
     An env may publish a real global state (SMAX's world state — absolute unit features,
-    and much narrower than N egocentric views); otherwise the global state is the
-    concatenation of the per-agent observations, which is what the MJX envs use.
+    and much narrower than N egocentric views; or an MJX env constructed with
+    `use_global_state=True`); otherwise the global state is the concatenation of the
+    per-agent observations, which is what every MJX env does by default.
 
     Shared by `make_train` and `run.py`'s checkpoint reload so the critic built at resume
     cannot disagree with the one that was trained — `flax.serialization.from_bytes`
@@ -54,6 +55,21 @@ def global_state_dim(env) -> int:
     if hasattr(env, "global_state"):
         return int(env.global_state_dim)
     return int(env.observation_dim) * int(env.n_agents)
+
+
+def global_state_fn(env):
+    """`(obs, env_state) -> (n_envs, global_state_dim)` — the centralized input.
+
+    The ONE definition of how the global state is built, so `make_train`, `view()`
+    and the offline probes can never disagree about what the network was trained
+    on. Mirrors `global_state_dim` above: an env that publishes a real world state
+    (SMAX, or an MJX env built with `use_global_state=True`) supplies it, otherwise
+    it is the concatenation of the per-agent observations.
+    """
+    if hasattr(env, "global_state"):
+        _v_gs = jax.vmap(env.global_state)
+        return lambda obs, env_state: _v_gs(env_state)
+    return lambda obs, env_state: obs.reshape(obs.shape[0], -1)
 
 
 def make_train(config: MAPPOConfig, env):
@@ -106,19 +122,10 @@ def make_train(config: MAPPOConfig, env):
     def _avail(env_state):
         return _v_avail(env_state) if use_action_mask else None
 
-    # Centralized-critic input. SMAX ships a real world state (absolute unit features);
-    # the MJX envs do not, and there the global state is the concatenation of the
-    # per-agent observations — which is what this used to do unconditionally.
-    if hasattr(env, "global_state"):
-        _v_gs = jax.vmap(env.global_state)
-
-        def _global_state(obs, env_state):
-            return _v_gs(env_state)
-
-    else:
-
-        def _global_state(obs, env_state):
-            return obs.reshape(obs.shape[0], -1)
+    # Centralized-critic input. An env may publish a real world state (SMAX's
+    # absolute unit features; an MJX env built with `use_global_state=True`);
+    # otherwise it is the concatenation of the per-agent observations.
+    _global_state = global_state_fn(env)
 
     gs_dim = global_state_dim(env)
 

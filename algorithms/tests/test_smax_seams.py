@@ -286,3 +286,52 @@ def test_both_stacks_expose_the_same_hook_contract(stack):
     mod = __import__(f"algorithms.{stack}.trainer", fromlist=["global_state_dim"])
     assert mod.global_state_dim(StubEnv()) == OBS_DIM * N_AGENTS
     assert mod.global_state_dim(MaskedStubEnv()) == GS_DIM
+
+
+# ------------------------------------- opt-in hook bound on the INSTANCE
+
+
+class LateBoundStubEnv(StubEnv):
+    """Hook bound in ``__init__``, not declared on the class.
+
+    This is exactly the shape of the MJX opt-in (`MultiBoxPushMJX(
+    use_global_state=True)`): the method must NOT exist on the class, or
+    `hasattr` fires for every arm and every saved critic's input width changes.
+    """
+
+    def __init__(self, on: bool):
+        self.global_state_enabled = bool(on)
+        if on:
+            self.global_state_dim = GS_DIM
+            self.global_state = self._gs
+
+    def _gs(self, state):
+        return jnp.arange(GS_DIM, dtype=jnp.float32) + state["t"]
+
+
+@pytest.mark.parametrize("stack", ["mappo_jax", "feudal_mappo_jax"])
+def test_instance_bound_hook_is_opt_in_for_both_stacks(stack):
+    """Off by default; on only for the instance that asked for it."""
+    mod = __import__(f"algorithms.{stack}.trainer", fromlist=["global_state_dim"])
+    # The class itself must stay hookless, or binding it on one instance would
+    # have flipped every other arm.
+    assert not hasattr(LateBoundStubEnv, "global_state")
+    assert mod.global_state_dim(LateBoundStubEnv(False)) == OBS_DIM * N_AGENTS
+    assert mod.global_state_dim(LateBoundStubEnv(True)) == GS_DIM
+
+
+def test_instance_bound_hook_reaches_the_rollout():
+    """`global_state_dim` picking it up is not enough — `make_train` must too."""
+    _, traj, _, _, _ = _collect(LateBoundStubEnv(True))
+    assert traj.global_state.shape[-1] == GS_DIM, traj.global_state.shape
+    _, traj_off, _, _, _ = _collect(LateBoundStubEnv(False))
+    assert traj_off.global_state.shape[-1] == OBS_DIM * N_AGENTS
+
+
+@pytest.mark.parametrize("stack", ["mappo_jax", "feudal_mappo_jax"])
+def test_global_state_fn_falls_back_to_concat_bit_exactly(stack):
+    """Pins the shared-helper refactor as behaviour-preserving."""
+    mod = __import__(f"algorithms.{stack}.trainer", fromlist=["global_state_fn"])
+    obs = jax.random.normal(jax.random.PRNGKey(0), (4, N_AGENTS, OBS_DIM))
+    got = mod.global_state_fn(LateBoundStubEnv(False))(obs, None)
+    assert jnp.array_equal(got, obs.reshape(obs.shape[0], -1))

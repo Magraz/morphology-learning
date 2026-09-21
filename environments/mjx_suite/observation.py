@@ -2,11 +2,14 @@
 
 Every ``box2d_suite`` env builds its per-agent observation through the same
 ``ObservationManager.get_observation`` (see ``box2d_suite/observation.py``), so
-every MJX port needs the same 40-dim vector::
+the shared base is the same 40-dim vector::
 
     own_velocity(2) + density_sensors(16) + is_touching_object(1)
     + neighbor_fraction(1) + contact_force(1) + nearest_box_vec(2)
     + goal_distance(1) + lidar(N_LIDAR_RAYS)
+
+With ``include_agent_sector_counts=True``, eight agent counts divided by a
+fixed reference of 4 are appended after lidar. Existing indices are unchanged.
 
 ``MJXObservationBuilder`` is the JAX counterpart of that manager: pure,
 ``jit``/``vmap``-able, and independent of any particular env. The env owns the
@@ -49,6 +52,7 @@ __all__ = [
 ]
 
 N_SECTORS = 8
+AGENT_SECTOR_COUNT_SCALE = 4.0  # fixed across team sizes; values are not clipped
 TOUCH_EPS = 0.2  # agent counts as touching within radius + eps of a box face
 LIDAR_EPS = 1e-3  # ray origin offset past the agent surface (self-hit guard)
 
@@ -77,7 +81,7 @@ def geom_index_maps(
 
 
 class MJXObservationBuilder:
-    """Builds the shared 40-dim per-agent observation from MJX state.
+    """Builds the shared observation, optionally appending eight sector counts.
 
     Args:
         model: the ``mjx.Model`` to raycast the lidar against (the base model —
@@ -87,6 +91,8 @@ class MJXObservationBuilder:
             objects; the contact force is then zero everywhere.
         sector_sensor_radius / lidar_range: default to ``world_width / 3`` and
             the sector radius respectively, matching the Box2D manager.
+        include_agent_sector_counts: append one normalized teammate count per
+            sector after lidar (48 dims with the default 16 rays).
     """
 
     def __init__(
@@ -107,6 +113,7 @@ class MJXObservationBuilder:
         touch_eps=TOUCH_EPS,
         agent_of_geom=None,
         object_of_geom=None,
+        include_agent_sector_counts=False,
     ):
         self.model = model
         self.n_agents = int(n_agents)
@@ -129,6 +136,7 @@ class MJXObservationBuilder:
         self.touch_eps = float(touch_eps)
         self._agent_of_geom = agent_of_geom
         self._object_of_geom = object_of_geom
+        self.include_agent_sector_counts = bool(include_agent_sector_counts)
 
         angles = np.arange(self.n_lidar_rays) * (2 * np.pi / self.n_lidar_rays)
         self.lidar_dirs = jnp.asarray(
@@ -136,7 +144,10 @@ class MJXObservationBuilder:
             dtype=jnp.float32,
         )  # (R, 3) — world frame, same convention as the density sectors
 
-        self.obs_dim = BASE_OBS_DIM + self.n_lidar_rays
+        self.obs_dim = (
+            BASE_OBS_DIM + self.n_lidar_rays
+            + (N_SECTORS if self.include_agent_sector_counts else 0)
+        )
 
     # ------------------------------------------------------------- components
 
@@ -162,6 +173,15 @@ class MJXObservationBuilder:
 
     def density_sensors(self, agent_pos, box_pos):
         """(A, 16) sector centroid-proximity sensors, cols 0-7 agents, 8-15 boxes."""
+        return self._density_sensors_and_counts(agent_pos, box_pos)[0]
+
+    def _density_sensors_and_counts(self, agent_pos, box_pos):
+        """Compute proximity and normalized agent counts from the same sectors.
+
+        Counts exclude self and use the same strict distance < radius mask as
+        proximity. Reuse the counts needed for centroids, avoiding a second
+        pairwise-distance or sector assignment pass.
+        """
         R = self.sector_sensor_radius
         shift = jnp.radians(22.5)
         step = 2 * jnp.pi / N_SECTORS
@@ -176,20 +196,25 @@ class MJXObservationBuilder:
             centroid_dist = jnp.linalg.norm(
                 sum_rel / jnp.maximum(count, 1.0)[..., None], axis=-1
             )
-            return jnp.where(count > 0, 1.0 - centroid_dist / R, 0.0)
+            return jnp.where(count > 0, 1.0 - centroid_dist / R, 0.0), count
 
         rel_aa = agent_pos[None, :, :] - agent_pos[:, None, :]  # (A, A, 2)
         dist_aa = jnp.linalg.norm(rel_aa, axis=-1)
-        agents_block = sector_block(rel_aa, (dist_aa > 0) & (dist_aa < R))
+        agents_block, agent_counts = sector_block(
+            rel_aa, (dist_aa > 0) & (dist_aa < R)
+        )
 
         if self.n_objects == 0:
             objects_block = jnp.zeros((self.n_agents, N_SECTORS))
         else:
             rel_ao = box_pos[None, :, :] - agent_pos[:, None, :]  # (A, O, 2)
             dist_ao = jnp.linalg.norm(rel_ao, axis=-1)
-            objects_block = sector_block(rel_ao, dist_ao < R)
+            objects_block, _ = sector_block(rel_ao, dist_ao < R)
 
-        return jnp.concatenate([agents_block, objects_block], axis=1)
+        return (
+            jnp.concatenate([agents_block, objects_block], axis=1),
+            agent_counts / AGENT_SECTOR_COUNT_SCALE,
+        )
 
     def neighbor_fractions(self, agent_pos):
         """(A,) fraction of agents within ``neighbor_detection_range`` (incl. self)."""
@@ -387,6 +412,7 @@ class MJXObservationBuilder:
         excluded from ``nearest_box_vec`` (see ``nearest_box_vectors``).
         """
         touch = self.touch_matrix(agent_pos, box_pos, box_yaw, box_half)
+        density, agent_counts = self._density_sensors_and_counts(agent_pos, box_pos)
         is_touching = (
             touch.any(axis=1).astype(jnp.float32)[:, None]
             if self.n_objects
@@ -405,16 +431,16 @@ class MJXObservationBuilder:
             goal_dist = jnp.where(
                 self.nearest_box_sensed(agent_pos, box_pos, delivered), goal_dist, 0.0
             )
-        return jnp.concatenate(
-            [
-                agent_vel / self.velocity_norm,
-                self.density_sensors(agent_pos, box_pos),
-                is_touching,
-                self.neighbor_fractions(agent_pos)[:, None],
-                (self.contact_forces(data) / self.force_multiplier)[:, None],
-                self.nearest_box_vectors(agent_pos, box_pos, delivered),
-                goal_dist[:, None],
-                self.lidar(data, agent_pos),
-            ],
-            axis=1,
-        ).astype(jnp.float32)
+        components = [
+            agent_vel / self.velocity_norm,
+            density,
+            is_touching,
+            self.neighbor_fractions(agent_pos)[:, None],
+            (self.contact_forces(data) / self.force_multiplier)[:, None],
+            self.nearest_box_vectors(agent_pos, box_pos, delivered),
+            goal_dist[:, None],
+            self.lidar(data, agent_pos),
+        ]
+        if self.include_agent_sector_counts:
+            components.append(agent_counts)
+        return jnp.concatenate(components, axis=1).astype(jnp.float32)

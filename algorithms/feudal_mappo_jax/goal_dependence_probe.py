@@ -210,6 +210,28 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
     mgr = tree["manager"]["params"]
     actor = tree["actor"]["params"]["MAPPOActor_0"]
     hidden_dim = int(actor["Dense_0"]["kernel"].shape[1])
+    worker_in = int(actor["Dense_0"]["kernel"].shape[0])
+
+    def _worker_encoder(manager_hidden_dim: int, goal_dim: int) -> str:
+        """Did the worker read `f_enc(obs_i)` instead of the raw observation?
+
+        Recoverable from the tree: the worker's first Dense takes `obs_dim`
+        (FiLM) or `obs_dim + goal_width` (concat) normally, and the SAME two
+        widths built on `manager_hidden_dim` when the encoder is shared. This
+        function exists for the reason the whole `_dims_from_checkpoint` does —
+        the yaml moves while checkpoints do not, and `worker_encoder` changes
+        what network is evaluated.
+
+        ⚠ Ambiguous if `obs_dim == manager_hidden_dim` (or the concat variants
+        collide). Returns None there rather than guessing, so the caller keeps
+        the composed config and the arm is not silently mismeasured.
+        """
+        shared = {manager_hidden_dim, manager_hidden_dim + goal_dim}
+        if worker_in not in shared:
+            return "none"
+        # Only claim "shared" when the raw reading is impossible; `obs_dim` is
+        # not in the tree, so a collision cannot be resolved here.
+        return "shared"
 
     percept = "f_percept_0" in mgr
     if "f_Mspace_agent_kernel" in mgr:
@@ -221,6 +243,9 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
             "hidden_dim": hidden_dim,
             "manager_latent": (
                 "local_global_private" if percept else "local_private"
+            ),
+            "worker_encoder": _worker_encoder(
+                int(w.shape[1]), int(w.shape[2])
             ),
         }
 
@@ -236,6 +261,11 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
         ),
         "hidden_dim": hidden_dim,
         "manager_latent": latent,
+        "worker_encoder": _worker_encoder(
+            int(mgr["f_enc_0" if local else "f_percept_0"]["kernel"].shape[1]),
+            int(mgr["f_Mspace"]["kernel"].shape[1])
+            // (1 if local else int(n_agents)),
+        ),
     }
 
 

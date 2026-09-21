@@ -341,9 +341,11 @@ machinery (boundary, observation, renderer, contact listener, target band).
 ### Shared observations (`environments/mjx_suite/observation.py`)
 
 `MJXObservationBuilder` is the JAX counterpart of the Box2D suite's
-`ObservationManager`: it owns the sensor math and the 40-dim `OBS_DIM` layout
-for **every** MJX port, so a new port only supplies its own qpos layout and
-goal. Pure and `jit`/`vmap`-able; the env passes plain arrays (agent positions/
+`ObservationManager`: it owns the sensor math and the 40-dim `OBS_DIM` base
+layout. `include_agent_sector_counts=True` appends eight normalized teammate
+counts after lidar, making `builder.obs_dim = 48` with the default rays.
+`MultiBoxPushMJX` enables this; the multi-goal env retains its existing layout.
+Pure and `jit`/`vmap`-able; the env passes plain arrays (agent positions/
 velocities, box poses) plus the `mjx.Data` (needed for lidar raycasts and the
 efc contact-force decode).
 
@@ -354,7 +356,7 @@ efc contact-force decode).
   attribution needs the geom→entity maps from the helper `geom_index_maps(mj_model,
   n_agents, n_objects)` (naming convention `g_agent_{i}` / `g_box_{j}`).
 - `build(data, agent_pos, agent_vel, box_pos=, box_yaw=, box_half=,
-  goal_coord=, goal_axis=, delivered=)` returns `(A, OBS_DIM)`; the components
+  goal_coord=, goal_axis=, delivered=)` returns `(A, builder.obs_dim)`; the components
   are also exposed individually (`touch_matrix`, `density_sensors`,
   `neighbor_fractions`, `pairwise_agent_distances`, `nearest_box_vectors`,
   `goal_distances`, `lidar`, `contact_forces`) — `_touch_matrix` (coupling) and
@@ -364,6 +366,14 @@ efc contact-force decode).
   in the goal band; all delivered → zero vector. The Box2D
   `ObservationManager._calculate_nearest_box_vectors` does the same via
   `env.delivered_objects`, keeping the two engines in parity.
+- **Agent-sector counts:** `obs[:, 40:48]` in `MultiBoxPushMJX` contains the
+  number of other agents in each of the eight density sectors, divided by
+  `AGENT_SECTOR_COUNT_SCALE = 4.0`. The sector assignment and strict `< radius`
+  mask are shared with agent proximity; self/zero-distance entries are excluded.
+  Counts are independent of total team size and are not clipped (eight
+  teammates in one sector gives 2.0). The existing centroid calculation already
+  needs these counts, so `_density_sensors_and_counts` computes both in one pass.
+  The original 40 fields, including lidar at `24:40`, retain their positions.
 - **Generalizes past multi_box_push**, mirroring the Box2D fallbacks: `n_objects=0`
   (scatter/rendezvouz) zeros the object density block, `is_touching_object`,
   `nearest_box_vec` and the contact force; `goal_coord=None` (contact/scatter/
@@ -392,10 +402,21 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   semantics as Box2D's `v /= 1 + d*dt`) and the default **pyramidal** friction
   cone (elliptic NaNs out on GPU/f32 when a light coupled box is crushed
   against a wall by many agents).
+- **Observation width:** 48 per agent: the original 40 fields plus eight
+  agent-sector counts. The synchronous macro wrapper inherits this width;
+  the asynchronous wrapper appends commitment features after all 48 fields.
+  Consumers use `env.observation_dim`, not the shared 40-dim `OBS_DIM` constant.
+  Existing 40-input policy checkpoints are incompatible with this expanded
+  observation; train new runs, and keep prior results identified as the old
+  observation layout. The optional compact global-state width is unchanged;
+  concatenated-observation critic inputs now contain `48 * n_agents` values.
+  Checks: `JAX_PLATFORMS=cpu .venv/bin/python -m pytest
+  algorithms/tests/test_mjx_sector_counts.py -q` covers multiplicity, range,
+  sector alignment, fixed scaling, preserved fields, and JIT/vmap/wrapper shapes.
 - **Parity with Box2D.** Same world sizing, spawn regions, coupling list, box
   sizing, target band, reward (shaping + one-time +100/box, dense/sparse),
-  boundary-contact termination, and the exact 40-dim `OBS_DIM` observation
-  layout (built by the shared `MJXObservationBuilder` above). Verified by
+  boundary-contact termination, and the original 40-dim observation prefix
+  (built by the shared `MJXObservationBuilder` above). Previously verified by
   posing both engines identically and diffing all 40 dims: everything equal to
   f32 precision, lidar within 4e-4. Box2D damping/mass constants are emulated
   with joint damping = coeff × mass (× inertia for the hinge).
@@ -507,6 +528,110 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   nothing from it), but it **is** the training env of the fully-jitted
   `mappo_jax` stack (below) via `EnvironmentEnum.MULTI_BOX_MJX =
   "multi_box_push_mjx"`.
+
+#### Compact global state (`use_global_state`, off by default)
+
+`MultiBoxPushMJX` can publish a real centralized state instead of leaving the
+critic (and, under `feudal_mappo_jax`, the manager) to read
+`obs.reshape(n_envs, -1)` — N egocentric 40-dim views with no shared frame. The
+arm is **`conf/env/mjx_16a_4o_trunc_1024_gs.yaml`**, a copy of
+`mjx_16a_4o_trunc_1024` differing in exactly one key.
+
+```
+uv run python train.py algorithm=mappo_jax env=mjx_16a_4o_trunc_1024_gs \
+    model=mlp trial_id=0
+```
+
+- **Layout** (`_compact_global_state`), agent-major then box-major, width
+  `n_agents*4 + n_objects*6` — **88 at 16a/4o against 640 for concat-obs**:
+
+  | block | dims | contents | normalization |
+  |---|---|---|---|
+  | agents | `(A, 4)` | `pos - centre`, `vel` | `/(world_width, world_height)`; `/velocity_norm` |
+  | boxes | `(O, 6)` | `pos - centre`, `target_y - box_y`, `delivered`, `touch.sum(0)`, `coupling` | `/(W, H)`; `/world_height`; —; `/n_agents`; `/n_agents` |
+
+  Every block is normalized with the env's own constants so none enters the first
+  Tanh at a different scale — the defect measured for `normalize_pooled_goal`,
+  where a 5x-scaled block took 91.6% of layer-1 preactivation variance. Measured:
+  `max |gs| = 1.557` over 100 steps at 16a/4o. `GLOBAL_STATE_AGENT_FEATURES` /
+  `GLOBAL_STATE_BOX_FEATURES` **are** the layout — `compact_global_state_dim`
+  derives from them and the builder uses them, so the declared and emitted widths
+  cannot disagree; `__init__` also checks it via `jax.eval_shape` (abstract, so no
+  FLOPs and no MJX compile).
+
+- **⚠ What it buys is EXACTNESS AND WIDTH, NOT INFORMATION.** A *linear* readout
+  already recovers agent world coordinates from the 640-dim concat to **3.36**
+  world units in a 47-wide arena, against 17.95 for predict-the-mean and 0.006
+  from the compact state (`global_state_probe.py`, results pickled next to it).
+  Do not write this up as "the manager finally sees where things are." What the
+  observation genuinely does **not** carry is `delivered` and the live touch
+  count.
+  - `delivered` is the load-bearing one: delivery **latches**, so a box shoved
+    back out of the band stays delivered and stops paying while its position says
+    otherwise. Without it, "already banked its +100" and "about to pay +100" are
+    the same state and `V(s)` must predict a 100-point discontinuity from a state
+    that does not contain it.
+  - `touch.sum(0)` is not derivable from the rest of the vector — the touch test
+    needs box **yaw**, which is deliberately omitted.
+  - ⚠ `goal_dist` is **exactly redundant here**: the band is fixed, so
+    `target_y - box_y` is affine in the box-y feature already present. It is kept
+    because it costs `O` dims, spares the critic a constant offset, and keeps the
+    layout portable to the per-box-goal envs where it is not redundant. Do not
+    report it as new information in this env.
+
+- **The gating is instance-binding, and it has to be.** `hasattr(env,
+  "global_state")` is the trainers' only switch and a class method always exists,
+  so an unconditional method would flip **every** MJX arm from `gs_dim = 640` to
+  88 — every saved `models_*.msgpack` failing `from_bytes`, every past result
+  incomparable. `__init__` therefore binds `self.global_state =
+  self._compact_global_state` into the **instance** dict only when the flag is
+  set. Read `env.global_state_enabled` in tests/logging, never `hasattr`. ⚠ The
+  ctor arg is `use_global_state`, **not** `global_state`: the latter invites
+  `self.global_state = bool(...)`, which makes `hasattr` true with a bool and
+  explodes inside `jax.vmap` far from the line that caused it.
+  - Verified: the hook is off by default, `gs_dim` stays 640 on every existing
+    group, and a **trained 1e8-step `mjx_16a_4o_trunc_1024/mlp/0` checkpoint still
+    loads and evaluates (282.42)** after the change.
+
+- **⚠ The layout is FROZEN once an arm trains.** `gs_dim` is baked into every
+  checkpoint, so adding box yaw later means a **new env group**, not an edit.
+  `GLOBAL_STATE_VERSION` exists to say so.
+
+- **`trainer.global_state_fn(env)`** is now the single definition of how the
+  centralized input is built (twin copies in both stacks, as CLAUDE.md requires),
+  replacing three hand-copied `if hasattr(...)` predicates. `make_train`,
+  `feudal run.py:view()` and the probes all route through it. This matters because
+  **`view()` used to hardcode `obs.reshape(-1)`** as the manager's input — with the
+  hook on that is an 88-vs-640 mismatch, a bare `ScopeParamShapeError` at render
+  time, and under `manager_latent: centralized` that vector is the manager's *only*
+  input.
+
+- **`SyncMacroMJX` REFUSES the hook** (`NotImplementedError` in `__init__`). It
+  re-declares its metadata explicitly and has no `__getattr__`, so a hook on the
+  base env does not propagate — the macro arm would silently train on concat-obs
+  while its config claimed otherwise. Forwarding it later is ~5 lines over the
+  existing `base_state()` staticmethod.
+
+- **The latent probes refuse a hook-on arm** (`latent_locality_probe.
+  unsupported_env_reason`): `collect_states` derives the manager input from obs,
+  i.e. assumes `global_state == concat(obs)`. The message now points at the
+  hook-**off** twin group, which the opt-in design guarantees exists and differs
+  in exactly one key. Making them work on a hook-on arm means storing `obs`
+  alongside `env.global_state(state)` rather than deriving one from the other.
+
+- **Not carried over**: `MultiBoxMultiGoalPushMJX` (a small port — same constants,
+  pass `_goal_dist(box_pos) / world_width` as the goal block; ⚠ that is the env
+  where the hook adds *real* information, since `MJXObservationBuilder.build`
+  zeroes `goal_distance` for any agent whose nearest box is out of
+  `sector_sensor_radius`).
+
+- Checks: `uv run python -m environments.mjx_suite.multi_box_push_mjx
+  --check-global-state [--n-agents 16 --n-objects 4]` (4 assertions: default-off,
+  width, layout round-trip, scale) and `uv run pytest
+  algorithms/tests/test_mjx_global_state.py -q` (8 tests, CPU-pinned).
+- **⚠ No training result.** Everything above is a mechanism check; whether the
+  compact state helps return needs full-length paired runs against
+  `mjx_16a_4o_trunc_1024` at the same seeds.
 
 #### `reward_mode="sparse"` (implemented, arm added 2026-09-04)
 
@@ -694,11 +819,17 @@ what makes the comparison attributable).
   key list at each of its two `MultiBoxPushMJX` construction sites (bare, and as
   the macro wrapper's base), so an `env:` yaml key that only one site forwarded
   was silently ignored — which is why `coupling_def` / `max_steps` /
-  `comm_radius` were unreachable from Hydra. Both sites now go through
-  `_base_env_kwargs(env_config)` (`_BASE_ENV_KEYS` / `_RUNNER_ENV_KEYS`), which
-  also **warns** on unrecognized `env:` keys. Nothing else validates the `env:`
-  block — no dataclass guards it (`environments/types.py:EnvironmentParams` is
-  never instantiated).
+  `comm_radius` were unreachable from Hydra. ⚠ **This note used to claim a
+  `_base_env_kwargs(env_config)` helper (`_BASE_ENV_KEYS` / `_RUNNER_ENV_KEYS`)
+  warns on unrecognized `env:` keys. NO SUCH HELPER EXISTS** — a repo-wide grep
+  finds it only in this file. Each `run.py` branch still pulls a hard-coded key
+  list inline, so a key is reachable only where a branch names it and a typo is
+  silent (the correct note is the one above at "Nothing validates the `env:`
+  block"). Nothing validates it — no dataclass guards it
+  (`environments/types.py:EnvironmentParams` is never instantiated). The one
+  mitigation is per-key: both runners print
+  `centralized input: gs_dim=... (env hook: ...)` at launch, so a
+  `use_global_state` that did not land shows up as the concat width.
 - **`scripted_push_action` now takes a per-agent assignment** (`box_idx` scalar,
   or `(A,)` e.g. `jnp.arange(A) % O` for a balanced partition) and gives agents
   sharing a box **distinct slots** along its bottom face. With the old single
@@ -1917,6 +2048,156 @@ would need a hardcoded key list that rots on the next new metric. Empty lists ar
 skipped (`action_distribution` is legitimately length 0 for continuous runs, and
 padding it would make it ragged). Pinned by `test_to_dict_left_pads_short_series`.
 
+#### Shared perceptual encoder (`worker_encoder: shared`) — wired, UNRUN
+
+FuN feeds **one** `z_t = f_percept(x_t)` to both the manager and the worker, and
+both gradients shape it. This stack never did: the worker ate the raw local
+observation and built its own features, a deviation `manager.py` documents but
+which had never been tested. `model_params.worker_encoder` closes it.
+
+```
+worker_encoder: "none"    # default, and a STATIC no-op (byte-identical)
+worker_encoder: "shared"  # worker reads f_enc(obs_i); its PPO gradient trains f_enc
+```
+
+Under `"shared"` the worker's observation input is **replaced** by
+`f_enc(obs_i)` — the manager's shared per-agent encoder output,
+`manager_hidden_dim` wide — and the worker's gradient flows back into `f_enc`
+with **no** `stop_gradient`. Arms:
+`conf/model/feudal_film_local_shared_enc.yaml` and
+`conf/model/feudal_film_local_private_shared_enc.yaml`, each one key apart from
+its own matched control.
+
+```
+uv run python train.py algorithm=feudal_mappo_jax env=mjx_12a_3o_trunc_1024 \
+    model=feudal_film_local_private_shared_enc trial_id=0
+```
+
+- **Why**: every measurement in this file says the goals are decorative
+  (`eval_gap_permuted` ≈ 0 on 40 of 45 non-control trials, `gap_zeroed`
+  systematically negative, best arm in `mjx_12a_3o_trunc_1024` is
+  `feudal_film_zerogoal_dilated` whose goals are provably disconnected). One live
+  explanation is that the worker must learn, from a scalar PPO gradient alone,
+  what directions in a space built by a network it shares **nothing** with mean.
+
+- **THE GRADIENT ROUTING IS THE WHOLE DESIGN, and three obvious ways to do it are
+  wrong.** `ppo_update` computes the worker's gradient w.r.t. the manager's
+  params and **returns it unapplied**; `update_fn` threads it into
+  `manager_update`, which clips it separately and adds it to the transition PG's
+  gradient before the single `apply_gradients`.
+  - **It must not be applied inside `ppo_update`.** The manager staying frozen
+    there is what keeps the epoch-0 PPO ratio exactly 1 **and** keeps
+    `manager_update`'s recompute equal to the goals the rollout emitted. Apply it
+    inline and the manager is optimized for a policy that never acted — silently,
+    every loss finite. Pinned by
+    `test_manager_ts_does_not_move_during_ppo_update`.
+  - **It must not be accumulated across PPO's minibatch steps.** That would mix
+    gradients taken at ~40 different actor iterates (the gradient of nothing) and
+    make `n_minibatches` a silent weight on the worker's authority over the shared
+    encoder. It is ONE gradient at the pre-PPO actor params, merely computed in
+    equal-size chunks to cap activation memory — a single full-batch
+    forward+backward through a 256-wide encoder over `T*E*N` rows is
+    `n_minibatches`× the peak of one PPO step. Pinned by
+    `test_the_encoder_gradient_is_one_full_batch_gradient`.
+  - **A second `apply_gradients` would corrupt the manager.** optax's Adam *moves*
+    a leaf with a zero gradient (`mu` is nonzero from the previous update and
+    `count` increments tree-wide), so every non-encoder manager parameter drifts.
+  - At the pre-PPO actor params the ratio is exactly 1, so the clip is provably
+    inactive and `min` is a no-op: the encoder gradient reduces to
+    `-mean(adv·∇log π)`, structurally the same form as the manager's own
+    `-mean(adv·∇d_cos)`. Two full-batch means, same batch, same advantage, same
+    parameter point, summed.
+
+- **⚠ The separate pre-clip BOUNDS the coupling, it does not remove it — measured,
+  and an earlier version of this note overclaimed.** The manager's optimizer is
+  `chain(clip_by_global_norm(grad_clip), adam)` and that clip is **global**, so
+  the encoder addend still contributes to the norm that rescales every leaf, even
+  though it is exactly zero on all of them. Pre-clipping it to `grad_clip` buys
+  **saturation**, not isolation. Worst relative displacement of a non-`f_enc`
+  parameter on the CPU stub:
+
+  | `\|enc grad\|` | 0 | 1e-3 | 1.0 | 1e6 |
+  |---|---|---|---|---|
+  | displacement | **0.0 exactly** | 1.9e-07 | 1.2e-05 | **1.2e-05** |
+
+  Six further orders of magnitude buy no further displacement. *Unclipped* it
+  would grow without bound and a large worker gradient would attenuate the
+  manager's transition PG by a factor set by how hard the worker pushed — while
+  `manager_pg_loss` logged a healthy number. That saturation is the real
+  guarantee and is what
+  `test_the_worker_gradient_cannot_scale_the_managers_own_pg_step` pins; do not
+  restate it as exact isolation.
+
+- **Guards** (`mappo.validate_worker_encoder`, called from **both**
+  `trainer.make_train` and `run.py`, like `validate_worker_objective`). Raises on
+  an unknown value; on a **non-local `manager_latent`** (only the locals build
+  `f_enc`; `centralized` has `f_percept` over the *global* state, which is
+  neither per-agent nor obs-width); and on **`n_manager_epochs != 1`** (the
+  encoder gradient is computed once at one parameter point, so replaying it
+  across manager epochs applies it where the parameters no longer are). Warns —
+  runnable on purpose, both are direct contrasts — on `worker_fusion: concat` and
+  on `worker_objective: intrinsic_only`.
+
+- **⚠ Pair with FiLM, not concat.** The goal is one block of a concatenated
+  input, so widening that input from `obs_dim` to `manager_hidden_dim` cuts the
+  goal's share of layer-1 preactivation variance at init from ~9.8% to
+  **~0.6–1.5%** — `normalize_pooled_goal`'s whole calibration was derived on the
+  narrow geometry. FiLM is immune: the goal reaches the policy only through
+  bias-free zero-init layers whose input is the goal, so the observation's width
+  is irrelevant to it. Separately, `_goal_column_ratio` is passed the **encoder**
+  width when sharing — with the raw `obs_dim` its concat-only guard
+  (`kernel.shape[0] <= obs_dim`) would **not** fire (the kernel is *wider*, 288 vs
+  40) and it would silently slice an "obs block" and a "goal block" that are
+  neither, a third documented misreading of that series.
+
+- **New diagnostics**: `worker_encoder_grad_norm` (from `ppo_update`),
+  `manager_encoder_grad_norm`, `worker_encoder_grad_norm_clipped` and
+  **`worker_manager_encoder_grad_cos`** (from `manager_update`). **Read the
+  COSINE first** — Adam is scale-invariant in the limit, so "the worker's norm is
+  10× larger" does not by itself mean the worker wins; a persistently negative
+  cosine means the two objectives are pulling the shared representation apart.
+  None of these keys exists at `worker_encoder: "none"`, so no pre-existing run
+  gains a column.
+
+- **⚠ NOT checkpoint-compatible with any existing feudal arm.** The worker's
+  `MAPPOActor_0/Dense_0/kernel` is `(manager_hidden_dim, hidden_dim)` = `(256,
+  168)` under sharing against `(obs_dim, hidden_dim)` = `(40, 168)` for FiLM.
+  That kernel shape is the tell — unlike the yaml, a checkpoint cannot lie about
+  what trained. The **manager's** tree is unchanged, so manager checkpoints stay
+  interchangeable. Note this also makes the ACTOR tree depend on
+  `manager_hidden_dim`, which previously had no effect on the actor at all.
+
+- **⚠ THE ARM CHANGES TWO THINGS AT ONCE**, so a return gap is not attributable to
+  perceptual sharing alone: (a) the worker's input becomes a 256-d encoding of its
+  own obs, and (b) the worker now trains `f_enc`. Same objection this file raises
+  against `feudal_a0` as an isolate of "hierarchy vs flat". The separating rung is
+  one `jax.lax.stop_gradient` (a `"shared_detached"` third value in
+  `manager.WORKER_ENCODERS`), deliberately not shipped; add it before attributing
+  anything. It also buys an exact test — its encoder gradient must be bitwise 0.
+
+- **⚠ The worker compresses 256 → 168.** `manager_hidden_dim` and the worker's
+  `hidden_dim` are one knob in FuN and two unrelated defaults here. Left as-is
+  rather than setting `manager_hidden_dim: 168`, which would change a second key
+  versus the control. Documented, not accidental.
+
+- **The single home of the shared forward is `worker.encode_obs`**, used by the
+  rollout, the eval scan, `ppo_update`, both `view()` policy fns and the FiLM
+  diagnostics. Callers that also flatten agent-major must **flatten first, then
+  encode** the `(rows, obs_dim)` array: `ppo_update` encodes at that rank, and
+  matching it keeps the two bitwise equal rather than merely close — which is what
+  keeps "the PPO ratio is exactly 1" an equality instead of a tolerance (verified
+  at `atol=1e-6`).
+
+- **The largest scientific risk, and it is specific to this arm**: if `f_enc`
+  collapses the way `local`'s `s` did (participation ratio 1.03–2.89 of 12), the
+  worker's **entire observation** collapses with it and a return regression is
+  uninterpretable. Run `latent_diversity_probe` on `h`, not only on `s`/`g`.
+
+- **⚠ No training result.** Everything above is a mechanism check. Acceptance is
+  the **between-arm** return comparison against `feudal_film_local` /
+  `feudal_film_local_private` on the same env group and seeds — not the
+  goal-dependence probe, which can rule an arm out but never in.
+
 #### The manager's latent is NOT agent-local — measured 2026-09-09, and it is what makes `r^I` unusable
 
 `worker_intrinsic_reward` scores `d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i])`, so
@@ -2807,10 +3088,12 @@ itself is not reproducible across processes, hence the stub).
    - The rule lives in **one** helper, `trainer.global_state_dim(env)`, used by both
      `make_train` and `run.py`'s checkpoint reload — `from_bytes` needs an
      exactly-shaped target tree, so a disagreement there is a load failure.
-   - In the feudal stack this is also the **manager's** joint-state input, which is the
-     one place SMAX is a better fit than the MJX envs: this file notes at length that
-     the egocentric MJX observations give the manager *no shared frame*, so it must
-     learn to localize agents first. SMAX's world state is already a shared frame.
+   - In the feudal stack this is also the **manager's** joint-state input. SMAX was
+     for a long time the only env that supplied one: the egocentric MJX observations
+     give the manager *no shared frame*, so it must localize agents first, whereas
+     SMAX's world state is already a shared frame. `MultiBoxPushMJX` can now publish
+     one too — see "Compact global state" below — though note the measured caveat
+     there: on MJX the hook buys exactness and width, not information.
 3. **`info["active"]` — dead units.** Nothing new was built: `Transition.active_mask` and
    its masked means in `ppo_update` were added for `SyncMacroMJX`'s staggered starts and
    apply verbatim. Dead units are dropped from the policy loss, the entropy loss and the

@@ -43,7 +43,7 @@ params:
   # "linear" decays alpha to 0 across n_total_steps; "none" holds it. Required
   # for asymptotic correctness — at constant alpha that gradient fraction points
   # at a task-irrelevant objective forever.
-  intrinsic_anneal: linear
+  intrinsic_anneal: none
   manager_lr: 0.0003
   manager_val_coef: 0.5
   # The manager operates on a longer timescale, so this may exceed `gamma`.

@@ -85,7 +85,7 @@ class Transition(NamedTuple):
     """
 
     obs: jax.Array  # (n_envs, n_agents, obs_dim)
-    global_state: jax.Array  # (n_envs, n_agents * obs_dim)
+    global_state: jax.Array  # (n_envs, trainer.global_state_dim(env))
     action: jax.Array  # (n_envs, n_agents, action_dim)
     reward: jax.Array  # (n_envs,) team | (n_envs, n_agents) per-agent
     done: jax.Array  # (n_envs,) terminated | truncated
