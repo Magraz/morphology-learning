@@ -8,3 +8,6 @@ model_params:
 
 params:
   intrinsic_coef: 0.1
+
+model_params:
+  worker_encoder: shared
