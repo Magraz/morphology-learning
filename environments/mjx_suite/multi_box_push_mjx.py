@@ -329,7 +329,7 @@ class MultiBoxPushMJX:
             lidar_range=self.lidar_range,
             agent_of_geom=agent_of_geom,
             object_of_geom=object_of_geom,
-            include_agent_sector_counts=True,
+            include_agent_sector_counts=False,
         )
 
         self._agent_spawn_grid = self._make_spawn_grid()
