@@ -1,10 +1,5 @@
 # @package _global_
 #
-# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
-# nests these keys under the `model` node, where nothing reads them, and the run
-# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
-# (CLAUDE.md, 2026-09-08).
-#
 # FeUdal with a LOCAL manager latent AND PER-AGENT projections into goal space:
 #
 #     obs_i --f_enc (SHARED, per agent)--> W_i        --> s_i

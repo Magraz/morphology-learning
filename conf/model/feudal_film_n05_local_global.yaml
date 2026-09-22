@@ -1,8 +1,13 @@
 # @package _global_
-model_params:
-  hidden_dim: 168
-  worker_fusion: film
-  manager_latent: local_global
+# Delta: `manager_latent: local_global`.
+#
+# The LOCAL latent plus a read of the env's own global state on the GOAL path —
+# the SMAX arm, dead weight on MJX. See `feudal_film_local_global.yaml`.
+#
+# Alpha is inherited from `feudal_film_n05` (= 0.5).
+defaults:
+  - feudal_film_n05_local
+  - _self_
 
-params:
-  intrinsic_coef: 0.5
+model_params:
+  manager_latent: local_global

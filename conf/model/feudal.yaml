@@ -1,10 +1,43 @@
 # @package _global_
-# FeUdal model group: goal-conditioned MLP worker + centralized manager.
+# ROOT of the FeUdal model-group family: goal-conditioned MLP worker (concat
+# fusion) + centralized manager. Every other `feudal*` group is this file plus
+# deltas, and this is the only one with no `defaults:` list.
 #
+# ── HOW THIS FAMILY IS ORGANIZED ──────────────────────────────────────────────
+# Each group is `defaults: [<nearest ancestor>, _self_]` plus the ONE key that
+# makes it distinct, and ITS COMMENTS EXPLAIN ONLY THAT KEY. Anything true of an
+# ancestor is documented there and pointed at, never restated — so to understand
+# an arm, read it and then walk up its defaults list. The axes, outermost first:
+#
+#   fusion   feudal (concat, here) | feudal_film (FiLM)
+#   alpha    _n001 / _n01 / _n05          intrinsic_coef  -> feudal_n01.yaml
+#   latent   _local / _local_private / _local_global[_private]
+#                                          manager_latent -> feudal_film_local.yaml
+#   extra    _shared[_enc] / _dilated / _zerogoal / _intrinsic
+#
+# The canonical home for each concept is the file closest to this root that
+# introduces it. A file that reuses a concept cites that file by name.
+#
+# ── TWO RULES THAT BREAK RUNS SILENTLY ────────────────────────────────────────
+# ⚠ EVERY FILE IN THIS FAMILY NEEDS `# @package _global_` ON LINE 1. Without it
+# Hydra nests the keys under the `model` node, where nothing reads them, and the
+# run proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
+# (CLAUDE.md, 2026-09-08).
+#
+# ⚠ A DUPLICATE TOP-LEVEL KEY DOES NOT MERGE — OmegaConf rejects the file
+# (`ConstructorError: found duplicate key model_params`) during Hydra
+# composition, before any banner names the arm you launched. Two `model_params:`
+# blocks in one file is how this gets written by accident. Lint with
+# `OmegaConf.load` over conf/**/*.yaml; PyYAML's SafeLoader will NOT catch it.
+#
+# ── THE RESULTS PATH ──────────────────────────────────────────────────────────
 # This group exists as much for the RESULTS PATH as for the knobs. `train.py`
 # builds experiments/results/<env-choice>/<model-choice>/ and the algorithm is
 # NOT part of that path, so running feudal with `model=mlp` would write into the
-# mappo_jax baseline's directory. Always run `algorithm=feudal_mappo_jax
-# model=feudal`.
+# mappo_jax baseline's directory. Always run `algorithm=feudal_mappo_jax` with a
+# `model=feudal*` group.
+#
+# `hidden_dim` is stated here rather than inherited so the family's width is
+# visible at its root; it happens to equal the algorithm default.
 model_params:
   hidden_dim: 168

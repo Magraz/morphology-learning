@@ -1,7 +1,16 @@
 # @package _global_
-model_params:
-  hidden_dim: 168
-  worker_fusion: film
+# Delta: `intrinsic_coef` 0.0 -> 0.01.
+#
+# See `feudal_n01.yaml` for what alpha means, why `intrinsic_anneal` is off,
+# the r^I timing status and the collapse watch-list — all of it applies
+# verbatim under FiLM fusion.
+#
+# ⚠ The goal-dependence probe grades an alpha arm exactly as it grades
+# `feudal_film` — all three gaps, see that file. A large `gap_zeroed` on its
+# own is the DEGENERATE outcome here, not progress.
+defaults:
+  - feudal_film
+  - _self_
 
 params:
   intrinsic_coef: 0.01

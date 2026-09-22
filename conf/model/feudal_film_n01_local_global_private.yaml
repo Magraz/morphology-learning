@@ -1,17 +1,14 @@
 # @package _global_
-# See feudal_film_local_global_private.yaml for why this latent exists and why
-# it is a SMAX-only arm (on MJX the global-state read is dead weight). alpha=0.1.
-# The r^I timing misalignment (plans/feudal_goal_reward_diagnosis_2026-09-09.md
-# §4) is still unfixed, but MEASURED 2026-09-14 it is NOT a confound worth
-# waiting on: `intrinsic_timing_probe.py` puts the correction at 0.08 deg of
-# actor-gradient rotation at alpha=0.01, 1.2 deg at 0.1 and 3.6 deg at 0.5 —
-# against 0.7 / 6.7 / 26.3 deg for the intrinsic term's own contribution, i.e.
-# ~13% of it. It also applies identically to every arm, so it cannot bias a
-# paired local-vs-centralized comparison. Run these arms.
-model_params:
-  hidden_dim: 168
-  worker_fusion: film
-  manager_latent: local_global_private
+# Delta: `manager_latent: local_global_private`.
+#
+# Both local axes at once: per-agent projections AND a global-state read on the
+# goal path — the SMAX arm, dead weight on MJX. See
+# `feudal_film_local_global_private.yaml`.
+#
+# Alpha is inherited from `feudal_film_n01` (= 0.1).
+defaults:
+  - feudal_film_n01_local_private
+  - _self_
 
-params:
-  intrinsic_coef: 0.1
+model_params:
+  manager_latent: local_global_private

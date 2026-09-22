@@ -1,10 +1,20 @@
 # @package _global_
+# Delta: `manager_latent: local_private`.
+#
+# The LOCAL latent with PER-AGENT projections into goal space, which restores the
+# row diversity a shared projection cannot manufacture. See
+# `feudal_film_local_private.yaml` for the axis and `feudal_film_local.yaml` for
+# the locality it builds on.
+#
+# This arm is CONCAT fusion. The latent rationale is written against the FiLM
+# arms because those are the alpha=0 controls it was measured on, but the latent
+# is a property of the MANAGER and is unchanged by the worker's fusion; see
+# `feudal_film.yaml` for why concat is the weaker of the two.
+#
+# Alpha is inherited from `feudal_n01` (= 0.1).
 defaults:
-  - feudal
+  - feudal_n01
   - _self_
-  
+
 model_params:
   manager_latent: local_private
-
-params:
-  intrinsic_coef: 0.1

@@ -1,8 +1,14 @@
 # @package _global_
-model_params:
-  hidden_dim: 168
-  worker_fusion: film
-  manager_latent: local
+# Delta: `manager_latent: local`.
+#
+# The LOCAL latent: `s_i` is built by a SHARED per-agent encoder from agent i's
+# OWN observation, instead of being a slice of one Dense over the joint state.
+# See `feudal_film_local.yaml`.
+#
+# Alpha is inherited from `feudal_film_n05` (= 0.5).
+defaults:
+  - feudal_film_n05
+  - _self_
 
-params:
-  intrinsic_coef: 0.5
+model_params:
+  manager_latent: local

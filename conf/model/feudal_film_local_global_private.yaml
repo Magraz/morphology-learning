@@ -1,19 +1,10 @@
 # @package _global_
 #
-# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
-# nests these keys under the `model` node, where nothing reads them, and the run
-# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
-# (CLAUDE.md, 2026-09-08).
+# Delta: `manager_latent: local_global_private` — the `global` axis added to
+# `feudal_film_local_private`. THE SMAX ARM.
 #
-# FeUdal with a LOCAL manager latent, PER-AGENT projections into goal space, AND
-# a direct read of the env's own global state on the goal path:
-#
-#     obs_i --f_enc (SHARED, per agent)--> W_i --> s_i
-#     global_state --f_percept--> z
-#     concat([s_1..s_N], z) --core--> y --W^g_i--> g_i
-#
-# This is BOTH single-axis local variants at once. The manager's local family is
-# a 2x2 over two INDEPENDENT axes on top of the shared per-agent encoder:
+# The local family is a 2x2 over two INDEPENDENT axes on top of the shared
+# per-agent encoder, and this is both at once:
 #
 #     model group                            private   global
 #     feudal_film_local                         -         -
@@ -21,89 +12,51 @@
 #     feudal_film_local_global                  -         X
 #     feudal_film_local_global_private (this)   X         X
 #
-# WHY BOTH AXES ARE NEEDED TOGETHER, AND ONLY ON SMAX
-# ---------------------------------------------------
-# The two axes fix two DIFFERENT, independently-measured defects, and on SMAX
-# both are live. Picking either single-axis arm there takes one fix and leaves
-# the other defect in place.
+#     obs_i --f_enc (SHARED, per agent)--> W_i --> s_i
+#     global_state --f_percept--> z
+#     concat([s_1..s_N], z) --core--> y --W^g_i--> g_i
 #
-# The `global` axis (see feudal_film_local_global.yaml): on SMAX `global_state`
-# is NOT recoverable from the observations. `SMAX.get_obs` zeroes unit j out of
-# unit i's observation entirely unless `||pos_j - pos_i|| < sight_range_i`, while
-# `get_world_state` applies no such gate; and obs positions are relative and
-# sight-normalized against the world state's absolute ones. Allies are
-# recoverable either way (`get_self_features` carries each unit's own absolute
-# position), so the loss is specifically about ENEMIES. Measured (64 envs x 100
-# steps, random legal actions), the fraction of alive enemies invisible to EVERY
-# ally is 100% at t=0 on all of 3m / 5m_vs_6m / 2s3z / 3s5z, falling to 28-42%
-# over the first 10 steps. Read the t=0 column: under random actions the teams
-# never engage so the later figures are pessimistic, but t=0 is a SPAWN property,
-# not a policy artifact, and with `goal_horizon: 10` that is exactly the window
-# the first pooled `w_t` is assembled in. Without this axis the manager assigns
-# goals having never seen the enemy team — strictly BLINDER than the centralized
-# branch it is being compared against, which turns a structural comparison into
-# an information one.
+# For each axis on its own, read the single-axis file: the `global` axis and the
+# SMAX enemy-visibility measurement that motivates it are in
+# `feudal_film_local_global.yaml`; the `private` axis and the row-diversity
+# collapse it repairs are in `feudal_film_local_private.yaml`.
 #
-# The `private` axis (see feudal_film_local_private.yaml): a SHARED projection
-# can only TRANSMIT the row diversity its input already has. Measured on the
-# trained 12-agent MJX arms (`latent_diversity_probe.py`, participation ratio
-# over the N agent rows; 1.0 = identical, N = orthogonal), `obs_i` carries only
-# ~4 of 12, and `local` collapsed `s` to 1.03-2.89 and `g` to 1.46-1.67 against
-# the centralized branch's 8.92-9.22 / 8.73-9.10 on the SAME input — i.e. 12
-# agents receiving ~1.5 distinct directives. Per-agent blocks MANUFACTURE that
-# diversity from a common input instead of inheriting it.
+# WHY BOTH TOGETHER, AND ONLY ON SMAX. The two axes fix two different,
+# independently-measured defects, and on SMAX BOTH are live — so either
+# single-axis arm there takes one fix and leaves the other in place. Without
+# `global` the manager assigns goals having never seen the enemy team (100% of
+# alive enemies are invisible to every ally at t=0, and `goal_horizon: 10` is
+# exactly the window the first pooled w_t is assembled in), making it strictly
+# BLINDER than the centralized branch it is compared against — which turns a
+# structural comparison into an information one. Without `private` the N goal
+# rows collapse onto ~1.5 directions.
 #
-# WHAT IS NOT AT STAKE: locality. `s` is a pure function of `obs` under all four
-# local variants — `d s[i]/d obs_j` is exactly zero for j != i — so `r^I` stays
-# clean here exactly as under plain `local`. Only GOAL GENERATION reads `z`. And
-# all three critics read `global_state` directly (`trainer._values` /
-# `_manager_values` / `_values_int`) under every latent, so CTDE is intact
-# regardless; only the manager's DIRECTIVES change.
-#
-# ⚠ DO NOT USE THIS ON AN MJX ENV. There `global_state` IS `obs.reshape(E, -1)`
-# (`trainer._global_state` falls back to exactly that when the env has no
-# `global_state` hook), so `z` would be computed from numbers the encoder
-# already saw: pure dead weight plus an extra `f_percept`, and the arm would
-# differ from `feudal_film_local_private` in a way that is real in the parameter
-# count and empty in information. On MJX compare `local` vs `local_private`; on
-# SMAX compare `local_global` vs `local_global_private`. Crossing the two
-# families in one comparison changes two things at once.
+# ⚠ DO NOT USE THIS ON AN MJX ENV. There `global_state` IS `obs.reshape(E, -1)`,
+# so `z` is computed from numbers the encoder already saw: dead weight plus an
+# extra `f_percept`. On MJX compare `local` vs `local_private`; on SMAX compare
+# `local_global` vs `local_global_private`. Crossing the two families changes two
+# things at once.
 #
 # ⚠ NOT checkpoint-compatible with ANY other arm. The manager tree carries
-# `f_enc_*` + the stacked `f_Mspace_agent_kernel`/`goal_head_agent_kernel` +
-# `f_percept_*`, and no `f_Mspace`/`f_gpre`/`f_goalhead`/`goal_head`. The five
-# latents are separated by PAIRS of keys, never one alone — `f_enc_0` is in all
-# four local variants, `f_percept_0` is in `centralized`/`local_global`/
-# `local_global_private`, and `f_Mspace_agent_kernel` is in both private ones —
-# which is how `goal_dependence_probe._dims_from_checkpoint` tells them apart.
+# `f_enc_*` + `f_Mspace_agent_kernel`/`goal_head_agent_kernel` + `f_percept_*`.
+# The five latents are separated by PAIRS of keys, never one alone — `f_enc_0` is
+# in all four local variants, `f_percept_0` is in `centralized`/`local_global`/
+# `local_global_private`, `f_Mspace_agent_kernel` is in both private ones — which
+# is how `goal_dependence_probe._dims_from_checkpoint` tells them apart.
 #
 # ⚠ `latent_locality_probe.py` and `latent_diversity_probe.py` do NOT work on
 # SMAX arms at any latent: both derive per-agent observations by un-flattening
-# the stored global state (`gs.reshape(N, obs_dim)`), which is only valid when
-# the env has no `global_state` hook. The diversity probe now skips such arms
-# with a message rather than reshaping the world state into fake observations;
-# to actually measure these arms, `collect_states` needs to store `obs`
-# alongside `global_state`.
-#
-# ⚠ BEFORE RUNNING ANY intrinsic_coef > 0 ARM, note the r^I timing misalignment
-# (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4) is still unfixed.
-# MEASURED 2026-09-14 it is small — `intrinsic_timing_probe.py` puts the
-# correction at 0.08 deg of actor-gradient rotation at alpha=0.01, 1.2 deg at
-# 0.1 and 3.6 deg at 0.5, against 0.7 / 6.7 / 26.3 deg for the intrinsic term's
-# own contribution — and it applies identically to every arm, so it cannot bias
-# a paired comparison.
+# the stored global state, valid only when the env has no `global_state` hook.
+# The diversity probe skips such arms with a message.
 #
 #   uv run python train.py algorithm=feudal_mappo_jax env=smax_3m \
 #       model=feudal_film_local_global_private trial_id=0
 #
-# Compare against `model=feudal_film_local_global` on the SAME env group — the
-# two differ in exactly one key, and the difference is precisely "can the N goal
-# rows be distinct from one another". Watch `goal_direction_count` across the
-# whole run, not just its value at the start: `local`'s collapse on the 12a arms
-# happened by ~10M steps and was permanent. Its random-direction baseline is
-# `N^2 / (N + N(N-1)/goal_dim)`, which at smax_3m (N=3, goal_dim=32) is 2.82 of
-# 3 — note that at small N a shared projection is far less likely to bind, so
-# this arm's motivation is strongest on the larger maps (3s5z, 5m_vs_6m).
+# Compare against `model=feudal_film_local_global` — one key apart, and the
+# difference is precisely "can the N goal rows be distinct from one another".
+# Watch `goal_direction_count` across the WHOLE run; its baseline at smax_3m
+# (N=3, goal_dim=32) is 2.82 of 3, and at small N a shared projection is far less
+# likely to bind, so this arm's motivation is strongest on 3s5z / 5m_vs_6m.
 defaults:
   - feudal_film_local_private
   - _self_

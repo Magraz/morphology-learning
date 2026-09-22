@@ -1,10 +1,5 @@
 # @package _global_
 #
-# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
-# nests these keys under the `model` node, where nothing reads them, and the run
-# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
-# (CLAUDE.md, 2026-09-08).
-#
 # FuN's shared perceptual module, on the `local_private` latent.
 #
 # `feudal_film_local_private` + `worker_encoder: shared` — exactly one key apart

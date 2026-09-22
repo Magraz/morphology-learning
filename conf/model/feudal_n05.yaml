@@ -1,15 +1,12 @@
 # @package _global_
-# FeUdal, NORMALIZED intrinsic stream, alpha_0 = 0.5, linearly annealed to 0.
-#
-# See conf/model/feudal_n01.yaml for why alpha's meaning changed (gradient
-# fraction, not reward coefficient) and why the `feudal_a*` arms could not simply
-# be retuned.
+# Delta: alpha 0.1 -> 0.5. See `feudal_n01.yaml` for what alpha means, why the
+# anneal is off, the r^I timing status and the collapse watch-list.
 #
 # At alpha_0 = 0.5 the intrinsic direction carries a third of the worker's
-# initial gradient (0.5 / (1 + 0.5)) — a deliberately strong exploration setting,
-# and the upper end of the intended sweep against `feudal_n01`. Under the old
-# reward-level fold this same nominal value was ~1700x the extrinsic magnitude;
-# with per-stream normalization it is exactly what it reads as.
+# gradient (0.5 / (1 + 0.5)) — a deliberately strong setting and the upper end of
+# the intended sweep against `feudal_n01`. Under the retired reward-level fold
+# this same nominal value was ~1700x the extrinsic magnitude; with per-stream
+# normalization it is exactly what it reads as.
 defaults:
   - feudal
   - _self_

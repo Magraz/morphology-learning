@@ -94,6 +94,9 @@
 #
 # Compare against `model=feudal` on the SAME env group -- the two differ in
 # exactly one key.
+defaults:
+  - feudal
+  - _self_
+
 model_params:
-  hidden_dim: 168
   worker_fusion: film

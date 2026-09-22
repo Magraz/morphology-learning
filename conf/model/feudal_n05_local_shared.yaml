@@ -1,0 +1,28 @@
+# @package _global_
+# Delta: `manager_latent: local` + `worker_encoder: shared` (two keys, because
+# this family has no `feudal_n05_local` intermediate to hang the second on).
+#
+# See `feudal_film_local.yaml` for the latent and
+# `feudal_film_local_shared_enc.yaml` for the shared encoder — the rationale,
+# the two-things-at-once caveat, the checkpoint incompatibility and the watch
+# list all apply here unchanged.
+#
+# ⚠ `manager_latent: local` is REQUIRED, not a preference: only the local
+# latents build `f_enc`, and `validate_worker_encoder` raises on
+# `centralized`. This file used to be `feudal_{a}_shared.yaml`, which set the
+# encoder while inheriting `centralized` and therefore could not run at all.
+#
+# ⚠ Concat + shared encoder is the combination `feudal_film_local_shared_enc`
+# warns about: widening the worker's input from obs_dim to manager_hidden_dim
+# cuts the goal's share of layer-1 variance at init from ~9.8% to ~1%, and
+# `normalize_pooled_goal`'s calibration was derived on the narrow geometry.
+# The run warns and proceeds.
+#
+# Alpha is inherited from `feudal_n05` (= 0.5).
+defaults:
+  - feudal_n05
+  - _self_
+
+model_params:
+  manager_latent: local
+  worker_encoder: shared

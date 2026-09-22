@@ -1,10 +1,5 @@
 # @package _global_
 #
-# ⚠ THE `# @package _global_` HEADER ABOVE IS LOAD-BEARING. Without it Hydra
-# nests these keys under the `model` node, where nothing reads them, and the run
-# proceeds at the ALGORITHM DEFAULTS with no warning. That cost 12 full runs
-# (CLAUDE.md, 2026-09-08).
-#
 # `feudal_film_local`, plus a direct read of the env's global state on the GOAL
 # path only. THIS IS THE SMAX ARM — on any MJX env use `feudal_film_local`
 # instead (see "when NOT to use this" below).
@@ -67,10 +62,6 @@
 # separated by the PAIR of keys, not either alone — `f_enc_0` is in both local
 # variants and `f_percept_0` is in both `centralized` and `local_global` — which
 # is how `goal_dependence_probe._dims_from_checkpoint` tells them apart.
-#
-# ⚠ BEFORE RUNNING ANY intrinsic_coef > 0 ARM, fix the r^I timing misalignment
-# (plans/feudal_goal_reward_diagnosis_2026-09-09.md §4). Separate correctness
-# fix; it confounds any alpha comparison.
 #
 #   uv run python train.py algorithm=feudal_mappo_jax env=smax_3m \
 #       model=feudal_film_local_global trial_id=0

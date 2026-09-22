@@ -1,14 +1,18 @@
 # @package _global_
+# Delta: `manager_latent: local_private`. See `feudal_intrinsic.yaml` for the
+# objective and `feudal_film_local_private.yaml` for the latent.
+#
+# ⚠ THE LATENT IS A PRECONDITION HERE, NOT A PREFERENCE. r^I scores
+# d_cos(s_t[i] - s_{t-k}[i], g_{t-k}[i]), so whatever `s[i]` responds to is what
+# agent i is paid for — and under `centralized` that is measurably NOT agent-local
+# (diag share 0.0631 against a uniform 1/N of 0.0625). A confound under `mixed`;
+# fatal when r^I is the worker's ENTIRE loss. `local_private` is the only latent
+# measured to have both locality (diag share exactly 1.0) and restored row
+# diversity (`s` 8.72, `g` 9.24). This arm is CONCAT fusion; the FiLM counterpart
+# is `feudal_film_intrinsic_only_local_private`.
 defaults:
+  - feudal_intrinsic
   - _self_
 
 model_params:
-  worker_objective: intrinsic_only
   manager_latent: local_private
-
-params:
-  # Inert as a magnitude — only its nonzero-ness matters (see above).
-  intrinsic_coef: 1.0
-  # Required: alpha does not appear in this objective's advantage.
-  intrinsic_anneal: none
-  ent_coef: 0.1

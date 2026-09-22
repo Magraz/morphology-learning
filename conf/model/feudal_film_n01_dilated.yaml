@@ -1,8 +1,11 @@
 # @package _global_
-model_params:
-  hidden_dim: 168
-  worker_fusion: film
-  manager_core: dilated_lstm
+# Delta: `manager_core: dilated_lstm`.
+#
+# See `feudal_film_dilated.yaml` for the recurrence; alpha is inherited from
+# `feudal_film_n01` (= 0.1).
+defaults:
+  - feudal_film_n01
+  - _self_
 
-params:
-  intrinsic_coef: 0.1
+model_params:
+  manager_core: dilated_lstm

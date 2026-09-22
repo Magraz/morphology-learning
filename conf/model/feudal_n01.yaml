@@ -1,28 +1,73 @@
 # @package _global_
-# FeUdal, NORMALIZED intrinsic stream, alpha_0 = 0.1, linearly annealed to 0.
+# Delta: `intrinsic_coef` (alpha) 0.0 -> 0.1, `intrinsic_anneal: none`.
 #
-# The `n` prefix distinguishes these from the `feudal_a*` arms: same alpha
-# values, but alpha means something different now. In `feudal_a01`/`feudal_a05`
-# it was a REWARD coefficient (r^I folded straight into the worker's reward); it
-# is now a GRADIENT FRACTION — extrinsic and intrinsic advantages are each
-# normalized to unit std and mixed as `adv_ext + alpha * adv_int`.
+# CANONICAL HOME FOR WHAT ALPHA MEANS. Every `_n0*` group in this family — concat
+# and FiLM alike — cites this file rather than restating the following.
 #
-# Why the old arms had to be replaced rather than retuned: r^I is ~0.155/step and
+# ── ALPHA IS A GRADIENT FRACTION, NOT A REWARD COEFFICIENT ────────────────────
+# The extrinsic and intrinsic streams each get their own critic, their own GAE
+# and their own normalization to unit std, and meet only in `ppo_update` as
+# `adv = adv_ext + alpha_t * adv_int`. The `n` prefix marks exactly this: in the
+# retired `feudal_a01`/`feudal_a05` arms alpha was a REWARD coefficient (r^I
+# folded straight into the worker's reward).
+#
+# Why those arms had to be replaced rather than retuned: r^I is ~0.155/step and
 # near-flat, while the extrinsic reward is ~5e-05/step until the policy starts
-# delivering boxes. As a reward coefficient even alpha=0.1 therefore put 300-600x
-# more magnitude on the intrinsic term through exactly the window where learning
-# had to start, and both 0.1 and 0.5 converged to a task-free fixed point (worker
-# and manager climbing each other's cosine) with env reward pinned near 1e-3 for
-# 1e8 steps. No value in a 0/0.1/0.5 sweep escapes that, because the smallest
-# nonzero member is already ~300x too large. Per-stream normalization removes the
-# scale gap outright.
+# delivering boxes. As a reward coefficient even alpha=0.1 put 300-600x more
+# magnitude on the intrinsic term through exactly the window where learning had
+# to start, and both 0.1 and 0.5 converged to a task-free fixed point (worker and
+# manager climbing each other's cosine) with env reward pinned near 1e-3 for 1e8
+# steps. NO value in a 0/0.1/0.5 sweep escapes that, because the smallest nonzero
+# member is already ~300x too large. Per-stream normalization removes the scale
+# gap outright.
 #
-# The anneal to 0 is what makes the ENDPOINT correct: at constant alpha, that
-# fraction of the worker's gradient would permanently point at a task-irrelevant
-# objective. Early exploration pressure is kept, asymptotic bias is not.
+# Read `adv_ext_std_raw` / `adv_int_std_raw` in the stats to see the raw scale gap
+# the normalization absorbs, `alpha_current` for the schedule, and scale against
+# `intrinsic_reward_abs` — the SIGNED mean is ~-4e-4 because cosines cancel about
+# zero, so it reads as "no intrinsic signal" while the per-step term is 0.152.
 #
-# Read `adv_ext_std_raw` / `adv_int_std_raw` in the training stats to see the raw
-# scale gap the normalization is absorbing, and `alpha_current` for the schedule.
+# ── THE ANNEAL IS OFF, DELIBERATELY ───────────────────────────────────────────
+# ⚠ Commit `eddd654` flipped `intrinsic_anneal` from `linear` to `none`; this
+# header documented the anneal for a while afterwards and was simply wrong. What
+# it gives up: under `linear` the endpoint is asymptotically correct, because a
+# constant alpha leaves that fraction of the worker's gradient pointing at a
+# task-irrelevant objective forever. Under `none` the pressure is held for the
+# whole run, so these arms measure what a SUSTAINED r^I does rather than what an
+# early-exploration bonus does. `alpha_current` should be flat.
+#
+# ── r^I TIMING: FIXED 2026-09-16, AND IT DOES NOT EXPLAIN THESE ARMS ──────────
+# ⚠ Earlier copies of this note (in ~8 files) said the misalignment was "still
+# unfixed" and one said to fix it BEFORE running any alpha>0 arm. Both are stale:
+# `trainer.py` now builds r^I from `worker_intrinsic_reward_aligned` against
+# `Transition.next_state_latent`, so r^I_t scores a_t as `reward[t]` already did.
+#
+# It was also never the reason the alpha>0 arms fail. `intrinsic_timing_probe.py`
+# rebuilds the actor's first-epoch gradient under both indexings and reports the
+# angle between them, over 13 trained arms:
+#
+#     alpha    rotation from FIXING the timing    rotation r^I ITSELF causes
+#     0.01                 0.08 deg                        0.68 deg
+#     0.1                  1.2  deg                        6.7  deg
+#     0.5                  3.6  deg                       26.3  deg
+#
+# i.e. ~13% of the effect r^I was already having. GAE is why: it integrates over
+# 1/(1-gamma*lambda) = 16.8 steps and r^I has lag-1 autocorrelation 0.53-0.73, so
+# shifting it one step leaves the advantage 0.986-0.998 correlated. It applied
+# identically to every arm, so it can never have biased a paired comparison —
+# the local-vs-centralized results predating the fix stand.
+#
+# ── WHAT TO WATCH ON ANY alpha > 0 ARM, IN THIS ORDER ─────────────────────────
+# Manager and worker share d_cos as an objective and can climb it THROUGH the
+# environment (no gradient crosses FuN's detach), so the degenerate joint
+# solution — manager freezes on one direction, worker drives its own observation
+# along it — is reachable and self-sealing. Across the WHOLE run, not just early
+# (`local`'s collapse landed by ~10M steps and was permanent):
+#     d_cos_var             <~1e-3  => the cosine is constant, annihilated by
+#                                   advantage centering
+#     goal_direction_count  vs the random-direction baseline
+#                           N^2/(N + N(N-1)/goal_dim), = 8.93 at N=12/goal_dim=32
+#     state_latent_erank    <~1.5   => rank-1 latent collapse
+#     only then, return
 defaults:
   - feudal
   - _self_

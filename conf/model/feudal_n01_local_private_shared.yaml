@@ -1,13 +1,13 @@
 # @package _global_
+# Delta: `worker_encoder: shared`. See `feudal_film_local_shared_enc.yaml` for
+# the rationale and the watch list, and `feudal_film_local_private_shared_enc`
+# for why `local_private` is the pair to run first.
+#
+# ⚠ Concat fusion — see `feudal_n0*_local_shared.yaml` for why that interacts
+# badly with a widened worker input. The run warns and proceeds.
 defaults:
-  - feudal
+  - feudal_n01_local_private
   - _self_
-  
-model_params:
-  manager_latent: local_private
-
-params:
-  intrinsic_coef: 0.1
 
 model_params:
   worker_encoder: shared

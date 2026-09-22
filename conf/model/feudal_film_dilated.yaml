@@ -1,60 +1,35 @@
 # @package _global_
 #
-# FeUdal worker with FiLM fusion instead of concatenation.
+# FiLM worker + RECURRENT manager: `feudal_film` with FuN's dilated LSTM core in
+# place of the stateless MLP. One key apart from `feudal_film`, which is the
+# control it must be read against.
 #
-# WHY THIS ARM EXISTS — measured 2026-09-06 by
-# `algorithms/feudal_mappo_jax/goal_dependence_probe.py` over all 20 trained
-# concat arms (5 env groups x 4 models x 3 trials, 64 paired eval episodes):
+# The core's state is a pool of `radius` sub-states (radius defaults to the goal
+# horizon `c`); at step t only group `t % r` is read and written, so a group's
+# gradient path spans r× more real time — the mechanism FuN uses to let the
+# manager commit to a directive over a horizon rather than re-deciding every
+# step. See CLAUDE.md, "Recurrent manager (`manager_core: dilated_lstm`)", for
+# the measured decision NOT to use `jax.checkpoint` on the BPTT.
 #
-#   * permuting the manager's goals across agents changes the return by
-#     NOTHING (only 5 of 45 non-control trials have a paired CI excluding 0,
-#     in both directions) -- the worker does not use the assignment;
-#   * ZEROING the goals *improves* the return on 15 of 16 non-control arms
-#     (27/45 trials significant, essentially all negative; e.g.
-#     mjx_16a_4o_1024/feudal_n05 43.7 -> 133.3) -- the goal is a net-harmful
-#     perturbation rather than a directive;
-#   * meanwhile the manager's goals are FINE: d_cos_gap_agent ~= d_cos_mean
-#     (agent-specific) and d_cos_gap_env is 60-90% of d_cos_mean
-#     (state-conditioned). So the failure is the manager->worker channel.
+# ⚠ THIS FILE WAS INERT UNTIL 2026-09-22 AND ITS EXISTING RESULTS ARE STALE.
+# It was created (commit `9c0c1b3`, "added 3 more yamls") by copying
+# `feudal_film.yaml` wholesale, and `manager_core: dilated_lstm` was never
+# added — so the arm was a byte-for-byte duplicate of `feudal_film` under a name
+# claiming recurrence, and nothing warned. Diagnosed from the CHECKPOINT, which
+# cannot lie about what trained: `manager/params/core` held a single
+# `Dense(384, 256)` (the mlp core) where every genuine `*_dilated` arm holds
+# `LSTMCell_0/{ii,if,ig,io,hi,hf,hg,ho}` gates. The 6 affected trials are
+# `mjx_12a_3o_trunc_1024` and `mjx_12a_3o_partition_1024`, seeds 0-2; they are
+# valid `feudal_film` runs and worthless as recurrence evidence. They are not
+# checkpoint-compatible with this file any more, so a `checkpoint=true` resume
+# now fails LOUDLY on the core shape mismatch rather than silently continuing.
+# Re-run them.
 #
-# The scale explanation is already spent: `normalize_pooled_goal` cut the goal
-# block from 59-78% of the worker's layer-1 variance to a measured 14-19%. What
-# remains are two STRUCTURAL properties of concatenation:
-#
-#   1. the default is influence, not no-influence. Orthogonal init makes the
-#      goal columns live from step 0, so goal-agnosticism is something the
-#      worker must actively learn -- and the numbers above say it never
-#      finished. FiLM's zero-init makes identity the default and influence the
-#      thing that has to be earned.
-#   2. concat can only TRANSLATE the policy. d(preactivation)/d(obs) = W_obs,
-#      with no dependence on the goal at all, so a concatenated goal cannot
-#      change which observation features matter. FiLM is multiplicative
-#      (h <- (1 + gamma(g)) * h + beta(g)), so the goal gates how the
-#      observation is read -- which is what "work the box on your left, ignore
-#      the one behind you" actually requires.
-#
-# ⚠ NOT checkpoint-compatible with the `feudal` arms: concat's first Dense has
-# input width obs_dim + goal_dim (56), FiLM's is obs_dim (40). This arm trains
-# from scratch and writes to results/<env>/feudal_film/.
-#
-# ACCEPTANCE TEST is the same probe. Success is BOTH:
-#   * gap_zeroed ~ 0      (the goal stopped costing return), and
-#   * gap_permuted > 0 with a paired CI excluding 0 (the pairing started
-#     mattering).
-# Today the concat arms have the opposite of both. Expect FiLM alone to deliver
-# the first: at intrinsic_coef=0 nothing in the worker's objective asks it to
-# follow the goal, so the second likely needs the objective side too -- and the
-# n01/n05 data says the current intrinsic reward is not it.
-#
-# Free pre-flight check, before spending a run: at init the FiLM layers are
-# exactly identity, so all four eval variants must return BITWISE-identical
-# values (same positive control as feudal_zerogoal).
-#
-#   uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o_trunc_1024 \
-#       model=feudal_film trial_id=0
-#
-# Compare against `model=feudal` on the SAME env group -- the two differ in
-# exactly one key.
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_dilated trial_id=0
+defaults:
+  - feudal_film
+  - _self_
+
 model_params:
-  hidden_dim: 168
-  worker_fusion: film
+  manager_core: dilated_lstm

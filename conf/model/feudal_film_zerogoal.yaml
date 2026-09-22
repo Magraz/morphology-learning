@@ -1,5 +1,25 @@
 # @package _global_
+# Delta: `zero_goal: true`. See `feudal_zerogoal.yaml` for the isolate ladder
+# this arm sits on and how to read it.
+#
+# WHAT FiLM ADDS TO THE ABLATION: the gamma/beta Dense layers are BIAS-FREE, so
+# gamma(0) = beta(0) = 0 forever, not just at init. A zero goal is therefore
+# EXACTLY the unmodulated flat policy — under concat it is merely a zeroed input
+# block that the first layer has still co-adapted to. That makes this the exact
+# isolate (flat policy + per-agent critic head + manager training) and gives the
+# goal-dependence probe its positive control: every eval gap must be BITWISE 0.0.
+# The FiLM goal-influence series are the same control read live —
+# `worker_film_gain_rms`, `worker_film_shift_ratio` and
+# `worker_goal_action_delta` are all exactly 0.000 here (verified, 3 seeds),
+# while `worker_tanh_saturation` is correctly nonzero: it is a property of the
+# trunk, not of the goal.
+#
+# ⚠ `goal_dependence_probe.py`'s positive-control assertion keys on the literal
+# model name `feudal_zerogoal`, so THIS name slips past it. Check the gaps by
+# hand for any renamed zerogoal arm.
+defaults:
+  - feudal_film
+  - _self_
+
 model_params:
-  hidden_dim: 168
-  worker_fusion: film
   zero_goal: true

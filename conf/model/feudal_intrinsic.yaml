@@ -1,5 +1,58 @@
 # @package _global_
+# Delta: `worker_objective: intrinsic_only` (+ the three settings that mode
+# requires). CANONICAL HOME for what the pure-intrinsic worker is.
+#
+# The worker's policy gradient drops the extrinsic advantage entirely, so its
+# only job is to follow the manager's goals:
+#
+#     mixed (every other arm):  adv = adv_ext + alpha_t * adv_int
+#     intrinsic_only:           adv = adv_int
+#
+# All task pressure then sits with the MANAGER, whose transition PG is already
+# weighted by the extrinsic advantage under `manager_gamma` — so task return can
+# only be reached THROUGH the goal channel. That is the classic Dayan-Hinton
+# feudal contract and the one configuration in which the hierarchy is
+# load-bearing by construction. It exists because under `mixed` every measurement
+# says the goals are decorative (`eval_gap_permuted` ~ 0 on 40 of 45 non-control
+# trials, `gap_zeroed` systematically NEGATIVE, and the best arm in
+# mjx_12a_3o_trunc_1024 is `feudal_film_zerogoal_dilated`, whose goals are
+# disconnected). The opposite extreme had never been run.
+#
+# Only the ACTOR's advantage changes. The extrinsic GAE, the worker critic's
+# regression and `explained_variance` all still run, deliberately: the param tree
+# stays shape-identical to the matched `mixed` control, and the extrinsic return
+# stays a live diagnostic.
+#
+# ⚠ ALPHA IS NOT A COEFFICIENT HERE, AND THAT IS A TRAP WITH A GUARD. `adv_int`
+# is already unit-std, so an alpha factor would be a uniform rescale of the whole
+# actor gradient — which `intrinsic_anneal: linear` would drive to EXACTLY 0,
+# silently deleting the worker's entire objective over the second half of a run
+# while every logged loss stayed healthy. The expression therefore carries no
+# alpha at all, and the arm RAISES unless `intrinsic_anneal: none`.
+# `intrinsic_coef` must still be nonzero — it is the static gate that builds V^I,
+# captures `next_state_latent` and computes r^I at all — but its VALUE is inert,
+# hence 1.0. Read `adv_ext_weight` / `adv_int_weight` (0.0 / 1.0 here), never
+# `alpha_current`, which is logged and meaningless in this mode.
+#
+# ⚠ THE PRIMARY RISK, and it is self-sealing. Manager and worker share d_cos as
+# an objective and can climb it through the environment. With `intrinsic_only`
+# there is nothing else in the worker's gradient, so the degenerate joint
+# solution (manager freezes on one direction, worker drives its own observation
+# along it — measured on `feudal_film_n01_local`: goal_direction_count 1.45
+# against a 8.93 baseline, return 1.4) is OPTIMAL for the worker. The
+# counter-pressure is that the manager's PG is weighted by the extrinsic
+# advantage. Watch the list in `feudal_n01.yaml` across the whole run.
+#
+# ⚠ THE GOAL-DEPENDENCE PROBE CANNOT GRADE THIS ARM: `gap_zeroed`,
+# `gap_constant` and `gap_permuted` are all large BY CONSTRUCTION. The three
+# conditions in `feudal_film.yaml` are vacuous here. Acceptance is the
+# BETWEEN-ARM return comparison against the matched `mixed` control, against
+# `feudal_zerogoal` (the goal-free floor) and against `mlp`.
+#
+# `ent_coef` is raised 0.01 -> 0.1: with no extrinsic term in the actor's
+# gradient there is nothing else resisting premature collapse of the policy.
 defaults:
+  - feudal
   - _self_
 
 model_params:
