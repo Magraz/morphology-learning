@@ -485,6 +485,33 @@ def validate_goal_space(config: MAPPOConfig, env=None) -> None:
             "guard turned a whole arm into its own baseline for two commits."
         )
     if config.goal_space not in GROUNDED_GOAL_SPACES:
+        # ⚠ Under `latent`, `goal_dim` and the manager's bottleneck are ONE knob,
+        # and that is FuN's definition rather than an implementation detail: a
+        # goal IS a direction in the state embedding, so `s` and `g` share a
+        # space and `transition_cosine` contracts them on the last axis.
+        # Splitting the widths here does not make a narrower goal — it makes the
+        # objective ill-posed, and it dies as a bare `TypeError: mul got
+        # incompatible shapes for broadcasting: (T,E,N,32), (T,E,N,2)` inside
+        # `manager_update`, naming neither key.
+        #
+        # The split is only coherent when `s` comes from somewhere OTHER than
+        # the bottleneck — i.e. a grounded goal space, where `s` is the env's
+        # readout and the bottleneck stays free to be wide.
+        latent_dim = config.manager_latent_dim
+        if latent_dim is not None and int(latent_dim) != int(config.goal_dim):
+            raise ValueError(
+                f"goal_space='latent' requires manager_latent_dim "
+                f"({latent_dim}) to equal goal_dim ({config.goal_dim}), or to "
+                "be null. Under FuN a goal is a DIRECTION IN the latent state "
+                "space, so `s` and `g` are the same space by construction and "
+                "the transition cosine contracts them together.\n"
+                "  * to narrow the GOAL under a learned latent, set goal_dim "
+                "alone and leave manager_latent_dim null — but that necessarily "
+                "narrows the manager's whole bottleneck too, which is exactly "
+                "why no clean goal-width control exists in this mode;\n"
+                "  * to keep a wide bottleneck with a 2-wide goal, use "
+                "goal_space='position_direction' or 'position_waypoint'."
+            )
         return
 
     # The env readout IS the goal space. Falling back to the learned latent here
@@ -1902,18 +1929,25 @@ def manager_update(
             "state_pairwise_cos": _mean_pairwise_cosine(_agent_gram(s_learned)),
             "state_latent_erank": _effective_rank(s_learned),
         }
-        if grounded:
+        if goal.shape[-1] == 2:
             # Angular dispersion REPLACES `goal_direction_count` as the headline
-            # collapse metric here, because that participation ratio is bounded by
-            # min(N, goal_dim) = 2 and saturates: N evenly-spaced headings score
-            # exactly 2.0, and so does "half at 0 degrees, half at 90". It cannot
-            # tell a uniform fan from two perpendicular clusters.
+            # collapse metric at this width, because that participation ratio is
+            # bounded by min(N, goal_dim) = 2 and saturates: N evenly-spaced
+            # headings score exactly 2.0, and so does "half at 0 degrees, half at
+            # 90". It cannot tell a uniform fan from two perpendicular clusters.
             #
             # This one's baseline depends only on N, not on goal_dim — exactly the
             # property the participation ratio lacked. For N iid uniform
             # directions E[Rbar] ~ 0.886/sqrt(N), so the random-goal level is
             # ~0.744 at N=12 and ~0.778 at N=16. Read it as a TREND toward 0,
             # which is the "everyone go north-east" degeneracy.
+            #
+            # ⚠ GATED ON THE GOAL'S WIDTH, NOT ON `grounded`. The saturation is a
+            # property of the 2-d geometry, so `feudal_film_narrow` (a LATENT arm
+            # at goal_dim=2) has exactly the same defect — measured, a random
+            # 2-wide latent goal at N=12 scores 1.85 against its ceiling of 2.
+            # Gating on groundedness left that arm reading only the saturated
+            # metric, i.e. flying blind on the one thing it is meant to show.
             metrics.update(_heading_dispersion(goal))
         if enc_grads is not None:
             # Who shapes `f_enc`. Read the COSINE first: norms alone are

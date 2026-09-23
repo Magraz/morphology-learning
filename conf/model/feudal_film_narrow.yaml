@@ -1,53 +1,54 @@
 # @package _global_
 #
-# FiLM feudal with a 2-WIDE GOAL and a 32-wide manager bottleneck — still the
-# LEARNED latent. Differs from `feudal_film` in exactly the two width keys.
+# FiLM feudal with a 2-WIDE GOAL, still the LEARNED latent. One key from
+# `feudal_film`.
 #
-# WHY THIS ARM EXISTS — it is the ATTRIBUTION RUNG, and without it no grounded
-# number means anything. A grounded arm (`feudal_film_position`,
-# `feudal_film_waypoint`) changes TWO things against `feudal_film` at once:
+# ⚠ READ THIS BEFORE USING IT AS A CONTROL — it is NOT the clean width isolate
+# an earlier version of this header claimed, and that version did not even run.
 #
-#   1. the goal becomes a physical quantity (an env readout, zero parameters);
-#   2. the goal becomes 2-wide instead of 32-wide.
+# The intent was: a grounded arm changes two things against `feudal_film` (the
+# goal becomes physical AND 2-wide), so this rung would hold the width fixed and
+# isolate grounding. That control CANNOT EXIST in the latent mode. Under FuN a
+# goal is a DIRECTION IN the latent state space, so `s` and `g` are the same
+# space by construction and `transition_cosine` contracts them on the last axis.
+# `goal_dim` is therefore ONE knob controlling both the goal width and the
+# manager's whole information bottleneck — `manager.py`'s docstring says exactly
+# this ("shrinking it throttles the goal RNN too").
 #
-# (2) is not cosmetic. Under FiLM the gamma/beta maps go from rank-32 to
-# RANK-2: gamma = Dense(hidden)(goal) with a 2-d input, so the set of achievable
-# per-unit gains is a 2-dimensional subspace of R^hidden instead of a 32-d one.
-# That is a real reduction in what a directive can express, and it is the whole
-# reason this rung exists — attributing a return gap to "grounding" without it
-# would be attributing it to a confound.
+# So `goal_dim: 2` here necessarily ALSO strangles the core to 2*n_agents = 24
+# numbers as its entire view of the world. Setting `manager_latent_dim: 32` to
+# avoid that is not a fix, it is an ill-posed objective (s in R^32 vs g in R^2);
+# `validate_goal_space` now raises on it. It previously died as a bare
+# `TypeError: mul got incompatible shapes for broadcasting` deep inside
+# `manager_update`, naming neither key.
 #
-# ⚠ What is NOT the mechanism, measured rather than assumed: the goal's SHARE of
-# layer-1 preactivation variance is 9.8% at goal_dim 32, 16 AND 2 alike, because
-# `normalize_pooled_goal` fixes ||w|| = 1 and that share is set by the block's
-# norm, not its width. (The same measurement reproduces CLAUDE.md's recorded
-# 91.6% for the pre-normalization raw sum, which is what validates it.) An
-# earlier draft of this header claimed the share collapses to ~1% at goal_dim=2.
-# It does not. Under CONCAT the real cost of narrowing is init goal-dominance:
-# swapping the goal moves the untrained action mean by 47.3% of its own RMS at
-# goal_dim=32 and 20.3% at 2 — against exactly 0.000 for FiLM at both widths.
+# WHAT THIS ARM ACTUALLY MEASURES, then: "narrow goal AND narrow bottleneck"
+# against `feudal_film`'s "wide goal AND wide bottleneck". That is a real and
+# interesting question on its own — how much width does the feudal channel need?
+# — but it is NOT the width control for the grounded arms, because they run a
+# 2-wide goal with a 32-wide bottleneck, a combination unreachable here.
 #
-#   narrow   - film    = the cost of the narrow channel
-#   position - narrow  = the value of grounding
+# ⚠ CONSEQUENCE FOR THE GROUNDED COMPARISON: the goal-width confound in
+# `waypoint - film` is IRREDUCIBLE, not merely uncontrolled. A rank-2 directive
+# expresses less than a rank-32 one, and that is part of what "a grounded (x, y)
+# goal" means rather than a nuisance to be subtracted. `goal_embed_dim` does not
+# help — a bias-free linear map out of R^2 still has rank <= 2. State the
+# limitation; do not manufacture a control that cannot exist.
 #
-# Same one-thing-per-rung discipline as the drift ladder
-# (baseline -> trunc -> drift) in CLAUDE.md.
-#
-# ⚠ It is also the LONGEST-LEAD item: it depends on nothing in the grounded
-# implementation, so start it training as soon as the foundation lands.
-#
-# ⚠ `manager_latent_dim` must stay 32 (the latent default). It sizes `f_Mspace`
-# and hence the manager's core input; fused with `goal_dim: 2` the core would
-# see 2*n_agents numbers as its only view of the world.
-#
-# ⚠ NOT checkpoint-compatible with `feudal_film` (goal head 2 wide, not 32).
+# Diagnostics: `goal_direction_count` SATURATES here exactly as it does on the
+# grounded arms — it is bounded by min(N, goal_dim) = 2, with a random baseline
+# of ~1.85 at N=12 (measured), and it reads the same for a uniform fan as for
+# two perpendicular clusters. Read `goal_heading_dispersion` instead, whose
+# baseline depends only on N (~0.744 at N=12, ~0.778 at N=16). That series is
+# emitted whenever the goal is 2-wide, grounded or not.
 #
 #   uv run python train.py algorithm=feudal_mappo_jax \
 #       env=mjx_12a_3o_trunc_1024 model=feudal_film_narrow trial_id=0
+#
+# Compare against `model=feudal_film` (one key apart, goal_dim 32 -> 2).
 defaults:
   - feudal_film
   - _self_
 
 model_params:
   goal_dim: 2
-  manager_latent_dim: 32
