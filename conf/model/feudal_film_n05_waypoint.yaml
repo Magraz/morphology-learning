@@ -21,9 +21,5 @@
 #       env=mjx_12a_3o_trunc_1024 model=feudal_film_n01_waypoint trial_id=0
 defaults:
   - feudal_film_waypoint
-  - feudal_film_n01
+  - feudal_film_n05
   - _self_
-
-model_params:
-  goal_space: position_waypoint
-  normalize_pooled_goal: false

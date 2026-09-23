@@ -23,7 +23,3 @@ defaults:
   - feudal_film_waypoint
   - feudal_film_n01
   - _self_
-
-model_params:
-  goal_space: position_waypoint
-  normalize_pooled_goal: false

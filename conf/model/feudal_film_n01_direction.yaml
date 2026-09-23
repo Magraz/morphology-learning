@@ -1,0 +1,82 @@
+# @package _global_
+# Delta: alpha = 0.1, inherited from `feudal_film_n01`.
+#
+# THE SATURATION TEST. This arm exists to be compared against
+# `feudal_film_n01_waypoint` at the same seeds and env group, and it is the ONLY
+# way to find out whether the saturation argument that made waypoints the
+# headline is real or just plausible.
+#
+# WHAT THE TWO ARMS DIFFER IN — exactly one thing, the shape of r^I:
+#
+#   position_direction : r^I_t = mean_k d_cos(s+_t - s_{t-k}, g_{t-k})
+#   position_waypoint  : r^I_t = ||pg_t|| - ||pg_t - (s+_t - s_t)/R||
+#
+# MEASURED, on a worker that perfectly obeys a FROZEN goal for 60 steps at
+# c = 10 — i.e. exactly the degenerate joint solution both modes are at risk of:
+#
+#                        mean r^I/step   sum per c-block   total over 60
+#   position_direction          1.0000            9.9998          59.999
+#   position_waypoint           0.0600            0.6000           3.600
+#
+# 16.7x more farmable intrinsic reward, with the direction figure pinned at its
+# theoretical maximum. The mechanism: d_cos pays ~1 EVERY STEP for moving along
+# a commanded heading, indefinitely — a force-controlled agent achieves any
+# heading trivially and no bounded resource is consumed. The waypoint reward
+# TELESCOPES, so perfect compliance can only ever collect the distance that
+# actually separates the agent from its waypoint, and then pays ~0 until the
+# next latch. CLAUDE.md names non-saturation as one of three compounding causes
+# of the alpha>0 absorbing state.
+#
+# ⚠ SO THIS ARM IS EXPECTED TO FAIL, AND THAT IS ITS JOB. alpha is precisely the
+# switch that activates the degeneracy: at alpha=0 there is no r^I and manager
+# and worker CANNOT climb each other's objective, while at alpha>0 they can —
+# through the environment, where no gradient crosses FuN's detach. The latent
+# precedent is `feudal_film_n01_local`: goal_direction_count 1.45 at a task
+# return of 1.4, with one frozen vector recovering 95% of it. The physical
+# analogue ("everyone go north-east") is EASIER to reach, not harder.
+#
+# HOW TO READ THE RESULT — the falsification matters more than the confirmation:
+#   * this arm collapses, n01_waypoint does not  => saturation is doing real
+#     work, and the waypoint header's central claim stands;
+#   * BOTH collapse                              => saturation is not sufficient;
+#     the shared-objective degeneracy survives grounding altogether and the
+#     problem is the contract, not the reward shape. Look at
+#     `worker_objective: intrinsic_only` or at the task, not at r^I;
+#   * this arm MATCHES OR BEATS n01_waypoint     => the saturation argument in
+#     `feudal_film_waypoint.yaml` is WRONG and must be retracted, and the
+#     phase ordering that put waypoints first was mis-reasoned. Say so there.
+#
+# WATCH, in this order, across the WHOLE run — `local`'s collapse landed by
+# ~10M steps and was permanent, so a healthy first checkpoint proves nothing:
+#   1. goal_heading_dispersion -> 0 is "everyone sent the same way". The random
+#      baseline is ~0.744 at N=12 and ~0.778 at N=16, and depends only on N.
+#      ⚠ Do NOT read goal_direction_count here: it is bounded by
+#      min(N, goal_dim) = 2 and saturates at ~1.85, so it reads the same for a
+#      uniform fan and for two perpendicular clusters.
+#   2. d_cos_var <~ 1e-3 => the cosine is constant, and a constant is
+#      annihilated by advantage centering — the mechanism is dead while
+#      d_cos_mean still looks healthy.
+#   3. intrinsic_reward_abs climbing toward ~1.0/step while `reward` stays flat
+#      IS the farming signature. (Contrast: the waypoint arm's r^I is ~0.006 at
+#      the same alpha — smaller by construction, not because it is failing.)
+#   4. displacement_norm_mean — near-stationary agents dilute d_cos here, since
+#      `_unit` is zero-safe and a mechanically dead agent scores cos ~ 0,
+#      indistinguishable from a disobedient one.
+#
+# ⚠ alpha=0.5 was deliberately NOT created for this mode. At that gradient
+# fraction the latent arms scored 36-91 against 152-272 at alpha=0, and this
+# mode has strictly weaker structural protection than those did.
+#
+# `intrinsic_anneal` is `none` (inherited), so alpha is HELD for the whole run —
+# this measures a SUSTAINED r^I, which is the regime the degeneracy needs, and
+# alpha_current is flat in the stats.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_n01_direction trial_id=0
+#
+# Compare against `model=feudal_film_n01_waypoint` (the saturating twin, one
+# key apart) and `model=feudal_film_direction` (the alpha=0 control).
+defaults:
+  - feudal_film_direction
+  - feudal_film_n01
+  - _self_
