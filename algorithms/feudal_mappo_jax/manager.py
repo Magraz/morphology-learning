@@ -78,6 +78,19 @@ Wiring notes for whoever hooks this up
   the **goal** arm, because the core consumes `s` — which is exactly why the
   bottleneck topology above is load-bearing rather than cosmetic. Wire the core
   to `z` instead and the detach starves `f_Mspace` to its random init.
+
+  ⚠ **Under a grounded ``goal_space`` this rule SURVIVES but its PURPOSE
+  CHANGES, and the topology's justification changes with it.** When `s` is
+  ``env.goal_state(state)`` — a zero-parameter readout of agent positions — the
+  manager no longer owns the measuring stick, so ``detach_states=True`` is a
+  no-op on a constant and rank-1 latent collapse is IMPOSSIBLE rather than
+  guarded. `f_Mspace` is then an ordinary perception bottleneck, not "the space
+  the objective is measured in", and the *surviving* reason to keep the core
+  consuming it is the SECOND one given above: the core is where the N per-agent
+  latents are mixed, which is what makes the local branches centralized. Do not
+  read the detach rule as still doing work it no longer does. Note the objective
+  is then scored on the STORED `s` (``Transition.state_latent``), so the detach
+  is structural — see ``mappo.manager_update``.
   Per-agent-specific residual risk, **not** guarded: `s` and `g` are each one
   ``Dense`` reshaped to ``(N, goal_dim)``, so nothing structurally forces the `N`
   rows to differ. If gradient pressure favours uniformity, per-agent goals
@@ -144,6 +157,52 @@ LATENTS = ("centralized",) + LOCAL_LATENTS
 #: shipped values conflate; adding it is one tuple entry plus one
 #: ``jax.lax.stop_gradient``. Worth having before attributing any return gap.
 WORKER_ENCODERS = ("none", "shared")
+
+#: Every accepted value of ``Model_Params.goal_space`` — what the manager's
+#: directive MEANS, and therefore what space `s` is measured in.
+#:
+#: ``"latent"`` (default) is the original FuN formulation: `g` is a direction in
+#: the LEARNED latent `s`, and the two share a space by construction. It is gated
+#: by python-level static ``if``s everywhere, so it is byte-identical to the code
+#: before this knob existed.
+#:
+#: The GROUNDED values replace `s` with a zero-parameter readout of the
+#: environment (``env.goal_state(state)`` — agent *i*'s own world ``(x, y)``,
+#: normalized). Three things follow structurally rather than by guard:
+#:
+#: * the manager cannot rotate the measuring stick, because the stick has no
+#:   parameters. FuN's detach rule (``transition_cosine(detach_states=True)``)
+#:   becomes a no-op on a constant, and the rank-1 latent collapse that
+#:   ``state_latent_erank`` exists to detect is IMPOSSIBLE, not merely guarded;
+#: * ``d s[i]/d obs_j`` is exactly ``0`` for ``j != i``, so the locality defect
+#:   measured on the centralized latent (diag share 0.0631 against a uniform
+#:   0.0625) disappears for every ``manager_latent``;
+#: * the objective acquires a unit. ``d_cos`` is "did the agent move the way it
+#:   was told", a goal is an arrow in the arena, and progress is in metres.
+#:
+#: ⚠ ``"position_direction"`` is MORE exposed to the shared-objective degeneracy
+#: than ``"latent"``, not less. Manager and worker still climb one objective
+#: THROUGH THE ENVIRONMENT, where no gradient crosses the detach; under
+#: ``"latent"`` the degenerate fixed point was "freeze on one direction and drive
+#: `s` along it" (measured: goal_direction_count 1.45, return 1.4), and its
+#: physical analogue — "everyone go north-east", everyone complies, `r^I` farmed
+#: at task return ~ 0 — is EASIER, because a force-controlled agent achieves any
+#: heading trivially and no bounded resource is consumed.
+#: ``"position_waypoint"``'s telescoping reward SATURATES (sum over a latch block
+#: <= 1), which is a structural protection and the reason that arm leads. Note the
+#: protection is only ACTIVE at ``intrinsic_coef > 0``: at alpha=0 there is no
+#: `r^I` at all and the two grounded modes differ only in the manager's PG.
+GOAL_SPACES = ("latent", "position_waypoint", "position_direction")
+
+#: The subset whose `s` is an env readout rather than a learned latent. Membership
+#: tests, not four hand-written string equalities — the same discipline
+#: ``PRIVATE_LATENTS`` / ``GLOBAL_LATENTS`` use, so adding a grounded mode later
+#: does not mean hunting every ``== "position_direction"`` in the stack.
+GROUNDED_GOAL_SPACES = ("position_waypoint", "position_direction")
+
+#: The subset that latches a target and conditions the worker on a live error
+#: vector, rather than pooling directions over a ring.
+WAYPOINT_GOAL_SPACES = ("position_waypoint",)
 
 
 def block_orthogonal(n_blocks: int):
@@ -460,6 +519,19 @@ class FeudalManager(nn.Module):
     core: str = "dilated_lstm"
     horizon: int = 10
     latent: str = "centralized"
+    #: Width of the internal bottleneck `s_learned` — what ``f_Mspace`` /
+    #: ``f_Mspace_agent`` / ``f_gpre`` emit and what the core consumes. ``None``
+    #: means ``goal_dim``, which is byte-identical to the pre-split module.
+    #:
+    #: The two were ONE knob until grounded goals needed them apart: a grounded
+    #: arm sets ``goal_dim = 2`` (an (x, y) readout), and fused that would hand
+    #: the core ``2 * n_agents`` numbers as its only view of the world.
+    latent_dim: int | None = None
+
+    @property
+    def _latent_dim(self) -> int:
+        """Resolved bottleneck width — ``goal_dim`` unless split explicitly."""
+        return self.goal_dim if self.latent_dim is None else self.latent_dim
 
     def _check_core(self):
         if self.core not in ("dilated_lstm", "mlp"):
@@ -482,7 +554,7 @@ class FeudalManager(nn.Module):
             name=name,
         )
 
-    def _agent_proj(self, x, name: str, per_agent_input: bool):
+    def _agent_proj(self, x, name: str, per_agent_input: bool, out_dim: int = None):
         """``out_i = W_i x_i + b_i`` — a PER-AGENT projection into goal space.
 
         The point of the whole ``"local_private"`` variant: a *shared* map can
@@ -498,20 +570,27 @@ class FeudalManager(nn.Module):
         `y` of shape ``(..., d_in)`` (one vector read N different ways, exactly
         as the centralized ``goal_head`` does).
 
+        `out_dim` defaults to ``goal_dim``. It is explicit because the two callers
+        now want DIFFERENT widths: ``f_Mspace_agent`` emits the internal
+        bottleneck (``_latent_dim``) while ``goal_head_agent`` emits the goal
+        (``goal_dim``). They coincide unless ``latent_dim`` is set, so every
+        pre-split checkpoint keeps its exact shapes.
+
         Params are flat (``<name>_kernel`` / ``<name>_bias``) rather than nested
         under a Dense, because this is a stacked weight, not a layer — see
         ``goal_dependence_probe._dims_from_checkpoint``, which keys the latent
         off ``f_Mspace_agent_kernel``.
         """
+        out_dim = self.goal_dim if out_dim is None else out_dim
         w = self.param(
             f"{name}_kernel",
             block_orthogonal(self.n_agents),
-            (self.n_agents, self.hidden_dim, self.goal_dim),
+            (self.n_agents, self.hidden_dim, out_dim),
         )
         b = self.param(
             f"{name}_bias",
             nn.initializers.constant(0.0),
-            (self.n_agents, self.goal_dim),
+            (self.n_agents, out_dim),
         )
         eq = "...nh,nhg->...ng" if per_agent_input else "...h,nhg->...ng"
         return jnp.einsum(eq, x, w) + b
@@ -589,11 +668,16 @@ class FeudalManager(nn.Module):
                 # applied, not of whether the projection is shared. What changes
                 # is that the N rows no longer have to inherit their distinctness
                 # from the observations. See `_agent_proj`.
-                s = self._agent_proj(h, "f_Mspace_agent", per_agent_input=True)
+                s = self._agent_proj(
+                    h,
+                    "f_Mspace_agent",
+                    per_agent_input=True,
+                    out_dim=self._latent_dim,
+                )
             else:
                 # Shared, so the goal-space coordinates mean the same thing for
                 # all agents. Same `orthogonal(1.0)` as the centralized f_Mspace.
-                s = self._dense(self.goal_dim, 1.0, "f_Mspace")(h)
+                s = self._dense(self._latent_dim, 1.0, "f_Mspace")(h)
             lead = s.shape[:-2]
         else:
             # f_percept: joint observation -> team embedding.
@@ -605,8 +689,8 @@ class FeudalManager(nn.Module):
             # f_Mspace: the latent space the goals live in. Feedforward from `z` and
             # *upstream* of the core, so `s` is a function of the current state alone
             # (no history), exactly as in FuN.
-            s = self._dense(self.n_agents * self.goal_dim, 1.0, "f_Mspace")(z)
-            s = s.reshape(z.shape[:-1] + (self.n_agents, self.goal_dim))
+            s = self._dense(self.n_agents * self._latent_dim, 1.0, "f_Mspace")(z)
+            s = s.reshape(z.shape[:-1] + (self.n_agents, self._latent_dim))
             lead = z.shape[:-1]
 
         if latent_only:
@@ -628,7 +712,7 @@ class FeudalManager(nn.Module):
         # PG detaches the target arm of the cosine. It is ALSO what makes the
         # local branches centralized: the core is where the N per-agent latents
         # are mixed, so goal assignment still reads the whole team.
-        core_in = s.reshape(lead + (self.n_agents * self.goal_dim,))
+        core_in = s.reshape(lead + (self.n_agents * self._latent_dim,))
         if is_global:
             # ...plus a direct read of the env's own global state, for envs where
             # that is NOT recoverable from the observations. `s` stays a pure
@@ -671,8 +755,8 @@ class FeudalManager(nn.Module):
             # the same basis as `s_i`; with a per-agent final layer (as the
             # centralized branch has) `g` would keep N private coordinate systems
             # and the cosine would compare incommensurate axes.
-            y_i = self._dense(self.n_agents * self.goal_dim, 1.0, "f_gpre")(y)
-            y_i = y_i.reshape(y.shape[:-1] + (self.n_agents, self.goal_dim))
+            y_i = self._dense(self.n_agents * self._latent_dim, 1.0, "f_gpre")(y)
+            y_i = y_i.reshape(y.shape[:-1] + (self.n_agents, self._latent_dim))
             goal = self._dense(self.goal_dim, 1.0, "f_goalhead")(nn.tanh(y_i))
         else:
             goal = self._dense(self.n_agents * self.goal_dim, 1.0, "goal_head")(y)
@@ -701,6 +785,7 @@ def init_manager(
     batch_shape=(),
     latent: str = "centralized",
     obs_dim: int = None,
+    latent_dim: int = None,
 ):
     """Build a `FeudalManager`, its params and its initial carry.
 
@@ -708,6 +793,9 @@ def init_manager(
 
     Every latent in ``LOCAL_LATENTS`` needs `obs_dim` so the init pass can
     supply a correctly shaped ``(*batch, n_agents, obs_dim)`` dummy observation.
+
+    `latent_dim` splits the internal bottleneck from the goal width; ``None``
+    keeps them fused, which is the pre-split behaviour exactly.
     """
     manager = FeudalManager(
         n_agents=n_agents,
@@ -716,6 +804,7 @@ def init_manager(
         core=core,
         horizon=horizon,
         latent=latent,
+        latent_dim=latent_dim,
     )
     carry_rng, init_rng = jax.random.split(rng)
     carry = manager.initialize_carry(carry_rng, batch_shape)
@@ -881,6 +970,316 @@ def goal_ring_reset(goal_hist: jnp.ndarray, done) -> jnp.ndarray:
     """
     mask = done.reshape((1,) + done.shape + (1,) * (goal_hist.ndim - done.ndim - 1))
     return jnp.where(mask, 0.0, goal_hist)
+
+
+# ---------------------------------------------------------------------------
+# GoalChannel: how the manager's per-step directive becomes what the worker eats
+# ---------------------------------------------------------------------------
+
+
+class GoalChannel(NamedTuple):
+    """The four operations every goal-conditioning scheme has to provide.
+
+    ONE call shape for all of them, because three separate consumers drive this
+    convention — the training scan (``trainer._env_step``), the eval scan
+    (``trainer.eval_fn``) and ``run.py:view()`` — and a drifted copy of it
+    **renders perfectly happily** while showing a different policy than the one
+    that trained. That is exactly why ``goal_ring_*`` was consolidated in the
+    first place; this keeps the property while adding a second scheme::
+
+        init(lead)                  -> carry
+        write(carry, goal, t, state)-> carry
+        pool(carry, state)          -> pooled goal, what the worker is conditioned on
+        reset(carry, done)          -> carry
+
+    The ring ignores `state`; the waypoint latch ignores `t`. Both ignore
+    **statically** (a python-level closure choice, not a traced branch), the same
+    discipline ``FeudalManager.__call__`` uses for `obs`.
+
+    `lead` is the batch shape in front of ``(n_agents, goal_dim)`` — ``(n_envs,)``
+    in the two scans, ``()`` unbatched in ``view()``. Every operation is
+    rank-agnostic, which is what lets those two layouts share one code path;
+    ``test_channel_helpers_agree_across_batched_and_unbatched_layouts`` pins it.
+    """
+
+    init: object
+    write: object
+    pool: object
+    reset: object
+
+
+def goal_channel(goal_space: str, n_agents: int, goal_dim: int, horizon: int,
+                 waypoint_radius: float = 1.0 / 3.0) -> GoalChannel:
+    """The `GoalChannel` for this `goal_space`.
+
+    ``"latent"`` and ``"position_direction"`` are thin adapters over the
+    **unmodified** ``goal_ring_write`` / ``goal_ring_pool`` / ``goal_ring_reset``
+    above, so every existing direct caller of those (including
+    ``latent_locality_probe``) is untouched and the latent path stays
+    byte-identical.
+
+    ``"position_waypoint"`` latches a target for `horizon` steps and conditions
+    the worker on the LIVE error to it. See ``latch_waypoints`` for the
+    whole-trajectory oracle this must agree with.
+    """
+    if goal_space not in GOAL_SPACES:
+        raise ValueError(
+            f"goal_space must be one of {GOAL_SPACES}, got {goal_space!r}"
+        )
+
+    if goal_space not in WAYPOINT_GOAL_SPACES:
+        return GoalChannel(
+            init=lambda lead: jnp.zeros((horizon,) + tuple(lead) + (n_agents, goal_dim)),
+            write=lambda carry, goal, t, state: goal_ring_write(carry, goal, t),
+            pool=lambda carry, state: goal_ring_pool(carry),
+            reset=lambda carry, done: goal_ring_reset(carry, done),
+        )
+
+    radius = float(waypoint_radius)
+
+    def _init(lead):
+        lead = tuple(lead)
+        # (w, age). `age` has no goal axis: the latch phase is per (env, agent),
+        # and every agent re-latches on its own episode's clock.
+        return (
+            jnp.zeros(lead + (n_agents, goal_dim)),
+            jnp.zeros(lead + (n_agents,), dtype=jnp.int32),
+        )
+
+    def _write(carry, goal, t, state):
+        w, age = carry
+        # Re-latch exactly when the previous commitment expired. `t` is NOT read:
+        # the phase lives in `age`, which resets per env on `done`, so an env that
+        # restarts mid-rollout gets a fresh commitment clock rather than inheriting
+        # the global step's phase.
+        relatch = (age == 0)[..., None]
+        w = jnp.where(relatch, state + radius * goal, w)
+        return w, (age + 1) % horizon
+
+    def _pool(carry, state):
+        w, _ = carry
+        # The LIVE error, recomputed every step from the CURRENT position: this is
+        # a closed loop, and it is the whole difference from a direction goal.
+        # Normalized by `radius` so it is exactly unit-norm at a latch step.
+        return (w - state) / radius
+
+    def _reset(carry, done):
+        w, age = carry
+        mask = done.reshape(done.shape + (1,) * (w.ndim - done.ndim))
+        age_mask = done.reshape(done.shape + (1,) * (age.ndim - done.ndim))
+        return jnp.where(mask, 0.0, w), jnp.where(age_mask, 0, age)
+
+    return GoalChannel(init=_init, write=_write, pool=_pool, reset=_reset)
+
+
+def latch_waypoints(goals, states, horizon, radius, done=None):
+    """``(T, ..., D)`` latched waypoints — the oracle for the waypoint channel.
+
+    The analogue of ``pool_goals`` being the ring's oracle: a whole-trajectory
+    function the in-scan carry is tested against, and simultaneously what
+    ``manager_update`` uses to rebuild `w` differentiably from stored data.
+
+    Closed form, **fully vectorized — no scan**, so ``manager_update`` stays
+    scan-free on the mlp core and the measured no-remat memory story is
+    unchanged::
+
+        last_reset[t] = 0, then max over s < t of (s+1 where done[s])
+        age[t]        = (t - last_reset[t]) % horizon
+        tau[t]        = t - age[t]                    # the step that latched
+        w[t]          = states[tau] + radius * goals[tau]
+
+    `done` must carry the FULL leading shape of `goals` minus its last axis, for
+    the same reason ``transition_cosine`` requires it: a partially-shaped mask
+    broadcasts into nonsense silently.
+    """
+    _check_done(done, goals.shape[:-1], "latch_waypoints")
+
+    T = goals.shape[0]
+    steps = jnp.arange(T)
+    lead = goals.shape[1:-1]
+
+    if done is None:
+        last_reset = jnp.zeros((T,) + lead, dtype=jnp.int32)
+        age = (steps.reshape((T,) + (1,) * len(lead)) - last_reset) % horizon
+    else:
+        d = jnp.broadcast_to(done, (T,) + lead)
+        marker = jnp.where(
+            d > 0, (steps + 1).reshape((T,) + (1,) * len(lead)), 0
+        ).astype(jnp.int32)
+        # Exclusive cumulative max: a done at step s starts a new episode at s+1,
+        # and done[t] itself must NOT reset step t — the same "after the goal is
+        # consumed" convention `goal_ring_reset` documents.
+        running = jax.lax.cummax(marker, axis=0)
+        last_reset = jnp.concatenate(
+            [jnp.zeros((1,) + lead, jnp.int32), running[:-1]], axis=0
+        )
+        age = (steps.reshape((T,) + (1,) * len(lead)) - last_reset) % horizon
+
+    tau = (steps.reshape((T,) + (1,) * len(lead)) - age)[..., None]
+    return jnp.take_along_axis(states, tau, axis=0) + radius * jnp.take_along_axis(
+        goals, tau, axis=0
+    )
+
+
+def latch_steps(goals_shape, horizon, done=None):
+    """``(T, ...)`` 1.0 where a waypoint is issued, i.e. ``age == 0``.
+
+    The manager's transition PG is scored **only here**, and that is not an
+    optimization. At a non-latch `t` the window ``[t, t+c]`` runs past the
+    current waypoint's own expiry, so the score would be attributed to a
+    directive that is no longer in force. At a latch step ``||w_t - s_t|| == R``
+    exactly, so the objective reduces to ``1 - ||w - s_{t+c}|| / R`` — "the
+    fraction of the commanded displacement achieved over the horizon the
+    waypoint was actually in force".
+
+    ⚠ Expect ``valid_fraction`` to fall to ``~1/horizon`` as a result (about 0.1
+    at c=10, against the 0.76-0.88 a latent arm reports). That is correct, not a
+    regression, but it cuts the manager's effective per-update sample count.
+    """
+    T = goals_shape[0]
+    lead = goals_shape[1:-1]
+    steps = jnp.arange(T).reshape((T,) + (1,) * len(lead))
+
+    if done is None:
+        last_reset = jnp.zeros((T,) + lead, dtype=jnp.int32)
+    else:
+        d = jnp.broadcast_to(done, (T,) + lead)
+        marker = jnp.where(d > 0, (steps + 1), 0).astype(jnp.int32)
+        running = jax.lax.cummax(marker, axis=0)
+        last_reset = jnp.concatenate(
+            [jnp.zeros((1,) + lead, jnp.int32), running[:-1]], axis=0
+        )
+    return (((steps - last_reset) % horizon) == 0).astype(jnp.float32)
+
+
+def waypoint_progress(
+    states: jnp.ndarray,
+    goals: jnp.ndarray,
+    horizon: int,
+    radius: float,
+    done: Optional[jnp.ndarray] = None,
+    detach_states: bool = True,
+):
+    """The manager's transition PG under ``goal_space="position_waypoint"``.
+
+    The waypoint analogue of :func:`transition_cosine`, and a drop-in for it:
+    same ``(states, goals, horizon, done)`` argument order, same ``(score,
+    valid)`` return at the same shapes, so ``manager_update`` and
+    ``manager_cosine_metrics`` route on one branch and share one mask::
+
+        progress_t = ( ||w_t - s_t|| - ||w_t - s_{t+c}|| ) / R
+
+    with ``w_t = s_tau + R * g_tau`` the waypoint in force at `t` (see
+    :func:`latch_waypoints`). Multiply by the manager advantage, as for the
+    cosine.
+
+    ⚠ **Scored at LATCH STEPS ONLY, and that is folded into `valid` here rather
+    than left to the caller.** At a non-latch `t` the window ``[t, t+c]`` runs
+    past the current waypoint's own expiry, so the score would be attributed to
+    a directive no longer in force. Folding it in is what keeps the permutation
+    nulls honest: ``manager_cosine_metrics`` computes real and null against ONE
+    shared mask, and a mask that did not know about latching would score the
+    null over steps the real objective never saw.
+
+    At a latch step ``||w_t - s_t|| == R`` exactly (the waypoint is placed at
+    radius `R` from the agent), so the objective reduces to the interpretable
+    ``1 - ||w - s_{t+c}|| / R`` — "the fraction of the commanded displacement
+    actually achieved over the horizon the waypoint was in force". It is <= 1,
+    and negative when the agent ends up further away than it started.
+
+    ⚠ Expect ``valid_fraction`` to fall to roughly ``1/horizon`` (about 0.1 at
+    c=10, against the 0.76-0.88 a latent arm reports). That is correct, not a
+    regression — but it cuts the manager's effective per-update sample count by
+    the same factor, so `manager_lr` / `n_manager_critic_epochs` may need
+    revisiting.
+
+    `detach_states` mirrors :func:`transition_cosine`: the observed trajectory is
+    DATA, and only ``g(theta)`` carries gradient — here through ``w_t``'s
+    ``R * g_tau`` term. Under a grounded goal space `states` is already stored,
+    non-differentiable data, so this is belt-and-braces rather than load-bearing.
+    """
+    _check_done(done, states.shape[:-1], "waypoint_progress")
+
+    target = jax.lax.stop_gradient(states) if detach_states else states
+    w = latch_waypoints(goals, target, horizon, radius, done=done)
+
+    T = states.shape[0]
+    steps = jnp.arange(T)
+    dst = jnp.minimum(steps + horizon, T - 1)
+
+    d_now = jnp.linalg.norm(w - target, axis=-1)
+    d_fut = jnp.linalg.norm(w - jnp.take(target, dst, axis=0), axis=-1)
+    progress = (d_now - d_fut) / radius
+
+    in_range = (steps + horizon <= T - 1).astype(jnp.float32)
+    valid = (
+        _align(in_range, progress)
+        * _same_episode(done, steps, dst, T)
+        * latch_steps(goals.shape, horizon, done=done)
+    )
+    return progress, jnp.broadcast_to(valid, progress.shape)
+
+
+def waypoint_intrinsic_reward(
+    pooled_goal: jnp.ndarray,
+    states: jnp.ndarray,
+    next_states: jnp.ndarray,
+    radius: float,
+) -> jnp.ndarray:
+    """``r^I`` under ``goal_space="position_waypoint"`` — the distance closed by `a_t`::
+
+        r^I_t = ||pg_t|| - || pg_t - (s^+_t - s_t)/R ||
+
+    where ``pg_t = (w_t - s_t)/R`` is exactly ``Transition.pooled_goal`` — the
+    live error vector the worker was conditioned on — and ``s^+_t`` is the
+    pre-reset successor the action actually produced. Algebraically this is
+    ``(||w - s_t|| - ||w - s^+_t||)/R``: the fraction of the waypoint radius the
+    agent closed this step.
+
+    **Three properties, and each replaces a piece of machinery the cosine needed.**
+
+    * **Transition-aligned by construction.** It is a function of ``s^+_t``, so
+      it scores `a_t`, exactly as ``reward[t]`` does. No shift, no offset range,
+      no ``_intrinsic_window``.
+    * **No episode mask.** Every term is local to step `t`, and ``s^+_t`` is the
+      successor of `t`'s OWN episode (read before the reset), so there is no
+      window to straddle a boundary and no episode-ending action to pay 0. The
+      standing bonus for terminating that a shifted endpoint creates cannot
+      arise here.
+    * **It SATURATES.** Over a latch block the sum telescopes to
+      ``(||w - s_latch|| - ||w - s_end||)/R = 1 - ||w - s_end||/R <= 1``,
+      because consecutive terms cancel. This is the structural difference from
+      ``d_cos``, whose non-saturation CLAUDE.md names as one of three compounding
+      causes of the alpha>0 absorbing state: a worker cannot farm this reward
+      indefinitely, it can only ever collect the distance that actually exists
+      between it and its waypoint.
+
+    ⚠ Consequently ``intrinsic_reward_abs`` reads MUCH smaller here than the
+    ~0.155/step of the cosine. alpha is a gradient fraction over unit-std
+    advantages, so this does not change the mixing — but read as a magnitude it
+    looks like a dead signal, and it is not.
+
+    All arguments are detached: a reward is data. Leaving them attached would let
+    the manager raise the worker's reward by moving the yardstick, and would
+    backpropagate the worker's objective into the manager — which FuN rules out
+    because it "would deprive Manager's goals `g` of any semantic meaning".
+    """
+    if next_states.shape != states.shape:
+        raise ValueError(
+            "waypoint_intrinsic_reward: `next_states` must have the same shape "
+            f"as `states`, got {tuple(next_states.shape)} vs "
+            f"{tuple(states.shape)}. It is the per-transition successor readout "
+            "(trainer stores it as Transition.next_state_latent), NOT a shifted "
+            "copy of `states`."
+        )
+    pooled_goal = jax.lax.stop_gradient(pooled_goal)
+    states = jax.lax.stop_gradient(states)
+    next_states = jax.lax.stop_gradient(next_states)
+
+    step = (next_states - states) / radius
+    return jnp.linalg.norm(pooled_goal, axis=-1) - jnp.linalg.norm(
+        pooled_goal - step, axis=-1
+    )
 
 
 # ---------------------------------------------------------------------------

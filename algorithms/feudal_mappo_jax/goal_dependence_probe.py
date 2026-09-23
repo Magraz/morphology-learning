@@ -203,6 +203,23 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
       build a manager whose target tree is missing those leaves, i.e. a
       ``from_bytes`` failure rather than a silent mis-load. Loud, but still
       wrong, and it fails at the arm you were trying to measure.
+
+    ⚠ **`goal_dim` is read off the GOAL HEAD, never off ``f_Mspace``.** Those
+    were the same width until ``manager_latent_dim`` split the manager's
+    internal bottleneck from the goal (a grounded arm runs ``goal_dim=2`` with
+    ``manager_latent_dim=32``). ``f_Mspace`` / ``f_Mspace_agent_kernel`` emit the
+    bottleneck; the goal width lives in ``goal_head`` / ``f_goalhead`` /
+    ``goal_head_agent_kernel``. Both are returned, and they are equal **iff** the
+    arm ran ``goal_space="latent"`` — which is also the only way to tell a
+    grounded checkpoint from a latent one.
+
+    ⚠ **``position_direction`` and ``position_waypoint`` are INDISTINGUISHABLE
+    from the tree.** They differ only in the objective and in what the channel
+    pools, neither of which is a parameter. So a checkpoint tells you the goal
+    space is grounded, not which grounded mode it was — record ``goal_space``
+    and ``waypoint_radius`` in the provenance dict (as this module does) and do
+    not try to infer them. Pinned by
+    ``test_goal_space_is_partially_recoverable_from_the_checkpoint``.
     """
     from flax.serialization import msgpack_restore
 
@@ -234,38 +251,58 @@ def _dims_from_checkpoint(path: Path, n_agents: int) -> dict:
         return "shared"
 
     percept = "f_percept_0" in mgr
-    if "f_Mspace_agent_kernel" in mgr:
-        # (n_agents, manager_hidden, goal_dim)
-        w = mgr["f_Mspace_agent_kernel"]
-        return {
-            "goal_dim": int(w.shape[2]),
-            "manager_hidden_dim": int(w.shape[1]),
-            "hidden_dim": hidden_dim,
-            "manager_latent": (
-                "local_global_private" if percept else "local_private"
-            ),
-            "worker_encoder": _worker_encoder(
-                int(w.shape[1]), int(w.shape[2])
-            ),
-        }
 
-    local = "f_enc_0" in mgr
-    latent = (
-        ("local_global" if percept else "local") if local else "centralized"
-    )
-    return {
-        "goal_dim": int(mgr["f_Mspace"]["kernel"].shape[1])
-        // (1 if local else int(n_agents)),
-        "manager_hidden_dim": int(
+    # ⚠ `goal_dim` MUST come off the GOAL HEAD, not off `f_Mspace`.
+    #
+    # They were the same number until `manager_latent_dim` split the manager's
+    # internal bottleneck from the goal width (grounded arms run goal_dim=2 with
+    # latent_dim=32). `f_Mspace` emits the BOTTLENECK; only the goal head emits
+    # the goal. Reading the old way would rebuild the target tree with the wrong
+    # `goal_dim`, and `from_bytes` would fail at the very arm being measured —
+    # the same failure this function's docstring records for
+    # `local_global_private`.
+    #
+    # The two are equal iff `goal_space == "latent"`, which is how a grounded
+    # checkpoint is recognized at all. See `_goal_space_from_dims`.
+    if "goal_head_agent_kernel" in mgr:          # local_private / local_global_private
+        goal_dim = int(mgr["goal_head_agent_kernel"].shape[2])
+    elif "f_goalhead" in mgr:                    # local / local_global
+        goal_dim = int(mgr["f_goalhead"]["kernel"].shape[1])
+    else:                                        # centralized
+        goal_dim = int(mgr["goal_head"]["kernel"].shape[1]) // int(n_agents)
+
+    if "f_Mspace_agent_kernel" in mgr:
+        # (n_agents, manager_hidden, manager_latent_dim)
+        w = mgr["f_Mspace_agent_kernel"]
+        manager_hidden_dim = int(w.shape[1])
+        latent_dim = int(w.shape[2])
+        manager_latent = "local_global_private" if percept else "local_private"
+        local = True
+    else:
+        local = "f_enc_0" in mgr
+        manager_latent = (
+            ("local_global" if percept else "local") if local else "centralized"
+        )
+        manager_hidden_dim = int(
             mgr["f_enc_0" if local else "f_percept_0"]["kernel"].shape[1]
-        ),
+        )
+        latent_dim = int(mgr["f_Mspace"]["kernel"].shape[1]) // (
+            1 if local else int(n_agents)
+        )
+
+    return {
+        "goal_dim": goal_dim,
+        # None when the widths coincide, so a pre-split checkpoint resolves to
+        # exactly the config it trained under rather than to an equivalent-but-
+        # explicit one.
+        "manager_latent_dim": None if latent_dim == goal_dim else latent_dim,
+        "manager_hidden_dim": manager_hidden_dim,
         "hidden_dim": hidden_dim,
-        "manager_latent": latent,
-        "worker_encoder": _worker_encoder(
-            int(mgr["f_enc_0" if local else "f_percept_0"]["kernel"].shape[1]),
-            int(mgr["f_Mspace"]["kernel"].shape[1])
-            // (1 if local else int(n_agents)),
-        ),
+        "manager_latent": manager_latent,
+        # ⚠ The worker's first Dense is `obs_dim + goal_dim` wide under concat,
+        # so this needs the GOAL width, not the bottleneck — another reason the
+        # two had to be separated above.
+        "worker_encoder": _worker_encoder(manager_hidden_dim, goal_dim),
     }
 
 

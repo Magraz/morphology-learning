@@ -1,0 +1,86 @@
+# @package _global_
+#
+# GROUNDED GOALS, waypoint form: the manager commits each agent a TARGET (x, y)
+# for `goal_horizon` steps and the worker is conditioned on the live error
+# vector to it. Differs from `feudal_film_narrow` in two keys, one of which is
+# forced by the other (see the normalize note below).
+#
+#     s_i = env.goal_state(state)[i]        # agent i's own (x, y), normalized
+#     w_i = s_i + R * unit(ghat_i)          # latched every c steps
+#     worker input = (w_i - s_t,i) / R      # LIVE error, recomputed each step
+#
+# WHY GROUNDING AT ALL — measured, and it is the whole motivation. Under a
+# learned latent the manager owns BOTH arguments of its own objective: it picks
+# the measuring stick `s` AND the target `g`. So `d_cos`'s level is
+# uninterpretable, latent collapse is possible, and every measurement to date
+# says the channel is decorative (eval_gap_permuted ~ 0 on 40 of 45 non-control
+# trials; gap_zeroed systematically NEGATIVE; the best arm in
+# mjx_12a_3o_trunc_1024 is feudal_film_zerogoal_dilated, whose goals are
+# PROVABLY disconnected). With `s` a zero-parameter env readout the manager
+# cannot rotate the yardstick, rank-1 collapse is impossible rather than
+# guarded, and the objective acquires a unit — "did the agent actually get
+# there", in metres.
+#
+# WHY WAYPOINT RATHER THAN DIRECTION — the saturation property, and it is
+# structural. r^I here is the fraction of R closed this step, so over a latch
+# block it TELESCOPES to `1 - ||w - s_end||/R <= 1`. CLAUDE.md names
+# non-saturation as one of three compounding causes of the alpha>0 absorbing
+# state: a worker cannot farm this reward indefinitely, only collect the
+# distance that actually exists between it and its waypoint. `position_direction`
+# has no such bound — see its own header for why it is MORE exposed to the
+# degeneracy than the latent mode it replaces.
+#
+# ⚠ THE SATURATION ARGUMENT IS ONLY ACTIVE AT alpha > 0. At intrinsic_coef=0
+# there is no r^I at all and this differs from the direction arm only in the
+# manager's PG. So `feudal_film_n01_waypoint` is the PRIMARY arm and this one is
+# its control, not the other way round.
+#
+# ⚠ `normalize_pooled_goal: false` IS MANDATORY, and it is set here because the
+# default is true and every feudal_film* ancestor inherits it. The worker's
+# input is the live error vector, whose MAGNITUDE is the distance still to go —
+# the entire content of a waypoint. L2-normalizing it discards exactly that and
+# silently leaves a latched direction, i.e. a worse `position_direction`, while
+# every shape, loss and diagnostic stays healthy. `validate_goal_space` raises
+# rather than letting that happen, so this key is a statement of intent, not a
+# workaround.
+#
+# WHAT TO WATCH, in this order, across the WHOLE run (`local`'s collapse landed
+# by ~10M steps and was permanent):
+#   * goal_heading_dispersion  -> 0 is "everyone sent the same way". Baseline is
+#     ~0.744 at N=12, ~0.778 at N=16 — it depends only on N, NOT on goal_dim,
+#     which is exactly what goal_direction_count could not offer (that metric is
+#     bounded by min(N, goal_dim) = 2 here and saturates: N evenly-spaced
+#     headings and two perpendicular clusters both score exactly 2.0).
+#   * d_cos_var (logged on `progress` here) <~ 1e-3 => constant, annihilated by
+#     advantage centering.
+#   * waypoint_error_norm / waypoint_reached_frac — achievement in world units.
+#
+# ⚠ valid_fraction WILL FALL TO ~1/c (about 0.1 at c=10, against 0.76-0.88 on a
+# latent arm). That is correct: the manager PG is scored at LATCH STEPS ONLY,
+# because at a non-latch t the window [t, t+c] runs past the current waypoint's
+# expiry. It does cut the manager's effective sample count by that factor, so
+# manager_lr / n_manager_critic_epochs may need revisiting.
+#
+# ⚠ intrinsic_reward_abs READS MUCH SMALLER than the ~0.155/step of the cosine.
+# alpha is a gradient fraction over unit-std advantages so this does not change
+# the mixing — but read as a magnitude it looks like a dead signal, and is not.
+#
+# ⚠ gap_zeroed DOES NOT GRADE THIS ARM. A zero error vector is not "no
+# directive", it is the specific, IN-DISTRIBUTION directive "you have arrived"
+# (it happens every time an agent reaches its waypoint). Of the three acceptance
+# conditions in feudal_film.yaml, read gap_constant as the content test here.
+#
+# ACCEPTANCE is the BETWEEN-ARM return on the same env group and seeds, against
+# `feudal_film_narrow` (the width-matched latent rung), `feudal_film_zerogoal`
+# (the goal-free floor) and `mlp` (flat MAPPO: 271.6 / 294.6 on the 12a groups).
+# The goal-dependence probe rules an arm OUT cheaply; it can never rule one IN.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_waypoint trial_id=0
+defaults:
+  - feudal_film_narrow
+  - _self_
+
+model_params:
+  goal_space: position_waypoint
+  normalize_pooled_goal: false

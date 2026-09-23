@@ -1,0 +1,49 @@
+# @package _global_
+#
+# GROUNDED GOALS, direction form: `g_i` is a unit direction in world (x, y) and
+# the existing d_cos objective applies VERBATIM. One key from
+# `feudal_film_narrow`.
+#
+#     s_i = env.goal_state(state)[i]     # agent i's own (x, y), normalized
+#     g_i = unit(ghat_i)                 # "head north-east"
+#     manager PG: d_cos(s_{t+c} - s_t, g_t)      <- unchanged function
+#     r^I:        worker_intrinsic_reward_aligned <- unchanged function
+#
+# ⚠ THIS IS THE ATTRIBUTION RUNG AND THE TEST FIXTURE, NOT THE ARM EXPECTED TO
+# WIN. Read this before spending a run budget on it.
+#
+# Manager and worker still climb ONE objective through the environment, where no
+# gradient crosses FuN's detach. Under `latent` that degenerate fixed point was
+# "freeze on one direction and drive `s` along it" — measured on
+# feudal_film_n01_local as goal_direction_count 1.45 at a task return of 1.4,
+# with one FROZEN vector recovering 95% of the return. The physical analogue
+# here, "everyone go north-east, everyone complies, r^I farmed at task return
+# ~ 0", is EASIER to reach, not harder: a force-controlled agent achieves any
+# commanded heading trivially and there is no bounded resource to exhaust.
+# `position_waypoint` is structurally protected by a saturating reward; this is
+# not. If you run one grounded arm at length, run the waypoint one.
+#
+# What this arm IS for:
+#   * it isolates "grounded manager objective" from "waypoint's latch +
+#     saturating reward" if the waypoint arm moves;
+#   * it exercises the grounded path WITHOUT the latch, so a foundation bug
+#     localizes away from the waypoint machinery;
+#   * its d_cos is directly comparable to every recorded latent d_cos, now with
+#     a unit: "did the agent actually move the way it was told".
+#
+# ⚠ Two reading hazards specific to this mode:
+#   * NEAR-STATIONARY AGENTS DILUTE d_cos. With a learned `s` the state always
+#     moved; a physical agent may not, and `_unit` is zero-safe, so a
+#     mechanically dead agent scores cos ~ 0 and is indistinguishable from a
+#     disobedient one. Read `displacement_norm_mean` alongside.
+#   * goal_heading_dispersion -> 0 across the run is the degeneracy above.
+#     Baseline ~0.744 at N=12, ~0.778 at N=16.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_position trial_id=0
+defaults:
+  - feudal_film_narrow
+  - _self_
+
+model_params:
+  goal_space: position_direction

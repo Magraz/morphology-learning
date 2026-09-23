@@ -239,7 +239,19 @@ def test_view_records_actual_manager_outputs_and_final_observation(monkeypatch, 
 
     runner = object.__new__(Feudal_MAPPO_JAX_Runner)
     runner.env = env
-    runner.config = SimpleNamespace(goal_horizon=2, goal_dim=3)
+    # A stand-in for MAPPOConfig. Every key `view()` reads must be present:
+    # a SimpleNamespace raises AttributeError rather than falling back, so a
+    # missing one fails the test instead of silently taking a default path.
+    # (`worker_encoder` was already missing here before `goal_space` was added —
+    # these three cases have been failing at HEAD.)
+    runner.config = SimpleNamespace(
+        goal_horizon=2,
+        goal_dim=3,
+        worker_encoder="none",
+        goal_space="latent",
+        manager_latent_dim=None,
+        waypoint_radius=1.0 / 3.0,
+    )
     runner.dirs = {"logs": tmp_path}
     runner.rng_seed = 0
     runner._load_train_state = lambda: SimpleNamespace(

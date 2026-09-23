@@ -218,6 +218,46 @@ def unsupported_env_reason(env):
     return None
 
 
+def unsupported_goal_space_reason(config) -> str | None:
+    """Why these probes cannot read this arm's goal space — or ``None``.
+
+    Separate from :func:`unsupported_env_reason` because it is a property of the
+    ARM, not the env: the same env supports both, and a grounded arm is
+    unsupported for a reason that is interesting rather than merely technical.
+
+    Both probes measure the manager's LEARNED latent — the block Jacobian
+    ``d s[i]/d obs_j`` (locality) and the participation ratio over the N rows of
+    `s` (diversity). Under a grounded ``goal_space`` the objective's `s` is not
+    that tensor at all: it is ``env.goal_state(state)``, a zero-parameter readout
+    of agent positions. So:
+
+    * **the locality question is answered by construction**, and trivially:
+      ``d s[i]/d pos_j`` is exactly ``delta_ij / extent``, i.e. diag share 1.0.
+      Reporting that as a measurement would be reporting the definition;
+    * the tensor the probes WOULD measure is ``s_learned``, the manager's
+      internal bottleneck. That is still a meaningful collapse detector — it is
+      what `state_latent_erank` tracks — but it is no longer the space the goals
+      live in, so its participation ratio is NOT comparable to the recorded
+      8.9-9.2 (centralized) / 1.0-2.9 (local) figures those probes exist to
+      compare;
+    * goal diversity for a grounded arm is `goal_heading_dispersion`
+      (``mappo._heading_dispersion``), whose baseline depends only on N.
+    """
+    goal_space = getattr(config, "goal_space", "latent")
+    if goal_space == "latent":
+        return None
+    return (
+        f"arm runs goal_space={goal_space!r}: the objective's `s` is the env's "
+        "zero-parameter position readout, so locality is exact BY CONSTRUCTION "
+        "(d s[i]/d pos_j = delta_ij/extent, diag share 1.0) and there is nothing "
+        "to measure. The learned `s` these probes would read is the manager's "
+        "internal bottleneck, whose participation ratio is not comparable to the "
+        "latent-arm figures. Read `goal_heading_dispersion` in the training "
+        "stats for goal diversity, and measure the matched latent twin "
+        "(feudal_film_narrow) if you want these numbers"
+    )
+
+
 def collect_states(runner, manager, m_params, worker, w_params, key,
                    n_envs, n_samples, stride, keep_env_states=False,
                    worker_encoder="none"):
@@ -241,6 +281,12 @@ def collect_states(runner, manager, m_params, worker, w_params, key,
     reason = unsupported_env_reason(env)
     if reason is not None:
         raise NotImplementedError(f"latent probes do not support this env: {reason}")
+    # Same single choke point, for the ARM rather than the env: `collect_states`
+    # also hardcodes the ring-based goal channel below, which a waypoint arm does
+    # not use. Raising here means neither probe can bypass it.
+    reason = unsupported_goal_space_reason(runner.config)
+    if reason is not None:
+        raise NotImplementedError(f"latent probes do not support this arm: {reason}")
     N, obs_dim, act_dim = env.n_agents, env.observation_dim, env.action_dim
     horizon, goal_dim = runner.config.goal_horizon, runner.config.goal_dim
     v_reset, v_step = jax.vmap(env.reset), jax.vmap(env.step)

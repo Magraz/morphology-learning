@@ -902,6 +902,24 @@ class SyncMacroMJX:
         """Underlying base ``EnvState`` from either macro-state representation."""
         return state.env_state if isinstance(state, StaggeredMacroState) else state
 
+    def goal_state(self, state) -> jnp.ndarray:
+        """Forward the base env's grounded goal space, `(n_agents, 2)`.
+
+        FORWARDED, not refused — unlike `global_state` a few lines up in
+        ``__init__``. The difference is the failure mode: a missing
+        `global_state` would make the trainers fall back to concat-obs
+        **silently**, training the wrong thing while the config claimed
+        otherwise, whereas a missing `goal_state` makes
+        ``validate_goal_space`` **raise** before the run starts. Agent positions
+        are a property of the physics, which the macro window does not change,
+        so there is nothing wrapper-specific to reinterpret.
+        """
+        return self.env.goal_state(self.base_state(state))
+
+    @property
+    def goal_state_dim(self) -> int:
+        return self.env.goal_state_dim
+
 
 if __name__ == "__main__":
     import argparse

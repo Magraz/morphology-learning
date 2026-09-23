@@ -31,6 +31,7 @@ from algorithms.feudal_mappo_jax.manager import (
 )
 from algorithms.feudal_mappo_jax.mappo import (
     create_train_state,
+    resolve_goal_space,
     validate_worker_objective,
     validate_worker_encoder,
 )
@@ -268,6 +269,9 @@ class Feudal_MAPPO_JAX_Runner:
             manager_hidden_dim=self.model_params.manager_hidden_dim,
             manager_core=self.model_params.manager_core,
             manager_latent=self.model_params.manager_latent,
+            manager_latent_dim=self.model_params.manager_latent_dim,
+            goal_space=self.model_params.goal_space,
+            waypoint_radius=self.model_params.waypoint_radius,
             goal_embed_dim=self.model_params.goal_embed_dim,
             normalize_pooled_goal=self.model_params.normalize_pooled_goal,
             zero_goal=self.model_params.zero_goal,
@@ -304,6 +308,12 @@ class Feudal_MAPPO_JAX_Runner:
         # `f_enc` on a centralized latent) or would apply a stale gradient
         # (n_manager_epochs > 1), warns on concat fusion and on intrinsic_only.
         validate_worker_encoder(self.config)
+        # Likewise for `goal_space`, which also DERIVES `goal_dim` from the env
+        # when the goal is grounded. Assigned back, so the banner below and the
+        # runner both report the width that will actually be built — a stale yaml
+        # `goal_dim` otherwise trains the worker on a wrong-width directive for a
+        # full update before anything raises.
+        self.config = resolve_goal_space(self.config, self.env)
 
         print(
             f"FeUdal MAPPO | env={environment} | n_envs={self.config.n_envs} | "
@@ -324,6 +334,22 @@ class Feudal_MAPPO_JAX_Runner:
             f"hidden={self.config.manager_hidden_dim} "
             f"latent={self.config.manager_latent} | "
             f"alpha(intrinsic)={self.config.intrinsic_coef}"
+        )
+        # What the goal MEANS. Printed unconditionally for the same reason the
+        # centralized-input line is: nothing validates the `env:` block, and a
+        # grounded arm whose flag did not land would train as plain latent feudal
+        # under a name claiming otherwise.
+        _grounded = self.config.goal_space != "latent"
+        print(
+            f"  goal space: {self.config.goal_space} "
+            f"(s = {'env.goal_state, 0 params' if _grounded else 'learned f_Mspace'}) | "
+            f"goal_dim={self.config.goal_dim} "
+            f"latent_dim={self.config.manager_latent_dim or self.config.goal_dim}"
+            + (
+                f" | R={self.config.waypoint_radius:.4g} of world extent"
+                if self.config.goal_space == "position_waypoint"
+                else ""
+            )
         )
         # Say what the WORKER is optimizing. Under 'intrinsic_only' alpha is
         # inert, so the line above would otherwise be the only intrinsic
@@ -718,11 +744,11 @@ class Feudal_MAPPO_JAX_Runner:
 
         import jax.numpy as jnp
 
-        from algorithms.feudal_mappo_jax.manager import (
-            goal_ring_pool,
-            goal_ring_write,
+        from algorithms.feudal_mappo_jax.manager import GROUNDED_GOAL_SPACES
+        from algorithms.feudal_mappo_jax.mappo import (
+            build_goal_channel,
+            build_manager,
         )
-        from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
         from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
@@ -796,11 +822,28 @@ class Feudal_MAPPO_JAX_Runner:
             )
             return actions
 
+        # The SAME constructor the training and eval scans use. `view()` had its
+        # own copy of the ring convention until that was consolidated, and a
+        # drifted copy renders perfectly happily — it just shows a different
+        # policy than the one that trained. Under `position_waypoint` the ring is
+        # not even the right structure (the worker eats a live error vector, not
+        # a sum of directions), so routing through the channel is what keeps the
+        # rendered policy provably the trained one.
+        channel = build_goal_channel(self.config, self.env.n_agents)
+        grounded = self.config.goal_space in GROUNDED_GOAL_SPACES
+
+        def _goal_state_for(state):
+            """The grounded `s` for one UNBATCHED state, or None under `latent`."""
+            if not grounded:
+                return None
+            base = type(self.env).base_state(state) if is_macro else state
+            return self.env.goal_state(base)
+
         def _fresh_goal_state():
-            """Per-episode manager memory: zeroed ring + zeroed core carry."""
+            """Per-episode manager memory: zeroed channel carry + core carry."""
             return (
                 manager.initialize_carry(jax.random.PRNGKey(0), ()),
-                jnp.zeros((horizon, self.env.n_agents, goal_dim)),
+                channel.init(()),
             )
 
         def _advance_goal(m_carry, goal_hist, t, obs, state):
@@ -816,10 +859,19 @@ class Feudal_MAPPO_JAX_Runner:
             m_carry, goal, latent = manager_fn(
                 m_carry, obs, _global_state_for(state, obs)
             )
+            # Under a grounded goal space the PLOT must show the space the goals
+            # actually live in — the env readout — not the manager's internal
+            # bottleneck. They are different widths, so feeding the latter would
+            # raise in `save_goal_plot` rather than mislead; but the right fix is
+            # to plot the real thing, which is also a literal 2-D map of the
+            # arena rather than a PCA projection.
+            s_now = _goal_state_for(state)
+            if s_now is None:
+                s_now = latent
             episode_goals.append(np.asarray(goal))
-            episode_latents.append(np.asarray(latent))
-            goal_hist = goal_ring_write(goal_hist, goal, t)
-            return m_carry, goal_hist, goal_ring_pool(goal_hist)
+            episode_latents.append(np.asarray(s_now))
+            goal_hist = channel.write(goal_hist, goal, t, s_now)
+            return m_carry, goal_hist, channel.pool(goal_hist, s_now)
 
         def _draw(state, obs):
             """Append one rendered frame (+ native) for the given base state."""
@@ -889,7 +941,10 @@ class Feudal_MAPPO_JAX_Runner:
             _, _, final_latent = manager_fn(
                 m_carry, obs, _global_state_for(state, obs)
             )
-            episode_latents.append(np.asarray(final_latent))
+            final_s = _goal_state_for(state)
+            episode_latents.append(
+                np.asarray(final_latent if final_s is None else final_s)
+            )
             save_goal_plot(
                 episode_goals, episode_latents, horizon,
                 self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
@@ -942,11 +997,11 @@ class Feudal_MAPPO_JAX_Runner:
 
         import jax.numpy as jnp
 
-        from algorithms.feudal_mappo_jax.manager import (
-            goal_ring_pool,
-            goal_ring_write,
+        from algorithms.feudal_mappo_jax.manager import GROUNDED_GOAL_SPACES
+        from algorithms.feudal_mappo_jax.mappo import (
+            build_goal_channel,
+            build_manager,
         )
-        from algorithms.feudal_mappo_jax.mappo import build_manager
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
         from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
@@ -957,6 +1012,12 @@ class Feudal_MAPPO_JAX_Runner:
         n_agents = self.env.n_agents
         obs_dim = self.env.observation_dim
         manager = build_manager(self.config, n_agents)
+        # Same constructor as the training and eval scans, so this renderer
+        # cannot condition the worker differently than training did. SMAX
+        # publishes no `goal_state`, so a grounded arm never reaches here
+        # (`validate_goal_space` raises at construction) and this is the latent
+        # ring — but it is built the one way regardless.
+        channel = build_goal_channel(self.config, n_agents)
         horizon, goal_dim = self.config.goal_horizon, self.config.goal_dim
 
         reset_fn = jax.jit(self.env.reset)
@@ -995,7 +1056,11 @@ class Feudal_MAPPO_JAX_Runner:
             # Per-episode manager memory: zeroed core carry + zeroed goal ring, the
             # same convention the training and eval scans use.
             m_carry = manager.initialize_carry(jax.random.PRNGKey(0), ())
-            goal_hist = jnp.zeros((horizon, n_agents, goal_dim))
+            # Channel rather than a bare ring, for the same one-convention
+            # reason as the MJX path above. SMAX publishes no `goal_state`, so a
+            # grounded arm never reaches here — `validate_goal_space` raises at
+            # construction — and this is the latent ring either way.
+            goal_hist = channel.init(())
 
             state_seq, rewards = [], []
             episode_goals, episode_latents = [], []
@@ -1007,8 +1072,10 @@ class Feudal_MAPPO_JAX_Runner:
                 )
                 episode_goals.append(np.asarray(goal))
                 episode_latents.append(np.asarray(latent))
-                goal_hist = goal_ring_write(goal_hist, goal, t)
-                actions = policy_fn(obs, goal_ring_pool(goal_hist), avail_fn(state))
+                goal_hist = channel.write(goal_hist, goal, t, latent)
+                actions = policy_fn(
+                    obs, channel.pool(goal_hist, latent), avail_fn(state)
+                )
                 state_seq.append(
                     (state.key, state.env_state, self.env.to_action_dict(actions))
                 )
@@ -1127,7 +1194,22 @@ class Feudal_MAPPO_JAX_Runner:
             # depend on the goals, so every gap is large by construction and none
             # of them grades the arm.
             "worker_objective": str(config.worker_objective),
+            # ⚠ UNPARAMETERIZED, and therefore recorded here or nowhere. Neither
+            # appears in the checkpoint: `_dims_from_checkpoint` can tell a
+            # grounded arm from a latent one (the goal head is narrower than
+            # `f_Mspace`) but CANNOT tell `position_direction` from
+            # `position_waypoint`, whose param trees are identical. They also
+            # change what the gaps MEAN: under a waypoint goal the `zeroed`
+            # variant is the in-distribution directive "you have arrived", not
+            # the absence of one, so `gap_zeroed` does not grade that arm the way
+            # it grades the others — read `gap_constant` there.
+            "goal_space": str(config.goal_space),
+            "waypoint_radius": float(config.waypoint_radius),
             "goal_dim": int(config.goal_dim),
+            "manager_latent_dim": (
+                None if config.manager_latent_dim is None
+                else int(config.manager_latent_dim)
+            ),
             "goal_horizon": int(config.goal_horizon),
             "n_agents": int(self.env.n_agents),
             "by_shift": {},

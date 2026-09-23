@@ -33,14 +33,30 @@ from algorithms.feudal_mappo_jax.manager import (
     LATENTS,
     LOCAL_LATENTS,
     PRIVATE_LATENTS,
+    _unit,
     constant_goals,
+    goal_channel,
+    init_manager,
+    latch_steps,
+    latch_waypoints,
     mean_goal_direction,
     pool_goals,
+    transition_cosine,
+    waypoint_intrinsic_reward,
+    waypoint_progress,
 )
-from algorithms.feudal_mappo_jax.mappo import build_manager
+from algorithms.feudal_mappo_jax.mappo import (
+    _agent_direction_count,
+    _agent_gram,
+    _heading_dispersion,
+    build_manager,
+    manager_cosine_metrics,
+    resolve_goal_space,
+    validate_goal_space,
+)
 from algorithms.feudal_mappo_jax.network import evaluate_action
 from algorithms.feudal_mappo_jax.trainer import make_train
-from algorithms.feudal_mappo_jax.types import MAPPOConfig
+from algorithms.feudal_mappo_jax.types import MAPPOConfig, Transition
 from algorithms.feudal_mappo_jax.worker import bind_goal
 
 @pytest.fixture(autouse=True)
@@ -130,6 +146,38 @@ class StubEnv:
         if self.per_agent_rewards:
             reward = jnp.full((self.n_agents,), reward)
         return obs, state, reward, terminated, truncated, info
+
+    # --- the GROUNDED goal space -------------------------------------------
+    # A stand-in for `MultiBoxPushMJX.goal_state`: each agent's own position,
+    # normalized. Deliberately a CLOSED FORM of (t, seed, agent index) so a test
+    # can recompute the expected value without calling the env — which is what
+    # makes "the trainer stored the env readout" a real assertion rather than a
+    # tautology. Per-agent distinct, moves every step, bounded like a normalized
+    # position, and it JUMPS at a reset (new seed, t -> 0) — the last property is
+    # what gives `next_state_latent`-vs-reset its teeth.
+    goal_state_dim = 2
+
+    def goal_state(self, state):
+        i = jnp.arange(self.n_agents, dtype=jnp.float32)
+        ang = 0.3 * state.t + 0.7 * i + state.seed
+        return 0.4 * jnp.stack([jnp.cos(ang), jnp.sin(ang)], axis=-1)
+
+
+class NoGoalStateStubEnv(StubEnv):
+    """`StubEnv` with the grounded hook REMOVED.
+
+    Exists for two tests that cannot be written any other way: that a grounded
+    arm RAISES rather than silently falling back to the learned latent, and that
+    merely having the hook present changes nothing under `goal_space="latent"`.
+    """
+
+    goal_state = None
+    goal_state_dim = None
+
+    def __getattribute__(self, name):
+        if name in ("goal_state", "goal_state_dim"):
+            raise AttributeError(name)
+        return super().__getattribute__(name)
 
 
 def _config(**overrides):
@@ -2986,4 +3034,535 @@ def test_shared_encoder_widens_the_workers_first_dense_to_the_encoder(fusion, wi
     ]
     assert raw.shape[0] != kernel.shape[0], (
         "shared and raw encoders must not be checkpoint-compatible"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grounded goal spaces (`goal_space`): the foundation, the waypoint latch, and
+# the two things that would otherwise fail SILENTLY.
+#
+# The pattern throughout is the repo's own: assert against an ORACLE computed a
+# different way (a closed form, or a whole-trajectory function) rather than
+# against the implementation's own output, so a convention that drifts is caught
+# instead of being reproduced on both sides.
+# ---------------------------------------------------------------------------
+
+GROUNDED = ["position_direction", "position_waypoint"]
+
+
+def _grounded_config(goal_space, **overrides):
+    """A config for a grounded arm. `goal_dim` is DERIVED, so it is not passed."""
+    cfg = dict(
+        goal_space=goal_space,
+        manager_latent_dim=GOAL_DIM,
+        worker_fusion="film",
+    )
+    if goal_space == "position_waypoint":
+        cfg["normalize_pooled_goal"] = False
+    cfg.update(overrides)
+    return _config(**cfg)
+
+
+def _goal_state_oracle(env, states):
+    """`env.goal_state` recomputed from the CLOSED FORM, not by calling the env."""
+    i = jnp.arange(env.n_agents, dtype=jnp.float32)
+    ang = 0.3 * states.t[..., None] + 0.7 * i + states.seed[..., None]
+    return 0.4 * jnp.stack([jnp.cos(ang), jnp.sin(ang)], axis=-1)
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_grounded_goal_dim_is_derived_from_the_env(goal_space):
+    """A stale yaml `goal_dim` must be OVERRIDDEN, not merely rejected.
+
+    It would otherwise raise only inside `cosine_similarity` in
+    `manager_update` — after `ppo_update` has already trained the worker on a
+    wrong-width "error vector" for a full update. Loud, but far too late.
+    """
+    cfg = _grounded_config(goal_space, goal_dim=999)
+    resolved = resolve_goal_space(cfg, StubEnv())
+    assert resolved.goal_dim == StubEnv.goal_state_dim == 2
+    # ...and the latent path is untouched, by identity rather than by equality.
+    latent = _config()
+    assert resolve_goal_space(latent, StubEnv()) is latent
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_grounded_mode_rejects_an_env_without_the_hook(goal_space):
+    """Falling back to the learned latent would be a whole dead arm."""
+    with pytest.raises(ValueError, match="goal_state"):
+        resolve_goal_space(_grounded_config(goal_space), NoGoalStateStubEnv())
+    with pytest.raises(ValueError, match="goal_state"):
+        make_train(_grounded_config(goal_space), NoGoalStateStubEnv())
+
+
+def test_validate_goal_space_rejects_incoherent_settings():
+    """Every raising rule, from the shared validator."""
+    env = StubEnv()
+    with pytest.raises(ValueError, match="not one of"):
+        validate_goal_space(_config(goal_space="bogus"), env)
+    # manager_latent_dim fused with a 2-wide goal strangles the core: it would
+    # see 2*n_agents numbers as its whole view of the world, and nothing else
+    # would notice.
+    with pytest.raises(ValueError, match="manager_latent_dim"):
+        validate_goal_space(
+            _config(goal_space="position_direction"), env
+        )
+    # The waypoint's magnitude IS the distance to go; normalizing silently
+    # degrades the arm into a worse position_direction.
+    with pytest.raises(ValueError, match="normalize_pooled_goal"):
+        validate_goal_space(
+            _config(
+                goal_space="position_waypoint",
+                manager_latent_dim=GOAL_DIM,
+                normalize_pooled_goal=True,
+            ),
+            env,
+        )
+
+
+def test_validate_goal_space_warns_without_blocking():
+    """Concat fusion and the zero-goal isolate stay runnable on purpose."""
+    env = StubEnv()
+    with pytest.warns(RuntimeWarning, match="concat"):
+        validate_goal_space(
+            _config(
+                goal_space="position_direction",
+                manager_latent_dim=GOAL_DIM,
+                worker_fusion="concat",
+            ),
+            env,
+        )
+    with pytest.warns(RuntimeWarning, match="zero_goal"):
+        validate_goal_space(
+            _grounded_config("position_direction", zero_goal=True), env
+        )
+
+
+def test_manager_latent_dim_none_reproduces_the_fused_param_tree():
+    """The width split must be an IDENTITY at its default.
+
+    Byte-for-byte, on every leaf, for every latent — otherwise the split is a
+    silent perturbation of every existing arm rather than a new knob.
+    """
+    for latent in LATENTS:
+        kw = dict(
+            global_state_dim=N_AGENTS * OBS_DIM,
+            n_agents=N_AGENTS,
+            goal_dim=GOAL_DIM,
+            hidden_dim=16,
+            core="mlp",
+            horizon=HORIZON,
+            batch_shape=(N_ENVS,),
+            latent=latent,
+            obs_dim=OBS_DIM,
+        )
+        _, fused, _ = init_manager(jax.random.PRNGKey(0), **kw)
+        _, explicit, _ = init_manager(
+            jax.random.PRNGKey(0), latent_dim=GOAL_DIM, **kw
+        )
+        a = jax.tree_util.tree_leaves(fused)
+        b = jax.tree_util.tree_leaves(explicit)
+        assert len(a) == len(b) and len(a) > 0
+        for x, y in zip(a, b):
+            assert jnp.array_equal(x, y), f"latent={latent}: param tree differs"
+
+
+def test_manager_latent_dim_actually_decouples_the_widths():
+    """Guards the guard: the test above would pass on a no-op implementation."""
+    manager, params, carry = init_manager(
+        jax.random.PRNGKey(0),
+        global_state_dim=N_AGENTS * OBS_DIM,
+        n_agents=N_AGENTS,
+        goal_dim=2,
+        hidden_dim=16,
+        core="mlp",
+        horizon=HORIZON,
+        batch_shape=(N_ENVS,),
+        latent="centralized",
+        obs_dim=OBS_DIM,
+        latent_dim=GOAL_DIM,
+    )
+    _, goal, s = manager.apply(
+        params, carry, jnp.ones((N_ENVS, N_AGENTS * OBS_DIM))
+    )
+    assert goal.shape == (N_ENVS, N_AGENTS, 2), "goal head must follow goal_dim"
+    assert s.shape == (N_ENVS, N_AGENTS, GOAL_DIM), (
+        "the bottleneck must follow manager_latent_dim, not goal_dim — fused, "
+        "the core would see 2*n_agents numbers as its whole view of the world"
+    )
+
+
+def test_goal_state_hook_presence_is_inert():
+    """Merely HAVING the hook must change nothing under `goal_space="latent"`.
+
+    This is the structural proof that `goal_state` may be an unconditional
+    method, unlike `global_state`, whose `hasattr` gate is the trainers' only
+    switch and would therefore flip every existing arm.
+    """
+    cfg = _config()
+    out = []
+    for env in (StubEnv(), NoGoalStateStubEnv()):
+        init_fn, collect_fn, update_fn, _, _ = make_train(cfg, env)
+        rs = init_fn(jax.random.PRNGKey(0))
+        rs, traj, boot, _ = collect_fn(rs)
+        rs, losses = update_fn(rs, traj, boot)
+        out.append((traj, losses, rs))
+
+    (t0, l0, r0), (t1, l1, r1) = out
+    for a, b, name in zip(t0, t1, Transition._fields):
+        assert jnp.array_equal(jnp.asarray(a), jnp.asarray(b)), (
+            f"Transition.{name} differs merely because the env has a goal_state hook"
+        )
+    for k in l0:
+        assert jnp.array_equal(
+            jnp.asarray(l0[k]), jnp.asarray(l1[k])
+        ), f"loss {k} differs merely because the env has a goal_state hook"
+    for x, y in zip(
+        jax.tree_util.tree_leaves(r0.train_state),
+        jax.tree_util.tree_leaves(r1.train_state),
+    ):
+        assert jnp.array_equal(x, y), "post-update params differ"
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_grounded_mode_stores_the_env_readout(goal_space):
+    """`state_latent` IS the env's readout, and is independent of the manager.
+
+    Checked against the closed-form oracle, so this cannot pass by the trainer
+    and the test agreeing on a shared mistake.
+    """
+    cfg = _grounded_config(goal_space)
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    assert traj.state_latent.shape == (N_STEPS, N_ENVS, N_AGENTS, 2), (
+        "width must follow env.goal_state_dim, not goal_dim"
+    )
+
+    # Assert against the ORACLE'S CLOSED FORM rather than against a second run.
+    # (Re-running with a different init key would also reseed the envs, and
+    # perturbing the manager changes the policy and hence the states it visits —
+    # so neither is a test of "this came from the env".) The stub's readout is
+    # `0.4 * (cos(ang), sin(ang))` with `ang = 0.3*t + 0.7*i + seed`, which is
+    # pinned by two properties that no learned latent would satisfy:
+    latent = np.asarray(traj.state_latent)
+
+    #   (a) constant radius 0.4, exactly;
+    radii = np.linalg.norm(latent, axis=-1)
+    assert np.allclose(radii, 0.4, atol=1e-5), (
+        "the stored state is not the env's readout — its radius is not constant, "
+        f"got {radii.min():.4f}..{radii.max():.4f}"
+    )
+
+    #   (b) a fixed 0.7 rad offset between consecutive agents, at every step.
+    ang = np.arctan2(latent[..., 1], latent[..., 0])
+    gap = np.diff(ang, axis=-1)
+    gap = (gap + np.pi) % (2 * np.pi) - np.pi
+    assert np.allclose(gap, 0.7, atol=1e-4), (
+        "consecutive agents are not 0.7 rad apart; the stored state is not the "
+        "env readout the oracle describes"
+    )
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_grounded_next_state_latent_is_the_successor_not_the_reset(goal_space):
+    """The one ordering mistake that leaves every other check passing.
+
+    `_restart_done` rebinds `next_obs`/`next_env_state` IN PLACE, so reading the
+    successor readout after it would score the freshly reset episode — which is
+    a standing reward for terminating.
+    """
+    cfg = _grounded_config(goal_space, intrinsic_coef=0.1, intrinsic_anneal="none")
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done = np.asarray(traj.done)
+    assert done.any(), "vacuous: no episode ended during the rollout"
+    nxt = np.asarray(traj.next_state_latent)
+    cur = np.asarray(traj.state_latent)
+    for t in range(N_STEPS - 1):
+        for e in range(N_ENVS):
+            if done[t, e]:
+                # The reset jumps the readout (new seed, t -> 0), so the stored
+                # successor must NOT be the next stored pre-step state.
+                assert not np.allclose(nxt[t, e], cur[t + 1, e], atol=1e-6), (
+                    "next_state_latent was read AFTER the reset"
+                )
+            else:
+                assert np.allclose(nxt[t, e], cur[t + 1, e], atol=1e-6)
+
+
+def test_waypoint_latch_matches_its_oracle():
+    """The in-scan channel vs the whole-trajectory closed form.
+
+    The waypoint analogue of `test_goal_ring_matches_pool_goals_oracle`, and it
+    must survive a full wrap-around AND a mid-rollout done: `N_STEPS=12`,
+    `HORIZON=3`, `EPISODE_LEN=5` force both.
+    """
+    cfg = _grounded_config("position_waypoint")
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    w = latch_waypoints(
+        traj.goal, traj.state_latent, HORIZON, cfg.waypoint_radius, done=done_a
+    )
+    expected = (w - traj.state_latent) / cfg.waypoint_radius
+    assert jnp.allclose(traj.pooled_goal, expected, atol=1e-5), (
+        "the in-scan latch disagrees with `latch_waypoints`; a drifted copy of "
+        "this convention renders and trains perfectly happily"
+    )
+
+
+def test_the_error_vector_is_unit_norm_exactly_at_latch_steps():
+    """One exact invariant catching three different mistakes.
+
+    `w = s + R*unit(ghat)`, so `||(w - s)/R|| == 1` at the step the waypoint was
+    issued — and only there. A wrong radius, a wrong latch phase, or a stray
+    `normalize_pooled_goal` each break it.
+    """
+    cfg = _grounded_config("position_waypoint")
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    at_latch = np.asarray(latch_steps(traj.goal.shape, HORIZON, done=done_a)) > 0
+    norms = np.asarray(jnp.linalg.norm(traj.pooled_goal, axis=-1))
+    assert at_latch.any() and not at_latch.all(), "vacuous latch mask"
+    assert np.allclose(norms[at_latch], 1.0, atol=1e-4), (
+        "the error vector is not unit-norm at a latch step"
+    )
+    # And the agent generally moves, so away from a latch step it should not be.
+    assert not np.allclose(norms[~at_latch], 1.0, atol=1e-4)
+
+
+def test_waypoint_manager_pg_is_scored_only_at_latch_steps():
+    """`valid` must be a SUBSET of the latch steps, and roughly 1/c of them.
+
+    At a non-latch `t` the window [t, t+c] runs past the current waypoint's own
+    expiry, so the score would be credited to a directive no longer in force.
+    """
+    cfg = _grounded_config("position_waypoint")
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    _, valid = waypoint_progress(
+        traj.state_latent, traj.goal, HORIZON, cfg.waypoint_radius, done=done_a
+    )
+    at_latch = latch_steps(traj.goal.shape, HORIZON, done=done_a)
+    assert jnp.all(valid <= at_latch + 1e-6), "scored a non-latch step"
+    assert float(valid.mean()) > 0.0, "nothing was scored at all"
+
+
+def test_waypoint_intrinsic_reward_telescopes():
+    """Summed over a latch block it collapses to the distance actually closed.
+
+    This is the SATURATION property, and it is the reason the waypoint form
+    leads: a worker cannot farm this reward indefinitely, only collect the
+    distance that exists between it and its waypoint. `d_cos` has no such bound,
+    which CLAUDE.md names as one of three causes of the alpha>0 absorbing state.
+    """
+    T, E, N, D, C, R = 16, 2, 3, 2, 4, 0.25
+    goals = _unit(jax.random.normal(jax.random.PRNGKey(0), (T, E, N, D)))
+    states = jnp.cumsum(
+        jax.random.normal(jax.random.PRNGKey(1), (T, E, N, D)) * 0.05, axis=0
+    )
+    channel = goal_channel("position_waypoint", N, D, C, waypoint_radius=R)
+    carry = channel.init((E,))
+    pooled = []
+    for t in range(T):
+        carry = channel.write(carry, goals[t], t, states[t])
+        pooled.append(channel.pool(carry, states[t]))
+    pooled = jnp.stack(pooled)
+
+    nxt = jnp.concatenate([states[1:], states[-1:]], axis=0)
+    r_int = waypoint_intrinsic_reward(pooled, states, nxt, R)
+
+    w = latch_waypoints(goals, states, C, R)
+    for blk in range(T // C):
+        lo, hi = blk * C, (blk + 1) * C
+        got = r_int[lo:hi].sum(axis=0)
+        want = (
+            jnp.linalg.norm(w[lo] - states[lo], axis=-1)
+            - jnp.linalg.norm(w[lo] - nxt[hi - 1], axis=-1)
+        ) / R
+        assert jnp.allclose(got, want, atol=1e-4), f"block {blk} does not telescope"
+        assert float(jnp.max(got)) <= 1.0 + 1e-4, "the reward failed to saturate"
+
+
+@pytest.mark.parametrize("goal_space", ["latent"] + GROUNDED)
+def test_ppo_ratio_is_exactly_one_for_every_goal_space(goal_space):
+    """The stored conditioning vector must be exactly what `sample_action` saw.
+
+    Under a waypoint goal that vector is the live error `(w - s_t)/R`, which is
+    recomputed every step — so this is the check that it is STORED rather than
+    re-derived in the update.
+    """
+    cfg = _config() if goal_space == "latent" else _grounded_config(goal_space)
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    actor_ts = rs.train_state.actor_ts
+    goal_dim = GOAL_DIM if goal_space == "latent" else StubEnv.goal_state_dim
+    n_flat = N_ENVS * N_AGENTS
+    for t in (0, N_STEPS // 2, N_STEPS - 1):
+        log_probs, _ = evaluate_action(
+            bind_goal(
+                actor_ts.apply_fn,
+                traj.pooled_goal[t].reshape(n_flat, goal_dim),
+            ),
+            actor_ts.params,
+            traj.obs[t].reshape(n_flat, OBS_DIM),
+            traj.action[t].reshape(n_flat, ACTION_DIM),
+            False,
+        )
+        ratio = jnp.exp(log_probs - traj.log_prob[t].reshape(n_flat))
+        assert jnp.allclose(ratio, 1.0, atol=1e-4), (
+            f"{goal_space} step {t}: the update re-evaluated a different "
+            "conditioning vector than the rollout acted on "
+            f"(max |ratio-1| = {float(jnp.max(jnp.abs(ratio - 1.0)))})"
+        )
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_the_grounded_state_receives_no_gradient(goal_space):
+    """FuN's detach rule, satisfied STRUCTURALLY rather than by stop_gradient.
+
+    The manager cannot raise its own objective by moving the measuring stick,
+    because the stick is stored data with no parameters behind it.
+    """
+    cfg = _grounded_config(goal_space)
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    if goal_space == "position_waypoint":
+        fn = lambda s: waypoint_progress(
+            s, traj.goal, HORIZON, cfg.waypoint_radius, done=done_a
+        )[0].sum()
+    else:
+        fn = lambda s: transition_cosine(
+            s, traj.goal, HORIZON, done=done_a, detach_states=True
+        )[0].sum()
+    g = jax.grad(fn)(traj.state_latent)
+    assert float(jnp.max(jnp.abs(g))) == 0.0, (
+        "gradient reached the grounded state; the detach is not structural"
+    )
+
+
+def test_heading_dispersion_discriminates_where_direction_count_saturates():
+    """The replacement metric, against the case that motivates it.
+
+    `goal_direction_count` is bounded by min(N, goal_dim) = 2 here and SATURATES:
+    N evenly-spaced headings and two perpendicular clusters BOTH score exactly
+    2.0, though they are very different directives.
+    """
+    def headings(degrees):
+        a = jnp.deg2rad(jnp.asarray(degrees, dtype=jnp.float32))
+        return jnp.stack([jnp.cos(a), jnp.sin(a)], axis=-1)[None, None]
+
+    fan = headings([0, 90, 180, 270])
+    clusters = headings([0, 0, 90, 90])
+    same = headings([30, 30, 30, 30])
+    line = headings([0, 180, 0, 180])
+
+    assert float(_agent_direction_count(_agent_gram(fan))) == pytest.approx(2.0, abs=1e-4)
+    assert float(_agent_direction_count(_agent_gram(clusters))) == pytest.approx(
+        2.0, abs=1e-4
+    ), "precondition: the old metric cannot tell these apart"
+
+    d_fan = float(_heading_dispersion(fan)["goal_heading_dispersion"])
+    d_cl = float(_heading_dispersion(clusters)["goal_heading_dispersion"])
+    assert d_fan > 0.9 and d_cl < 0.4, (d_fan, d_cl)
+    assert float(_heading_dispersion(same)["goal_heading_dispersion"]) < 1e-5
+    # A +u/-u split looks maximally diverse to the signed form; the axial
+    # companion is what reports the single line it really is.
+    assert float(_heading_dispersion(line)["goal_heading_dispersion"]) > 0.9
+    assert float(_heading_dispersion(line)["goal_heading_dispersion_axial"]) < 1e-5
+
+
+@pytest.mark.parametrize("goal_space", GROUNDED)
+def test_manager_nulls_are_scored_with_the_same_objective_as_the_loss(goal_space):
+    """Real and null must share one mask AND one scoring function.
+
+    If the loss scores the grounded `s` while the nulls score the learned one,
+    `d_cos_gap_*` is a difference of two quantities measured in different spaces
+    — finite, plausible-looking, meaningless.
+    """
+    cfg = _grounded_config(goal_space)
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    rs2, traj, boot, _ = collect_fn(rs)
+    _, losses = update_fn(rs2, traj, boot)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    if goal_space == "position_waypoint":
+        score = lambda s, g: waypoint_progress(
+            s, g, HORIZON, cfg.waypoint_radius, done=done_a
+        )
+    else:
+        score = lambda s, g: transition_cosine(
+            s, g, HORIZON, done=done_a, detach_states=True
+        )
+    # Recomputed from the STORED grounded state, which is what the loss used.
+    ref = manager_cosine_metrics(
+        traj.state_latent,
+        traj.goal,
+        HORIZON,
+        done_a,
+        traj.active_mask,
+        cfg.goal_permute_shift,
+        score_fn=score,
+    )
+    assert float(losses["d_cos_mean"]) == pytest.approx(
+        float(ref["d_cos_mean"]), abs=1e-4
+    )
+    assert float(losses["valid_fraction"]) == pytest.approx(
+        float(ref["valid_fraction"]), abs=1e-4
+    )
+
+
+def test_the_perception_metrics_still_read_the_learned_bottleneck():
+    """`state_latent_erank` must not silently become a statement about 2-d positions.
+
+    On a grounded arm the objective's `s` is a 2-wide readout, so an erank
+    computed on it is bounded by 2 and would read as permanently "collapsed".
+    These two series are detectors for the manager's learned PERCEPTION, which
+    is still `manager_latent_dim` wide.
+    """
+    cfg = _grounded_config("position_direction")
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    rs2, traj, boot, _ = collect_fn(rs)
+    _, losses = update_fn(rs2, traj, boot)
+    assert float(losses["state_latent_erank"]) > 2.0, (
+        "erank is bounded by 2 — it is being computed on the grounded readout "
+        "rather than on the learned bottleneck"
     )

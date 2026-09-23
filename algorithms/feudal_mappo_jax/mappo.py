@@ -19,6 +19,7 @@ Parity notes (vs. the torch implementation):
 - ``explained_variance`` is the same pre-update diagnostic vanilla computes.
 """
 
+import dataclasses
 import warnings
 from typing import NamedTuple, Tuple
 
@@ -33,9 +34,13 @@ from algorithms.feudal_mappo_jax.network import (
     evaluate_action,
 )
 from algorithms.feudal_mappo_jax.manager import (
+    GOAL_SPACES,
+    GROUNDED_GOAL_SPACES,
     LOCAL_LATENTS,
+    WAYPOINT_GOAL_SPACES,
     WORKER_ENCODERS,
     FeudalManager,
+    goal_channel,
 )
 from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs, init_worker
 
@@ -88,6 +93,27 @@ def build_manager(config: MAPPOConfig, n_agents: int) -> FeudalManager:
         core=config.manager_core,
         horizon=config.goal_horizon,
         latent=config.manager_latent,
+        # None keeps the bottleneck fused with `goal_dim`, i.e. byte-identical to
+        # every pre-split checkpoint. Only a grounded arm sets it.
+        latent_dim=config.manager_latent_dim,
+    )
+
+
+def build_goal_channel(config: MAPPOConfig, n_agents: int):
+    """The `GoalChannel` for this config — how a directive reaches the worker.
+
+    A free function for the same reason :func:`build_manager` is: the training
+    scan, the eval scan and ``run.py:view()`` all need it and none of them calls
+    ``create_train_state``. Routing all three through one constructor is what
+    stops a drifted copy of the convention from rendering a policy that never
+    trained.
+    """
+    return goal_channel(
+        config.goal_space,
+        n_agents,
+        config.goal_dim,
+        config.goal_horizon,
+        config.waypoint_radius,
     )
 
 
@@ -438,6 +464,140 @@ def validate_worker_encoder(config: MAPPOConfig) -> None:
             RuntimeWarning,
             stacklevel=2,
         )
+
+
+def validate_goal_space(config: MAPPOConfig, env=None) -> None:
+    """Check `goal_space` and the settings a grounded one makes incoherent.
+
+    ONE copy, called from both ``trainer.make_train`` and ``run.py`` via
+    :func:`resolve_goal_space`, for exactly the reason
+    :func:`validate_worker_encoder` is.
+
+    Four raises are structural (the arm cannot be built, or would silently train
+    the wrong thing) and two warnings mark combinations that stay runnable
+    because they are contrasts worth drawing.
+    """
+    if config.goal_space not in GOAL_SPACES:
+        raise ValueError(
+            f"goal_space={config.goal_space!r} is not one of {GOAL_SPACES}. "
+            "Caught at build time so a typo fails before a run is launched — "
+            "CLAUDE.md records the `VARIANTS` regression where a silently-false "
+            "guard turned a whole arm into its own baseline for two commits."
+        )
+    if config.goal_space not in GROUNDED_GOAL_SPACES:
+        return
+
+    # The env readout IS the goal space. Falling back to the learned latent here
+    # would produce a run that trains happily and answers a different question
+    # than its name claims — the `# @package _global_` failure that cost 12 runs.
+    if env is None or not hasattr(env, "goal_state"):
+        raise ValueError(
+            f"goal_space={config.goal_space!r} requires the env to publish a "
+            "`goal_state(state) -> (n_agents, D)` hook and a `goal_state_dim`; "
+            f"{type(env).__name__ if env is not None else 'None'} has none. "
+            "The MJX box-push envs do. SMAX does not yet: allies' absolute "
+            "positions are reachable as "
+            "`_inner(state.env_state).unit_positions[:n_allies]` "
+            "(environments/smax/smax_env.py), but the normalization is a "
+            "separate question, and an arm whose waypoint radius means nothing "
+            "would look like it ran. This raises rather than falling back to "
+            "the learned latent, which would be silent."
+        )
+
+    # `manager.py`'s core reads s.reshape(..., n_agents * latent_dim). Fused with
+    # a 2-wide goal that is 2*n_agents numbers as the manager's ONLY view of the
+    # world — crippling, and nothing else would notice.
+    if config.manager_latent_dim is None:
+        raise ValueError(
+            f"goal_space={config.goal_space!r} requires an explicit "
+            "manager_latent_dim. It defaults to `goal_dim`, which a grounded "
+            f"arm DERIVES from the env (here {getattr(env, 'goal_state_dim', '?')}"
+            "), so leaving it fused would shrink the manager's whole information "
+            "bottleneck to n_agents*goal_dim and throttle the goal core. Set it "
+            "to the latent default (32)."
+        )
+
+    # `R * unit(ghat)` is a circle only if x and y are normalized by the same
+    # number. Both MJX envs set world_height = world_width, so this is an
+    # assertion about a shared assumption rather than a restriction.
+    w = getattr(env, "world_width", None)
+    h = getattr(env, "world_height", None)
+    if w is not None and h is not None and float(w) != float(h):
+        raise ValueError(
+            f"goal_space={config.goal_space!r} assumes an isotropic position "
+            f"normalization, but world_width={w} != world_height={h}. A goal of "
+            "fixed norm would then describe an ellipse, and the "
+            "unit-norm-at-latch invariant would silently fail."
+        )
+
+    if config.goal_space in WAYPOINT_GOAL_SPACES and config.normalize_pooled_goal:
+        raise ValueError(
+            "goal_space='position_waypoint' is incompatible with "
+            "normalize_pooled_goal=True. The worker is conditioned on the LIVE "
+            "error vector (w - s_t)/R, whose MAGNITUDE is the distance still to "
+            "go — the entire content of a waypoint. L2-normalizing it discards "
+            "exactly that and leaves a latched direction, i.e. it silently "
+            "degrades this arm into a worse `position_direction` while every "
+            "shape, loss and diagnostic stays healthy. Set "
+            "normalize_pooled_goal: false explicitly — the default is True and "
+            "every feudal_film* ancestor inherits it."
+        )
+
+    if config.worker_fusion == "concat":
+        warnings.warn(
+            f"goal_space={config.goal_space!r} with worker_fusion='concat': the "
+            "goal is a 2-column block of the worker's first Dense instead of a "
+            "32-column one. ⚠ MEASURED, and NOT for the reason you might "
+            "expect: the goal's share of layer-1 preactivation variance is "
+            "**9.8% at every goal_dim** (32, 16 and 2 alike), because "
+            "`normalize_pooled_goal` fixes ||w||=1 and that share is driven by "
+            "the block's NORM, not by its width. So narrowing the goal does not "
+            "starve it of scale. What it does change is init goal-dominance: "
+            "swapping the goal moves the untrained action mean by 47.3% of its "
+            "own RMS at goal_dim=32 and 20.3% at goal_dim=2, against EXACTLY "
+            "0.000 for FiLM at both. Concat's problem here is the same "
+            "structural one it always had — influence is the default and "
+            "goal-agnosticism must be learned, and a concatenated goal can only "
+            "TRANSLATE the policy, never change which observation features "
+            "matter. Prefer worker_fusion='film'.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    if config.zero_goal:
+        warnings.warn(
+            f"goal_space={config.goal_space!r} with zero_goal=True: the policy is "
+            "provably independent of the manager, so the grounded goal space is "
+            "not being tested at all. This is the legitimate isolate arm, hence a "
+            "warning rather than a raise.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
+def resolve_goal_space(config: MAPPOConfig, env=None) -> MAPPOConfig:
+    """Validate `goal_space` and DERIVE the widths it determines.
+
+    Returns a config with `goal_dim` set to ``env.goal_state_dim`` under a
+    grounded goal space, and the **identical object** under ``"latent"`` — so the
+    default path is a python-level no-op and cannot perturb an existing arm.
+
+    ⚠ `goal_dim` is derived rather than checked, and that is deliberate. A
+    grounded arm inheriting ``goal_dim: 32`` from `feudal_film` would make the
+    manager emit a 32-vector "direction in R^2". That *does* eventually raise —
+    inside `cosine_similarity` in `manager_update` — but only AFTER `ppo_update`
+    has already trained the worker on a 32-wide "error vector" for a full update.
+    Loud but late, and wrong throughout. Overriding removes the failure mode
+    instead of reporting it.
+
+    Called from ``trainer.make_train`` AND ``run.py.__init__``, so every path
+    that builds a config (the seam tests and the probes included) gets the same
+    treatment and the rules keep exactly one home.
+    """
+    validate_goal_space(config, env)
+    if config.goal_space not in GROUNDED_GOAL_SPACES:
+        return config
+    return dataclasses.replace(config, goal_dim=int(env.goal_state_dim))
 
 
 def _annealed_alpha(config: MAPPOConfig, progress: jnp.ndarray) -> jnp.ndarray:
@@ -1301,6 +1461,59 @@ def _agent_direction_count(gram: jnp.ndarray) -> jnp.ndarray:
     return (n**2 / (frob_sq + 1e-12)).mean()
 
 
+def _heading_dispersion(goal: jnp.ndarray) -> dict:
+    """Circular dispersion of the agents' goal directions — the GROUNDED headline.
+
+    ``1 - ||mean of the unit goals over the agent axis||``, in [0, 1]: 0 means
+    every agent got the same heading, 1 means they cancel perfectly.
+
+    **Why this replaces `goal_direction_count` under a grounded goal space.**
+    That metric is the participation ratio of the agent Gram, hence bounded by
+    ``min(N, goal_dim)``, which is **2** here. Worse than a compressed range, it
+    SATURATES and stops discriminating:
+
+    * N evenly-spaced headings score exactly 2.0 (``||G||_F^2 = N^2/2``);
+    * "half the agents at 0 degrees, half at 90" scores exactly 2.0 as well —
+      the same second moment.
+
+    So it cannot tell a uniform fan from two perpendicular clusters, which are
+    very different directives. On that pair this reads **1.0** vs **0.293**.
+
+    **Its baseline depends only on N, not on `goal_dim`** — exactly the property
+    the participation ratio lacked ("only comparable across runs that share
+    goal_dim"). For N iid uniform directions ``E[Rbar] ~ 0.886/sqrt(N)``, so the
+    random-goal level is ~0.744 at N=12 and ~0.778 at N=16. Read it as a trend:
+    a drift toward 0 is the "everyone go north-east" degeneracy that
+    `position_direction` is structurally exposed to.
+
+    The ``_axial`` companion doubles the angles before averaging, making it
+    sign-blind the way `goal_pairwise_cos_abs` is: goals split into +u/-u
+    clusters cancel to a dispersion of 1.0 (looks maximally diverse) but are
+    one line, and the axial form reports 0.0 for them.
+    """
+    n = goal.shape[-2]
+    if n < 2:
+        return {
+            "goal_heading_dispersion": jnp.float32(jnp.nan),
+            "goal_heading_dispersion_axial": jnp.float32(jnp.nan),
+        }
+    u = goal / (jnp.linalg.norm(goal, axis=-1, keepdims=True) + 1e-6)
+    disp = 1.0 - jnp.linalg.norm(u.mean(axis=-2), axis=-1)
+    # Doubled angles, for a 2-d goal: (x, y) -> (x^2 - y^2, 2xy), i.e. z^2 on the
+    # unit circle. Antipodal directions map to the same point, so a +u/-u split
+    # reads as the single line it is. Only defined for goal_dim == 2.
+    if goal.shape[-1] == 2:
+        x, y = u[..., 0], u[..., 1]
+        u2 = jnp.stack([x * x - y * y, 2.0 * x * y], axis=-1)
+        disp_ax = 1.0 - jnp.linalg.norm(u2.mean(axis=-2), axis=-1)
+    else:
+        disp_ax = jnp.full(disp.shape, jnp.nan)
+    return {
+        "goal_heading_dispersion": disp.mean(),
+        "goal_heading_dispersion_axial": disp_ax.mean(),
+    }
+
+
 def manager_cosine_metrics(
     s: jnp.ndarray,
     goal: jnp.ndarray,
@@ -1310,6 +1523,7 @@ def manager_cosine_metrics(
     shift: int = 1,
     cos: jnp.ndarray = None,
     valid: jnp.ndarray = None,
+    score_fn=None,
 ) -> dict:
     """``d_cos`` and the two permutation nulls that make it interpretable.
 
@@ -1363,10 +1577,21 @@ def manager_cosine_metrics(
         transition_cosine,
     )
 
-    if cos is None or valid is None:
-        cos, valid = transition_cosine(
-            s, goal, horizon, done=done_a, detach_states=True
+    # `score_fn` is the manager's objective, so the NULLS are computed with the
+    # same one the loss used. Under `goal_space="position_waypoint"` that is
+    # `waypoint_progress`, whose `valid` additionally restricts to latch steps —
+    # and the whole construction below rests on real and null sharing ONE mask,
+    # so a null scored by a different function (or over steps the real objective
+    # never saw) would silently be a difference of two different quantities.
+    # Both candidates have the same (states, goals, horizon, done) -> (score,
+    # valid) contract precisely so this stays a one-line swap.
+    if score_fn is None:
+        score_fn = lambda st, gl: transition_cosine(
+            st, gl, horizon, done=done_a, detach_states=True
         )
+
+    if cos is None or valid is None:
+        cos, valid = score_fn(s, goal)
     # ONE mask for all three, so real and null are provably averaged over the
     # same entries. This is sound because `transition_cosine`'s `valid` is a
     # function of `states` and `done` only, never of `goals` — the single
@@ -1379,9 +1604,7 @@ def manager_cosine_metrics(
 
     if goal.shape[-2] > 1:
         goal_agent = permute_agent_goals(goal, shift)
-        cos_null_agent, _ = transition_cosine(
-            s, goal_agent, horizon, done=done_a, detach_states=True
-        )
+        cos_null_agent, _ = score_fn(s, goal_agent)
         null_agent = _masked_mean(cos_null_agent, mask)
         unit = goal / (jnp.linalg.norm(goal, axis=-1, keepdims=True) + 1e-6)
         perm_cos = jnp.sum(unit * permute_agent_goals(unit, shift), axis=-1)
@@ -1390,9 +1613,7 @@ def manager_cosine_metrics(
     # env axis is 1 here: the manager path's goals are (T, n_envs, n_agents, D).
     if goal.shape[1] > 1:
         goal_env = permute_env_goals(goal, 1, shift)
-        cos_null_env, _ = transition_cosine(
-            s, goal_env, horizon, done=done_a, detach_states=True
-        )
+        cos_null_env, _ = score_fn(s, goal_env)
         null_env = _masked_mean(cos_null_env, mask)
 
     return {
@@ -1437,10 +1658,17 @@ def manager_update(
     Returns the updated train state and a metrics dict whose keys are all
     scalars (``run.py`` casts them with ``float()``).
     """
-    from algorithms.feudal_mappo_jax.manager import transition_cosine
+    from algorithms.feudal_mappo_jax.manager import (
+        transition_cosine,
+        waypoint_progress,
+    )
 
     dones = trajectory.done.astype(jnp.float32)
     horizon = config.goal_horizon
+    # Static (python-level), so the traced graph holds only the branch taken and
+    # the `latent` path is byte-identical to the pre-flag code.
+    grounded = config.goal_space in GROUNDED_GOAL_SPACES
+    waypoint = config.goal_space in WAYPOINT_GOAL_SPACES
 
     # --- manager advantage on the extrinsic stream -------------------------
     m_adv, m_ret = compute_gae(
@@ -1468,6 +1696,24 @@ def manager_update(
     # broadcasts into a wrong shape silently (see manager._check_done).
     done_a = jnp.broadcast_to(dones[..., None], trajectory.goal.shape[:-1])
     active = trajectory.active_mask
+
+    # THE manager's objective, chosen once and used by both the loss and the
+    # permutation nulls. Both candidates share the (states, goals) -> (score,
+    # valid) contract, so this is the only place `goal_space` reaches the PG.
+    #
+    #   latent / position_direction : d_cos(s_{t+c} - s_t, g_t)
+    #   position_waypoint           : (||w-s_t|| - ||w-s_{t+c}||)/R, at LATCH
+    #                                 STEPS ONLY (folded into its own `valid`)
+    if waypoint:
+        def _score(st, gl):
+            return waypoint_progress(
+                st, gl, horizon, config.waypoint_radius, done=done_a
+            )
+    else:
+        def _score(st, gl):
+            return transition_cosine(
+                st, gl, horizon, done=done_a, detach_states=True
+            )
 
     # --- V^M regression -----------------------------------------------------
     # Its own loop, with its own epoch count. The targets `m_ret` are fixed, so
@@ -1564,18 +1810,27 @@ def manager_update(
 
         # --- transition policy gradient ---
         def manager_loss_fn(params):
-            goal, s = _recompute(manager_ts.apply_fn, params)
-            cos, valid = transition_cosine(
-                s, goal, horizon, done=done_a, detach_states=True
-            )
+            goal, s_learned = _recompute(manager_ts.apply_fn, params)
+            # THE space the objective is measured in. Under a grounded goal space
+            # that is the env's zero-parameter readout, STORED on the transition:
+            # stored data carries no gradient, so FuN's detach rule is satisfied
+            # STRUCTURALLY rather than by `stop_gradient`, and the manager
+            # provably cannot raise the objective by rotating the measuring
+            # stick. `s_learned` is then an ordinary perception bottleneck; it
+            # still receives gradient through the GOAL arm, because the core
+            # consumes it (see manager.py's docstring).
+            s = trajectory.state_latent if grounded else s_learned
+            cos, valid = _score(s, goal)
             mask = valid * active
-            # Maximize A^M * d_cos(s_{t+c} - s_t, g_t)  =>  minimize its negation.
+            # Maximize A^M * score  =>  minimize its negation. The score is the
+            # cosine under a latent/direction goal and the fraction of the
+            # commanded displacement achieved under a waypoint one.
             pg_loss = -_masked_mean(cos * m_adv, mask)
-            return pg_loss, (cos, valid, mask, goal, s)
+            return pg_loss, (cos, valid, mask, goal, s, s_learned)
 
-        (pg_loss, (cos, valid, mask, goal, s)), m_grads = jax.value_and_grad(
-            manager_loss_fn, has_aux=True
-        )(manager_ts.params)
+        (pg_loss, (cos, valid, mask, goal, s, s_learned)), m_grads = (
+            jax.value_and_grad(manager_loss_fn, has_aux=True)(manager_ts.params)
+        )
 
         # --- the worker's share of the SHARED encoder (worker_encoder="shared") ---
         # Two losses write to `f_enc`, so their gradients are summed at the one
@@ -1628,16 +1883,38 @@ def manager_update(
             # env-axis nulls that make the level interpretable at all.
             **manager_cosine_metrics(
                 s, goal, horizon, done_a, active, config.goal_permute_shift,
-                cos=cos, valid=valid,
+                cos=cos, valid=valid, score_fn=_score,
             ),
             "goal_pairwise_cos": _mean_pairwise_cosine(goal_gram),
             # Sign-blind companions to the signed mean: goals collapsed onto one
             # LINE give cos ~ 0 but |cos| ~ 1 and a direction count ~ 1.
             "goal_pairwise_cos_abs": _mean_pairwise_cosine(jnp.abs(goal_gram)),
             "goal_direction_count": _agent_direction_count(goal_gram),
-            "state_pairwise_cos": _mean_pairwise_cosine(_agent_gram(s)),
-            "state_latent_erank": _effective_rank(s),
+            # ⚠ These two take `s_learned`, NOT the objective's `s`. They are
+            # detectors for a collapse of the manager's learned PERCEPTION, which
+            # is what `s_learned` still is under every goal space. Feeding them a
+            # grounded `s` would make `state_latent_erank` a statement about the
+            # rank of a 2-d position readout (bounded by 2, always "collapsed")
+            # and `state_pairwise_cos` a statement about how aligned agents'
+            # positions are with the world origin — neither of which is what the
+            # names mean. Under `goal_space="latent"` the two arrays are the same
+            # object, so no existing series changes.
+            "state_pairwise_cos": _mean_pairwise_cosine(_agent_gram(s_learned)),
+            "state_latent_erank": _effective_rank(s_learned),
         }
+        if grounded:
+            # Angular dispersion REPLACES `goal_direction_count` as the headline
+            # collapse metric here, because that participation ratio is bounded by
+            # min(N, goal_dim) = 2 and saturates: N evenly-spaced headings score
+            # exactly 2.0, and so does "half at 0 degrees, half at 90". It cannot
+            # tell a uniform fan from two perpendicular clusters.
+            #
+            # This one's baseline depends only on N, not on goal_dim — exactly the
+            # property the participation ratio lacked. For N iid uniform
+            # directions E[Rbar] ~ 0.886/sqrt(N), so the random-goal level is
+            # ~0.744 at N=12 and ~0.778 at N=16. Read it as a TREND toward 0,
+            # which is the "everyone go north-east" degeneracy.
+            metrics.update(_heading_dispersion(goal))
         if enc_grads is not None:
             # Who shapes `f_enc`. Read the COSINE first: norms alone are
             # misleading under Adam, whose step is scale-invariant in the limit,

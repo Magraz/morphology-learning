@@ -1,0 +1,29 @@
+# @package _global_
+# Delta: alpha = 0.1, inherited from `feudal_film_n01`.
+#
+# THE PRIMARY GROUNDED ARM. `feudal_film_waypoint` (alpha=0) is its control.
+#
+# The reason waypoint goals lead at all is that their r^I SATURATES (over a
+# latch block it telescopes to <= 1), and r^I only exists at intrinsic_coef > 0.
+# At alpha=0 the two grounded modes differ only in the manager's PG and the
+# structural argument is inactive — so running only the alpha=0 arm would spend
+# the budget without testing the thing that motivated the design.
+#
+# Everything else — the mandatory `normalize_pooled_goal: false`, the
+# valid_fraction ~ 1/c, the small intrinsic_reward_abs, the voided gap_zeroed,
+# the acceptance criterion — is in `feudal_film_waypoint.yaml`. Read that first.
+#
+# `intrinsic_anneal` is `none` (inherited), so alpha is HELD for the whole run:
+# this measures a sustained r^I, not an early-exploration bonus, and
+# alpha_current is flat in the stats.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_n01_waypoint trial_id=0
+defaults:
+  - feudal_film_waypoint
+  - feudal_film_n01
+  - _self_
+
+model_params:
+  goal_space: position_waypoint
+  normalize_pooled_goal: false

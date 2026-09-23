@@ -26,18 +26,20 @@ from algorithms.feudal_mappo_jax.types import Bootstrap, MAPPOConfig, Transition
 from algorithms.feudal_mappo_jax.network import sample_action
 from algorithms.feudal_mappo_jax.manager import (
     _goal_transform_variants,
-    goal_ring_pool,
-    goal_ring_reset,
-    goal_ring_write,
     training_goal_variants,
     worker_intrinsic_reward_aligned,
+    waypoint_intrinsic_reward,
+    GROUNDED_GOAL_SPACES,
+    WAYPOINT_GOAL_SPACES,
 )
 from algorithms.feudal_mappo_jax.mappo import (
     FeudalTrainState,
+    build_goal_channel,
     build_manager,
     create_train_state,
     manager_update,
     ppo_update,
+    resolve_goal_space,
     validate_worker_objective,
     validate_worker_encoder,
 )
@@ -89,6 +91,24 @@ def global_state_fn(env):
     return lambda obs, env_state: obs.reshape(obs.shape[0], -1)
 
 
+def goal_state_fn(env):
+    """`env_state -> (n_envs, n_agents, goal_state_dim)` — the GROUNDED `s`.
+
+    The ONE definition of the grounded goal space, for the same reason
+    :func:`global_state_fn` is the one definition of the centralized input: the
+    training scan, the eval scan and ``run.py:view()`` must all agree about what
+    `s` is, and a disagreement would be silent.
+
+    Returns ``None`` when the env publishes no hook, which is the only correct
+    behaviour under ``goal_space="latent"`` — and which
+    ``mappo.validate_goal_space`` turns into a raise for every grounded arm,
+    rather than a fallback to the learned latent.
+    """
+    if not hasattr(env, "goal_state"):
+        return None
+    return jax.vmap(env.goal_state)
+
+
 def make_train(config: MAPPOConfig, env):
     """Build jitted train functions for a functional MJX env.
 
@@ -129,6 +149,14 @@ def make_train(config: MAPPOConfig, env):
     validate_worker_encoder(config)
     share_encoder = config.worker_encoder != "none"  # static
 
+    # What the GOAL MEANS, and the widths that follow from it. Same reasoning
+    # again: one home for the rules. This also DERIVES `goal_dim` from the env
+    # under a grounded goal space, so a stale yaml value cannot train the worker
+    # on a wrong-width directive for a full update before anything raises.
+    config = resolve_goal_space(config, env)
+    grounded = config.goal_space in GROUNDED_GOAL_SPACES  # static
+    waypoint = config.goal_space in WAYPOINT_GOAL_SPACES  # static
+
     # Goal-ablation eval variants (see `eval_fn`). Validate the shift HERE, at
     # build time, rather than at the first eval hundreds of updates in: a shift
     # that is a multiple of n_agents makes the permutation the identity, so
@@ -167,6 +195,28 @@ def make_train(config: MAPPOConfig, env):
 
     # Centralized state — read by the worker critic, V^M, V^I *and* the manager itself.
     _global_state = global_state_fn(env)
+
+    # The GROUNDED goal space, when one is configured. `None` under "latent", and
+    # `resolve_goal_space` above has already guaranteed the hook exists whenever
+    # `grounded` is True — so this is never a silent fallback.
+    _v_goal_state = goal_state_fn(env) if grounded else None
+
+    def _goal_state(env_state, fallback):
+        """`s` for this state: the env readout when grounded, else the learned one.
+
+        `fallback` is a THUNK, not a value: under a grounded goal space the
+        manager's `s_learned` is never needed here, and forcing it would run a
+        manager forward whose result is discarded. XLA would very likely DCE it,
+        but the latent path must be byte-identical for reasons stronger than
+        "the compiler probably notices".
+        """
+        return _v_goal_state(env_state) if grounded else fallback()
+
+    # How a directive becomes what the worker eats. ONE constructor for the three
+    # consumers (training scan, eval scan, view()), because a drifted copy of this
+    # convention renders perfectly happily while showing a policy that never
+    # trained.
+    channel = build_goal_channel(config, n_agents)
 
     gs_dim = global_state_dim(env)
 
@@ -315,11 +365,17 @@ def make_train(config: MAPPOConfig, env):
         global_state = _global_state(obs, env_state)
 
         # --- Manager: one read of the joint state -> one directive per agent ---
-        m_carry, goal, state_latent = _manager_forward(
+        m_carry, goal, s_learned = _manager_forward(
             train_state, m_carry, global_state, obs
         )
-        goal_hist = goal_ring_write(goal_hist, goal, t)
-        pooled_goal = goal_ring_pool(goal_hist)
+        # THE state space the objective is measured in. Under a grounded
+        # `goal_space` this is `env.goal_state(env_state)` — a zero-parameter
+        # readout — so the manager cannot rotate the measuring stick and FuN's
+        # detach rule holds structurally. `s_learned` remains the manager's
+        # internal perception bottleneck either way.
+        state_latent = _goal_state(env_state, lambda: s_learned)
+        goal_hist = channel.write(goal_hist, goal, t, state_latent)
+        pooled_goal = channel.pool(goal_hist, state_latent)
 
         values = _values(train_state, global_state)
         manager_values = _manager_values(train_state, global_state)
@@ -379,7 +435,10 @@ def make_train(config: MAPPOConfig, env):
         # ordering mistake that would leave every other check in this file
         # passing.
         next_state_latent = (
-            _manager_latent(train_state, next_gs, next_obs)
+            _goal_state(
+                next_env_state,
+                lambda: _manager_latent(train_state, next_gs, next_obs),
+            )
             if use_intrinsic
             else _latent_placeholder
         )
@@ -425,7 +484,7 @@ def make_train(config: MAPPOConfig, env):
         # step's `pooled_goal` was consumed reproduces `pool_goals`'s semantics
         # exactly: `_same_episode` counts dones in [src, t), so g_src still
         # contributes to w_t on the step where done[t] fires, and not after.
-        goal_hist = goal_ring_reset(goal_hist, done)
+        goal_hist = channel.reset(goal_hist, done)
         if m_carry is not None:
             # Dilated-LSTM pools are (E, radius, features); zero the finished
             # envs' rows. `t` is a single shared scalar counter with no env axis,
@@ -543,13 +602,30 @@ def make_train(config: MAPPOConfig, env):
             trajectory.done[..., None].astype(jnp.float32),
             trajectory.state_latent.shape[:-1],
         )
-        r_int = worker_intrinsic_reward_aligned(
-            trajectory.state_latent,
-            trajectory.next_state_latent,
-            trajectory.goal,
-            horizon,
-            done=done_a,
-        )  # (T, E, N)
+        if waypoint:
+            # The distance the action actually closed toward the latched
+            # waypoint, as a fraction of R. Needs NO episode mask and no offset
+            # window: every term is local to step t, and `next_state_latent` is
+            # the pre-reset successor of t's OWN episode. In particular there is
+            # no episode-ending action forced to 0, i.e. none of the standing
+            # bonus for terminating that a shifted endpoint creates.
+            #
+            # It reads `pooled_goal`, the exact error vector the worker was
+            # conditioned on, so the reward and the conditioning cannot drift.
+            r_int = waypoint_intrinsic_reward(
+                trajectory.pooled_goal,
+                trajectory.state_latent,
+                trajectory.next_state_latent,
+                config.waypoint_radius,
+            )  # (T, E, N)
+        else:
+            r_int = worker_intrinsic_reward_aligned(
+                trajectory.state_latent,
+                trajectory.next_state_latent,
+                trajectory.goal,
+                horizon,
+                done=done_a,
+            )  # (T, E, N)
         # The truncation bootstrap was computed in-scan against V^I (it needs the
         # pre-reset successor state); add it here, where the stream is formed.
         return trajectory._replace(
@@ -566,7 +642,7 @@ def make_train(config: MAPPOConfig, env):
         # The manager's memory resets with them. `m_carry` is None for the mlp
         # core — a valid empty pytree, so the carry slot costs nothing there.
         m_carry = manager.initialize_carry(carry_rng, (config.n_envs,))
-        goal_hist = jnp.zeros((horizon, config.n_envs, n_agents, goal_dim))
+        goal_hist = channel.init((config.n_envs,))
 
         # The final env state is bound (not discarded): with a state-derived global
         # state the bootstrap below needs it, not just the last observation.
@@ -753,7 +829,7 @@ def make_train(config: MAPPOConfig, env):
         # Eval must run the full hierarchy: the worker is goal-conditioned, so
         # without the manager it would be evaluated on a goal it never sees.
         m_carry = manager.initialize_carry(rng, (total,))
-        goal_hist = jnp.zeros((horizon, total, n_agents, goal_dim))
+        goal_hist = channel.init((total,))
 
         def _eval_step(carry, t):
             (
@@ -766,14 +842,22 @@ def make_train(config: MAPPOConfig, env):
                 goal_hist,
             ) = carry
             gs = _global_state(obs, env_state)
-            m_carry, goal, _ = _manager_forward(train_state, m_carry, gs, obs)
-            goal_hist = goal_ring_write(goal_hist, goal, t)
+            m_carry, goal, s_learned = _manager_forward(
+                train_state, m_carry, gs, obs
+            )
+            # The eval scan is the THIRD consumer of the goal convention, and it
+            # must use the same channel as the rollout and `view()`: under a
+            # waypoint goal the worker eats a live error vector, so a ring here
+            # would evaluate a policy the training never produced — silently, at
+            # a plausible-looking return.
+            s_eval = _goal_state(env_state, lambda: s_learned)
+            goal_hist = channel.write(goal_hist, goal, t, s_eval)
             # THE seam. Transform the POOLED goal, per variant block. `variants`
             # is static so this unrolls at trace time into V concatenated
             # slices — deliberately not a block-diagonal mixing matrix, which
             # would be the same arithmetic with far more room for a silent
             # block/pairing bug.
-            pooled = goal_ring_pool(goal_hist)
+            pooled = channel.pool(goal_hist, s_eval)
             if n_variants > 1:
                 blocks = jnp.split(pooled, n_variants, axis=0)
                 pooled = jnp.concatenate(

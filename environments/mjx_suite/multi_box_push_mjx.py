@@ -213,6 +213,17 @@ class MultiBoxPushMJX:
         self.comm_radius = self.world_width / 3.0
         self.force_multiplier = _FORCE_MULTIPLIER
 
+        # Position normalization, ONE definition shared by `_compact_global_state`
+        # and `goal_state` so the two cannot drift apart — the same argument
+        # `_box_goal_distance` makes for the goal-distance channel. Built
+        # explicitly as f32: `world_center_x` is `world_width // 2`, an int.
+        self._centre = jnp.asarray(
+            [self.world_center_x, self.world_center_y], dtype=jnp.float32
+        )
+        self._extent = jnp.asarray(
+            [self.world_width, self.world_height], dtype=jnp.float32
+        )
+
         # --- target band spanning the top wall ---
         bt = self.boundary_thickness
         target_h = max(5.0, 5.0 * self.world_height / 30.0)
@@ -526,6 +537,43 @@ class MultiBoxPushMJX:
         q = data.qpos[self._box_qadr]  # (O, 3)
         return q[:, :2], q[:, 2]  # positions (O, 2), yaws (O,)
 
+    def goal_state(self, state: EnvState) -> jnp.ndarray:
+        """`(n_agents, 2)` — each agent's own world position, normalized.
+
+        The GROUNDED goal space for `feudal_mappo_jax`
+        (``model_params.goal_space``): the manager's directive becomes a
+        direction or a waypoint in THIS space, and `s` is this readout rather
+        than a learned latent. Normalized exactly as the agent block of
+        `_compact_global_state` (same `_centre` / `_extent` objects), so the two
+        channels report the same quantity.
+
+        Three properties follow structurally, not by guard, and they are the
+        whole point of the flag:
+
+        * the readout has **zero parameters**, so the manager cannot rotate the
+          measuring stick and FuN's detach rule is satisfied by construction;
+        * ``d s[i] / d obs_j`` is exactly 0 for ``j != i``, so the intrinsic
+          reward is genuinely per-agent — the locality defect measured on the
+          centralized latent (diag share 0.0631 vs a uniform 0.0625) is gone;
+        * the objective acquires a unit: a goal is an arrow in the arena and
+          progress is measurable in metres.
+
+        ⚠ **Unconditional, unlike `global_state`.** That hook must be bound into
+        the instance dict because `hasattr(env, "global_state")` is the trainers'
+        only switch, so a class-level method would silently change the critic
+        width of every existing arm. This one has no `hasattr` consumer: the only
+        switch is `config.goal_space`, which defaults to `"latent"` and never
+        calls this. Adding it therefore changes nothing for any arm that does not
+        ask for it — pinned by `test_goal_state_hook_presence_is_inert`.
+        """
+        return (self._agent_pos(state.data) - self._centre) / self._extent
+
+    #: Width of `goal_state`'s per-agent readout. The feudal stack DERIVES
+    #: `goal_dim` from this under a grounded `goal_space`, rather than trusting a
+    #: yaml value — a mismatch there does not raise until `manager_update`, long
+    #: after `ppo_update` has trained the worker on a wrong-width vector.
+    goal_state_dim = 2
+
     def _box_goal_distance(self, box_pos: jnp.ndarray) -> jnp.ndarray:
         """(O,) SIGNED distance from each box to the goal band, along the goal axis.
 
@@ -572,11 +620,10 @@ class MultiBoxPushMJX:
         # one-step skew later.
         goal_dist = self._box_goal_distance(box_pos)  # (O,)
 
-        # Built explicitly as f32: `world_center_x` is `world_width // 2`, an int.
-        centre = jnp.asarray(
-            [self.world_center_x, self.world_center_y], dtype=jnp.float32
-        )
-        extent = jnp.asarray([self.world_width, self.world_height], dtype=jnp.float32)
+        # ONE definition of the position normalization, shared with `goal_state`
+        # (built in `__init__`), so the compact state and the grounded goal space
+        # cannot report positions on different scales.
+        centre, extent = self._centre, self._extent
 
         agents = jnp.concatenate(
             [(agent_pos - centre) / extent, agent_vel / self.velocity_norm], axis=-1

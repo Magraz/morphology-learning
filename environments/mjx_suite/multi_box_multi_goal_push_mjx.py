@@ -631,6 +631,28 @@ class MultiBoxMultiGoalPushMJX:
         q = data.qpos[self._box_qadr]  # (O, 3)
         return q[:, :2], q[:, 2]  # positions (O, 2), yaws (O,)
 
+    def goal_state(self, state: EnvState) -> jnp.ndarray:
+        """`(n_agents, 2)` — each agent's own world position, normalized.
+
+        The GROUNDED goal space for `feudal_mappo_jax`; see
+        `MultiBoxPushMJX.goal_state` for the rationale and for why this is an
+        unconditional method rather than a `use_...`-gated hook.
+
+        ⚠ This env's centre is the TRUE geometric centre (`world_width / 2`),
+        where the square env uses the integer `world_width // 2`. The 0.5-unit
+        difference is inert for everything the goal space does — the constant
+        cancels in `s_{t+c} - s_t` and in `w - s_t`, since a waypoint
+        `s_tau + R*u` carries the same centre — but it is NOT inert for an
+        absolute-position diagnostic, so read those per env.
+        """
+        extent = jnp.asarray(
+            [self.world_width, self.world_height], dtype=jnp.float32
+        )
+        return (self._agent_pos(state.data) - self._center) / extent
+
+    #: See `MultiBoxPushMJX.goal_state_dim`.
+    goal_state_dim = 2
+
     def _radius(self, pos: jnp.ndarray) -> jnp.ndarray:
         """(N,) distance of each (N, 2) position from the goal/arena center."""
         return jnp.linalg.norm(pos - self._center, axis=-1)

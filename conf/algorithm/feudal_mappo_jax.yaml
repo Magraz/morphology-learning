@@ -77,6 +77,26 @@ model_params:
   # a direction in the state embedding). Also the manager's whole information
   # bottleneck — the core consumes `s`.
   goal_dim: 32
+  # Width of the manager's INTERNAL bottleneck `s_learned` — what f_Mspace emits
+  # and the core consumes. null = fused with goal_dim, which is byte-identical to
+  # the behaviour before the two were split. They only need splitting when the
+  # goal is grounded: `goal_dim` is then DERIVED from the env (2 for an (x, y)
+  # readout), and fused that would shrink the manager's whole view of the world
+  # to 2*n_agents numbers. Grounded arms set this to 32.
+  manager_latent_dim: null
+  # What the goal MEANS. "latent" (default) is FuN's: a direction in the LEARNED
+  # space `s`, where the manager owns both arguments of its own objective.
+  # "position_waypoint" / "position_direction" make `s` a ZERO-PARAMETER readout
+  # of the env (agent (x, y)), so the yardstick cannot be rotated, latent
+  # collapse is impossible rather than guarded, and progress is measurable in
+  # metres. See conf/model/feudal_film_waypoint.yaml — and note
+  # "position_direction" is MORE exposed to the shared-objective degeneracy than
+  # "latent", not less; only the waypoint form's reward saturates.
+  goal_space: latent
+  # Waypoint reach as a fraction of world extent; read only under
+  # "position_waypoint". 1/3 is exactly sector_sensor_radius/world_width in both
+  # MJX envs, so a waypoint lands inside one perceptual horizon.
+  waypoint_radius: 0.3333333333333333
   manager_hidden_dim: 256
   # "mlp" (stateless) or "dilated_lstm" (FuN's dilated recurrence). mlp is the
   # default so goal-mechanism effects stay attributable separately from

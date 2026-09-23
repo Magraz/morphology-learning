@@ -12,6 +12,7 @@ from algorithms.feudal_mappo_jax.goal_dependence_probe import _checkpoint_path, 
 from algorithms.feudal_mappo_jax.latent_locality_probe import (
     collect_states,
     unsupported_env_reason,
+    unsupported_goal_space_reason,
 )
 from algorithms.feudal_mappo_jax.manager import (
     GLOBAL_LATENTS,
@@ -54,6 +55,14 @@ for batch in a.batches.split(","):
         print(f"{batch}/{model}: SKIPPED — {reason}")
         continue
     cfg = runner.config
+    # Checked AFTER the env but BEFORE the rollout, and against the resolved
+    # config rather than the yaml: a grounded arm's `s` is an env readout, so
+    # these numbers would describe the manager's internal bottleneck under a
+    # heading that claims they describe the goal space.
+    reason = unsupported_goal_space_reason(cfg)
+    if reason is not None:
+        print(f"{batch}/{model}: SKIPPED — {reason}")
+        continue
     tree = msgpack_restore(path.read_bytes())
     mp = jax.tree.map(jnp.asarray, {"params": tree["manager"]["params"]})
     wp = jax.tree.map(jnp.asarray, {"params": tree["actor"]["params"]})

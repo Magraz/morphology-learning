@@ -103,10 +103,27 @@ class Model_Params:
     hidden_dim: int
     # Width of the manager's latent state space `s` AND of the goal `g` — in FuN
     # a goal is a *direction in the state embedding*, so they share a space and
-    # this is the only width knob. It is also the manager's entire information
-    # bottleneck (the recurrent core consumes `s`), so shrinking it throttles the
-    # goal RNN too.
+    # this is the only width knob.
+    #
+    # ⚠ Under a GROUNDED `goal_space` this is DERIVED, not configured:
+    # `trainer.resolve_goal_space` overwrites it with `env.goal_state_dim` (2 for
+    # an (x, y) readout). Setting it by hand there does not raise at composition —
+    # it raises much later, inside `cosine_similarity` in `manager_update`, by
+    # which time `ppo_update` has already trained the worker on a wrong-width
+    # "error vector". Hence the override rather than a guard.
     goal_dim: int = 32
+    # Width of the manager's internal bottleneck `s_learned` — what `f_Mspace` /
+    # `f_Mspace_agent` / `f_gpre` emit and what the recurrent core consumes.
+    # `None` (default) resolves to `goal_dim`, which is byte-for-byte the original
+    # behaviour: the two were ONE knob until grounded goals needed them split.
+    #
+    # WHY THEY HAD TO SPLIT: `manager.py`'s core reads
+    # `s.reshape(..., n_agents * <this>)`, so this width is the manager's entire
+    # information channel, not just the goal space. A grounded arm sets
+    # `goal_dim: 2`, and with the knobs fused that would hand the core 2*n_agents
+    # numbers (24 at N=12) as its only view of the world — crippling, and silent.
+    # Keep this at the latent default (32) on every grounded arm.
+    manager_latent_dim: int | None = None
     manager_hidden_dim: int = 256
     # "mlp" (stateless) or "dilated_lstm" (FuN's dilated recurrence, radius =
     # goal_horizon). The mlp core is the default so that goal-mechanism effects
@@ -161,6 +178,43 @@ class Model_Params:
     # (manager_hidden, n_agents*goal_dim)). "local_private" is compatible with
     # NEITHER: it has no f_Mspace/f_gpre/f_goalhead at all.
     manager_latent: str = "centralized"
+    # What the goal MEANS — the space the manager's directive lives in, and hence
+    # what `s` is measured in. See manager.GOAL_SPACES.
+    #
+    #   "latent"             (default) a direction in the LEARNED space `s`. The
+    #                        original, and bit-identical to the pre-flag code.
+    #   "position_waypoint"  `g` is a target (x, y), latched for `goal_horizon`
+    #                        steps; the worker reads the LIVE error (w - s_t)/R and
+    #                        is scored on distance closed.
+    #   "position_direction" `g` is a unit direction in world (x, y); the existing
+    #                        d_cos objective applies verbatim.
+    #
+    # WHY: under "latent" the manager owns BOTH arguments of the cosine — it picks
+    # the measuring stick `s` AND the target `g` — so the objective's level is
+    # uninterpretable, latent collapse is possible, and every measurement to date
+    # says the channel is decorative (gap_permuted ~ 0 on 40/45 trials, gap_zeroed
+    # systematically negative, best arm provably goal-free). A grounded `s` is a
+    # ZERO-PARAMETER readout of the env, so the yardstick cannot be rotated,
+    # rank-1 collapse is impossible rather than guarded, and the goal becomes
+    # drawable and measurable in metres.
+    #
+    # ⚠ "position_direction" is MORE exposed to the shared-objective degeneracy
+    # than "latent", not less: manager and worker still climb one objective
+    # through the environment, and "everyone go north-east" is trivially
+    # achievable for a force-controlled agent with no bounded resource to exhaust.
+    # "position_waypoint"'s telescoping reward SATURATES (sum over a latch block
+    # <= 1), which is the structural protection — and the reason it is the arm to
+    # run. That protection is only active at intrinsic_coef > 0.
+    goal_space: str = "latent"
+    # Waypoint reach, as a fraction of world extent. Only read under
+    # goal_space="position_waypoint". The default 1/3 is exactly
+    # `sector_sensor_radius / world_width` in BOTH MJX envs, so a waypoint lands
+    # inside one perceptual horizon.
+    #
+    # ⚠ Unparameterized: it does not appear in any checkpoint, so a run cannot be
+    # told apart from one at a different radius after the fact. It is recorded in
+    # `evaluate_goal_dependence`'s provenance dict for that reason.
+    waypoint_radius: float = 1.0 / 3.0
     # Optional bias-free Dense on the goal before it meets the obs (FuN's `phi`).
     # None = raw concat fusion; see the degeneracy note in worker.py.
     goal_embed_dim: int | None = None
@@ -307,11 +361,22 @@ class MAPPOConfig:
     manager_gamma: float = 0.99
     n_manager_epochs: int = 1
     n_manager_critic_epochs: int = 8
+    # See Model_Params.manager_latent_dim — the manager's internal bottleneck,
+    # which `f_Mspace`/`f_gpre` emit and the core consumes. None => goal_dim
+    # (byte-identical to the pre-split behaviour). Resolved eagerly by
+    # `trainer.resolve_goal_space`, so anything downstream may read it directly.
+    manager_latent_dim: int | None = None
     manager_hidden_dim: int = 256
     manager_core: str = "mlp"
     # See Model_Params.manager_latent — "centralized" (default), "local",
     # "local_global" or "local_private".
     manager_latent: str = "centralized"
+    # See Model_Params.goal_space — "latent" (default), "position_waypoint" or
+    # "position_direction". Under a grounded value `goal_dim` above is DERIVED
+    # from `env.goal_state_dim` by `trainer.resolve_goal_space`.
+    goal_space: str = "latent"
+    # See Model_Params.waypoint_radius. Only read under "position_waypoint".
+    waypoint_radius: float = 1.0 / 3.0
     goal_embed_dim: int | None = None
     normalize_pooled_goal: bool = True
     zero_goal: bool = False
@@ -363,17 +428,25 @@ class Transition(NamedTuple):
     # reward (which detaches both of its arguments), and because it is the oracle
     # the "recomputed goals match the rollout" seam test compares against.
     goal: jax.Array
-    # The goal the worker ACTUALLY acted on: sum of the last `goal_horizon` goals
-    # (FuN's w_t), (n_envs, n_agents, goal_dim). Must be stored rather than
-    # recomputed — the PPO ratio is only valid if `evaluate_action` sees exactly
-    # the vector `sample_action` saw, and recomputation would drift once the
-    # manager's params move.
+    # The goal the worker ACTUALLY acted on, (n_envs, n_agents, goal_dim) — what
+    # the configured `GoalChannel` pools out of its carry:
+    #   latent / position_direction  sum of the last `goal_horizon` goals (FuN's w_t)
+    #   position_waypoint            the LIVE error (w_t - s_t)/R, which shrinks as
+    #                                the agent closes on its latched waypoint
+    # Must be stored rather than recomputed — the PPO ratio is only valid if
+    # `evaluate_action` sees exactly the vector `sample_action` saw, and
+    # recomputation would drift once the manager's params move.
     pooled_goal: jax.Array
-    # The manager's latent state `s` at ACT time — i.e. BEFORE this transition's
-    # action, built from `obs`/`global_state` above. (n_envs, n_agents, goal_dim).
-    # It must stay the pre-action latent: `manager_update` recomputes exactly it,
-    # differentiably, from the stored state, and the goal-reproducibility seam
-    # test pins that equality.
+    # The manager's state space `s` at ACT time — i.e. BEFORE this transition's
+    # action. (n_envs, n_agents, goal_dim). What it holds depends on `goal_space`:
+    #   latent    the LEARNED latent, built from `obs`/`global_state` above.
+    #             `manager_update` recomputes exactly it, differentiably, and the
+    #             goal-reproducibility seam test pins that equality.
+    #   grounded  the env's ZERO-PARAMETER readout, `env.goal_state(env_state)`.
+    #             Stored data carries no gradient, so FuN's detach rule is
+    #             satisfied STRUCTURALLY rather than by `stop_gradient`, and the
+    #             recompute-matches-rollout test does NOT apply to this field (the
+    #             goal half of it still does).
     state_latent: jax.Array
     # The latent of the successor this transition's action ACTUALLY produced,
     # read BEFORE the auto-reset overwrites it. Same shape as `state_latent`; a
