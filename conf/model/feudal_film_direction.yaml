@@ -40,10 +40,23 @@
 #     Baseline ~0.744 at N=12, ~0.778 at N=16.
 #
 #   uv run python train.py algorithm=feudal_mappo_jax \
-#       env=mjx_12a_3o_trunc_1024 model=feudal_film_position trial_id=0
+#       env=mjx_12a_3o_trunc_1024 model=feudal_film_direction trial_id=0
 defaults:
-  - feudal_film_narrow
+  - feudal_film
   - _self_
 
 model_params:
+  # ⚠ REQUIRED, and it is not a tuning knob. `manager.py`'s core reads
+  # s.reshape(..., n_agents*manager_latent_dim), so this width is the manager's
+  # ENTIRE information channel. A grounded arm DERIVES `goal_dim` from the env
+  # (2 for an (x, y) readout), and left fused the core would see 2*n_agents = 24
+  # numbers as its whole view of the world. 32 is the latent default, i.e. this
+  # keeps the bottleneck exactly as wide as every other feudal_film* arm.
+  #
+  # Unlike the latent mode, `s` and `g` are DIFFERENT spaces here — `s` is the
+  # env readout and `g` is a direction/target in it — so a 2-wide goal against a
+  # 32-wide bottleneck is well-posed, where in `latent` it would be ill-posed
+  # (that is what `feudal_film_narrow` cannot do, and why it is NOT this arm's
+  # width control).
+  manager_latent_dim: 32
   goal_space: position_direction

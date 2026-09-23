@@ -71,16 +71,36 @@
 # conditions in feudal_film.yaml, read gap_constant as the content test here.
 #
 # ACCEPTANCE is the BETWEEN-ARM return on the same env group and seeds, against
-# `feudal_film_narrow` (the width-matched latent rung), `feudal_film_zerogoal`
-# (the goal-free floor) and `mlp` (flat MAPPO: 271.6 / 294.6 on the 12a groups).
+# `feudal_film_zerogoal` (the goal-free floor) and `mlp` (flat MAPPO).
+#
+# ⚠ THERE IS NO WIDTH-MATCHED LATENT CONTROL, and there cannot be. This arm
+# runs a 2-wide goal against a 32-wide bottleneck; in `latent` mode `s` and
+# `g` are the same space by construction, so that combination is unreachable
+# (see feudal_film_narrow.yaml). The rank-2-vs-rank-32 FiLM modulation is
+# therefore a confound against `feudal_film` that no latent arm can isolate —
+# state it rather than pretending `feudal_film_narrow` controls for it, since
+# that arm varies the bottleneck too.
 # The goal-dependence probe rules an arm OUT cheaply; it can never rule one IN.
 #
 #   uv run python train.py algorithm=feudal_mappo_jax \
 #       env=mjx_12a_3o_trunc_1024 model=feudal_film_waypoint trial_id=0
 defaults:
-  - feudal_film_narrow
+  - feudal_film
   - _self_
 
 model_params:
+  # ⚠ REQUIRED, and it is not a tuning knob. `manager.py`'s core reads
+  # s.reshape(..., n_agents*manager_latent_dim), so this width is the manager's
+  # ENTIRE information channel. A grounded arm DERIVES `goal_dim` from the env
+  # (2 for an (x, y) readout), and left fused the core would see 2*n_agents = 24
+  # numbers as its whole view of the world. 32 is the latent default, i.e. this
+  # keeps the bottleneck exactly as wide as every other feudal_film* arm.
+  #
+  # Unlike the latent mode, `s` and `g` are DIFFERENT spaces here — `s` is the
+  # env readout and `g` is a direction/target in it — so a 2-wide goal against a
+  # 32-wide bottleneck is well-posed, where in `latent` it would be ill-posed
+  # (that is what `feudal_film_narrow` cannot do, and why it is NOT this arm's
+  # width control).
+  manager_latent_dim: 32
   goal_space: position_waypoint
   normalize_pooled_goal: false
