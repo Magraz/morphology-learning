@@ -1,0 +1,38 @@
+# @package _global_
+#
+# `mjx_16a_4o_trunc_1024` + a COMPACT GLOBAL STATE, differing in exactly one key
+# (`use_global_state: true`), so it is the controlled comparison against that
+# group. New group name => new `experiments/results/<group>/` directory, so it
+# cannot collide with the baseline's checkpoints.
+#
+# The centralized critic (and, under `feudal_mappo_jax`, the manager) reads
+# `MultiBoxPushMJX._compact_global_state` instead of `obs.reshape(n_envs, -1)`:
+#   agents (A, 4): centred position / (W, H), velocity / velocity_norm
+#   boxes  (O, 6): centred position / (W, H), goal distance / H, delivered,
+#                  touch count / A, coupling / A
+# At 16a/4o that is **gs_dim = 88** against 640 for the concatenated obs. The
+# banner prints the resolved `gs_dim` at launch — if it says 640 the key did not
+# land (nothing validates the `env:` block).
+#
+# ⚠ What this buys, honestly: exactness and width, NOT information. A *linear*
+# readout already recovers agent world coordinates from the 640-dim concat to
+# 3.36 world units in a 47-wide arena (against 17.95 for predict-the-mean and
+# 0.006 from the compact state) — measured by
+# `algorithms/feudal_mappo_jax/global_state_probe.py`. What the observation does
+# not carry at all is `delivered` (delivery latches, so a box pushed back out of
+# the band keeps a position that says "undelivered") and the live touch count.
+#
+# ⚠ The layout is frozen: `gs_dim` is baked into every `models_*.msgpack`, so
+# changing the feature set means a NEW group, not an edit to this one.
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 6
+  n_objects: 4
+  reward_mode: dense
+
+  variant: trunc
+  coupling_def: [4,3,3,2]
+
+params:
+  n_steps: 1024

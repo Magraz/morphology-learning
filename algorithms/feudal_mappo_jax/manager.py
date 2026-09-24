@@ -204,6 +204,12 @@ GROUNDED_GOAL_SPACES = ("position_waypoint", "position_direction")
 #: vector, rather than pooling directions over a ring.
 WAYPOINT_GOAL_SPACES = ("position_waypoint",)
 
+#: A waypoint counts as REACHED (`waypoint_reached_frac`) when the agent comes
+#: within this fraction of the waypoint radius R of it at any step of its
+#: commitment. In units of R so it scales with the directive: 0.1 R is 1.1 world
+#: units at 6a/4o (W=33), ~2.75 agent radii.
+WAYPOINT_REACHED_TOL = 0.1
+
 
 def block_orthogonal(n_blocks: int):
     """Init for a stacked per-agent projection ``(n_blocks, d_in, d_out)``.
@@ -1211,13 +1217,87 @@ def waypoint_progress(
     d_fut = jnp.linalg.norm(w - jnp.take(target, dst, axis=0), axis=-1)
     progress = (d_now - d_fut) / radius
 
-    in_range = (steps + horizon <= T - 1).astype(jnp.float32)
-    valid = (
-        _align(in_range, progress)
-        * _same_episode(done, steps, dst, T)
-        * latch_steps(goals.shape, horizon, done=done)
-    )
+    valid = _complete_commitments(goals.shape, horizon, done)
     return progress, jnp.broadcast_to(valid, progress.shape)
+
+
+def _complete_commitments(goals_shape, horizon: int, done=None):
+    """``(T, ...)`` 1.0 at a latch step whose whole commitment was observed.
+
+    I.e. `t` issued a waypoint, and ``[t, t+c]`` lies inside the rollout and
+    inside one episode, so the waypoint's full horizon and the position it
+    expired at are both in the data. The one mask shared by the manager's
+    objective (``waypoint_progress``) and the logged achievement metrics
+    (``waypoint_achievement``), so the two are averaged over the same
+    commitments by construction.
+    """
+    T = goals_shape[0]
+    lead = goals_shape[1:-1]
+    steps = jnp.arange(T)
+    dst = jnp.minimum(steps + horizon, T - 1)
+    in_range = (steps + horizon <= T - 1).astype(jnp.float32)
+    return (
+        in_range.reshape((T,) + (1,) * len(lead))
+        * _same_episode(done, steps, dst, T)
+        * latch_steps(goals_shape, horizon, done=done)
+    )
+
+
+def waypoint_achievement(
+    states: jnp.ndarray,
+    goals: jnp.ndarray,
+    horizon: int,
+    radius: float,
+    done: Optional[jnp.ndarray] = None,
+    tol: float = WAYPOINT_REACHED_TOL,
+):
+    """Did the agents get to their waypoints? ``(error, reached, valid)``.
+
+    Diagnostics only (no gradient), computed from the STORED rollout — the
+    raw goals and env readouts in ``Transition`` — so they describe what the
+    agents actually did under the waypoints actually issued. Scored per
+    commitment, at its latch step ``tau``, with ``w = s_tau + R * g_tau``:
+
+    * ``error[tau] = ||w - s_{tau+c}|| / R`` — the distance left when the
+      waypoint EXPIRES, in units of R. 1.0 = no net progress, 0 = arrived,
+      > 1 = ended further away than it started. At a latch step this is exactly
+      ``1 - progress`` (``waypoint_progress``), so its masked mean equals
+      ``1 - d_cos_mean`` on a waypoint arm whenever the manager's recompute
+      reproduces the rollout's goals.
+    * ``reached[tau]`` — 1.0 if the agent came within ``tol * R`` of `w` at ANY
+      step of ``[tau, tau+c]``. The closest approach, not the endpoint, so an
+      agent that passes through its waypoint and overshoots still counts —
+      which ``error`` alone would read as a failure.
+
+    ⚠ Bounded by physics as well as by the policy: an agent covers at most
+    ``c * v_max * dt`` in one commitment. Measured on `MultiBoxPushMJX` at the
+    shipped ``goal_horizon=10`` / ``waypoint_radius=1/3``, that is 6-12% of R
+    from rest (reaching R takes ~50-90 steps) — so ``error`` cannot fall below
+    ~0.85 and ``reached`` is 0 for any policy.
+
+    `valid` is ``_complete_commitments``: only latch steps whose whole
+    ``[tau, tau+c]`` window is in one episode and in the rollout.
+    """
+    _check_done(done, states.shape[:-1], "waypoint_achievement")
+    states = jax.lax.stop_gradient(states)
+    goals = jax.lax.stop_gradient(goals)
+    w = latch_waypoints(goals, states, horizon, radius, done=done)
+
+    T = states.shape[0]
+    steps = jnp.arange(T)
+    # Python loop over the (static, small) horizon rather than a stacked
+    # (T, c+1, ...) gather, so peak memory stays one (T, ...) distance array.
+    closest = error = None
+    for k in range(horizon + 1):
+        s_k = jnp.take(states, jnp.minimum(steps + k, T - 1), axis=0)
+        error = jnp.linalg.norm(w - s_k, axis=-1) / radius
+        closest = error if closest is None else jnp.minimum(closest, error)
+
+    reached = (closest <= tol).astype(jnp.float32)
+    valid = jnp.broadcast_to(
+        _complete_commitments(goals.shape, horizon, done), error.shape
+    )
+    return error, reached, valid
 
 
 def waypoint_intrinsic_reward(

@@ -1,0 +1,9 @@
+# @package _global_
+# Delta: `goal_horizon` (c) 10 -> 50. The alpha=0.5 twin of `feudal_n01_c50`;
+# see that file for what c controls and which env groups it is valid on.
+defaults:
+  - feudal_n05
+  - _self_
+
+params:
+  goal_horizon: 50

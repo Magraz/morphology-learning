@@ -42,6 +42,7 @@ from algorithms.feudal_mappo_jax.manager import (
     mean_goal_direction,
     pool_goals,
     transition_cosine,
+    waypoint_achievement,
     waypoint_intrinsic_reward,
     waypoint_progress,
 )
@@ -3369,6 +3370,91 @@ def test_waypoint_manager_pg_is_scored_only_at_latch_steps():
     at_latch = latch_steps(traj.goal.shape, HORIZON, done=done_a)
     assert jnp.all(valid <= at_latch + 1e-6), "scored a non-latch step"
     assert float(valid.mean()) > 0.0, "nothing was scored at all"
+
+
+def test_waypoint_achievement_reads_known_trajectories():
+    """Closed-form trajectories, one per agent, straight along the waypoint axis.
+
+    Every agent is issued the same waypoint `R` ahead on +x and then moves at a
+    constant velocity `v` per step, so the answers are arithmetic. The overshoot
+    agent is the case the two metrics exist to disagree on: it passes exactly
+    through its waypoint mid-commitment, so it REACHED it, yet it expires as far
+    from it as it started.
+    """
+    c, R = 4, 1.0
+    #            still   half   exact   overshoot   away
+    v = jnp.array([0.0, 0.5 * R / c, R / c, 2.0 * R / c, -R / c])
+    T = c + 1  # exactly one complete commitment, issued at t=0
+    t = jnp.arange(T, dtype=jnp.float32)[:, None, None]
+    states = jnp.stack(
+        [t * v[None, None, :], jnp.zeros((T, 1, v.shape[0]))], axis=-1
+    )  # (T, 1 env, 5 agents, 2)
+    goals = jnp.broadcast_to(jnp.array([1.0, 0.0]), states.shape)
+
+    error, reached, valid = waypoint_achievement(states, goals, c, R)
+
+    assert np.array_equal(np.asarray(valid[:, 0, 0]), [1.0, 0, 0, 0, 0]), (
+        "only the t=0 commitment is complete"
+    )
+    np.testing.assert_allclose(error[0, 0], [1.0, 0.5, 0.0, 1.0, 2.0], atol=1e-6)
+    np.testing.assert_array_equal(reached[0, 0], [0.0, 0.0, 1.0, 1.0, 0.0])
+
+
+def test_waypoint_achievement_shares_the_objectives_mask():
+    """Same commitments as the manager's objective, and `error == 1 - progress`.
+
+    The shared mask is what makes `waypoint_error_norm` comparable with
+    `d_cos_mean`; the identity is what the logged pair relies on.
+    """
+    cfg = _grounded_config("position_waypoint")
+    env = StubEnv()
+    init_fn, collect_fn, _, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    _, traj, _, _ = collect_fn(rs)
+
+    done_a = jnp.broadcast_to(
+        traj.done[..., None].astype(jnp.float32), traj.goal.shape[:-1]
+    )
+    progress, valid_p = waypoint_progress(
+        traj.state_latent, traj.goal, HORIZON, cfg.waypoint_radius, done=done_a
+    )
+    error, reached, valid_a = waypoint_achievement(
+        traj.state_latent, traj.goal, HORIZON, cfg.waypoint_radius, done=done_a
+    )
+    assert float(valid_a.sum()) > 0, "vacuous: no complete commitment"
+    assert jnp.array_equal(valid_a, valid_p), "the two masks diverged"
+    on = np.asarray(valid_a) > 0
+    np.testing.assert_allclose(
+        np.asarray(error)[on], 1.0 - np.asarray(progress)[on], atol=1e-5
+    )
+    assert set(np.unique(np.asarray(reached))) <= {0.0, 1.0}
+
+
+@pytest.mark.parametrize(
+    "goal_space", ["latent", "position_direction", "position_waypoint"]
+)
+def test_waypoint_achievement_is_logged_only_on_waypoint_arms(goal_space):
+    """The keys exist exactly when a waypoint is issued, so no other arm gains a
+    column — and on a waypoint arm the logged error is `1 - d_cos_mean`, i.e. the
+    stored rollout and the manager's recompute describe the same commitments."""
+    cfg = (
+        _config() if goal_space == "latent" else _grounded_config(goal_space)
+    )
+    env = StubEnv()
+    init_fn, collect_fn, update_fn, _, _ = make_train(cfg, env)
+    rs = init_fn(jax.random.PRNGKey(0))
+    rs, traj, boot, _ = collect_fn(rs)
+    _, losses = update_fn(rs, traj, boot)
+
+    keys = {"waypoint_error_norm", "waypoint_reached_frac"}
+    if goal_space != "position_waypoint":
+        assert not keys & set(losses), f"{goal_space} arm logged waypoint keys"
+        return
+    assert keys <= set(losses)
+    assert float(losses["waypoint_error_norm"]) == pytest.approx(
+        1.0 - float(losses["d_cos_mean"]), abs=1e-4
+    )
+    assert 0.0 <= float(losses["waypoint_reached_frac"]) <= 1.0
 
 
 def test_waypoint_intrinsic_reward_telescopes():

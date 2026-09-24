@@ -1,0 +1,34 @@
+# @package _global_
+# Delta: `goal_horizon` (c) 10 -> 50.
+#
+# See `feudal_n01.yaml` for what alpha means and the collapse watch-list, and
+# `conf/algorithm/feudal_mappo_jax.yaml` for c. c is three things at once, and
+# this arm moves all three together: the lag of the manager's transition cosine
+# d_cos(s_{t+c} - s_t, g_t), the number of goals the worker pools over, and the
+# window of the worker's intrinsic reward r^I. (It is also the dilation radius
+# of the `dilated_lstm` core, which this arm does not use.)
+#
+# ⚠ ONLY RUN ON LONG-EPISODE ENV GROUPS (`trunc`, `_1024`, multi-goal). A
+# horizon that straddles an episode boundary is masked out, so on a group whose
+# episodes end early — `mjx_16a_4o` terminates on wall contact at ~43 steps —
+# almost no horizon is valid at c=50 and the manager gets no gradient. Read
+# `valid_fraction`: at c=10 it is 0.88 -> 0.76 on that group; on a 1024-step
+# group it sits at (n_steps - c) / n_steps — measured 0.951 on
+# `mjx_16a_4o_trunc_1024` (n_steps 1024), i.e. the last c steps of each rollout.
+#
+# ⚠ GPU MEMORY GROWS LINEARLY IN c. r^I (`manager._intrinsic_window`) vmaps
+# over all c offsets and materializes a (c, T, n_envs, n_agents, goal_dim)
+# intermediate. Measured peak on `mjx_16a_4o_trunc_1024` (feudal_n05_c50, 2
+# updates, no preallocation): 4.7 GB at c=10 vs 10.8 GB at c=50, including a
+# 1.2 GB desktop baseline. Fits a 16 GB card; a 12 GB card would be tight.
+# Only alpha > 0 arms pay this (alpha = 0 never computes r^I).
+#
+# The pooled goal is a sum of 50 unit goals, so this arm depends on
+# `normalize_pooled_goal: true` (the default). Without it the goal would enter
+# the worker's first layer at up to 50x the scale of the observation.
+defaults:
+  - feudal_n01
+  - _self_
+
+params:
+  goal_horizon: 50

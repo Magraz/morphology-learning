@@ -1687,6 +1687,7 @@ def manager_update(
     """
     from algorithms.feudal_mappo_jax.manager import (
         transition_cosine,
+        waypoint_achievement,
         waypoint_progress,
     )
 
@@ -1969,6 +1970,22 @@ def manager_update(
 
     metrics = jax.tree.map(lambda x: x.mean(), epoch_metrics)
     metrics["manager_value_loss"] = critic_losses.mean()
+    if waypoint:
+        # Waypoint achievement, from the STORED rollout (the goals the worker
+        # actually acted under), so it is independent of the manager params and
+        # sits outside the epoch loop. Same commitments as the objective's mask.
+        # `waypoint_error_norm` == 1 - d_cos_mean here by construction; see
+        # `manager.waypoint_achievement`.
+        wp_error, wp_reached, wp_valid = waypoint_achievement(
+            trajectory.state_latent,
+            trajectory.goal,
+            horizon,
+            config.waypoint_radius,
+            done=done_a,
+        )
+        wp_mask = wp_valid * active
+        metrics["waypoint_error_norm"] = _masked_mean(wp_error, wp_mask)
+        metrics["waypoint_reached_frac"] = _masked_mean(wp_reached, wp_mask)
     # Pre-update EV, like the worker's: measures the critic that PRODUCED the
     # advantages this update used, not the one left behind after fitting.
     metrics["manager_explained_variance"] = m_explained_variance

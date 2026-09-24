@@ -730,14 +730,17 @@ class Feudal_MAPPO_JAX_Runner:
 
     # ------------------------------------------------------------------ view / eval
 
-    def view(self):
-        """Render trained-policy episodes and plot manager goals versus outcomes."""
+    def view(self, *, detailed_goal_plots: bool = False):
+        """Render episodes with task-return/alignment summaries.
+
+        Set detailed_goal_plots=True for the per-agent PCA and raw cosine plots.
+        """
         # Envs that bring their own renderer (SMAX) take a separate path: the MJX
         # renderers below are not generic — they read world_width, sector_sensor_radius,
         # objects_push_coupling_list, _build_xml(), state.data.qpos and hardcoded MJX
         # observation-slice constants off the env.
         if hasattr(self.env, "render_episode"):
-            return self._view_with_env_renderer()
+            return self._view_with_env_renderer(detailed_goal_plots=detailed_goal_plots)
 
         import imageio
         import matplotlib.pyplot as plt
@@ -751,7 +754,13 @@ class Feudal_MAPPO_JAX_Runner:
         )
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
-        from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
+        from algorithms.feudal_mappo_jax.goal_visualization import (
+            save_goal_alignment_plot,
+            save_goal_plot,
+            save_task_alignment_episode,
+            save_task_alignment_overview,
+            summarize_task_alignment,
+        )
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
@@ -871,7 +880,9 @@ class Feudal_MAPPO_JAX_Runner:
             episode_goals.append(np.asarray(goal))
             episode_latents.append(np.asarray(s_now))
             goal_hist = channel.write(goal_hist, goal, t, s_now)
-            return m_carry, goal_hist, channel.pool(goal_hist, s_now)
+            pooled = channel.pool(goal_hist, s_now)
+            episode_pooled_goals.append(np.asarray(pooled))
+            return m_carry, goal_hist, pooled
 
         def _draw(state, obs):
             """Append one rendered frame (+ native) for the given base state."""
@@ -888,6 +899,7 @@ class Feudal_MAPPO_JAX_Runner:
         base_step_fn = jax.jit(render_env.step) if is_macro else None
         skill_actions_fn = jax.jit(self.env._skill_actions) if is_macro else None
 
+        episode_summaries = []
         print("\nTesting trained agents...")
         for episode in range(10):
             key = jax.random.PRNGKey(int(np.random.randint(0, 2**31)))
@@ -899,6 +911,8 @@ class Feudal_MAPPO_JAX_Runner:
                 state = self.env.base_state(state)
             rewards, frames, native_frames = [], [], []
             episode_goals, episode_latents = [], []
+            episode_pooled_goals, episode_active = [], []
+            episode_task_rewards = []
             m_carry, goal_hist = _fresh_goal_state()
 
             if is_macro:
@@ -910,6 +924,8 @@ class Feudal_MAPPO_JAX_Runner:
                         m_carry, goal_hist, t, obs, state
                     )
                     skills = policy_fn(obs, pooled)
+                    macro_active = np.ones(self.env.n_agents, dtype=bool)
+                    macro_reward = 0.0
                     for _ in range(self.env.macro_len):  # low-level steps
                         _draw(state, obs)
                         actions = skill_actions_fn(state, skills)
@@ -917,9 +933,15 @@ class Feudal_MAPPO_JAX_Runner:
                             state, actions
                         )
                         rewards.append(float(info["task_reward"]))
+                        macro_reward += rewards[-1]
+                        macro_active &= np.asarray(
+                            info.get("active", np.ones(self.env.n_agents)), dtype=bool
+                        )
                         if bool(terminated) or bool(truncated):
                             done = True
                             break
+                    episode_active.append(macro_active)
+                    episode_task_rewards.append(macro_reward)
                     if done:
                         break
             else:
@@ -934,6 +956,10 @@ class Feudal_MAPPO_JAX_Runner:
                     # Team reward: the env's `reward` is per-agent under
                     # difference_rewards, and the plot is of team performance.
                     rewards.append(float(info["task_reward"]))
+                    episode_task_rewards.append(rewards[-1])
+                    episode_active.append(np.asarray(
+                        info.get("active", np.ones(self.env.n_agents))
+                    ))
                     if bool(terminated) or bool(truncated):
                         break
             # Include s_T from the final observation, without resetting the env
@@ -945,10 +971,27 @@ class Feudal_MAPPO_JAX_Runner:
             episode_latents.append(
                 np.asarray(final_latent if final_s is None else final_s)
             )
-            save_goal_plot(
-                episode_goals, episode_latents, horizon,
-                self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+            summary = summarize_task_alignment(
+                episode_goals, episode_latents, episode_pooled_goals, horizon,
+                episode_task_rewards, episode=episode,
+                active=episode_active, goal_space=self.config.goal_space,
+                macro_steps=is_macro,
             )
+            episode_summaries.append(summary)
+            save_task_alignment_episode(
+                summary, self.dirs["logs"] / f"task_vs_alignment_episode_{episode}.png",
+            )
+            if detailed_goal_plots:
+                save_goal_plot(
+                    episode_goals, episode_latents, horizon,
+                    self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+                )
+                save_goal_alignment_plot(
+                    episode_goals, episode_latents, episode_pooled_goals, horizon,
+                    self.dirs["logs"] / f"goal_alignment_episode_{episode}.png", episode,
+                    active=episode_active, goal_space=self.config.goal_space,
+                    macro_steps=is_macro,
+                )
             rewards = np.asarray(rewards)
 
             # Episode *return* (sum), not the final step's reward — the delivery
@@ -980,7 +1023,13 @@ class Feudal_MAPPO_JAX_Runner:
                 imageio.mimwrite(native_path, native_frames, fps=30, macro_block_size=1)
                 print(f"Native video saved to {native_path}")
 
-    def _view_with_env_renderer(self, n_episodes: int = 3):
+        save_task_alignment_overview(
+            episode_summaries, self.dirs["logs"] / "task_vs_alignment.png",
+        )
+
+    def _view_with_env_renderer(
+        self, n_episodes: int = 3, *, detailed_goal_plots: bool = False,
+    ):
         """Render episodes using the env's own renderer (SMAX -> SMAXVisualizer).
 
         Fewer episodes than the MJX path renders (10) because SMAXVisualizer animates
@@ -1004,7 +1053,13 @@ class Feudal_MAPPO_JAX_Runner:
         )
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
-        from algorithms.feudal_mappo_jax.goal_visualization import save_goal_plot
+        from algorithms.feudal_mappo_jax.goal_visualization import (
+            save_goal_alignment_plot,
+            save_goal_plot,
+            save_task_alignment_episode,
+            save_task_alignment_overview,
+            summarize_task_alignment,
+        )
 
         train_state = self._load_train_state()
         # Static: does the worker read the manager's encoder instead of raw obs?
@@ -1051,6 +1106,7 @@ class Feudal_MAPPO_JAX_Runner:
             )
             return actions
 
+        episode_summaries = []
         for episode in range(n_episodes):
             obs, state = reset_fn(jax.random.PRNGKey(self.rng_seed + episode))
             # Per-episode manager memory: zeroed core carry + zeroed goal ring, the
@@ -1064,6 +1120,8 @@ class Feudal_MAPPO_JAX_Runner:
 
             state_seq, rewards = [], []
             episode_goals, episode_latents = [], []
+            episode_pooled_goals, episode_active = [], []
+            episode_task_rewards = []
             for t in range(self.env.max_steps):
                 # The manager reads the env's real global state here, exactly as the
                 # trainer does — not a reshape of the observations.
@@ -1073,14 +1131,18 @@ class Feudal_MAPPO_JAX_Runner:
                 episode_goals.append(np.asarray(goal))
                 episode_latents.append(np.asarray(latent))
                 goal_hist = channel.write(goal_hist, goal, t, latent)
-                actions = policy_fn(
-                    obs, channel.pool(goal_hist, latent), avail_fn(state)
-                )
+                pooled = channel.pool(goal_hist, latent)
+                episode_pooled_goals.append(np.asarray(pooled))
+                actions = policy_fn(obs, pooled, avail_fn(state))
                 state_seq.append(
                     (state.key, state.env_state, self.env.to_action_dict(actions))
                 )
                 obs, state, _, terminated, truncated, info = step_fn(state, actions)
                 rewards.append(float(info["task_reward"]))
+                episode_task_rewards.append(rewards[-1])
+                episode_active.append(np.asarray(
+                    info.get("active", np.ones(n_agents))
+                ))
                 if bool(terminated) or bool(truncated):
                     break
 
@@ -1088,10 +1150,27 @@ class Feudal_MAPPO_JAX_Runner:
                 m_carry, gs_fn(state), obs.reshape(n_agents, obs_dim)
             )
             episode_latents.append(np.asarray(final_latent))
-            save_goal_plot(
-                episode_goals, episode_latents, horizon,
-                self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+            summary = summarize_task_alignment(
+                episode_goals, episode_latents, episode_pooled_goals, horizon,
+                episode_task_rewards, episode=episode,
+                active=episode_active, goal_space=self.config.goal_space,
+                macro_steps=False,
             )
+            episode_summaries.append(summary)
+            save_task_alignment_episode(
+                summary, self.dirs["logs"] / f"task_vs_alignment_episode_{episode}.png",
+            )
+            if detailed_goal_plots:
+                save_goal_plot(
+                    episode_goals, episode_latents, horizon,
+                    self.dirs["logs"] / f"goals_episode_{episode}.png", episode,
+                )
+                save_goal_alignment_plot(
+                    episode_goals, episode_latents, episode_pooled_goals, horizon,
+                    self.dirs["logs"] / f"goal_alignment_episode_{episode}.png", episode,
+                    active=episode_active, goal_space=self.config.goal_space,
+                    macro_steps=False,
+                )
 
             gif_path = self.dirs["logs"] / f"episode_{episode}.gif"
             self.env.render_episode(state_seq, gif_path)
@@ -1107,6 +1186,11 @@ class Feudal_MAPPO_JAX_Runner:
             ax.set_title(f"Episode {episode} (return {sum(rewards):.2f})")
             fig.savefig(self.dirs["logs"] / f"episode_{episode}_reward.png")
             plt.close(fig)
+
+        save_task_alignment_overview(
+            episode_summaries, self.dirs["logs"] / "task_vs_alignment.png",
+        )
+
 
     def evaluate(self):
         """Deterministic evaluation of the saved policy (PolicyEvaluator parity)."""

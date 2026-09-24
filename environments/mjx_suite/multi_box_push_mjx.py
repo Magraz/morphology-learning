@@ -208,9 +208,9 @@ class MultiBoxPushMJX:
 
         self.velocity_norm = _FORCE_MULTIPLIER / (_AGENT_DAMPING * _AGENT_MASS)
         self.neighbor_detection_range = 3.0
-        self.sector_sensor_radius = self.world_width / 3.0
+        self.sector_sensor_radius = self.world_width / 4.0
         self.lidar_range = self.sector_sensor_radius
-        self.comm_radius = self.world_width / 3.0
+        self.comm_radius = self.world_width / 4.0
         self.force_multiplier = _FORCE_MULTIPLIER
 
         # Position normalization, ONE definition shared by `_compact_global_state`

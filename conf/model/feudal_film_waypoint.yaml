@@ -53,7 +53,16 @@
 #     headings and two perpendicular clusters both score exactly 2.0).
 #   * d_cos_var (logged on `progress` here) <~ 1e-3 => constant, annihilated by
 #     advantage centering.
-#   * waypoint_error_norm / waypoint_reached_frac — achievement in world units.
+#   * waypoint_error_norm / waypoint_reached_frac — achievement, in units of R
+#     (so comparable across arena sizes). error_norm = distance left when the
+#     waypoint EXPIRES / R (1.0 = no net progress; == 1 - d_cos_mean on this
+#     arm); reached_frac = share of commitments whose closest approach came
+#     within 0.1 R (manager.WAYPOINT_REACHED_TOL).
+#     ⚠ PHYSICALLY CAPPED at this config: an agent covers only 6-12% of R in
+#     c=10 steps from rest (measured, 2a/6a/12a MJX; it needs ~50-90 steps to
+#     reach a waypoint R away). So error_norm cannot fall below ~0.85 and
+#     reached_frac reads 0 for ANY policy — the waypoint is unreachable by
+#     construction, not by the policy's failure.
 #
 # ⚠ valid_fraction WILL FALL TO ~1/c (about 0.1 at c=10, against 0.76-0.88 on a
 # latent arm). That is correct: the manager PG is scored at LATCH STEPS ONLY,

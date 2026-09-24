@@ -14,6 +14,7 @@
 #   latent   _local / _local_private / _local_global[_private]
 #                                          manager_latent -> feudal_film_local.yaml
 #   extra    _shared[_enc] / _dilated / _zerogoal / _intrinsic
+#            _c50 (goal_horizon 10 -> 50)  -> feudal_n01_c50.yaml
 #
 # The canonical home for each concept is the file closest to this root that
 # introduces it. A file that reuses a concept cites that file by name.

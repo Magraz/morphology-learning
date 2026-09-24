@@ -1,0 +1,40 @@
+# @package _global_
+#
+# `mjx_1a_3o_111_1024` + the COMPACT GLOBAL STATE, differing in exactly one key
+# (`use_global_state: true`), so it is the controlled comparison against that
+# group. New group name => new `experiments/results/<group>/` directory, so it
+# cannot collide with the baseline's checkpoints (the results path carries the
+# env GROUP name, not its overrides — do NOT flip this with a CLI override on
+# the base group).
+#
+# The critic reads `MultiBoxPushMJX._compact_global_state` instead of the
+# agent's own 40-dim observation; the actor still reads the observation:
+#   agent (1, 4): centred position / (W, H), velocity / velocity_norm
+#   boxes (3, 6): centred position / (W, H), goal distance / H, delivered,
+#                 touch count / A, coupling / A
+# gs_dim = 22 here, against 40 for the baseline. The launch banner prints
+# `centralized input: gs_dim=...` — if it says 40 the key did not land (nothing
+# validates the `env:` block).
+#
+# ⚠ Unlike the multi-agent `_gs` groups, this one gives the critic real
+# INFORMATION, not only exactness. With one agent the "concatenated obs" is that
+# agent's own egocentric view, which senses boxes only within
+# `sector_sensor_radius` and never sees `delivered`; the compact state holds
+# every box's position and delivery flag. Measured (256 envs, sensor radius
+# W/4 = 7.5 in a 30-wide arena): the agent senses 5.7% of the boxes at spawn,
+# 6.3% averaged over 300 random-action steps, and NONE of them 84% of the time.
+#
+# ⚠ The layout is frozen: `gs_dim` is baked into every `models_*.msgpack`, so
+# changing the feature set means a NEW group, not an edit to this one.
+#
+#   uv run python train.py algorithm=mappo_jax env=mjx_1a_3o_111_1024_gs \
+#       model=mlp trial_id=0
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 1
+  n_objects: 3
+  reward_mode: dense
+  variant: trunc
+  use_global_state: true
+  coupling_def: [1,1,1]
