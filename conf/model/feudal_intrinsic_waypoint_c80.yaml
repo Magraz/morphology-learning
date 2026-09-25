@@ -53,3 +53,6 @@ defaults:
   - feudal_film_waypoint
   - feudal_intrinsic
   - _self_
+
+params:
+  goal_horizon: 80
