@@ -37,6 +37,109 @@ def set_seeds(seed: int):
     np.random.seed(seed)
 
 
+def make_env(env_config: dict):
+    """Build the functional JAX env named by an `env:` config block.
+
+    Shared by every runner built on this stack (`mappo_jax` and
+    `simplified_feudal_mappo_jax`), so an `env:` key is wired in one place.
+    """
+    # Create the functional MJX environment. Three supported env groups:
+    #   MULTI_BOX_MJX            — continuous force control (the base env)
+    #   MULTI_BOX_MULTI_GOAL_MJX — the same task on a circular arena with one
+    #                   concentric goal ring per box (box j -> ring j from the
+    #                   center out); same 40-dim obs, action space and reward
+    #                   modes, so nothing downstream changes
+    #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
+    #                   one decision per macro_len low-level steps), which
+    #                   wraps a base MultiBoxPushMJX.
+    # `coupling_def` is forwarded to every branch that builds a box-push env
+    # (bare, multi-goal, and the macro wrapper's base). Default "even" ==
+    # n_agents // n_objects for every box, i.e. exactly what each group got
+    # before this was reachable — so no existing arm changes. "random" draws
+    # per-box requirements in [2, n_agents//2] from a FIXED rng(42), which
+    # also resizes the boxes (`box_half_extents = max(1.5, coupling*0.4)`)
+    # and, in the multi-goal env, the goal rings derived from them.
+    environment = env_config.get("environment")
+    reward_mode = env_config.get("reward_mode", "dense")
+
+    if environment == EnvironmentEnum.MULTI_BOX_MJX:
+        env = MultiBoxPushMJX(
+            n_agents=env_config.get("n_agents"),
+            n_objects=env_config.get("n_objects"),
+            reward_mode=reward_mode,
+            variant=env_config.get("variant"),
+            coupling_def=env_config.get("coupling_def", "even"),
+            use_global_state=env_config.get("use_global_state", False),
+        )
+    elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
+        env = MultiBoxMultiGoalPushMJX(
+            n_agents=env_config.get("n_agents"),
+            n_objects=env_config.get("n_objects"),
+            reward_mode=reward_mode,
+            boundary_ends_episode=env_config.get("boundary_ends_episode", False),
+            coupling_def=env_config.get("coupling_def", "even"),
+        )
+    elif environment == EnvironmentEnum.MACRO_MJX:
+        from environments.mjx_suite.macro_wrapper import (
+            ALIGNED_WINDOWED_DIFFERENCE_REWARDS,
+            WINDOWED_DIFFERENCE_REWARDS,
+            SyncMacroMJX,
+        )
+
+        # The windowed difference rewards (global-window and decision-aligned)
+        # are computed by the wrapper (it forks macro windows per agent), so the
+        # base env must stay dense — it must not also emit its own per-step D.
+        # The single-step "difference_rewards" mode instead lives on the base
+        # env and passes through the wrapper's accumulation.
+        base_reward_mode = (
+            "dense"
+            if reward_mode
+            in (WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS)
+            else reward_mode
+        )
+        base_env = MultiBoxPushMJX(
+            n_agents=env_config.get("n_agents"),
+            n_objects=env_config.get("n_objects"),
+            reward_mode=base_reward_mode,
+            variant=env_config.get("variant"),
+            coupling_def=env_config.get("coupling_def", "even"),
+        )
+        env = SyncMacroMJX(
+            base_env,
+            macro_len=env_config.get("macro_len", 10),
+            reward_mode=reward_mode,
+            # Staggered-starts async study: agents come online at random
+            # low-level steps and decide on their own phase (max_start_delay in
+            # low-level steps). Off by default -> ordinary lockstep options env.
+            stagger_starts=env_config.get("stagger_starts", False),
+            max_start_delay=env_config.get("max_start_delay", 0),
+        )
+    elif environment == EnvironmentEnum.SMAX:
+        # JaxMARL StarCraft, behind an adapter that presents the same functional
+        # array contract as the MJX envs. It brings three things the MJX envs do
+        # not: legal-action masks, a real global state, and units that die
+        # mid-episode (masked out of the loss via info["active"]).
+        # `max_steps` is the benchmark's own episode limit, NOT params.n_steps —
+        # unlike the MJX branches above, the two are independent here.
+        from environments.smax.smax_env import SMAXAdapter
+
+        env = SMAXAdapter(
+            map_name=env_config.get("env_variant", "3m"),
+            smax_env_id=env_config.get("smax_env_id", "HeuristicEnemySMAX"),
+            max_steps=env_config.get("max_steps"),
+            walls_cause_death=env_config.get("walls_cause_death", True),
+            use_self_play_reward=env_config.get("use_self_play_reward", False),
+        )
+    else:
+        raise ValueError(
+            f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
+            f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}', "
+            f"'{EnvironmentEnum.MACRO_MJX}' and '{EnvironmentEnum.SMAX}' "
+            f"(functional JAX API); got {environment!r}"
+        )
+    return env
+
+
 class MAPPO_JAX_Runner:
     def __init__(
         self,
@@ -49,130 +152,17 @@ class MAPPO_JAX_Runner:
         env_config: dict,
     ):
 
-        # Directory setup (same layout as Runner, without the torch import)
-        self.device = device
-        self.trial_id = trial_id
-        self.batch_dir = batch_dir
-        self.trial_dir = trials_dir / trial_id
-        self.logs_dir = self.trial_dir / "logs"
-        self.models_dir = self.trial_dir / "models"
-
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-
-        self.dirs = {
-            "batch": batch_dir,
-            "logs": self.logs_dir,
-            "models": self.models_dir,
-        }
-
-        self.checkpoint = checkpoint
-
         # Set params
         self.params = Params(**exp_config.params)
         self.model_params = Model_Params(**exp_config.model_params)
+        self._init_trial(
+            device, batch_dir, trials_dir, trial_id, checkpoint,
+            self.params.random_seeds,
+        )
 
-        # Set seeds
-        random_seed = self.params.random_seeds[0]
-        if self.trial_id.isdigit():
-            random_seed = self.params.random_seeds[int(self.trial_id)]
-        set_seeds(random_seed)
-        self.rng_seed = random_seed
-
-        # Create the functional MJX environment. Three supported env groups:
-        #   MULTI_BOX_MJX            — continuous force control (the base env)
-        #   MULTI_BOX_MULTI_GOAL_MJX — the same task on a circular arena with one
-        #                   concentric goal ring per box (box j -> ring j from the
-        #                   center out); same 40-dim obs, action space and reward
-        #                   modes, so nothing downstream changes
-        #   MACRO_MJX     — the hierarchical macro layer (discrete skill choice,
-        #                   one decision per macro_len low-level steps), which
-        #                   wraps a base MultiBoxPushMJX.
-        # `coupling_def` is forwarded to every branch that builds a box-push env
-        # (bare, multi-goal, and the macro wrapper's base). Default "even" ==
-        # n_agents // n_objects for every box, i.e. exactly what each group got
-        # before this was reachable — so no existing arm changes. "random" draws
-        # per-box requirements in [2, n_agents//2] from a FIXED rng(42), which
-        # also resizes the boxes (`box_half_extents = max(1.5, coupling*0.4)`)
-        # and, in the multi-goal env, the goal rings derived from them.
+        self.env = make_env(env_config)
         environment = env_config.get("environment")
-        reward_mode = env_config.get("reward_mode", "dense")
 
-        if environment == EnvironmentEnum.MULTI_BOX_MJX:
-            self.env = MultiBoxPushMJX(
-                n_agents=env_config.get("n_agents"),
-                n_objects=env_config.get("n_objects"),
-                reward_mode=reward_mode,
-                variant=env_config.get("variant"),
-                coupling_def=env_config.get("coupling_def", "even"),
-                use_global_state=env_config.get("use_global_state", False),
-            )
-        elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
-            self.env = MultiBoxMultiGoalPushMJX(
-                n_agents=env_config.get("n_agents"),
-                n_objects=env_config.get("n_objects"),
-                reward_mode=reward_mode,
-                boundary_ends_episode=env_config.get("boundary_ends_episode", False),
-                coupling_def=env_config.get("coupling_def", "even"),
-            )
-        elif environment == EnvironmentEnum.MACRO_MJX:
-            from environments.mjx_suite.macro_wrapper import (
-                ALIGNED_WINDOWED_DIFFERENCE_REWARDS,
-                WINDOWED_DIFFERENCE_REWARDS,
-                SyncMacroMJX,
-            )
-
-            # The windowed difference rewards (global-window and decision-aligned)
-            # are computed by the wrapper (it forks macro windows per agent), so the
-            # base env must stay dense — it must not also emit its own per-step D.
-            # The single-step "difference_rewards" mode instead lives on the base
-            # env and passes through the wrapper's accumulation.
-            base_reward_mode = (
-                "dense"
-                if reward_mode
-                in (WINDOWED_DIFFERENCE_REWARDS, ALIGNED_WINDOWED_DIFFERENCE_REWARDS)
-                else reward_mode
-            )
-            base_env = MultiBoxPushMJX(
-                n_agents=env_config.get("n_agents"),
-                n_objects=env_config.get("n_objects"),
-                reward_mode=base_reward_mode,
-                variant=env_config.get("variant"),
-                coupling_def=env_config.get("coupling_def", "even"),
-            )
-            self.env = SyncMacroMJX(
-                base_env,
-                macro_len=env_config.get("macro_len", 10),
-                reward_mode=reward_mode,
-                # Staggered-starts async study: agents come online at random
-                # low-level steps and decide on their own phase (max_start_delay in
-                # low-level steps). Off by default -> ordinary lockstep options env.
-                stagger_starts=env_config.get("stagger_starts", False),
-                max_start_delay=env_config.get("max_start_delay", 0),
-            )
-        elif environment == EnvironmentEnum.SMAX:
-            # JaxMARL StarCraft, behind an adapter that presents the same functional
-            # array contract as the MJX envs. It brings three things the MJX envs do
-            # not: legal-action masks, a real global state, and units that die
-            # mid-episode (masked out of the loss via info["active"]).
-            # `max_steps` is the benchmark's own episode limit, NOT params.n_steps —
-            # unlike the MJX branches above, the two are independent here.
-            from environments.smax.smax_env import SMAXAdapter
-
-            self.env = SMAXAdapter(
-                map_name=env_config.get("env_variant", "3m"),
-                smax_env_id=env_config.get("smax_env_id", "HeuristicEnemySMAX"),
-                max_steps=env_config.get("max_steps"),
-                walls_cause_death=env_config.get("walls_cause_death", True),
-                use_self_play_reward=env_config.get("use_self_play_reward", False),
-            )
-        else:
-            raise ValueError(
-                f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
-                f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}', "
-                f"'{EnvironmentEnum.MACRO_MJX}' and '{EnvironmentEnum.SMAX}' "
-                f"(functional JAX API); got {environment!r}"
-            )
         # A per-agent reward (single-step or windowed difference rewards) switches
         # the critic to a per-agent value head and runs GAE on the agent axis (see
         # MAPPOConfig.per_agent_rewards). The macro wrapper exposes the flag
@@ -219,12 +209,49 @@ class MAPPO_JAX_Runner:
             f"(env hook: {hasattr(self.env, 'global_state')})"
         )
 
+    def _init_trial(
+        self, device, batch_dir, trials_dir, trial_id, checkpoint, random_seeds
+    ):
+        """Results directories and seeding, shared with subclassed runners."""
+        # Directory setup (same layout as Runner, without the torch import)
+        self.device = device
+        self.trial_id = trial_id
+        self.batch_dir = batch_dir
+        self.trial_dir = trials_dir / trial_id
+        self.logs_dir = self.trial_dir / "logs"
+        self.models_dir = self.trial_dir / "models"
+
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        self.dirs = {
+            "batch": batch_dir,
+            "logs": self.logs_dir,
+            "models": self.models_dir,
+        }
+
+        self.checkpoint = checkpoint
+
+        # Set seeds
+        random_seed = random_seeds[0]
+        if self.trial_id.isdigit():
+            random_seed = random_seeds[int(self.trial_id)]
+        set_seeds(random_seed)
+        self.rng_seed = random_seed
+
+    def _make_train(self):
+        """`(init_fn, collect_fn, update_fn, eval_fn, num_updates)` for this run.
+
+        The hook a subclassed runner overrides to reuse `train()` / `evaluate()`
+        with its own jitted functions. `train()` treats the trajectory and bootstrap
+        value opaquely, so any structure works as long as `update_fn` accepts it.
+        """
+        return make_train(self.config, self.env)
+
     def train(self):
         from algorithms.mappo_vanilla.trainer_components import TrainingStatsTracker
 
-        init_fn, collect_fn, update_fn, eval_fn, num_updates = make_train(
-            self.config, self.env
-        )
+        init_fn, collect_fn, update_fn, eval_fn, num_updates = self._make_train()
         steps_per_update = self.config.n_steps * self.config.n_envs
         total_steps = self.config.n_total_steps
         log_every = 10e3
@@ -634,7 +661,7 @@ class MAPPO_JAX_Runner:
     def evaluate(self):
         """Deterministic evaluation of the saved policy (PolicyEvaluator parity)."""
         train_state = self._load_train_state()
-        _, _, _, eval_fn, _ = make_train(self.config, self.env)
+        _, _, _, eval_fn, _ = self._make_train()
         reward = float(eval_fn(train_state, jax.random.PRNGKey(self.rng_seed + 1)))
         print(f"Mean eval episode return: {reward:.2f}")
         return reward

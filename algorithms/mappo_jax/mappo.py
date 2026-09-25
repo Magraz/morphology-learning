@@ -49,19 +49,26 @@ def create_train_state(
     action_dim: int,
     discrete: bool,
     n_critic_outputs: int = 1,
+    keep_critic_output_axis: bool = False,
 ) -> ActorCriticTrainState:
     """Initialize actor/critic params and optimizers.
 
     Matches ``MAPPONetwork``: actor hidden = ``hidden_dim``, centralized critic
     hidden = ``2 * hidden_dim``. ``n_critic_outputs`` > 1 gives the critic a
     per-agent value head (per-agent rewards); 1 keeps the scalar critic.
+    ``keep_critic_output_axis`` keeps that head's trailing axis even at width 1
+    (see ``MAPPOCritic.keep_output_axis``); it does not change the params.
     """
     rng_actor, rng_critic = jax.random.split(rng)
 
     actor = MAPPOActor(
         action_dim=action_dim, hidden_dim=config.hidden_dim, discrete=discrete
     )
-    critic = MAPPOCritic(hidden_dim=2 * config.hidden_dim, n_outputs=n_critic_outputs)
+    critic = MAPPOCritic(
+        hidden_dim=2 * config.hidden_dim,
+        n_outputs=n_critic_outputs,
+        keep_output_axis=keep_critic_output_axis,
+    )
 
     actor_params = actor.init(rng_actor, jnp.zeros(obs_dim))
     critic_params = critic.init(rng_critic, jnp.zeros(global_state_dim))

@@ -111,6 +111,29 @@ def _dispatch(
                 env_config,
             )
 
+        case AlgorithmEnum.SIMPLIFIED_FEUDAL_MAPPO_JAX:
+            # Two-level PPO hierarchy over the same MJX envs: a manager picks one
+            # waypoint per agent every `goal_horizon` steps (rewarded by team
+            # return), a worker steers to it (rewarded only for closing the gap).
+            from algorithms.simplified_feudal_mappo_jax.run import (
+                Simplified_Feudal_MAPPO_JAX_Runner,
+            )
+            from algorithms.simplified_feudal_mappo_jax.types import Experiment
+
+            if debug:
+                jax.config.update("jax_disable_jit", True)
+
+            exp_config = Experiment(**exp_dict)
+            runner = Simplified_Feudal_MAPPO_JAX_Runner(
+                exp_config.device,
+                batch_dir,
+                results_dir,
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
         case AlgorithmEnum.DCG:
             from algorithms.dcg.run import DCG_Runner
             from algorithms.dcg.types import Experiment

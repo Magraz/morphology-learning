@@ -1,0 +1,41 @@
+# @package _global_
+# Simplified feudal MAPPO (algorithms/simplified_feudal_mappo_jax): two PPO
+# policies on two timescales.
+#   manager — every `goal_horizon` steps picks one waypoint per agent; rewarded
+#             with the discounted TEAM reward over that window.
+#   worker  — every step, steers toward its own waypoint; rewarded ONLY with the
+#             distance to the waypoint it closed.
+# Both are trained by mappo_jax's ppo_update. The PPO block below drives the
+# worker and is the same surface as conf/algorithm/mappo_jax.yaml, so the two
+# are comparable; the manager_* keys override it for the manager.
+#
+# ⚠ Pair with `model=simplified_feudal`, never `model=mlp`: the results path
+# experiments/results/<env>/<model>/ does not include the algorithm. (`mlp` is
+# rejected anyway — it lacks the required goal_horizon / waypoint_radius.)
+algorithm: simplified_feudal_mappo_jax
+params:
+  n_epochs: 6
+  n_total_steps: 100000000.0     # float on purpose; env groups override when different
+  n_minibatches: 8
+  # Rollout length per env stream, rounded UP to a whole number of manager
+  # windows (a multiple of goal_horizon). Keep it >= the env's max_steps: every
+  # rollout starts from freshly reset envs.
+  n_steps: 1048
+  parameter_sharing: true
+  lr: 0.0003
+  gamma: 0.99
+  lmbda: 0.95
+  eps_clip: 0.2
+  ent_coef: 0.01
+  grad_clip: 0.5
+  n_eval_episodes: 32            # equal to mappo_jax, so eval noise floors match
+
+  # ---- manager ----
+  # The manager makes one decision per goal_horizon steps, so it gets ~c x fewer
+  # samples per update than the worker and needs its own epoch/minibatch counts.
+  # Its discount is derived, not set: gamma ** goal_horizon per decision.
+  manager_lr: 0.0003
+  manager_n_epochs: 4
+  manager_n_minibatches: 2
+model_params:
+  hidden_dim: 168

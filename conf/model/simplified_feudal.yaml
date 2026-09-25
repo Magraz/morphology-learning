@@ -1,0 +1,18 @@
+# @package _global_
+# Model group for algorithm=simplified_feudal_mappo_jax. Exists as much for the
+# RESULTS PATH (experiments/results/<env>/simplified_feudal/) as for its knobs.
+#
+# ⚠ `# @package _global_` on line 1 is load-bearing: without it Hydra nests these
+# keys under `model`, where nothing reads them (CLAUDE.md, 2026-09-08).
+model_params:
+  hidden_dim: 168                # worker actor; critics are 2x. Manager uses the same widths.
+  # c: env steps a waypoint stays in force = the manager's decision period.
+  goal_horizon: 32
+  # R: the manager's maximum waypoint offset PER AXIS, in the env's goal_state
+  # units (position / arena extent, so the arena spans ~[-0.5, 0.5]). The manager
+  # chooses any offset inside [-R, R]^2, so it can issue short waypoints too.
+  # Sized from the measured MJX agent speed (terminal 0.167 world units/step,
+  # 6-step time constant): flat out, an agent covers ~4.3 units in 32 steps,
+  # ~0.145 of a 30-wide arena, so a full-R axis waypoint is about reachable in
+  # one window at 1a/3o and only partly in larger arenas (47 wide at 16a/4o).
+  waypoint_radius: 0.15
