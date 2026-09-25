@@ -50,7 +50,7 @@
 #   uv run python train.py algorithm=feudal_mappo_jax \
 #       env=mjx_1a_3o_111_1024_gs model=feudal_intrinsic_waypoint trial_id=0
 defaults:
-  - feudal_film_waypoint
+  - feudal_film_direction
   - feudal_intrinsic
   - _self_
 
