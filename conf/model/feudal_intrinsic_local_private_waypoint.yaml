@@ -1,0 +1,37 @@
+# @package _global_
+# Delta vs `feudal_intrinsic_waypoint`: `manager_latent: local_private` (verified
+# on the resolved config — it is the only differing key). Read that file first;
+# everything there applies.
+#
+# ⚠ ON A GROUNDED GOAL SPACE THIS IS NOT A LOCALITY CONTRAST. In the latent mode
+# `local_private` exists to make r^I agent-local (`feudal_intrinsic_local_private
+# .yaml`), but here r^I is scored on `env.goal_state`, which is agent-local under
+# every latent. What the latent still changes is the manager's INPUT, i.e. what
+# it knows when it picks a waypoint:
+#
+#   centralized    f_percept(global_state)  — the env's compact state when the
+#                                             env publishes one
+#   local_private  f_enc(obs_i), per agent  — the agent's egocentric observation
+#
+# On `mjx_1a_3o_111_1024_gs` that is the 22-dim compact state (every box's
+# position and `delivered` flag) against the 40-dim egocentric view, which
+# senses ~6% of the boxes and none at all 84% of the time (measured under
+# random actions; a trained policy that approaches boxes sees more). So the pair
+# asks whether the manager needs to see the boxes to send the worker somewhere
+# useful. On the hook-off twin (`mjx_1a_3o_111_1024`) the two latents read the
+# same information at N=1 (CLAUDE.md, "Single-agent FeUdal runs").
+#
+# Not checkpoint-compatible with `feudal_intrinsic_waypoint`: the manager tree
+# carries `f_enc_*` / `f_Mspace_agent_kernel` / `goal_head_agent_kernel`
+# instead of `f_percept_*` / `f_Mspace` / `goal_head`.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=feudal_intrinsic_local_private_waypoint \
+#       trial_id=0
+defaults:
+  - feudal_film_waypoint
+  - feudal_intrinsic_local_private
+  - _self_
+
+params:
+  goal_horizon: 80

@@ -5,6 +5,32 @@ from pathlib import Path
 import numpy as np
 
 
+# Diverging scale for goal-alignment cosines, shared by the raster heatmaps and
+# the video overlay so a color means the same thing in both. Blue = follows
+# (+1), orange = opposes (-1), neutral gray at 0. Orange rather than a red pole
+# because MJX agents are drawn as red discs; the two poles sit at the same OKLCH
+# lightness (0.575 / 0.577), so neither arm reads as the stronger one.
+ALIGNMENT_POSITIVE = "#2a78d6"
+ALIGNMENT_NEUTRAL = "#f0efec"
+ALIGNMENT_NEGATIVE = "#c4501f"
+
+
+def alignment_cmap():
+    """The diverging colormap over [-1, 1]; NaN (undefined) is transparent."""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list(
+        "goal_alignment", [ALIGNMENT_NEGATIVE, ALIGNMENT_NEUTRAL, ALIGNMENT_POSITIVE]
+    ).with_extremes(bad=(0, 0, 0, 0))
+
+
+def alignment_rgb(values):
+    """Cosines (...,) -> (..., 3) uint8 on `alignment_cmap`; NaN maps to neutral."""
+    values = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0)
+    rgba = alignment_cmap()(np.clip((values + 1.0) / 2.0, 0.0, 1.0))
+    return np.rint(np.asarray(rgba)[..., :3] * 255).astype(np.uint8)
+
+
 def project_goal_outcomes(goals, latents, horizon):
     """Pair g_t with s_(t+c), using one PCA for goals and all latent states.
 
@@ -93,6 +119,45 @@ def goal_alignment_scores(
             valid &= (np.arange(count) % horizon == 0)[:, None]
         horizon_scores[:count] = np.where(valid, scores, np.nan)
     return horizon_scores, one_step
+
+
+def frame_alignment(
+    horizon_scores, one_step, frame_decision, horizon, *, goal_space="latent",
+):
+    """Place `goal_alignment_scores` on rendered frames, as known at each frame.
+
+    `frame_decision` (F,) names the policy step `d` each frame belongs to: the
+    identity for flat envs, and constant over a macro window. Both outputs are
+    (F, N) and CAUSAL — frame `d` shows the state `s_d` and uses only `s_0..s_d`:
+
+    * ring: ``horizon_scores[d - c]`` = cos(g_(d-c), s_d - s_(d-c)), i.e. was the
+      goal issued `c` steps ago followed? For waypoints, which are scored only
+      at latches, the most recent COMPLETED latch ``(d // c) * c - c`` is held
+      rather than flickering between latches.
+    * dot: ``one_step[d - 1]`` = cos(w_(d-1), s_d - s_(d-1)), i.e. did the last
+      move follow the goal the worker held?
+
+    NaN before a score exists, and wherever the source score is NaN.
+    """
+    horizon_scores = np.asarray(horizon_scores, dtype=np.float64)
+    one_step = np.asarray(one_step, dtype=np.float64)
+    decision = np.asarray(frame_decision)
+    if horizon_scores.shape != one_step.shape or one_step.ndim != 2:
+        raise ValueError("Expected horizon and one-step scores with shape (T, N)")
+    if decision.ndim != 1 or not np.issubdtype(decision.dtype, np.integer):
+        raise ValueError("Expected integer frame decisions with shape (F,)")
+    if len(decision) and (decision.min() < 0 or decision.max() >= len(one_step)):
+        raise ValueError("Frame decisions must index the policy steps")
+
+    if goal_space == "position_waypoint":
+        issued = (decision // horizon) * horizon - horizon
+    else:
+        issued = decision - horizon
+    ring = np.full((len(decision), one_step.shape[1]), np.nan)
+    ring[issued >= 0] = horizon_scores[issued[issued >= 0]]
+    dot = np.full_like(ring, np.nan)
+    dot[decision >= 1] = one_step[decision[decision >= 1] - 1]
+    return ring, dot
 
 
 def _mean_valid_scores(scores):
@@ -558,3 +623,148 @@ def save_goal_plot(
         finally:
             plt.close(fig)
         print(f"Goal plot saved to {agent_path}")
+
+
+# Chart chrome (reference palette ink/surface roles).
+_SURFACE = "#fcfcfb"
+_INK = "#0b0b0b"
+_INK_SECONDARY = "#52514e"
+_MUTED = "#898781"
+_BASELINE = "#c3c2b7"
+_SPACE_LABELS = {
+    "latent": "learned latent goals",
+    "position_direction": "position-direction goals",
+    "position_waypoint": "position-waypoint goals",
+}
+
+
+def goal_following_figure(
+    ring, dot, rewards, *, horizon, goal_space, episode, macro_steps=False,
+    size_px=(1200, 700), hud_px=0,
+):
+    """Reward trace over two agents x frame heatmaps: `frame_alignment`'s ring
+    (horizon) and dot (one-step) values, on one shared diverging scale.
+
+    One definition serves both outputs: saved as the per-episode raster PNG, and
+    rasterized as the goal video's side panel (`hud_px` then reserves a blank band
+    at the top for the per-frame text). Built on a bare `Figure` with an Agg
+    canvas, so it touches no pyplot state. Returns ``(fig, [reward, ring, dot])``.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
+    from matplotlib.ticker import MaxNLocator
+
+    ring = np.asarray(ring, dtype=np.float64)
+    dot = np.asarray(dot, dtype=np.float64)
+    rewards = np.asarray(rewards, dtype=np.float64)
+    if ring.ndim != 2 or dot.shape != ring.shape or rewards.shape != (len(ring),):
+        raise ValueError("Expected ring/dot (F, N) and one reward per frame")
+    frames, agents = ring.shape
+    width, height = size_px
+    fig = Figure(figsize=(width / 100, height / 100), dpi=100, facecolor=_SURFACE)
+    FigureCanvasAgg(fig)
+    top = 1 - hud_px / height
+    grid = fig.add_gridspec(
+        3, 2, width_ratios=(1, 0.02), height_ratios=(1, 1.3, 1.3),
+        left=0.1, right=0.85, top=top - 0.16, bottom=0.24, hspace=0.45, wspace=0.03,
+    )
+    reward_ax = fig.add_subplot(grid[0, 0])
+    ring_ax = fig.add_subplot(grid[1, 0], sharex=reward_ax)
+    dot_ax = fig.add_subplot(grid[2, 0], sharex=reward_ax)
+    cax = fig.add_subplot(grid[1:, 1])
+
+    unit = "decisions" if macro_steps else "steps"
+    reward_ax.plot(np.arange(frames), rewards, color=_INK_SECONDARY, linewidth=1.2)
+    reward_ax.set_title("Team task reward", loc="left", fontsize=9, color=_INK)
+    reward_ax.set_ylabel("Reward", fontsize=8, color=_INK_SECONDARY)
+    reward_ax.grid(axis="y", color=_BASELINE, alpha=0.4, linewidth=0.6)
+
+    cmap = alignment_cmap()
+    rows = (
+        (ring_ax, ring, f"Horizon: goal issued {horizon} {unit} ago vs. displacement since"),
+        (dot_ax, dot, "One-step: goal the worker held vs. its last move"),
+    )
+    for ax, values, title in rows:
+        # Hatching behind a transparent-NaN image marks "undefined" without
+        # borrowing a color from the scale.
+        ax.add_patch(Rectangle(
+            (-0.5, -0.5), max(frames, 1), agents, hatch="////", fill=False,
+            edgecolor=_BASELINE, linewidth=0, zorder=0,
+        ))
+        image = ax.imshow(
+            values.T, aspect="auto", cmap=cmap, vmin=-1, vmax=1,
+            interpolation="nearest", zorder=1,
+            extent=(-0.5, max(frames, 1) - 0.5, agents - 0.5, -0.5),
+        )
+        ax.set_title(title, loc="left", fontsize=9, color=_INK)
+        ax.set_ylabel("Agent", fontsize=8, color=_INK_SECONDARY)
+        if agents <= 16:  # label every agent, 0-based like the video's labels
+            ax.set_yticks(np.arange(agents))
+        else:
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=8, integer=True))
+    colorbar = fig.colorbar(image, cax=cax, ticks=[-1, 0, 1])
+    colorbar.ax.set_yticklabels(["−1 opposes", "0", "+1 follows"], fontsize=8)
+    colorbar.outline.set_visible(False)
+
+    for ax in (reward_ax, ring_ax, dot_ax):
+        ax.set_xlim(-0.5, max(frames, 1) - 0.5)
+        ax.tick_params(labelsize=8, colors=_MUTED)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.spines[["left", "bottom"]].set_color(_BASELINE)
+    for ax in (reward_ax, ring_ax):
+        ax.tick_params(labelbottom=False)
+    dot_ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    dot_ax.set_xlabel(
+        "Physics step (scores update at each macro decision)" if macro_steps
+        else "Policy timestep", fontsize=8, color=_INK_SECONDARY,
+    )
+
+    fig.text(
+        0.1, top - 0.035,
+        f"Episode {episode} — goal following", fontsize=12, color=_INK,
+        va="top", weight="bold",
+    )
+    fig.text(
+        0.1, top - 0.075,
+        f"{_SPACE_LABELS.get(goal_space, goal_space)} · horizon c = {horizon} {unit}"
+        f" · return {rewards.sum():.1f}",
+        fontsize=9, color=_INK_SECONDARY, va="top",
+    )
+    caption = [
+        "Cosine of each agent's goal with its goal-space displacement, shown when the "
+        "outcome is known (horizon: end of the window; one-step: after the move).",
+        "Hatched: undefined (no complete horizon yet, inactive agent, or zero vector).",
+    ]
+    if goal_space == "position_waypoint":
+        caption.append("Waypoints are scored only at latches; each score is held "
+                       "until the next latch completes.")
+    caption.append("Following a goal is not the same as the goal helping: compare "
+                   "returns against goal-free controls.")
+    fig.text(0.1, 0.02, "\n".join(caption), fontsize=7.5, color=_INK_SECONDARY,
+             va="bottom", linespacing=1.4, wrap=True)
+    return fig, [reward_ax, ring_ax, dot_ax]
+
+
+def rasterize_panel(fig, axes, n_frames):
+    """Render `fig` to (H, W, 3) uint8, plus where frame f's cursor goes.
+
+    Returns ``(image, cursor_x, (row_top, row_bottom))``: `cursor_x` (F,) is the
+    pixel column of each frame's heatmap cell centre, and the rows span every
+    axis in `axes` (image coordinates, origin top-left).
+    """
+    fig.canvas.draw()
+    image = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    height = image.shape[0]
+    boxes = [ax.get_window_extent() for ax in axes]
+    x0, x1 = boxes[0].x0, boxes[0].x1
+    cursor_x = x0 + (np.arange(n_frames) + 0.5) / max(n_frames, 1) * (x1 - x0)
+    rows = (int(height - max(b.y1 for b in boxes)), int(height - min(b.y0 for b in boxes)))
+    return np.rint(cursor_x).astype(int), rows, image
+
+
+def save_goal_following_raster(ring, dot, rewards, path: Path, **kwargs):
+    """Save `goal_following_figure` as one PNG per episode."""
+    fig, _ = goal_following_figure(ring, dot, rewards, **kwargs)
+    fig.savefig(path, dpi=150, facecolor=_SURFACE)
+    print(f"Goal-following raster saved to {path}")

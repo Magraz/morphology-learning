@@ -733,6 +733,10 @@ class Feudal_MAPPO_JAX_Runner:
     def view(self, *, detailed_goal_plots: bool = False):
         """Render episodes with task-return/alignment summaries.
 
+        Per episode, besides the plain videos: `goal_following_episode_<i>.png`
+        (reward + agents x time heatmaps of horizon / one-step goal alignment) and
+        `episode_<i>_goals.mp4` (the same panel with a moving cursor, beside the
+        frames with per-agent goal marks — see `goal_video.py`).
         Set detailed_goal_plots=True for the per-agent PCA and raw cosine plots.
         """
         # Envs that bring their own renderer (SMAX) take a separate path: the MJX
@@ -754,13 +758,18 @@ class Feudal_MAPPO_JAX_Runner:
         )
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
+        from algorithms.feudal_mappo_jax.goal_video import save_goal_video
         from algorithms.feudal_mappo_jax.goal_visualization import (
+            frame_alignment,
+            goal_alignment_scores,
             save_goal_alignment_plot,
+            save_goal_following_raster,
             save_goal_plot,
             save_task_alignment_episode,
             save_task_alignment_overview,
             summarize_task_alignment,
         )
+        from environments.mjx_suite.multi_box_push_mjx import _AGENT_RADIUS
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
@@ -884,9 +893,20 @@ class Feudal_MAPPO_JAX_Runner:
             episode_pooled_goals.append(np.asarray(pooled))
             return m_carry, goal_hist, pooled
 
-        def _draw(state, obs):
-            """Append one rendered frame (+ native) for the given base state."""
+        def _draw(state, obs, t):
+            """Append one rendered frame (+ native) for the given base state.
+
+            Also records a frame WITHOUT the sensor overlay, where every agent is
+            in it, and which policy decision `t` it belongs to — the goal video
+            draws its marks onto those frames after the episode (see
+            `goal_video.py`). Clean frames because the focus agent's lidar,
+            sectors and arrows would otherwise bury its goal marks (with one
+            agent, that is the whole picture).
+            """
             frames.append(renderer.render(state, obs=np.asarray(obs)))
+            goal_frames.append(renderer.render(state))
+            frame_agent_pos.append(renderer.agent_positions(state))
+            frame_decision.append(t)
             if native_renderer is not None:
                 native_frames.append(native_renderer.render(state))
 
@@ -897,6 +917,9 @@ class Feudal_MAPPO_JAX_Runner:
         # at each macro boundary off the base obs there, exactly as SyncMacroMJX
         # does internally.
         base_step_fn = jax.jit(render_env.step) if is_macro else None
+        # Goal-influence arrows need a continuous action to difference; the
+        # macro/skill action is a discrete index, so they are skipped there.
+        record_influence = not discrete
         skill_actions_fn = jax.jit(self.env._skill_actions) if is_macro else None
 
         episode_summaries = []
@@ -913,6 +936,8 @@ class Feudal_MAPPO_JAX_Runner:
             episode_goals, episode_latents = [], []
             episode_pooled_goals, episode_active = [], []
             episode_task_rewards = []
+            frame_agent_pos, frame_decision, episode_influence = [], [], []
+            goal_frames = []
             m_carry, goal_hist = _fresh_goal_state()
 
             if is_macro:
@@ -927,7 +952,7 @@ class Feudal_MAPPO_JAX_Runner:
                     macro_active = np.ones(self.env.n_agents, dtype=bool)
                     macro_reward = 0.0
                     for _ in range(self.env.macro_len):  # low-level steps
-                        _draw(state, obs)
+                        _draw(state, obs, t)
                         actions = skill_actions_fn(state, skills)
                         obs, state, _, terminated, truncated, info = base_step_fn(
                             state, actions
@@ -946,12 +971,25 @@ class Feudal_MAPPO_JAX_Runner:
                         break
             else:
                 for t in range(self.env.max_steps):
-                    _draw(state, obs)
+                    _draw(state, obs, t)
                     m_carry, goal_hist, pooled = _advance_goal(
                         m_carry, goal_hist, t, obs, state
                     )
+                    actions = policy_fn(obs, pooled)
+                    if record_influence:
+                        # What the goal makes each agent DO: the executed action
+                        # (the env clips to +-1) under the real pooled goal minus
+                        # under a zero goal. The per-step analogue of the probe's
+                        # `zeroed` variant — exactly the unmodulated trunk for
+                        # FiLM, off-distribution for concat, "arrived" for a
+                        # waypoint. Exactly 0 on a `zero_goal` arm.
+                        null_actions = policy_fn(obs, jnp.zeros_like(pooled))
+                        episode_influence.append(
+                            np.clip(np.asarray(actions), -1.0, 1.0)
+                            - np.clip(np.asarray(null_actions), -1.0, 1.0)
+                        )
                     obs, state, _, terminated, truncated, info = step_fn(
-                        state, policy_fn(obs, pooled)
+                        state, actions
                     )
                     # Team reward: the env's `reward` is per-agent under
                     # difference_rewards, and the plot is of team performance.
@@ -992,6 +1030,38 @@ class Feudal_MAPPO_JAX_Runner:
                     active=episode_active, goal_space=self.config.goal_space,
                     macro_steps=is_macro,
                 )
+            # Goal following on the frames themselves: one set of scores feeds
+            # the raster, the panel and the per-agent marks.
+            ring, dot = frame_alignment(
+                *goal_alignment_scores(
+                    episode_goals, episode_latents, episode_pooled_goals, horizon,
+                    active=episode_active, goal_space=self.config.goal_space,
+                ),
+                np.asarray(frame_decision), horizon, goal_space=self.config.goal_space,
+            )
+            figure_kwargs = dict(
+                horizon=horizon, goal_space=self.config.goal_space, episode=episode,
+                macro_steps=is_macro,
+            )
+            save_goal_following_raster(
+                ring, dot, rewards,
+                self.dirs["logs"] / f"goal_following_episode_{episode}.png",
+                **figure_kwargs,
+            )
+            influence = np.asarray(episode_influence) if record_influence else None
+            if influence is not None:
+                print(f"Goal influence: max |action change| {np.abs(influence).max():.4g}")
+            save_goal_video(
+                self.dirs["logs"] / f"episode_{episode}_goals.mp4", renderer, goal_frames,
+                agent_pos=frame_agent_pos, frame_decision=frame_decision,
+                ring=ring, dot=dot, rewards=rewards, agent_radius=_AGENT_RADIUS,
+                influence=influence,
+                goal_states=episode_latents if grounded else None,
+                goals=episode_goals, pooled_goals=episode_pooled_goals,
+                waypoint_radius=self.config.waypoint_radius,
+                to_world=getattr(render_env, "goal_state_to_world", None),
+                **figure_kwargs,
+            )
             rewards = np.asarray(rewards)
 
             # Episode *return* (sum), not the final step's reward — the delivery
@@ -1054,7 +1124,10 @@ class Feudal_MAPPO_JAX_Runner:
         from algorithms.feudal_mappo_jax.network import sample_action
         from algorithms.feudal_mappo_jax.worker import bind_goal, encode_obs
         from algorithms.feudal_mappo_jax.goal_visualization import (
+            frame_alignment,
+            goal_alignment_scores,
             save_goal_alignment_plot,
+            save_goal_following_raster,
             save_goal_plot,
             save_task_alignment_episode,
             save_task_alignment_overview,
@@ -1171,6 +1244,20 @@ class Feudal_MAPPO_JAX_Runner:
                     active=episode_active, goal_space=self.config.goal_space,
                     macro_steps=False,
                 )
+            # Raster only: the GIF comes from jaxmarl's own visualizer, which
+            # has no hook to draw per-agent marks on.
+            ring, dot = frame_alignment(
+                *goal_alignment_scores(
+                    episode_goals, episode_latents, episode_pooled_goals, horizon,
+                    active=episode_active, goal_space=self.config.goal_space,
+                ),
+                np.arange(len(rewards)), horizon, goal_space=self.config.goal_space,
+            )
+            save_goal_following_raster(
+                ring, dot, rewards,
+                self.dirs["logs"] / f"goal_following_episode_{episode}.png",
+                horizon=horizon, goal_space=self.config.goal_space, episode=episode,
+            )
 
             gif_path = self.dirs["logs"] / f"episode_{episode}.gif"
             self.env.render_episode(state_seq, gif_path)
@@ -1253,8 +1340,10 @@ class Feudal_MAPPO_JAX_Runner:
         """
         import numpy as np
 
-        from algorithms.feudal_mappo_jax.manager import GOAL_VARIANTS
+        from algorithms.feudal_mappo_jax.manager import offline_goal_variants
         from algorithms.feudal_mappo_jax.mappo import manager_cosine_metrics
+
+        variants = offline_goal_variants(self.env.n_agents)
 
         config = self.config
         if n_eval_episodes is not None and n_eval_episodes != config.n_eval_episodes:
@@ -1321,22 +1410,22 @@ class Feudal_MAPPO_JAX_Runner:
             rewards, lengths = eval_fn(
                 train_state,
                 key,
-                variants=GOAL_VARIANTS,
+                variants=variants,
                 detail=True,
                 constant_goal=constant_goal,
             )
             rewards, lengths = np.asarray(rewards), np.asarray(lengths)
-            per_variant = dict(zip(GOAL_VARIANTS, rewards))
+            per_variant = dict(zip(variants, rewards))
             real = per_variant["real"]
 
             entry = {
-                "returns": {v: r.tolist() for v, r in zip(GOAL_VARIANTS, rewards)},
-                "lengths": {v: l.mean().item() for v, l in zip(GOAL_VARIANTS, lengths)},
+                "returns": {v: r.tolist() for v, r in zip(variants, rewards)},
+                "lengths": {v: l.mean().item() for v, l in zip(variants, lengths)},
                 "return_mean": {
-                    v: r.mean().item() for v, r in zip(GOAL_VARIANTS, rewards)
+                    v: r.mean().item() for v, r in zip(variants, rewards)
                 },
             }
-            for v in GOAL_VARIANTS[1:]:
+            for v in variants[1:]:
                 # PAIRED: episode j of every block started from the same state,
                 # so the per-episode difference removes reset variance.
                 diff = real - per_variant[v]

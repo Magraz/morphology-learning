@@ -354,6 +354,8 @@ def _has_checkpoint(batch: str, model: str, trial: str) -> bool:
 
 
 def _fmt_gap(entry, variant):
+    if f"gap_{variant}" not in entry:  # e.g. `permuted` at one agent
+        return f"{'n/a':>8s}"
     lo, hi = entry[f"gap_{variant}_ci"]
     star = "" if (lo <= 0.0 <= hi) else "*"  # * = CI excludes 0
     return f"{entry[f'gap_{variant}']:+8.2f} [{lo:+7.2f},{hi:+7.2f}]{star}"
@@ -371,13 +373,14 @@ def _print_arm(batch, model, shift, entries):
         sem = vals.std(ddof=1) / np.sqrt(len(vals)) if len(vals) > 1 else 0.0
         return vals.mean(), sem
 
+    variants = [v for v in GOAL_VARIANTS if f"return_mean_{v}" in entries[0]]
     print("    returns   ", end="")
-    for v in GOAL_VARIANTS:
+    for v in variants:
         m, s = agg(f"return_mean_{v}")
         print(f"{v}={m:7.1f}+-{s:5.1f}  ", end="")
     print()
     print("    ep_len    ", end="")
-    for v in GOAL_VARIANTS:
+    for v in variants:
         m, _ = agg(f"length_{v}")
         print(f"{v}={m:6.1f}  ", end="")
     print()
@@ -478,16 +481,18 @@ def main():
 
             for s in shifts:
                 _print_arm(batch, model, s, per_shift[s])
-                if model == "feudal_zerogoal":
+                # Any `*zerogoal*` arm (`feudal_zerogoal`, `feudal_film_zerogoal`,
+                # ...) zeroes the goal inside the worker, so it is a control.
+                if "zerogoal" in model:
                     bad = [
                         (e["trial"], v, e[f"gap_{v}"])
                         for e in per_shift[s]
                         for v in GOAL_VARIANTS[1:]
-                        if e[f"gap_{v}"] != 0.0
+                        if f"gap_{v}" in e and e[f"gap_{v}"] != 0.0
                     ]
                     if bad:
                         print(
-                            "    !!! POSITIVE CONTROL FAILED: feudal_zerogoal zeroes "
+                            f"    !!! POSITIVE CONTROL FAILED: {model} zeroes "
                             "the goal inside the worker, so every variant must "
                             f"coincide and every gap must be exactly 0.0. Got {bad}. "
                             "The harness is wrong — do not read any other number."

@@ -159,6 +159,19 @@ class MJXRenderer(Renderer):
             return None
         return np.transpose(pygame.surfarray.array3d(self.screen), (1, 0, 2)).copy()
 
+    def annotate(self, frame: np.ndarray, draw) -> np.ndarray:
+        """Draw on top of an already-rendered (H, W, 3) frame; returns a copy.
+
+        ``draw(surface, to_screen, scale)`` gets a pygame surface holding the
+        frame, the world->pixel transform and the pixels-per-world-unit scale.
+        Lets a caller overlay things it only knows AFTER the frame was drawn
+        (e.g. a score that needs future steps) without re-rendering the state.
+        """
+        pygame.font.init()
+        surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
+        draw(surface, self._to_screen, self.scale)
+        return np.transpose(pygame.surfarray.array3d(surface), (1, 0, 2)).copy()
+
     def close(self):
         if self.screen is not None:
             if self.mode == "human":
@@ -178,6 +191,10 @@ class MJXRenderer(Renderer):
         else:
             pygame.font.init()
             self.screen = pygame.Surface(self.screen_size)
+
+    def agent_positions(self, state: EnvState) -> np.ndarray:
+        """(A, 2) world agent positions — exactly what the frame draws."""
+        return np.asarray(self.env._agent_pos(state.data))
 
     def _snapshot(self, state: EnvState) -> dict:
         """Pull everything drawable out of the jax state as numpy."""

@@ -568,6 +568,15 @@ class MultiBoxPushMJX:
         """
         return (self._agent_pos(state.data) - self._centre) / self._extent
 
+    def goal_state_to_world(self, s) -> np.ndarray:
+        """Inverse of `goal_state`: `(..., 2)` normalized readout -> world (x, y).
+
+        Kept beside the forward map so a goal-space point (an agent's `s`, or a
+        waypoint `s + R*u`) is drawn in the arena with the SAME centre/extent it
+        was measured with. Host-side numpy; used by the feudal `view()` overlay.
+        """
+        return np.asarray(s) * np.asarray(self._extent) + np.asarray(self._centre)
+
     #: Width of `goal_state`'s per-agent readout. The feudal stack DERIVES
     #: `goal_dim` from this under a grounded `goal_space`, rather than trusting a
     #: yaml value — a mismatch there does not raise until `manager_update`, long

@@ -1,0 +1,45 @@
+# @package _global_
+# Delta: `goal_horizon` (c) 10 -> 80. The alpha=0 CONTROL for
+# `feudal_film_n01_waypoint_c80`, exactly as `feudal_film_waypoint` is the
+# control for `feudal_film_n01_waypoint`. Read `feudal_film_waypoint.yaml`
+# first — everything there still applies except the reachability cap below.
+#
+# WHY 80: at c=10 NO WAYPOINT CAN BE REACHED, so the waypoint's distinguishing
+# content (the distance still to go) was never live. Measured on
+# `mjx_1a_3o_111_1024_gs` 2026-09-24 (flat-out agent from 64 reset states,
+# 8 directions): R = 1/3 of the 30-wide arena = 10 world units, and covering
+# it takes
+#
+#   direction   to 0.9 R   to 1.0 R   progress at c = 10 / 50 / 80
+#   axis           60         66        0.09 / 0.73 / 1.21 R
+#   diagonal       45         49        0.12 / 1.04 / 1.66 R
+#
+# 0.9 R is what `waypoint_reached_frac` counts as reached (tolerance 0.1 R).
+# So c=50 (the latent `_c50` arms' value) still cannot reach an axis waypoint,
+# and c=80 reaches every unobstructed one with ~20% margin. The previous batch
+# read `waypoint_reached_frac` = 0.0 and `waypoint_error_norm` ~ 1.0 in every
+# seed; above ~0 here is the first sign the mode is being exercised at all.
+# Some directions stay unreachable because a wall is in the way (straight down
+# from spawn: 0% of envs) — choosing reachable waypoints is the manager's job,
+# not a defect.
+#
+# ⚠ Scaled to THIS arena. c is in steps and R is a fraction of the world, so on
+# a larger arena the same c covers less of R. Re-measure before reusing it.
+#
+# ⚠ The manager gets ~1/8 the samples of the c=10 arm. Its PG is scored at
+# latch steps only, so `valid_fraction` falls to ~1/c (~0.012 here): about
+# 13 commitments per env per 1048-step rollout, ~400 per update at 32 envs.
+# `manager_lr` / `n_manager_critic_epochs` are unchanged so this stays a
+# one-key delta; revisit them if the manager's losses look starved.
+#
+# GPU memory does NOT grow with c on this arm (unlike the latent `_c50` arms):
+# the waypoint r^I is a per-step quantity with no c-offset window.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=feudal_film_waypoint_c80 trial_id=0
+defaults:
+  - feudal_film_waypoint
+  - _self_
+
+params:
+  goal_horizon: 80

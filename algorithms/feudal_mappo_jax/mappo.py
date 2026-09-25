@@ -366,7 +366,14 @@ def validate_worker_objective(config: MAPPOConfig) -> None:
 
     # A warning, not a raise: this combination is the direct contrast that tests
     # whether locality is what matters, so it must stay runnable on purpose.
-    if config.manager_latent not in LOCAL_LATENTS:
+    # Latent goal space only: under a GROUNDED one r^I is scored on
+    # `s = env.goal_state(state)`, agent i's own position readout, which is
+    # agent-local for EVERY `manager_latent` — the premise of the warning is
+    # false there, and a warning that fires when it does not apply gets filtered.
+    if (
+        config.goal_space not in GROUNDED_GOAL_SPACES
+        and config.manager_latent not in LOCAL_LATENTS
+    ):
         warnings.warn(
             "worker_objective='intrinsic_only' with "
             f"manager_latent={config.manager_latent!r}: r^I is the worker's "

@@ -9,7 +9,14 @@ import numpy as np
 import pytest
 
 from algorithms.feudal_mappo_jax.goal_visualization import (
+    ALIGNMENT_NEGATIVE,
+    ALIGNMENT_NEUTRAL,
+    ALIGNMENT_POSITIVE,
+    alignment_rgb,
+    frame_alignment,
     goal_alignment_scores,
+    goal_following_figure,
+    rasterize_panel,
     project_goal_outcomes,
     save_goal_alignment_plot,
     save_goal_plot,
@@ -415,7 +422,8 @@ def test_view_records_actual_manager_outputs_and_final_observation(monkeypatch, 
         n_agents = 2
         observation_dim = 3
         max_steps = 5
-        discrete = True
+        # Continuous on the flat MJX path, so the goal-influence arrows run.
+        discrete = kind != "mjx"
 
         def reset(self, key):
             return np.zeros((2, 3)), SimpleNamespace(t=0, key=key, env_state=0)
@@ -466,15 +474,60 @@ def test_view_records_actual_manager_outputs_and_final_observation(monkeypatch, 
 
     def record_binding(apply_fn, goal):
         conditioned.append(np.array(goal))
-        return apply_fn
+        return goal
+
+    def goal_dependent_action(key, goal, params, obs, **kwargs):
+        # A goal-sensitive stand-in policy, so the influence arrow is nonzero.
+        return np.repeat(0.1 * np.asarray(goal).sum(-1, keepdims=True), 2, -1), None
 
     monkeypatch.setattr(worker, "bind_goal", record_binding)
     monkeypatch.setattr(mappo, "build_manager", lambda config, n_agents: Manager())
-    monkeypatch.setattr(network, "sample_action", lambda *args, **kwargs: (np.zeros(2), None))
-    dummy_renderer = lambda env: SimpleNamespace(render=lambda *args, **kwargs: np.zeros((2, 2, 3)))
+    monkeypatch.setattr(network, "sample_action", goal_dependent_action)
+
+    def annotate(frame, draw):
+        import pygame
+        draw(pygame.Surface(frame.shape[1::-1]), lambda x, y: (int(x), int(y)), 1.0)
+        return frame
+
+    dummy_renderer = lambda env: SimpleNamespace(  # noqa: E731
+        render=lambda *args, **kwargs: np.zeros((300, 300, 3), np.uint8),
+        agent_positions=lambda state: np.full((2, 2), float(state.t)),
+        annotate=annotate,
+    )
     monkeypatch.setattr(renderer, "MJXRenderer", dummy_renderer)
     monkeypatch.setattr(renderer, "MuJoCoNativeRenderer", dummy_renderer)
     monkeypatch.setattr(imageio, "mimwrite", lambda *args, **kwargs: None)
+    written = []
+
+    class Writer:
+        def __init__(self, path, **kwargs):
+            self.path, self.frames = path, []
+
+        def append_data(self, frame):
+            self.frames.append(frame)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            written.append(self)
+
+    monkeypatch.setattr(imageio, "get_writer", Writer)
+    from algorithms.feudal_mappo_jax import goal_video
+    rasters, goal_videos = [], []
+    original_raster = goal_visualization.save_goal_following_raster
+    original_video = goal_video.save_goal_video
+
+    def record_raster(ring, dot, rewards, path, **kwargs):
+        rasters.append((np.array(ring), np.array(rewards), path))
+        return original_raster(ring, dot, rewards, path, **kwargs)
+
+    def record_video(path, renderer_, frames, **kwargs):
+        goal_videos.append((path, len(frames), kwargs))
+        return original_video(path, renderer_, frames, **kwargs)
+
+    monkeypatch.setattr(goal_visualization, "save_goal_following_raster", record_raster)
+    monkeypatch.setattr(goal_video, "save_goal_video", record_video)
     recorded = []
     monkeypatch.setattr(goal_visualization, "save_goal_plot",
                         lambda goals, latents, horizon, path, episode:
@@ -535,6 +588,37 @@ def test_view_records_actual_manager_outputs_and_final_observation(monkeypatch, 
 
     expected_times = [0, 2, 3] if kind == "macro" else [0, 1, 2, 3]
     steps = len(expected_times) - 1
+    if kind == "mjx":
+        # Every step conditions the worker twice: the real pooled goal, then the
+        # ZERO goal the influence arrow is measured against.
+        assert all((null == 0).all() for null in conditioned[1::2])
+        conditioned = conditioned[0::2]
+
+    # The raster is written for every kind; the goal video only where the view
+    # owns the frames (not jaxmarl's visualizer).
+    assert [path for *_, path in rasters] == [
+        tmp_path / f"goal_following_episode_{e}.png" for e in range(episodes)]
+    frames = 3  # low-level frames in every stub episode (macro: 2 + 1)
+    for ring, rewards, _ in rasters:
+        assert ring.shape == (frames, 2) and len(rewards) == frames
+        assert np.isnan(ring[0]).all()  # no complete horizon at the first frame
+    if kind == "env_renderer":
+        assert goal_videos == [] and written == []
+    else:
+        assert [v[0] for v in goal_videos] == [
+            tmp_path / f"episode_{e}_goals.mp4" for e in range(episodes)]
+        assert [len(w.frames) for w in written] == [frames] * episodes
+        assert all(f.shape == (300, 600, 3) for w in written for f in w.frames)
+        kwargs = goal_videos[0][2]
+        np.testing.assert_array_equal(
+            kwargs["frame_decision"], [0, 0, 1] if kind == "macro" else [0, 1, 2])
+        if kind == "mjx":
+            pooled0 = np.array(conditioned[:steps])
+            expected = np.clip(np.repeat(0.1 * pooled0.sum(-1, keepdims=True), 2, -1), -1, 1)
+            np.testing.assert_allclose(kwargs["influence"], expected)
+        else:
+            assert kwargs["influence"] is None
+        assert (kwargs["goal_states"] is None) == (goal_space == "latent")
     for episode, (goals, latents, pooled, horizon, task_rewards, kwargs) in enumerate(summary_inputs):
         state_scale = 10 if goal_space == "latent" else 1
         np.testing.assert_array_equal(latents[:, 0, 0], np.array(expected_times) * state_scale)
@@ -566,3 +650,193 @@ def test_view_records_actual_manager_outputs_and_final_observation(monkeypatch, 
             np.testing.assert_array_equal(alignments[episode][2], pooled)
             assert recorded[episode][3] == tmp_path / f"goals_episode_{episode}.png"
             assert alignments[episode][4] == tmp_path / f"goal_alignment_episode_{episode}.png"
+
+
+def _random_episode(steps=12, agents=3, dim=4, seed=0):
+    rng = np.random.default_rng(seed)
+    goals = rng.normal(size=(steps, agents, dim))
+    latents = np.cumsum(rng.normal(size=(steps + 1, agents, dim)), axis=0)
+    pooled = rng.normal(size=(steps, agents, dim))
+    return goals, latents, pooled
+
+
+@pytest.mark.parametrize("goal_space", ["latent", "position_direction"])
+def test_frame_alignment_is_causal_and_indexes_the_scores(goal_space):
+    goals, latents, pooled = _random_episode()
+    horizon = 4
+    scores, one_step = goal_alignment_scores(
+        goals, latents, pooled, horizon, goal_space=goal_space,
+    )
+    ring, dot = frame_alignment(
+        scores, one_step, np.arange(len(goals)), horizon, goal_space=goal_space,
+    )
+    assert ring.shape == dot.shape == one_step.shape
+    assert np.isnan(ring[:horizon]).all() and np.isnan(dot[0]).all()
+    for d in range(horizon, len(goals)):
+        # cos(g_(d-c), s_d - s_(d-c)): uses nothing past the frame's own state.
+        np.testing.assert_array_equal(ring[d], scores[d - horizon])
+    np.testing.assert_array_equal(dot[1:], one_step[:-1])
+
+
+def test_frame_alignment_holds_one_decision_across_macro_frames():
+    goals, latents, pooled = _random_episode(steps=6)
+    scores, one_step = goal_alignment_scores(goals, latents, pooled, 2)
+    decision = np.array([0, 0, 1, 1, 1, 2, 3, 3, 4, 5])
+    ring, dot = frame_alignment(scores, one_step, decision, 2)
+    for f, d in enumerate(decision):
+        np.testing.assert_array_equal(dot[f], one_step[d - 1] if d else np.nan)
+        np.testing.assert_array_equal(ring[f], scores[d - 2] if d >= 2 else np.nan)
+
+
+def test_frame_alignment_holds_the_last_completed_waypoint_latch():
+    goals, latents, pooled = _random_episode(steps=10)
+    horizon = 3
+    scores, one_step = goal_alignment_scores(
+        goals, latents, pooled, horizon, goal_space="position_waypoint",
+    )
+    ring, _ = frame_alignment(
+        scores, one_step, np.arange(10), horizon, goal_space="position_waypoint",
+    )
+    assert np.isnan(ring[:3]).all()
+    for d in range(3, 10):
+        latch = (d // horizon) * horizon - horizon
+        np.testing.assert_array_equal(ring[d], scores[latch])
+        assert np.isfinite(ring[d]).all()  # never the NaN between latches
+
+
+@pytest.mark.parametrize("decision", [np.array([0, 5]), np.array([-1]), np.array([0.0, 1.0])])
+def test_frame_alignment_rejects_decisions_outside_the_episode(decision):
+    goals, latents, pooled = _random_episode(steps=5)
+    with pytest.raises(ValueError):
+        frame_alignment(*goal_alignment_scores(goals, latents, pooled, 2), decision, 2)
+
+
+def test_alignment_colors_share_poles_and_midpoint():
+    def rgb(hex_color):
+        return [int(hex_color[i:i + 2], 16) for i in (1, 3, 5)]
+
+    colors = alignment_rgb([1.0, -1.0, 0.0, np.nan])
+    np.testing.assert_array_equal(colors[0], rgb(ALIGNMENT_POSITIVE))
+    np.testing.assert_array_equal(colors[1], rgb(ALIGNMENT_NEGATIVE))
+    np.testing.assert_allclose(colors[2], rgb(ALIGNMENT_NEUTRAL), atol=1)
+    np.testing.assert_array_equal(colors[3], colors[2])
+
+
+@pytest.mark.parametrize("agents", [1, 16])
+def test_panel_cursor_moves_monotonically_inside_the_heatmaps(agents):
+    frames = 300
+    ring = np.linspace(-1, 1, frames * agents).reshape(frames, agents)
+    ring[:10] = np.nan
+    fig, axes = goal_following_figure(
+        ring, ring[::-1], np.zeros(frames), horizon=10, goal_space="latent",
+        episode=0, size_px=(700, 700), hud_px=64,
+    )
+    cursor_x, (top, bottom), image = rasterize_panel(fig, axes, frames)
+    assert image.shape == (700, 700, 3) and image.dtype == np.uint8
+    assert np.all(np.diff(cursor_x) >= 0) and cursor_x[-1] > cursor_x[0]
+    heat = axes[1].get_window_extent()
+    assert heat.x0 <= cursor_x[0] and cursor_x[-1] <= heat.x1
+    assert 64 <= top < bottom <= 700  # below the HUD band
+
+
+def test_goal_overlay_draws_ring_dot_and_arena_marks():
+    import pygame
+
+    from algorithms.feudal_mappo_jax import goal_video
+
+    surface = pygame.Surface((200, 200))
+    surface.fill((255, 255, 255))
+    to_screen = lambda x, y: (int(x), int(200 - y))  # noqa: E731 - y flipped
+    goal_video.draw_goal_overlay(
+        surface, to_screen, 1.0, agent_pos=np.array([[50.0, 150.0], [150.0, 50.0]]),
+        agent_radius=10, ring=np.array([1.0, np.nan]), dot=np.array([-1.0, np.nan]),
+        heading=np.array([[0.0, 1.0], [np.nan, np.nan]]),
+    )
+    center = (50, 50)
+    r_ring = 10 + 2 + 4
+    assert tuple(surface.get_at((center[0] + r_ring - 2, center[1]))[:3]) == tuple(
+        alignment_rgb(1.0))
+    assert tuple(surface.get_at(center)[:3]) == tuple(alignment_rgb(-1.0))
+    # Undefined ring: a thin muted outline, no colored band.
+    assert tuple(surface.get_at((150 + r_ring - 2, 150))[:3]) == (255, 255, 255)
+    # Heading +y in the world points UP on screen.
+    # Mid-shaft: past the ring (r=16), short of the haloed head (last 12 px).
+    assert tuple(surface.get_at((50, 50 - 25))[:3]) == goal_video._GOAL
+
+
+def test_world_goal_marks_map_goal_space_into_the_arena():
+    from algorithms.feudal_mappo_jax.goal_video import _world_goal_marks
+
+    to_world = lambda s: np.asarray(s) * [30.0, 10.0] + [15.0, 5.0]  # noqa: E731
+    s = np.zeros((3, 1, 2))
+    goals = np.array([[[1.0, 1.0]], [[0.0, -2.0]]])
+    heading, none = _world_goal_marks("position_direction", s, goals, None, None, to_world)
+    assert none is None
+    # A unit goal-space step is anisotropic in the world: (1,1) -> (30,10).
+    np.testing.assert_allclose(heading[0, 0], np.array([30.0, 10.0]) / np.hypot(30, 10))
+    np.testing.assert_allclose(heading[1, 0], [0.0, -1.0])
+    none, waypoint = _world_goal_marks(
+        "position_waypoint", s, None, goals, 0.5, to_world,
+    )
+    assert none is None
+    np.testing.assert_allclose(waypoint[0, 0], [15.0 + 15.0, 5.0 + 5.0])
+    assert _world_goal_marks("latent", s, goals, goals, 0.5, to_world) == (None, None)
+
+
+def test_goal_video_streams_every_frame_beside_the_panel(monkeypatch, tmp_path):
+    import imageio
+    import pygame
+
+    from algorithms.feudal_mappo_jax import goal_video
+
+    written = []
+
+    class Writer:
+        def __init__(self, path, **kwargs):
+            self.path, self.frames = path, []
+
+        def append_data(self, frame):
+            self.frames.append(frame)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            written.append(self)
+
+    monkeypatch.setattr(imageio, "get_writer", Writer)
+    trails = []
+    original = goal_video.draw_goal_overlay
+
+    def spy(*args, trail=None, **kwargs):
+        trails.append(None if trail is None else len(trail))
+        return original(*args, trail=trail, **kwargs)
+
+    monkeypatch.setattr(goal_video, "draw_goal_overlay", spy)
+
+    def annotate(frame, draw):
+        surface = pygame.surfarray.make_surface(np.transpose(frame, (1, 0, 2)))
+        draw(surface, lambda x, y: (int(x), int(300 - y)), 1.0)
+        return np.transpose(pygame.surfarray.array3d(surface), (1, 0, 2))
+
+    steps, agents, horizon = 7, 2, 3
+    frames = [np.full((300, 300, 3), 255, np.uint8) for _ in range(steps)]
+    goals, latents, pooled = _random_episode(steps, agents, 2)
+    scores, one_step = goal_alignment_scores(
+        goals, latents, pooled, horizon, goal_space="position_waypoint",
+    )
+    ring, dot = frame_alignment(scores, one_step, np.arange(steps), horizon,
+                                goal_space="position_waypoint")
+    goal_video.save_goal_video(
+        tmp_path / "goals.mp4", SimpleNamespace(annotate=annotate), frames,
+        agent_pos=np.full((steps, agents, 2), 100.0), frame_decision=np.arange(steps),
+        ring=ring, dot=dot, rewards=np.arange(steps, dtype=float), horizon=horizon,
+        goal_space="position_waypoint", episode=0, agent_radius=5,
+        influence=np.zeros((steps, agents, 2)), goal_states=latents, goals=goals,
+        pooled_goals=pooled, waypoint_radius=1.0 / 3.0, to_world=lambda s: s * 30 + 150,
+    )
+    assert len(written) == 1 and written[0].path == tmp_path / "goals.mp4"
+    assert len(written[0].frames) == steps
+    assert all(frame.shape == (300, 600, 3) for frame in written[0].frames)
+    # Trail = the path since the waypoint latched (every `horizon` steps).
+    assert trails == [1, 2, 3, 1, 2, 3, 1]

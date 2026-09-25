@@ -7,6 +7,19 @@ from Box2D import b2CircleShape, b2PolygonShape
 from environments.box2d_suite.utils import COLORS_LIST
 
 
+def draw_arrow_head(surface, start, end, color, size=9):
+    """Filled triangle at pixel `end` on `surface`, pointing away from `start`."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return
+    ux, uy = dx / length, dy / length
+    # Two points size/2 either side of the shaft, size back from the tip.
+    left = (end[0] - ux * size - uy * size / 2, end[1] - uy * size + ux * size / 2)
+    right = (end[0] - ux * size + uy * size / 2, end[1] - uy * size - ux * size / 2)
+    pygame.draw.polygon(surface, color, [end, left, right])
+
+
 class Renderer:
     """Encapsulates all pygame rendering for MultiBoxPushEnv."""
 
@@ -341,15 +354,7 @@ class Renderer:
 
     def _draw_arrow_head(self, start, end, color, size=9):
         """Filled triangle at `end`, pointing away from `start`."""
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        length = math.hypot(dx, dy)
-        if length < 1e-6:
-            return
-        ux, uy = dx / length, dy / length
-        # Two points size/2 either side of the shaft, size back from the tip.
-        left = (end[0] - ux * size - uy * size / 2, end[1] - uy * size + ux * size / 2)
-        right = (end[0] - ux * size + uy * size / 2, end[1] - uy * size - ux * size / 2)
-        pygame.draw.polygon(self.screen, color, [end, left, right])
+        draw_arrow_head(self.screen, start, end, color, size)
 
     def _draw_sensor_hud(self, idx, readout):
         """Legend + the scalar obs values for the focus agent, top-left."""

@@ -1,0 +1,58 @@
+# @package _global_
+# PURE-INTRINSIC WORKER ON GROUNDED WAYPOINTS at a reachable horizon (c = 80):
+# `feudal_film_waypoint` + `feudal_intrinsic` + `goal_horizon: 80`.
+#
+# The worker's policy gradient is `adv = adv_int` alone (see `feudal_intrinsic.yaml`
+# for the objective), and here r^I is the WAYPOINT reward (see
+# `feudal_film_waypoint.yaml`): the fraction of R closed each step, which
+# telescopes to `1 - ||w - s_end||/R <= 1` over a latch block. So the worker's
+# ENTIRE job is to reach the manager's waypoints, and every bit of task pressure
+# reaches the policy only through the manager's choice of where to send it. That
+# bound is the reason to pair this objective with waypoints: under the latent
+# `d_cos` the worker could farm r^I indefinitely; here it can only collect the
+# distance that actually exists. c=80 because at c=10 no waypoint is reachable
+# (measurement in `feudal_film_waypoint_c80.yaml`).
+#
+# ⚠ FiLM, not concat, despite the `feudal_intrinsic` name. `feudal_intrinsic` is
+# a concat arm, but it sets no fusion key of its own, so `worker_fusion: film`
+# from `feudal_film_waypoint` survives. Its `defaults:` re-includes `feudal`
+# after the waypoint chain; harmless today (`feudal.yaml` sets only
+# `hidden_dim`), but a key added there would silently override this chain.
+#
+# ⚠ NOT a one-key delta from its controls. Against `feudal_film_waypoint_c80`
+# (alpha=0) and `feudal_film_n01_waypoint_c80` (alpha=0.1) the resolved config
+# differs in `worker_objective` AND `ent_coef` 0.01 -> 0.1 (`intrinsic_coef` also
+# differs but is inert as a magnitude here). A gap is therefore
+# objective + entropy, unseparated.
+#
+# `manager_latent` is the default `centralized`, and that is fine HERE: r^I is
+# scored on `env.goal_state`, agent i's own position, which is agent-local for
+# every latent (so `validate_worker_objective` does not warn on grounded goal
+# spaces). The latent only decides what the manager READS — see
+# `feudal_intrinsic_local_private_waypoint.yaml` for that contrast.
+#
+# Reading it:
+#   * `adv_ext_weight` / `adv_int_weight` must be 0.0 / 1.0; `alpha_current` is
+#     logged and inert.
+#   * `waypoint_reached_frac` is the worker's success rate at its only job; it is
+#     0.0 at init. `intrinsic_reward_abs` reads ~0.002 by construction (one step
+#     closes a small fraction of R), not because the stream is dead.
+#   * `valid_fraction` ~ 1/c (0.0115): the manager is scored at latch steps only.
+#   * The goal-dependence probe CANNOT grade this arm — every gap is large by
+#     construction (`feudal_intrinsic.yaml`), and `gap_zeroed` is void on a
+#     waypoint arm anyway (`feudal_film_waypoint.yaml`).
+#
+# Acceptance is BETWEEN-ARM on the same env group and seeds: against the two
+# `_waypoint_c80` controls above, `feudal_film_zerogoal` (goal-free floor) and
+# `mlp`. On `mjx_1a_3o_111_1024_gs` every solved seed ends at ~326 return, so
+# compare time-to-solve and `eval_len_real`, not final return.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=feudal_intrinsic_waypoint trial_id=0
+defaults:
+  - feudal_film_waypoint
+  - feudal_intrinsic
+  - _self_
+
+params:
+  goal_horizon: 80

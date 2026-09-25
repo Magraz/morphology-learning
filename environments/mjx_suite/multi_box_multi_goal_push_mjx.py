@@ -645,10 +645,16 @@ class MultiBoxMultiGoalPushMJX:
         `s_tau + R*u` carries the same centre — but it is NOT inert for an
         absolute-position diagnostic, so read those per env.
         """
-        extent = jnp.asarray(
-            [self.world_width, self.world_height], dtype=jnp.float32
-        )
-        return (self._agent_pos(state.data) - self._center) / extent
+        return (self._agent_pos(state.data) - self._center) / self._goal_extent
+
+    @property
+    def _goal_extent(self) -> jnp.ndarray:
+        """Normalization shared by `goal_state` and its inverse."""
+        return jnp.asarray([self.world_width, self.world_height], dtype=jnp.float32)
+
+    def goal_state_to_world(self, s) -> np.ndarray:
+        """Inverse of `goal_state`; see `MultiBoxPushMJX.goal_state_to_world`."""
+        return np.asarray(s) * np.asarray(self._goal_extent) + np.asarray(self._center)
 
     #: See `MultiBoxPushMJX.goal_state_dim`.
     goal_state_dim = 2

@@ -163,3 +163,19 @@ def test_macro_wrapper_refuses_the_hook():
     SyncMacroMJX(MultiBoxPushMJX(n_agents=A, n_objects=1))  # hook off: fine
     with pytest.raises(NotImplementedError, match="global_state"):
         SyncMacroMJX(MultiBoxPushMJX(n_agents=A, n_objects=1, use_global_state=True))
+
+
+@pytest.mark.parametrize("circular", [False, True])
+def test_goal_state_to_world_inverts_goal_state(circular):
+    """The feudal goal video draws waypoints/headings via this inverse; a wrong
+    centre or extent would draw every mark in the wrong place, silently."""
+    if circular:
+        from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
+            MultiBoxMultiGoalPushMJX as Env,
+        )
+    else:
+        Env = MultiBoxPushMJX
+    env = Env(n_agents=A, n_objects=O)
+    _, state = jax.jit(env.reset)(jax.random.PRNGKey(3))
+    world = env.goal_state_to_world(env.goal_state(state))
+    np.testing.assert_allclose(world, np.asarray(env._agent_pos(state.data)), atol=1e-5)

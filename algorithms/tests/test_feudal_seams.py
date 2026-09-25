@@ -30,6 +30,7 @@ import pytest
 from algorithms.feudal_mappo_jax.manager import (
     GLOBAL_LATENTS,
     GOAL_VARIANTS,
+    GROUNDED_GOAL_SPACES,
     LATENTS,
     LOCAL_LATENTS,
     PRIVATE_LATENTS,
@@ -40,6 +41,7 @@ from algorithms.feudal_mappo_jax.manager import (
     latch_steps,
     latch_waypoints,
     mean_goal_direction,
+    offline_goal_variants,
     pool_goals,
     transition_cosine,
     waypoint_achievement,
@@ -526,6 +528,28 @@ def test_single_agent_collect_update_and_eval(
     # Explicitly requesting an impossible permutation must still fail.
     with pytest.raises(ValueError, match="identity"):
         eval_fn(state.train_state, key, variants=("real", "permuted"))
+
+
+def test_offline_goal_variants_drop_only_the_agent_permutation_at_one_agent():
+    """The offline probe's variant list runs at N=1 and keeps `env_permuted`."""
+    assert offline_goal_variants(2) == GOAL_VARIANTS
+    single = offline_goal_variants(1)
+    assert single == tuple(v for v in GOAL_VARIANTS if v != "permuted")
+
+    config = _config(intrinsic_coef=0.0)
+    env = StubEnv()
+    env.n_agents = 1
+    init_fn, collect_fn, _, eval_fn, _ = make_train(config, env)
+    _, trajectory, _, _ = collect_fn(init_fn(jax.random.PRNGKey(0)))
+    rewards, _ = eval_fn(
+        init_fn(jax.random.PRNGKey(0)).train_state,
+        jax.random.PRNGKey(1),
+        variants=single,
+        detail=True,
+        constant_goal=mean_goal_direction(trajectory.pooled_goal),
+    )
+    assert rewards.shape == (len(single), config.n_eval_episodes)
+    assert np.isfinite(rewards).all()
 
 
 def test_transition_cosine_valid_is_independent_of_goals():
@@ -2618,6 +2642,15 @@ def test_intrinsic_only_warns_on_a_non_local_latent_but_still_runs():
         warnings.simplefilter("error")
         for latent in LOCAL_LATENTS:
             validate_worker_objective(_config(manager_latent=latent, **base))
+
+    # So must a grounded goal space, whatever the latent: r^I is then scored on
+    # the env's per-agent position readout, which is agent-local by construction.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for goal_space in GROUNDED_GOAL_SPACES:
+            validate_worker_objective(
+                _config(manager_latent="centralized", goal_space=goal_space, **base)
+            )
 
     # And it really does run: the warning is not a disguised abort.
     with pytest.warns(RuntimeWarning):

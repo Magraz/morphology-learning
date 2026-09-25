@@ -1571,6 +1571,17 @@ def training_goal_variants(n_agents: int, enabled: bool = True) -> tuple[str, ..
     return ("real", "permuted", "constant", "zeroed")
 
 
+def offline_goal_variants(n_agents: int) -> tuple[str, ...]:
+    """Offline probe variants: every one in ``GOAL_VARIANTS`` that is defined.
+
+    Same single-agent rule as ``training_goal_variants`` — ``permuted`` rolls
+    the agent axis, which is the identity at one agent and raises.
+    """
+    if n_agents == 1:
+        return tuple(v for v in GOAL_VARIANTS if v != "permuted")
+    return GOAL_VARIANTS
+
+
 def _goal_transform_variants(shift: int, env_axis: int, constant=None):
     """Build the variant name -> transform map for one call site.
 

@@ -1,0 +1,28 @@
+# @package _global_
+# Delta: `goal_horizon` (c) 10 -> 80, on `feudal_film_n01_waypoint`.
+#
+# THE PRIMARY GROUNDED ARM AT A REACHABLE HORIZON. `feudal_film_waypoint_c80`
+# (alpha=0) is its control. At c=10 the waypoint could not be reached, so its
+# saturating r^I — the whole reason waypoints lead — could only ever pay a small
+# fraction of R per commitment. At c=80 an unobstructed waypoint is reachable,
+# and the telescoped r^I over a latch block, `1 - ||w - s_end||/R`, can actually
+# approach 1.
+#
+# The reachability measurement, the ~1/c `valid_fraction` and the
+# arena-specific scaling are documented in `feudal_film_waypoint_c80.yaml`; the
+# rest (mandatory `normalize_pooled_goal: false`, voided `gap_zeroed`,
+# acceptance criterion) is in `feudal_film_waypoint.yaml`.
+#
+# Acceptance is still the BETWEEN-ARM result against `feudal_film_zerogoal` on
+# the same env group and seeds. On `mjx_1a_3o_111_1024_gs` every solved seed
+# ends at ~326 return, so compare time-to-solve and `eval_len_real`, not final
+# return.
+#
+#   uv run python train.py algorithm=feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=feudal_film_n01_waypoint_c80 trial_id=0
+defaults:
+  - feudal_film_n05_waypoint
+  - _self_
+
+params:
+  goal_horizon: 80
