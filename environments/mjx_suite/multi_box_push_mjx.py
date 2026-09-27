@@ -615,6 +615,19 @@ class MultiBoxPushMJX:
         `delivered` is NOT redundant — delivery latches, so a box pushed back out
         of the band keeps paying nothing while its position says otherwise.
         """
+        agents, boxes = self.entity_state(state)
+        return jnp.concatenate([agents.ravel(), boxes.ravel()])
+
+    def entity_state(self, state: EnvState) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """`(agents (A, 4), boxes (O, 6))` for one UNBATCHED `EnvState`.
+
+        The per-entity blocks of `_compact_global_state`, which is their
+        flattened concatenation (so the two cannot disagree). Unlike
+        `global_state` this is an UNCONDITIONAL method: nothing tests for it with
+        `hasattr` to pick a critic width. Its one consumer is
+        `simplified_feudal_mappo_jax` under `manager_input: relative`, which
+        builds an agent-relative manager input from these blocks.
+        """
         d = state.data
         agent_pos = self._agent_pos(d)  # (A, 2)
         agent_vel = self._agent_vel(d)  # (A, 2)
@@ -647,7 +660,7 @@ class MultiBoxPushMJX:
             axis=-1,
         )  # (O, 6)
 
-        return jnp.concatenate([agents.ravel(), boxes.ravel()])
+        return agents, boxes
 
     def _touch_matrix(self, agent_pos, box_pos, box_yaw) -> jnp.ndarray:
         """(A, O) bool — agent within radius + eps of a (rotated) box surface."""

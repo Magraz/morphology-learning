@@ -1,0 +1,33 @@
+# @package _global_
+# Delta from `simplified_feudal_gh16`: model_params.waypoint_radius 0.15 -> 0.06.
+#
+# `simplified_feudal_gh16` halves the window (goal_horizon 32 -> 16) but keeps
+# R = 0.15, which was sized for 32 steps. Measured flat-out reach per axis
+# (2026-09-27, both 30-wide `_gs` arenas, 64 resets):
+#
+#   window     from rest   already moving
+#   32 steps   0.145       ~0.175
+#   16 steps   0.058       0.086
+#
+# The c=32 default puts R at the from-rest reach (0.15 vs 0.145); 0.06 is the
+# same calibration at c=16. With R = 0.15 the trained `clip` gh16 managers
+# reached their waypoint (closest approach within 0.1 R) in 0.3-0.6% of windows
+# on average (0.03-2.5% per seed), with 0.74-0.81 R still to go on average when
+# the waypoint expired. So that arm
+# changed the window length AND made the waypoints unreachable, and cannot
+# isolate the effect of c. This one changes only c against `simplified_feudal`
+# in the sense that matters: a full-length waypoint is still reachable in one
+# window.
+#
+# ⚠ `waypoint_*` diagnostics are in units of R, so their values are not
+# comparable with the R = 0.15 arms in absolute terms; `waypoint_reached_frac`
+# is (it is a fraction of windows).
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_gh16_scaled_radius trial_id=0
+defaults:
+  - simplified_feudal_gh16
+  - _self_
+
+model_params:
+  waypoint_radius: 0.06

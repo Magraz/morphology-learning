@@ -1,0 +1,19 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_gh16`: model_params.waypoint_radius
+# 0.15 -> 0.06. The `tanh` twin of `simplified_feudal_gh16_scaled_radius`; see
+# that file for the measured reach table and why 0.06 (the c=32 calibration,
+# R ~ the flat-out reach from rest in one window, applied at c=16).
+#
+# The trained `tanh` gh16 managers had already learned to shrink their offsets
+# (0.46-0.89 R at the end of training, per seed), so their waypoints were
+# reached far more often than `clip`'s (12-63% of windows per seed), but a
+# full-length waypoint was still out of reach.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_gh16_scaled_radius trial_id=0
+defaults:
+  - simplified_feudal_tanh_gh16
+  - _self_
+
+model_params:
+  waypoint_radius: 0.06

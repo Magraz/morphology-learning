@@ -1,0 +1,29 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh`: params.manager_gamma null -> 0.997.
+#
+# The manager's per-env-step discount, so per decision it is 0.997^32 = 0.908
+# instead of 0.99^32 = 0.725: a ~333-step horizon (about 10 windows) instead of
+# ~100 steps (about 3.6 windows). The worker keeps gamma = 0.99. FeUdal Networks
+# gives its manager a longer discount than its worker for the same reason: the
+# manager is the level that is supposed to plan past the next few steps.
+#
+# Why (measured 2026-09-27): `mlp` takes ~125-165 env steps between boxes, so
+# when the manager should start heading for the next box, the +100 is worth
+# 0.99^150 = 0.22 of its value today and GAE's credit reaching back 5 windows is
+# (0.725 * 0.95)^5 = 0.16. At 0.997 those are 0.64 and 0.48. Every learned
+# manager caps at one box; after it, window rewards are ~0 whichever way the
+# manager sends the agents, so the next box has to register through the
+# discount or not at all.
+#
+# Set in the model group (not on the CLI) so results land in their own
+# directory. Checkpoints are shape-identical to `simplified_feudal_tanh`, so
+# the results path is the only record of which discount trained them.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_manager_gamma trial_id=0
+defaults:
+  - simplified_feudal_tanh
+  - _self_
+
+params:
+  manager_gamma: 0.997

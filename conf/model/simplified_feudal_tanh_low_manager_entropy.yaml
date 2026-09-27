@@ -1,0 +1,30 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh`: params.manager_ent_coef null -> 0.001
+# (the manager's entropy coefficient, 10x below the shared 0.01; the worker
+# keeps 0.01).
+#
+# Why (measured 2026-09-27): after the first delivery every window earns ~0
+# whatever the manager does, so the entropy bonus is the only steady pull on the
+# manager's mean. Under `tanh` that bonus is the entropy of the squashed action,
+# which is highest at mean 0, i.e. a ZERO waypoint offset. The trained `tanh`
+# managers' post-delivery offsets fell to 0.08-0.36 R (from ~1 R before
+# delivery) and the agents sat at the top wall, below an undelivered box < 2% of
+# the time (`mlp`: 20-36%).
+#
+# 0.001, not 0: this weakens the pull but keeps a small floor under the
+# manager's spread. At 0 nothing stops the spread from collapsing, and the toy
+# check in CLAUDE.md found the squashed entropy is what lets a saturated `tanh`
+# mean turn around quickly. The cost of lowering it is that same turnaround.
+#
+# `manager_entropy_loss` is the coefficient-free entropy, so it stays comparable
+# with `simplified_feudal_tanh`. Checkpoints are shape-identical, so the results
+# path is the only record of which coefficient trained a run.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_low_manager_entropy trial_id=0
+defaults:
+  - simplified_feudal_tanh
+  - _self_
+
+params:
+  manager_ent_coef: 0.001

@@ -8,8 +8,11 @@ Two PPO policies on two timescales, both trained by the UNMODIFIED
   `w_i = s_i + R * b(a_i)`, where `b` is `clip(., -1, 1)` or `tanh` per
   `manager_action_bound` (see `waypoints.waypoint_from_action`). Its
   reward is the discounted TEAM reward over the window,
-  `sum_{k<c} gamma^k r_{t+k}`, with discount `gamma^c` per decision, so it is
-  trained on exactly "which waypoints led to high env return".
+  `sum_{k<c} gamma_M^k r_{t+k}`, with discount `gamma_M^c` per decision, so it
+  is trained on exactly "which waypoints led to high env return". `gamma_M` is
+  the manager's per-step discount (`manager_step_gamma`), the worker's `gamma`
+  unless set. The actor reads the team view (`manager_input: global`) or each
+  agent's own relative view (`relative`); the critic always reads the team view.
 * **Worker** — acts every env step on `(obs_i, (w_i - s_i)/R, time left)`. Its
   ONLY reward is the distance to its waypoint closed by the step
   (`waypoints.intrinsic_reward`). Each commitment is one worker episode: `done`
@@ -79,6 +82,32 @@ def validate_env(env) -> None:
         )
 
 
+def validate_manager_input(config: FeudalConfig, env) -> None:
+    """`manager_input: relative` needs the env's per-entity readout."""
+    wp.validate_manager_input(config.manager_input)
+    if config.manager_input == "relative" and not hasattr(env, "entity_state"):
+        raise ValueError(
+            "manager_input='relative' needs an env with an `entity_state(state)` "
+            f"hook (per-agent and per-box blocks); {type(env).__name__} has none. "
+            "Supported: multi_box_push_mjx."
+        )
+
+
+def manager_actor_dim(config: FeudalConfig, env):
+    """Manager actor input width. None under `global` (input_dims' formula);
+    under `relative`, read off the builder by abstract evaluation (no FLOPs), so
+    the declared width is by construction the width the builder emits."""
+    if config.manager_input == "global":
+        return None
+
+    def build(key):
+        _, state = env.reset(key)
+        agents, boxes = env.entity_state(state)
+        return wp.manager_actor_input_relative(agents[None], boxes[None])
+
+    return jax.eval_shape(build, jax.random.PRNGKey(0)).shape[-1]
+
+
 def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
     """Worker + manager train states, each built by `mappo_jax`'s factory.
 
@@ -86,8 +115,13 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
     waypoint and hence its own return) and keeps that axis at one agent. The
     manager critic is a scalar team value.
     """
+    validate_manager_input(config, env)
     dims = wp.input_dims(
-        env.observation_dim, global_state_dim(env), env.n_agents, env.goal_state_dim
+        env.observation_dim,
+        global_state_dim(env),
+        env.n_agents,
+        env.goal_state_dim,
+        manager_actor_dim=manager_actor_dim(config, env),
     )
     worker_rng, manager_rng = jax.random.split(rng)
     worker = create_train_state(
@@ -133,8 +167,9 @@ class Policy(NamedTuple):
     """The hierarchy's forward pass, shared by training, eval and `view()`.
 
     `observe(obs, env_state) -> (global_state, pos)`
-    `decide(manager_ts, global_state, pos, rng, deterministic)
+    `decide(manager_ts, global_state, pos, env_state, rng, deterministic)
         -> (waypoint, actor_in, critic_in, action, log_prob)`
+        — `env_state` is read only under `manager_input: relative`.
     `act(worker_ts, obs, pos, waypoint, k, rng, deterministic)
         -> (action, log_prob, actor_in)`  — `k` is the step within the window.
 
@@ -150,14 +185,20 @@ def make_policy(config: FeudalConfig, env) -> Policy:
     horizon, radius = config.goal_horizon, config.waypoint_radius
     bound = config.manager_action_bound
     wp.validate_action_bound(bound)
+    validate_manager_input(config, env)
+    relative = config.manager_input == "relative"
     v_pos = jax.vmap(env.goal_state)
+    v_entity = jax.vmap(env.entity_state) if relative else None
     global_state = global_state_fn(env)
 
     def observe(obs, env_state):
         return global_state(obs, env_state), v_pos(env_state)
 
-    def decide(manager_ts, gs, pos, rng, deterministic=False):
-        actor_in = wp.manager_actor_input(gs, pos)
+    def decide(manager_ts, gs, pos, env_state, rng, deterministic=False):
+        if relative:
+            actor_in = wp.manager_actor_input_relative(*v_entity(env_state))
+        else:
+            actor_in = wp.manager_actor_input(gs, pos)
         critic_in = wp.manager_critic_input(gs, pos)
         action, log_prob = _act(manager_ts, actor_in, rng, deterministic)
         waypoint = wp.waypoint_from_action(pos, action, radius, bound)
@@ -215,6 +256,16 @@ def make_train(config: FeudalConfig, env):
 
     n_envs, n_agents = wcfg.n_envs, env.n_agents
     gamma = wcfg.gamma
+    # The manager's per-step discount: it sums the team reward within a window
+    # and bootstraps a truncation, and `ppo_update` discounts decisions with
+    # `mcfg.gamma`. Both must describe one horizon, or the window return and
+    # the GAE recursion value the future differently.
+    m_gamma = gamma if config.manager_step_gamma is None else config.manager_step_gamma
+    if not math.isclose(mcfg.gamma, m_gamma**horizon, rel_tol=1e-6):
+        raise ValueError(
+            f"manager.gamma ({mcfg.gamma}) must equal the manager's per-step "
+            f"discount ({m_gamma}) ** goal_horizon ({horizon}) = {m_gamma**horizon}"
+        )
     num_updates = int(wcfg.n_total_steps) // (wcfg.n_steps * n_envs)
 
     policy = make_policy(config, env)
@@ -279,12 +330,12 @@ def make_train(config: FeudalConfig, env):
 
         # --- Manager: discounted team reward over the window, plus the same
         # truncation bootstrap with its own critic.
-        m_reward = m_reward + alive_f * jnp.power(gamma, k) * team_reward
+        m_reward = m_reward + alive_f * jnp.power(m_gamma, k) * team_reward
         m_next_value = _value(
             train_state.manager, wp.manager_critic_input(next_gs, next_pos)
         )
         m_reward = m_reward + (
-            time_limit.astype(jnp.float32) * jnp.power(gamma, k + 1) * m_next_value
+            time_limit.astype(jnp.float32) * jnp.power(m_gamma, k + 1) * m_next_value
         )
         m_done = m_done | (alive & done)
 
@@ -321,7 +372,7 @@ def make_train(config: FeudalConfig, env):
 
         gs, pos = policy.observe(obs, env_state)
         waypoint, m_actor_in, m_critic_in, m_action, m_log_prob = policy.decide(
-            train_state.manager, gs, pos, manager_rng
+            train_state.manager, gs, pos, env_state, manager_rng
         )
         m_value = _value(train_state.manager, m_critic_in)  # (E,)
 
@@ -475,7 +526,9 @@ def make_train(config: FeudalConfig, env):
         def _eval_window(carry, _):
             obs, env_state, _, _ = carry
             gs, pos = policy.observe(obs, env_state)
-            waypoint = policy.decide(train_state.manager, gs, pos, no_rng, True)[0]
+            waypoint = policy.decide(
+                train_state.manager, gs, pos, env_state, no_rng, True
+            )[0]
             carry, _ = jax.lax.scan(
                 partial(_eval_step, waypoint), carry, jnp.arange(horizon)
             )

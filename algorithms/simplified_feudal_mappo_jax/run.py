@@ -23,6 +23,7 @@ from algorithms.simplified_feudal_mappo_jax.trainer import (
     make_policy,
     make_train,
     validate_env,
+    validate_manager_input,
 )
 from algorithms.simplified_feudal_mappo_jax.types import (
     Experiment,
@@ -34,6 +35,61 @@ from algorithms.simplified_feudal_mappo_jax.types import (
 # Waypoint overlay colour in view(): violet, as in the feudal stack's videos.
 _WAYPOINT_COLOR = (130, 60, 200)
 _HALO_COLOR = (255, 255, 255)
+
+
+def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
+    """Resolve the Hydra `params` / `model_params` into the `FeudalConfig` that
+    `make_train` consumes. Pure (no env), so the seam tests can check the wiring.
+
+    * The rollout is a whole number of manager windows: `n_steps` is rounded UP
+      so it still covers the configured length (set >= max_steps in the env
+      groups, because every rollout starts from freshly reset envs).
+    * The manager shares every worker PPO knob except the ones below.
+    * One manager decision spans `horizon` env steps, so its per-decision
+      discount is (per-step discount)^c. The per-step discount is the worker's
+      gamma unless `manager_gamma` gives the manager a longer horizon.
+    * `manager_ent_coef` replaces the worker's entropy coefficient for the
+      manager only; None keeps the shared value (the original behaviour).
+    """
+    horizon = int(model_params.goal_horizon)
+    n_steps = math.ceil(params.n_steps / horizon) * horizon
+    worker = MAPPOConfig(
+        lr=params.lr,
+        gamma=params.gamma,
+        gae_lambda=params.lmbda,
+        eps_clip=params.eps_clip,
+        ent_coef=params.ent_coef,
+        val_coef=params.val_coef,
+        grad_clip=params.grad_clip,
+        n_epochs=params.n_epochs,
+        n_minibatches=params.n_minibatches,
+        n_steps=n_steps,
+        n_envs=n_envs,
+        n_total_steps=int(params.n_total_steps),
+        parameter_sharing=params.parameter_sharing,
+        hidden_dim=model_params.hidden_dim,
+        n_eval_episodes=params.n_eval_episodes,
+    )
+    step_gamma = params.gamma if params.manager_gamma is None else params.manager_gamma
+    manager = dataclasses.replace(
+        worker,
+        lr=params.manager_lr,
+        gamma=step_gamma**horizon,
+        ent_coef=(
+            params.ent_coef if params.manager_ent_coef is None else params.manager_ent_coef
+        ),
+        n_epochs=params.manager_n_epochs,
+        n_minibatches=params.manager_n_minibatches,
+    )
+    return FeudalConfig(
+        worker=worker,
+        manager=manager,
+        goal_horizon=horizon,
+        waypoint_radius=float(model_params.waypoint_radius),
+        manager_action_bound=model_params.manager_action_bound,
+        manager_input=model_params.manager_input,
+        manager_step_gamma=params.manager_gamma,
+    )
 
 
 class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
@@ -57,61 +113,35 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         self.env = make_env(env_config)
         validate_env(self.env)
 
-        horizon = int(self.model_params.goal_horizon)
-        # The rollout is a whole number of manager windows. Rounded UP so it
-        # still covers the configured length (set >= max_steps in the env groups,
-        # because every rollout starts from freshly reset envs).
-        n_steps = math.ceil(self.params.n_steps / horizon) * horizon
+        self.feudal_config = make_feudal_config(
+            self.params, self.model_params, env_config.get("n_envs")
+        )
+        validate_manager_input(self.feudal_config, self.env)
+        worker, manager = self.feudal_config.worker, self.feudal_config.manager
+        horizon, n_steps = self.feudal_config.goal_horizon, worker.n_steps
         if n_steps != self.params.n_steps:
             print(
                 f"  n_steps {self.params.n_steps} -> {n_steps} "
                 f"(a multiple of goal_horizon={horizon})"
             )
-
-        worker = MAPPOConfig(
-            lr=self.params.lr,
-            gamma=self.params.gamma,
-            gae_lambda=self.params.lmbda,
-            eps_clip=self.params.eps_clip,
-            ent_coef=self.params.ent_coef,
-            val_coef=self.params.val_coef,
-            grad_clip=self.params.grad_clip,
-            n_epochs=self.params.n_epochs,
-            n_minibatches=self.params.n_minibatches,
-            n_steps=n_steps,
-            n_envs=env_config.get("n_envs"),
-            n_total_steps=int(self.params.n_total_steps),
-            parameter_sharing=self.params.parameter_sharing,
-            hidden_dim=self.model_params.hidden_dim,
-            n_eval_episodes=self.params.n_eval_episodes,
-        )
-        # One manager decision spans `horizon` env steps, so its per-decision
-        # discount is gamma^c: both levels see the same horizon in env steps.
-        manager = dataclasses.replace(
-            worker,
-            lr=self.params.manager_lr,
-            gamma=self.params.gamma**horizon,
-            n_epochs=self.params.manager_n_epochs,
-            n_minibatches=self.params.manager_n_minibatches,
-        )
-        self.feudal_config = FeudalConfig(
-            worker=worker,
-            manager=manager,
-            goal_horizon=horizon,
-            waypoint_radius=float(self.model_params.waypoint_radius),
-            manager_action_bound=self.model_params.manager_action_bound,
-        )
         # The inherited train loop reads n_steps / n_envs / n_total_steps here.
         self.config = worker
 
+        own_gamma = self.feudal_config.manager_step_gamma is not None
+        own_entropy = self.params.manager_ent_coef is not None
         print(
             f"Simplified feudal MAPPO (JAX) | env={env_config.get('environment')} | "
             f"n_agents={self.env.n_agents} | n_envs={worker.n_envs} | "
             f"n_steps={n_steps} ({n_steps // horizon} windows of {horizon}) | "
             f"waypoint_radius={self.feudal_config.waypoint_radius} | "
             f"manager_action_bound={self.feudal_config.manager_action_bound} | "
-            f"manager_gamma={manager.gamma:.4f} | total={worker.n_total_steps} | "
-            f"backend={jax.default_backend()}"
+            f"manager_input={self.feudal_config.manager_input} | "
+            f"manager_gamma={manager.gamma:.4f}/decision "
+            f"({manager.gamma ** (1 / horizon):.4g}/step, "
+            f"{'own' if own_gamma else 'worker'}) | "
+            f"manager_ent_coef={manager.ent_coef} "
+            f"({'own' if own_entropy else 'worker'}) | "
+            f"total={worker.n_total_steps} | backend={jax.default_backend()}"
         )
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
@@ -224,7 +254,9 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         @jax.jit
         def decide_fn(obs, env_state):
             gs, pos = policy.observe(obs, env_state)
-            return policy.decide(train_state.manager, gs, pos, no_rng, True)[0]
+            return policy.decide(
+                train_state.manager, gs, pos, env_state, no_rng, True
+            )[0]
 
         @jax.jit
         def act_fn(obs, env_state, waypoint, k):

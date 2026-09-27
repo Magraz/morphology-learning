@@ -22,3 +22,9 @@ model_params:
   # with the model group, not a CLI override: the results path carries the model
   # group name, and a checkpoint cannot tell you which bound trained it.
   manager_action_bound: clip
+  # What the manager ACTOR reads (waypoints.MANAGER_INPUTS): `global` (the team
+  # view: global state + every agent's position, the original) or `relative`
+  # (each agent's view measured from itself, delivered boxes removed). The
+  # `relative` input is a different width, so its checkpoints do not load here.
+  # Switch it with the model group, like manager_action_bound.
+  manager_input: global

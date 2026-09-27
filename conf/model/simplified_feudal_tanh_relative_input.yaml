@@ -1,0 +1,37 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh`: manager_input global -> relative.
+#
+# The manager ACTOR reads each agent's own view measured from itself: own
+# position and velocity, every box as (box - own position, goal distance, touch
+# fraction, coupling fraction), sorted nearest first with DELIVERED boxes zeroed
+# and moved to the end, then teammates relative to it, then the one-hot agent
+# index (waypoints.manager_actor_input_relative). The manager critic still reads
+# the team view, so this arm changes only what the policy conditions on.
+#
+# Why (measured 2026-09-27, both `_gs` batches, all four simplified feudal arms,
+# 5 seeds): every learned manager caps at about ONE box, while a scripted
+# manager driving the same trained workers delivers nearly all of them. After
+# the first delivery the manager's waypoints stop tracking the boxes (correlation
+# with box direction ~0, down from +0.4-0.5 before). Editing the input at spawn
+# states showed the approach skill survives moving the agent to the top or
+# marking a box delivered; it is gone only in the states actually visited after
+# a delivery. The global input's absolute positions and per-box `delivered` flags
+# make those states a separate region the manager learned a separate, useless
+# policy for (it earns ~0 reward there, so nothing corrects it). Here the next
+# box to go for is always the first slot, as for the flat policy's
+# `nearest_box_vec`, so the first box's lesson applies to the next.
+#
+# Residual: the zeroed tail still reveals how many boxes are delivered.
+# Requires an env with `entity_state` (multi_box_push_mjx); other envs raise.
+# The manager actor's input width differs (23 at 1a/3o, 34 at 2a/4o against 25 /
+# 38 for `global` with the compact global state), so checkpoints are NOT
+# interchangeable with `simplified_feudal_tanh`.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_relative_input trial_id=0
+defaults:
+  - simplified_feudal_tanh
+  - _self_
+
+model_params:
+  manager_input: relative

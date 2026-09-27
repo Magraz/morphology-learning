@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax
 
@@ -16,13 +16,25 @@ class Params(MAPPOParams):
     samples per update than the worker; sharing the worker's epoch/minibatch
     counts would give it the same number of gradient steps on a tiny batch.
     Every other PPO hyperparameter (clip, entropy, value coef, lambda, grad clip)
-    is shared. The manager's discount is DERIVED as `gamma ** goal_horizon`, so
-    both levels see the same effective horizon in env steps.
+    is shared. The manager's discount per decision is `manager_gamma **
+    goal_horizon`, where `manager_gamma` is a PER-ENV-STEP discount.
     """
 
     manager_lr: float = 3e-4
     manager_n_epochs: int = 4
     manager_n_minibatches: int = 2
+    # Per-ENV-STEP discount of the manager. None (the default) uses the worker's
+    # `gamma`, i.e. both levels share one ~100-step horizon. Set higher (e.g.
+    # 0.997, a ~333-step horizon) to give the manager a longer horizon than the
+    # worker, as in FeUdal Networks. Per step rather than per decision so one
+    # value means the same horizon at any goal_horizon.
+    manager_gamma: Optional[float] = None
+    # Entropy coefficient of the MANAGER only. None (the default) shares the
+    # worker's `ent_coef`. Under `manager_action_bound: tanh` the bonus is the
+    # squashed entropy, which peaks at mean 0 (a zero waypoint offset), so in
+    # states that pay nothing it pulls the manager toward standing still; a
+    # smaller value weakens that pull.
+    manager_ent_coef: Optional[float] = None
 
 
 @dataclass
@@ -35,6 +47,9 @@ class Model_Params:
     # "clip" | "tanh": how the manager's Gaussian action is bounded to [-1, 1]
     # (waypoints.ACTION_BOUNDS). "clip" is the original behaviour.
     manager_action_bound: str = "clip"
+    # "global" | "relative": what the manager ACTOR reads
+    # (waypoints.MANAGER_INPUTS). "global" is the original behaviour.
+    manager_input: str = "global"
 
 
 @dataclass
@@ -58,6 +73,11 @@ class FeudalConfig:
     goal_horizon: int
     waypoint_radius: float
     manager_action_bound: str = "clip"
+    manager_input: str = "global"
+    # Per-env-step discount used to sum the team reward within a window and to
+    # bootstrap a truncation. None = `worker.gamma` (the original code path).
+    # `manager.gamma` must equal this ** goal_horizon; `make_train` checks it.
+    manager_step_gamma: Optional[float] = None
 
 
 class Rollout(NamedTuple):

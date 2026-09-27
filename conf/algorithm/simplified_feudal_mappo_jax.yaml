@@ -33,9 +33,16 @@ params:
   # ---- manager ----
   # The manager makes one decision per goal_horizon steps, so it gets ~c x fewer
   # samples per update than the worker and needs its own epoch/minibatch counts.
-  # Its discount is derived, not set: gamma ** goal_horizon per decision.
   manager_lr: 0.0003
   manager_n_epochs: 4
   manager_n_minibatches: 2
+  # The manager's PER-ENV-STEP discount; per decision it is this ** goal_horizon.
+  # null = the worker's gamma (0.99, a ~100-step horizon for both levels). Set it
+  # in a MODEL group, never on the CLI: the results path carries the model group
+  # name, not the algorithm's overrides.
+  manager_gamma: null
+  # The manager's own entropy coefficient. null = the shared ent_coef above.
+  # Same rule: set it in a model group, never on the CLI.
+  manager_ent_coef: null
 model_params:
   hidden_dim: 168
