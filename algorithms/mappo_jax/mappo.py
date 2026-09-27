@@ -164,6 +164,7 @@ def ppo_update(
     last_value: jnp.ndarray,
     config: MAPPOConfig,
     discrete: bool,
+    squash: bool = False,
 ) -> Tuple[ActorCriticTrainState, dict]:
     """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
 
@@ -174,6 +175,9 @@ def ppo_update(
         last_value: (n_envs,) bootstrap values (GAE masks dones internally)
         config: hyperparameters
         discrete: action space type
+        squash: the env applies `tanh` to the stored Gaussian sample, so the
+            entropy bonus is the squashed entropy (`evaluate_action`). Off by
+            default; off is byte-identical to the code before the flag.
 
     Returns:
         updated train_state, loss metrics dict
@@ -278,6 +282,7 @@ def ppo_update(
                     mb_actions,
                     discrete,
                     action_mask=mb_mask,
+                    squash=squash,
                 )
                 ratio = jnp.exp(log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv

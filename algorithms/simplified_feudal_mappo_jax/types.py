@@ -32,6 +32,9 @@ class Model_Params:
     # into experiments/results/<env>/mlp/, the mappo_jax baseline's directory.
     goal_horizon: int  # c: steps a waypoint stays in force
     waypoint_radius: float  # R: max waypoint offset per axis, in goal_state units
+    # "clip" | "tanh": how the manager's Gaussian action is bounded to [-1, 1]
+    # (waypoints.ACTION_BOUNDS). "clip" is the original behaviour.
+    manager_action_bound: str = "clip"
 
 
 @dataclass
@@ -54,6 +57,7 @@ class FeudalConfig:
     manager: MAPPOConfig
     goal_horizon: int
     waypoint_radius: float
+    manager_action_bound: str = "clip"
 
 
 class Rollout(NamedTuple):

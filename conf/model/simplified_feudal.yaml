@@ -16,3 +16,9 @@ model_params:
   # ~0.145 of a 30-wide arena, so a full-R axis waypoint is about reachable in
   # one window at 1a/3o and only partly in larger arenas (47 wide at 16a/4o).
   waypoint_radius: 0.15
+  # How the manager's Gaussian action is bounded to [-1, 1] before scaling by R
+  # (waypoints.ACTION_BOUNDS). `clip` is the original; `simplified_feudal_tanh`
+  # flips it. Kept here so the key exists and the value is visible, but switch it
+  # with the model group, not a CLI override: the results path carries the model
+  # group name, and a checkpoint cannot tell you which bound trained it.
+  manager_action_bound: clip

@@ -16,7 +16,13 @@ import numpy as np
 import pytest
 
 from algorithms.mappo_jax.mappo import create_train_state
-from algorithms.mappo_jax.network import MAPPOCritic, evaluate_action
+from algorithms.mappo_jax.network import (
+    MAPPOActor,
+    MAPPOCritic,
+    _gaussian_entropy,
+    _squashed_gaussian_entropy,
+    evaluate_action,
+)
 from algorithms.mappo_jax.types import MAPPOConfig
 from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 from algorithms.simplified_feudal_mappo_jax.trainer import (
@@ -91,7 +97,7 @@ class StubEnv:
         return state.pos
 
 
-def _config(n_steps=N_STEPS):
+def _config(n_steps=N_STEPS, bound="clip"):
     worker = MAPPOConfig(
         n_steps=n_steps,
         n_envs=N_ENVS,
@@ -105,12 +111,16 @@ def _config(n_steps=N_STEPS):
         worker, gamma=worker.gamma**HORIZON, n_minibatches=1
     )
     return FeudalConfig(
-        worker=worker, manager=manager, goal_horizon=HORIZON, waypoint_radius=RADIUS
+        worker=worker,
+        manager=manager,
+        goal_horizon=HORIZON,
+        waypoint_radius=RADIUS,
+        manager_action_bound=bound,
     )
 
 
-def _collect(env, seed=0):
-    config = _config()
+def _collect(env, seed=0, bound="clip"):
+    config = _config(bound=bound)
     init_fn, collect_fn, update_fn, eval_fn, _ = make_train(config, env)
     runner_state = init_fn(jax.random.PRNGKey(seed))
     out = collect_fn(runner_state)
@@ -233,11 +243,13 @@ def test_time_limit_mid_window_bootstraps_both_levels(n_agents):
     )
 
 
+@pytest.mark.parametrize("bound", ["clip", "tanh"])
 @pytest.mark.parametrize("n_agents", [1, 3])
-def test_ppo_ratio_is_exactly_one_before_update_at_both_levels(n_agents):
+def test_ppo_ratio_is_exactly_one_before_update_at_both_levels(n_agents, bound):
     """The stored inputs must re-evaluate to the stored log-probs, or PPO's
-    importance ratio compares two different distributions."""
-    _, _, (runner_state, rollout, _, _), _ = _collect(StubEnv(n_agents))
+    importance ratio compares two different distributions. Under `tanh` the
+    stored manager action is the pre-tanh sample, so this holds unchanged."""
+    _, _, (runner_state, rollout, _, _), _ = _collect(StubEnv(n_agents), bound=bound)
     ts = runner_state.train_state
     for level, traj in (("worker", rollout.worker), ("manager", rollout.manager)):
         actor = getattr(ts, level).actor_ts
@@ -254,10 +266,11 @@ def test_ppo_ratio_is_exactly_one_before_update_at_both_levels(n_agents):
         )
 
 
+@pytest.mark.parametrize("bound", ["clip", "tanh"])
 @pytest.mark.parametrize("n_agents", [1, 3])
-def test_collect_update_eval_end_to_end(n_agents):
+def test_collect_update_eval_end_to_end(n_agents, bound):
     config, _, (runner_state, rollout, last_values, _), (update_fn, eval_fn) = (
-        _collect(StubEnv(n_agents, max_steps=10))
+        _collect(StubEnv(n_agents, max_steps=10), bound=bound)
     )
     n_windows = N_STEPS // HORIZON
     assert rollout.worker.value.shape == (N_STEPS, N_ENVS, n_agents)
@@ -272,6 +285,7 @@ def test_collect_update_eval_end_to_end(n_agents):
         "manager_policy_loss", "manager_value_loss", "manager_explained_variance",
         "intrinsic_reward", "waypoint_reached_frac", "waypoint_final_error",
         "waypoint_offset", "manager_window_return", "rollout_team_reward",
+        "manager_action_saturation",
     ):
         assert np.isfinite(float(losses[key])), key
     # Both levels actually moved.
@@ -285,11 +299,87 @@ def test_collect_update_eval_end_to_end(n_agents):
     assert np.isfinite(ret)
 
 
-def test_waypoints_stay_in_the_arena_and_within_radius():
+@pytest.mark.parametrize(
+    "bound, expected",
+    [
+        ("clip", [[0.5, -0.5], [0.1, -0.2]]),
+        ("tanh", [[0.5, -0.5], [0.2 * np.tanh(0.5), -0.2 * np.tanh(2.0)]]),
+    ],
+)
+def test_waypoints_stay_in_the_arena_and_within_radius(bound, expected):
     pos = jnp.array([[0.45, -0.45], [0.0, 0.0]])
     action = jnp.array([[5.0, -5.0], [0.5, -2.0]])
-    w = wp.waypoint_from_action(pos, action, 0.2)
-    np.testing.assert_allclose(w, [[0.5, -0.5], [0.1, -0.2]], atol=1e-6)
+    w = wp.waypoint_from_action(pos, action, 0.2, bound)
+    np.testing.assert_allclose(w, expected, atol=1e-6)
+
+
+def test_tanh_moves_the_waypoint_where_clip_is_flat():
+    """The defect `tanh` removes: under `clip` two different samples past the
+    bound give the SAME waypoint, so the advantage cannot tell them apart."""
+    pos = jnp.zeros((1, 2))
+    a, b = jnp.array([[2.0, 0.0]]), jnp.array([[5.0, 0.0]])
+    clip_a, clip_b = (wp.waypoint_from_action(pos, x, 0.2, "clip") for x in (a, b))
+    tanh_a, tanh_b = (wp.waypoint_from_action(pos, x, 0.2, "tanh") for x in (a, b))
+    np.testing.assert_array_equal(clip_a, clip_b)
+    assert float(tanh_b[0, 0] - tanh_a[0, 0]) > 0.0
+
+
+def test_unknown_action_bound_is_rejected():
+    with pytest.raises(ValueError, match="manager_action_bound"):
+        make_train(_config(bound="sigmoid"), StubEnv(2))
+    assert Model_Params(
+        hidden_dim=8, goal_horizon=4, waypoint_radius=0.1
+    ).manager_action_bound == "clip"
+
+
+@pytest.mark.parametrize("mean, log_std", [(0.0, -0.5), (1.5, -1.0), (-3.0, 0.3)])
+def test_squashed_entropy_matches_monte_carlo(mean, log_std):
+    """Quadrature vs a Monte Carlo estimate of H[u] + E[log(1 - tanh(u)^2)]."""
+    mu = jnp.full((1, 2), mean)
+    ls = jnp.full((2,), log_std)
+    u = mean + np.exp(log_std) * np.random.default_rng(0).standard_normal(2_000_000)
+    jac_mc = np.log1p(-np.tanh(u) ** 2).mean()
+    gauss = 0.5 * (1 + np.log(2 * np.pi)) + log_std
+    np.testing.assert_allclose(
+        float(_squashed_gaussian_entropy(mu, ls)[0]), 2 * (gauss + jac_mc), atol=5e-3
+    )
+
+
+def test_squashed_entropy_pulls_a_saturated_mean_back():
+    """Maximizing the squashed entropy moves the mean toward 0; the plain
+    Gaussian entropy does not depend on the mean at all."""
+    ls = jnp.full((1,), -1.5)
+
+    def grad_at(m):
+        return float(jax.grad(lambda x: _squashed_gaussian_entropy(x, ls).sum())(
+            jnp.full((1, 1), m)
+        )[0, 0])
+
+    assert grad_at(3.0) < -1.0 and grad_at(-3.0) > 1.0
+    assert abs(grad_at(0.0)) < 1e-6
+    assert float(_squashed_gaussian_entropy(jnp.zeros((1, 1)), ls)[0]) < float(
+        _gaussian_entropy(ls, (1,))[0]
+    )
+
+
+def test_squash_changes_the_entropy_and_not_the_log_prob():
+    """`squash=False` is the original Gaussian path exactly; `squash=True`
+    keeps the log-prob (the tanh Jacobian cancels in the PPO ratio)."""
+    actor = MAPPOActor(action_dim=2, hidden_dim=8, discrete=False)
+    obs = jax.random.normal(jax.random.PRNGKey(0), (5, 3))
+    params = actor.init(jax.random.PRNGKey(1), obs)
+    action = jax.random.normal(jax.random.PRNGKey(2), (5, 2)) * 3.0
+    lp, ent = evaluate_action(actor.apply, params, obs, action, discrete=False)
+    lp_s, ent_s = evaluate_action(
+        actor.apply, params, obs, action, discrete=False, squash=True
+    )
+    np.testing.assert_array_equal(lp, lp_s)
+    np.testing.assert_array_equal(
+        ent, _gaussian_entropy(params["params"]["log_action_std"], (5,))
+    )
+    assert np.all(np.asarray(ent_s) < np.asarray(ent))
+    with pytest.raises(ValueError, match="continuous"):
+        evaluate_action(actor.apply, params, obs, action, discrete=True, squash=True)
 
 
 def test_critic_keep_output_axis_is_inert_by_default():

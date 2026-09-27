@@ -19,6 +19,10 @@ import flax.linen as nn
 
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
 _LOG_2PI = math.log(2.0 * math.pi)
+# Gauss–Hermite rule for E_{u ~ N(mu, sigma^2)}[f(u)] in the squashed entropy.
+_GH_NODES, _GH_WEIGHTS = (
+    jnp.asarray(x, dtype=jnp.float32) for x in np.polynomial.hermite.hermgauss(16)
+)
 
 
 class MAPPOActor(nn.Module):
@@ -118,6 +122,28 @@ def _gaussian_entropy(log_std, batch_shape):
     return jnp.full(batch_shape, ent)
 
 
+def _log_tanh_jacobian(u):
+    """`log(1 - tanh(u)^2)`, in the numerically stable form SAC uses."""
+    return 2.0 * (math.log(2.0) - u - jax.nn.softplus(-2.0 * u))
+
+
+def _squashed_gaussian_entropy(mean, log_std):
+    """Entropy of `a = tanh(u)`, `u ~ N(mean, exp(log_std)^2)`, summed over dims.
+
+    `H[a] = H[u] + E_u[sum log(1 - tanh(u)^2)]`. The expectation is taken by
+    Gauss–Hermite quadrature, so it is deterministic and differentiable in both
+    `mean` and `log_std`. The second term is <= 0 and falls as `|mean|` grows, so
+    maximizing it pulls the mean toward the range where the action still
+    responds to it. The pull is about `2 * ent_coef` per dim, weak next to a
+    normalized policy gradient, so it limits saturation rather than preventing
+    it. Without it, tanh saturates further than a clipped Gaussian does.
+    """
+    std = jnp.exp(log_std)
+    u = mean[..., None] + math.sqrt(2.0) * std[..., None] * _GH_NODES  # (..., D, K)
+    jacobian = (_log_tanh_jacobian(u) * _GH_WEIGHTS).sum(-1) / math.sqrt(math.pi)
+    return (0.5 * (1.0 + _LOG_2PI) + log_std + jacobian).sum(-1)
+
+
 def _masked_logits(logits, action_mask):
     if action_mask is not None:
         logits = logits + (1.0 - action_mask) * (-1e9)
@@ -171,9 +197,20 @@ def evaluate_action(
     action: jnp.ndarray,
     discrete: bool,
     action_mask: Optional[jnp.ndarray] = None,
+    squash: bool = False,
 ):
-    """Evaluate log_prob and entropy for given actions. Pure function."""
+    """Evaluate log_prob and entropy for given actions. Pure function.
+
+    `squash=True` is for a policy whose environment applies `tanh` to the
+    Gaussian sample. `action` is then the stored PRE-tanh sample `u`. The tanh
+    Jacobian in `log pi(tanh(u))` depends on `u` alone, so it cancels in the PPO
+    ratio, and the Gaussian log-prob of `u` stays exact for the update. Only the
+    entropy changes, to that of the squashed action (see
+    `_squashed_gaussian_entropy`).
+    """
     if discrete:
+        if squash:
+            raise ValueError("squash applies to continuous actions only")
         logits = _masked_logits(actor_apply_fn(params, obs), action_mask)
         log_prob = _categorical_log_prob(logits, action)
         entropy = _categorical_entropy(logits)
@@ -181,6 +218,9 @@ def evaluate_action(
         mean, log_std = actor_apply_fn(params, obs)
         log_std = jnp.clip(log_std, LOG_STD_MIN, LOG_STD_MAX)
         log_prob = _gaussian_log_prob(action, mean, log_std)
-        entropy = _gaussian_entropy(log_std, log_prob.shape)
+        if squash:
+            entropy = _squashed_gaussian_entropy(mean, log_std)
+        else:
+            entropy = _gaussian_entropy(log_std, log_prob.shape)
 
     return log_prob, entropy

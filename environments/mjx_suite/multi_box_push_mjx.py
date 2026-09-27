@@ -109,6 +109,7 @@ from environments.mjx_suite.observation import (
     MJXObservationBuilder,
     geom_index_maps,
 )
+from environments.mjx_suite.physics_options import physics_xml
 
 _AGENT_RADIUS = 0.4
 _AGENT_MASS = 1.0  # Box2D default-mass fallback for zero-density fixtures
@@ -398,13 +399,10 @@ class MultiBoxPushMJX:
         ]
         agent_rgba = "0.78 0.2 0.2 1"  # Box2D agent disc red
 
+        # Integrator, solver iterations and contact cap: see physics_options.py.
         parts = [
             "<mujoco>",
-            # implicitfast integrates joint damping implicitly — same semantics
-            # as Box2D's v /= (1 + damping * dt). Pyramidal cone (the default):
-            # elliptic NaNs out when a light coupled box is crushed against a
-            # wall by many agents.
-            f'  <option timestep="{_TIME_STEP}" gravity="0 0 0" integrator="implicitfast"/>',
+            *physics_xml(_TIME_STEP, self.n_agents, self.n_objects),
         ]
         if visual:
             parts += [

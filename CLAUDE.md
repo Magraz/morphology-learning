@@ -153,7 +153,10 @@ push each box with `coupling_def: [1, 1, 1]`. The coupling sum warning is
 informational. FeUdal training skips the agent-permuted eval block when
 `n_agents == 1`, retaining the real, constant and zeroed blocks.
 `manager.training_goal_variants` supplies the same selection to the trainer and
-runner. Agent-permutation cosine metrics (`d_cos_null_agent`,
+runner. The offline `goal_dependence_probe` uses `manager.offline_goal_variants`,
+which drops only `permuted` at `n_agents == 1` and keeps the offline-only
+`env_permuted` (until 2026-09-24 the probe hardcoded all five and raised on
+every single-agent checkpoint). Agent-permutation cosine metrics (`d_cos_null_agent`,
 `d_cos_gap_agent`, `goal_perm_cos`) are NaN because there is no other agent to
 swap with. Environment-permutation metrics remain available when `n_envs > 1`;
 they likewise become NaN for a singleton env axis. Direct requests for an
@@ -163,6 +166,23 @@ agent (`MAPPOCritic.keep_output_axis`), as does the manager critic under
 per-agent rewards. Otherwise the singleton output was squeezed, causing
 truncation bootstraps to broadcast `(n_envs, 1)` rewards to `(n_envs, n_envs)`
 and fail at the first advantage calculation. Team manager values stay scalar.
+At `n_agents == 1`, `manager_latent: centralized` and `local_private` are the
+**same network** unless the env publishes `global_state`. Without that hook,
+`global_state` is `obs.reshape(E, -1)`, which is agent 0's observation.
+`f_percept` then matches `f_enc`, `f_Mspace` matches `f_Mspace_agent`, and
+`goal_head` matches `goal_head_agent` in shape and init distribution. The
+parameter counts match. With transplanted weights, `goal` and `s` differ by
+exactly 0.0 on both cores (CPU check, 2026-09-23). Only the parameter names
+differ, so initial draws differ and checkpoints do not load across them. On
+`mjx_1a_3o_111_1024`, an arm pair differs only by seed. On the `_gs` twin,
+the difference is informational: `centralized` reads the 22-dimensional compact
+state, while `local_private` reads the 40-dimensional egocentric observation.
+`manager_latent: local` is the same except in the goal path. Its `s` is exactly
+`local_private`'s after transplanting weights, with a 0.0 difference. Its goal
+path adds one 32-wide tanh layer, `f_gpre -> tanh -> f_goalhead`, with 1,056
+more parameters. `worker_encoder: shared` is the one `*_local_shared` change
+that is real at any N: the worker reads the 256-wide `f_enc(obs)`, not raw obs,
+and its PPO gradient trains `f_enc`.
 `debug=true` disables JAX compilation; use `debug=false` for training speed.
 
 ## Box2D suite observations
@@ -344,7 +364,9 @@ machinery (boundary, observation, renderer, contact listener, target band).
 `ObservationManager`: it owns the sensor math and the 40-dim `OBS_DIM` base
 layout. `include_agent_sector_counts=True` appends eight normalized teammate
 counts after lidar, making `builder.obs_dim = 48` with the default rays.
-`MultiBoxPushMJX` enables this; the multi-goal env retains its existing layout.
+No env currently enables it — `MultiBoxPushMJX` passes
+`include_agent_sector_counts=False` (commit `b6bf344`), so its observation is the
+40-dim base layout.
 Pure and `jit`/`vmap`-able; the env passes plain arrays (agent positions/
 velocities, box poses) plus the `mjx.Data` (needed for lidar raycasts and the
 efc contact-force decode).
@@ -402,15 +424,57 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   semantics as Box2D's `v /= 1 + d*dt`) and the default **pyramidal** friction
   cone (elliptic NaNs out on GPU/f32 when a light coupled box is crushed
   against a wall by many agents).
-- **Observation width:** 48 per agent: the original 40 fields plus eight
-  agent-sector counts. The synchronous macro wrapper inherits this width;
-  the asynchronous wrapper appends commitment features after all 48 fields.
-  Consumers use `env.observation_dim`, not the shared 40-dim `OBS_DIM` constant.
-  Existing 40-input policy checkpoints are incompatible with this expanded
-  observation; train new runs, and keep prior results identified as the old
-  observation layout. The optional compact global-state width is unchanged;
-  concatenated-observation critic inputs now contain `48 * n_agents` values.
-  Checks: `JAX_PLATFORMS=cpu .venv/bin/python -m pytest
+- **Solver settings and contact cap (changed 2026-09-25)**, defined once in
+  `environments/mjx_suite/physics_options.py` and emitted by `physics_xml()`
+  into both `MultiBoxPushMJX._build_xml` and `MultiBoxMultiGoalPushMJX._build_xml`:
+  - Solver: `iterations="20" ls_iterations="10"`, down from MuJoCo's 100 / 50.
+  - Contact cap: `max_contact_points = max(64, 4 * (n_agents + n_objects))`.
+
+  **Why.** A step is ~all constraint solver: observations and lidar take ~0.05 ms
+  of a 3.4-5.9 ms step, and collection is ~93% of a `mappo_jax` iteration. Under
+  `vmap` two defaults make the solver expensive:
+  - The Newton `while_loop` runs to the slowest env in the batch.
+  - The line search's early exit becomes a select, so every Newton iteration
+    pays all `ls_iterations`.
+  - Separately, MJX gave the solver one contact slot per candidate geom pair: 210
+    slots (840 rows) at 12a/3o, against ~9 contacts touching on average.
+
+  **Fidelity, measured.** Identical states are stepped once under each setting,
+  since rollouts are chaotic.
+  - Relative error of the velocity update: median ~1e-6, p99 <= 2e-2, including
+    all 16 agents crowding one box.
+  - The contact-force obs column matches (median difference 0).
+  - Trained `mlp` policies score the same, paired over 128 episodes:
+    `mjx_12a_3o_trunc_1024` +2.6 ± 6.8, `mjx_16a_4o_partition_1024` −5.1 ± 4.0.
+  - `--check-drift` reproduces its recorded numbers.
+
+  **Speed.** Collection with a trained policy (1048 steps × 32 envs) went from
+  7.64 to 2.72 s at 12a/3o and from 11.52 to 2.79 s at 16a/4o. Throughput now
+  scales with `n_envs` (16a/4o: 21k -> 97k steps/s from 32 -> 256 envs), where
+  the old settings saturated the GPU at ~8.5k. `n_envs` is still a
+  hyperparameter, per the rules at the top.
+
+  **Pre-change throughput numbers in this file were measured under 100 / 50 with
+  no cap.** Results before this date ran under the old settings. The difference
+  is below the existing cross-process nondeterminism, so they stay comparable.
+  - ⚠ **Do not go below ~8 iterations.** At 4 iterations the velocity update is
+    off by 50-200%, while scripted deliveries still succeed, so a
+    return-based check will not catch it. 1 iteration NaNs. The CG solver is 5x
+    slower.
+  - ⚠ **The cap is exact only while fewer contacts touch (`contact.dist < 0`)
+    than the cap.** MJX keeps the most-penetrating contacts, so a binding cap
+    silently drops real ones. Measured maximum touching, scripted
+    partition/swarm, 1024 steps × 32 envs, both arenas: 26/27/36 at
+    9a3o/12a3o/16a4o, against caps of 64/64/80. Re-check before a much more
+    crowded config: `touching == cap` means the cap bound.
+- **Observation width:** **40** per agent — the agent-sector counts were
+  turned OFF again in commit `b6bf344` (2026-09-21), so the concatenated-obs
+  critic input is `40 * n_agents` (verified: `global_state_dim` = 40 at 1a/3o).
+  While they were on (the stretch before `b6bf344`) it was 48 per agent, and
+  checkpoints from that window are 48-input — incompatible with the current
+  40-input networks in both directions. Consumers use `env.observation_dim`,
+  not the shared 40-dim `OBS_DIM` constant, so they follow either setting.
+  Checks (the builder option itself, still tested): `JAX_PLATFORMS=cpu .venv/bin/python -m pytest
   algorithms/tests/test_mjx_sector_counts.py -q` covers multiplicity, range,
   sector alignment, fixed scaling, preserved fields, and JIT/vmap/wrapper shapes.
 - **Parity with Box2D.** Same world sizing, spawn regions, coupling list, box
@@ -534,13 +598,33 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
 `MultiBoxPushMJX` can publish a real centralized state instead of leaving the
 critic (and, under `feudal_mappo_jax`, the manager) to read
 `obs.reshape(n_envs, -1)` — N egocentric 40-dim views with no shared frame. The
-arm is **`conf/env/mjx_16a_4o_trunc_1024_gs.yaml`**, a copy of
-`mjx_16a_4o_trunc_1024` differing in exactly one key.
+flag is **`env.use_global_state: true`**, forwarded by the `MULTI_BOX_MJX` branch
+of both `mappo_jax/run.py` and `feudal_mappo_jax/run.py`; nothing else changes —
+the actor still reads its own observation, only the critic (and the feudal
+manager) switch. Turn it on with a **twin env group** differing in exactly that
+one key, never with a CLI override on the base group: the results path is
+`results/<env group>/<model>/<trial>`, so an override would write into — and a
+`checkpoint=true` resume would try to load — the baseline's directory, whose
+critic has a different input width. Current arms:
+**`mjx_6a_4o_1024_gs`** (twin of the untracked `mjx_6a_4o_1024`) and
+**`mjx_1a_3o_111_1024_gs`** (twin of the single-agent `mjx_1a_3o_111_1024`;
+gs_dim 22 vs 40). The `mjx_16a_4o_trunc_1024_gs` group this section used to name
+no longer exists in `conf/env/`.
 
 ```
-uv run python train.py algorithm=mappo_jax env=mjx_16a_4o_trunc_1024_gs \
+uv run python train.py algorithm=mappo_jax env=mjx_1a_3o_111_1024_gs \
     model=mlp trial_id=0
 ```
+
+- **Single agent: here the hook adds INFORMATION, not just exactness** (the ⚠
+  below is about the multi-agent case). With one agent the concat-obs critic
+  input is that agent's own egocentric view. Measured at 1a/3o (256 envs,
+  sensor radius W/4 = 7.5, 30-wide arena), it senses **5.7%** of boxes at spawn,
+  **6.3%** over 300 random-action steps, and **none 84%** of the time. The compact
+  state carries every box's position and `delivered` flag. Verified end-to-end
+  with `mappo_jax` (train, `checkpoint=true` resume, `evaluate=true`): the
+  checkpoint's critic `Dense_0/kernel` is `(22, 336)` and the actor's
+  `(40, 168)`.
 
 - **Layout** (`_compact_global_state`), agent-major then box-major, width
   `n_agents*4 + n_objects*6` — **88 at 16a/4o against 640 for concat-obs**:
@@ -812,7 +896,8 @@ what makes the comparison attributable).
 - **Difference rewards are structurally blind to this pressure.** An unattended
   box's drift cost does not depend on agent *i*, so it appears identically in `G`
   and `G_-i` and cancels exactly. Measured: pivotal `D_i` (exactly `coupling`
-  agents touching) rises only ~7% (1.33e-2 -> 1.43e-2), and the pile-on case
+  agents touching) rises only ~5% (1.332e-2 -> 1.395e-2, re-measured 2026-09-25
+  under both the old and new solver settings), and the pile-on case
   (`2*coupling` touching) is unchanged to 4 significant figures. **Use the drift
   arms in the dense/team-reward study, not as a fix for the DR magnitude gap.**
 - **Config plumbing**: `algorithms/mappo_jax/run.py` used to `.get()` a hard-coded
@@ -1203,9 +1288,21 @@ drop-in comparable:
   uv run python train.py algorithm=mappo_jax env=mjx_16a_4o_multi_goal \
       model=mlp trial_id=0
   ```
-  `run.py` has one `elif` per supported env group
-  (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX`), each passing its
+  `run.make_env(env_config)` has one `elif` per supported env group
+  (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX` / `SMAX`), each passing its
   constructor arguments explicitly — deliberately not a shared kwargs helper.
+  It is module-level (moved out of `MAPPO_JAX_Runner.__init__` on 2026-09-25) so
+  `simplified_feudal_mappo_jax` builds envs through the same code; the feudal
+  stack still has its own copy in its `run.py`.
+  - **Subclass hooks** (same date, behaviour-preserving): `MAPPO_JAX_Runner.
+    _init_trial(...)` (results dirs + seeding) and `_make_train()` (default:
+    `make_train(self.config, self.env)`, called by `train()` and `evaluate()`).
+    `train()` treats the trajectory and bootstrap value opaquely, so a subclass
+    can return any structure its own `update_fn` accepts.
+  - `MAPPOCritic.keep_output_axis` / `create_train_state(...,
+    keep_critic_output_axis=)` (default `False`) keep a width-1 per-agent value
+    head's trailing axis. It only skips the squeeze, so the param tree is
+    unchanged and every existing checkpoint loads.
   This means an `env:` key is only reachable where a branch names it.
 
 - **`env.coupling_def` is wired** (all three branches — bare `MultiBoxPushMJX`,
@@ -1244,6 +1341,197 @@ drop-in comparable:
   - Under `even`, `coupling_fraction` (the multi-goal obs extra) is the constant
     0.25; an explicit unequal list is now what makes it informative.
 
+## Simplified Feudal MAPPO (`algorithms/simplified_feudal_mappo_jax/`)
+
+A deliberately small (~970 lines with docstrings, added 2026-09-25) waypoint hierarchy.
+- **Relation to `feudal_mappo_jax`:** it is not a copy. It keeps none of that
+  stack's variants: latents, FiLM, LSTM, alpha mixing, permutation nulls, probes.
+- **Relation to `mappo_jax`:** built on top of it, reusing its code unmodified.
+- **Levels:** two PPO policies on two timescales, both trained by the
+  **unmodified** `mappo_jax.mappo.ppo_update`.
+
+```
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_12a_3o_trunc_1024 model=simplified_feudal trial_id=0
+# squashed-Gaussian manager (see manager_action_bound below):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh trial_id=0
+```
+
+- **Manager: PPO, one decision per window of `c = goal_horizon` env steps**
+  (a semi-Markov decision).
+  - Actor: shared across agents, reads `concat(M, one_hot(i))`, where
+    `M = concat(global_state, every agent's goal_state)`.
+  - Critic: scalar `V^M(M)`.
+  - Action: a 2-D Gaussian per agent, mapped to `w_i = clip(s_i + R*clip(a_i, -1, 1), -0.5, 0.5)`,
+    where `s_i = env.goal_state(state)[i]` (normalized position) and
+    `R = waypoint_radius`.
+  - **The manager picks direction AND distance** (up to R per axis), so it can
+    learn reachable waypoints. The feudal waypoint arm used a unit direction ×
+    fixed R, which no policy could reach at c=10.
+  - Reward: `sum_{k<c} gamma^k r_{t+k}` of the TEAM reward
+    (`info["task_reward"]`, so any `reward_mode` works).
+  - Discount: **`gamma^c` per decision, derived** (no knob).
+  - Chosen over FeUdal's transition gradient (`-A^M * progress`) because PPO
+    optimizes "waypoints that led to env return" directly, without assuming the
+    worker follows its goals.
+- **Worker: PPO every step, and its ONLY reward is following the waypoint.**
+  - Actor input: `concat(obs_i, (w_i - s_i)/R, time_left)`, with the error
+    recomputed live each step.
+  - Reward: `(||w - s_t|| - ||w - s_{t+1}||)/R`, the distance closed. It
+    telescopes over a commitment, so it cannot be farmed.
+  - Episode: **each commitment is one worker episode.** `done` fires on the
+    window's last step (a true terminal, since the goal expires). A time limit
+    mid-window bootstraps.
+  - Critic: centralized `MAPPOCritic(n_outputs=N, keep_output_axis=True)` on
+    `concat(global_state, all errors, time_left)`. The per-agent reward makes
+    `ppo_update` take its existing per-agent path.
+- **Rollout layout: freeze-to-boundary.** `n_steps / c` windows: an outer scan
+  over windows, an inner scan over `c` steps.
+  - An env that finishes mid-window is **frozen**: its state is held, its worker
+    steps are masked via `active_mask` with reward 0, and it is reset at the
+    window boundary.
+  - This keeps every manager decision at a fixed index, so both levels are plain
+    `(time, env, ...)` `Transition`s and `ppo_update` is reused as-is.
+  - Cost: wasted steps on **early termination only**. That is zero on `trunc`
+    groups (`max_steps=1024` is 32 windows of 32). It is heavy on
+    boundary-terminating groups (e.g. `mjx_16a_4o`, ~43-step episodes), which are
+    a poor fit.
+  - Residual: advantage normalization in `ppo_update` is not masked, so frozen
+    steps enter the per-stream mean/std.
+- **Reuse:**
+  - From `mappo_jax`: `ppo_update` ×2, `create_train_state`,
+    `sample_action`/`evaluate_action`, `global_state_fn`/`global_state_dim`
+    (so `_gs` twin groups work), `Transition` and `make_env`.
+  - The runner **subclasses `MAPPO_JAX_Runner`**, so the train loop, stats,
+    checkpoint cadence, resume and `evaluate()` are inherited.
+  - It overrides only `_make_train`, the four-train-state msgpack I/O
+    (`worker_*` / `manager_*` keys), and `view()`.
+  - `collect_fn` returns a `Rollout(worker, manager, diagnostics)` bundle that the
+    inherited loop passes through untouched. `update_fn` merges the diagnostics
+    into the losses dict, which is how they reach the stats pickle.
+  - `trainer.make_policy` is the one forward pass (observe / decide / act) shared
+    by training, eval and `view()`.
+- **Config:**
+  - Algorithm group: `conf/algorithm/simplified_feudal_mappo_jax.yaml`, with the
+    `mappo_jax` PPO block for the worker plus `manager_lr` / `manager_n_epochs` /
+    `manager_n_minibatches`. The manager sees ~c x fewer samples.
+  - Model group: `conf/model/simplified_feudal.yaml`, with `hidden_dim: 168`,
+    `goal_horizon: 32`, `waypoint_radius: 0.15`.
+    - These two keys are **required** in `Model_Params`, so `model=mlp` raises a
+      `TypeError` before any results directory is created.
+    - The defaults come from the measured agent speed: flat out, ~4.3 world units
+      in 32 steps, ~0.145 of a 30-wide arena.
+    - `manager_action_bound: clip | tanh` (default `clip`, the original) sets how
+      the manager's raw Gaussian action is bounded to [-1, 1] before scaling by R.
+      `conf/model/simplified_feudal_tanh.yaml` is the one-key `tanh` arm. Switch it
+      by model group, never by CLI override: the parameter trees are identical, so
+      a checkpoint cannot tell you which bound trained it, and the model group
+      name in the results path is the only record.
+    - `tanh` also switches the manager's entropy bonus to the squashed-action
+      entropy, via a default-off `squash=` argument on the shared
+      `mappo_jax.mappo.ppo_update` / `network.evaluate_action`. The stored action
+      is the pre-tanh sample, so the Jacobian cancels in the PPO ratio and the
+      log-prob is unchanged. The expectation uses 16-point Gauss–Hermite
+      quadrature. `squash=False` is the original code path; the 222
+      `test_feudal_seams` / `test_smax_seams` / `test_mjx_global_state` tests pass.
+      `manager_entropy_loss` is therefore not comparable between the two arms.
+  - `n_steps` is rounded **up** to a multiple of `c` (1048 -> 1056), with a
+    printed notice.
+  - A rollout needs >= 2 windows, because `ppo_update`'s unbiased std over one
+    decision is NaN.
+- **Scope:** envs with a `goal_state` hook and continuous actions, i.e.
+  `multi_box_push_mjx` and `multi_box_multi_goal_push_mjx`, at any `n_agents`
+  including 1. `validate_env` rejects SMAX (no positions) and the macro env
+  (discrete).
+- **Logged series (per update):**
+  - `worker_*` / `manager_*` `{policy,value,entropy,total}_loss` and
+    `explained_variance`: the PPO health signals at each level.
+  - `intrinsic_reward`: mean fraction of R closed per live step.
+  - `waypoint_offset`: mean initial distance `||w - s_start||/R`, i.e. how far the
+    manager asks agents to go.
+  - `waypoint_final_error`: `||w - s_end||/R` when the waypoint expires. It equals
+    `waypoint_offset` for a worker that ignores its goal, so the **gap between the
+    two is the worker's goal-following**.
+  - `waypoint_reached_frac`: closest approach within 0.1 R.
+  - `manager_window_return`: mean manager reward per decision.
+  - `manager_action_saturation`: share of manager action components whose
+    bounded value is within 1% of +-1, i.e. waypoint offsets on the edge of the
+    R-square. Comparable across `clip` and `tanh` (added 2026-09-26; older runs
+    lack it).
+  - `rollout_team_reward`: stochastic-policy team reward per step.
+  - `reward`: deterministic eval return, the same series as `mappo_jax`.
+- **`view()`:** 10 deterministic episodes to `logs/episode_<i>.mp4`, drawing a
+  violet line and × per agent at its current waypoint, **without** the sensor
+  overlay (it buried the marks). Reward plots mark the manager's decision steps.
+  - Early in training the deterministic manager's mean offset is ~0, so each ×
+    sits on its agent. That is correct, not a bug.
+- **Measured (smoke only, 2026-09-25, ~2e5 steps):** at 1a/3o and 12a/3o the
+  worker is learning to follow within ~5 updates.
+  - `waypoint_final_error` fell 0.69 -> 0.49 against a flat `waypoint_offset` of
+    ~0.68.
+  - `worker_explained_variance` rose from -3.4 to 0.57.
+  - `manager_explained_variance` is strongly negative (to -22). That is expected
+    while task reward is ~0, the same reading as the feudal stack's `V^M`.
+- **MEASURED 2026-09-26, `mjx_1a_3o_111_1024_gs`, 5 seeds at 1e8 steps: the
+  MANAGER fails, and the interface does not.** Eval return is 29–110 (at most
+  one box), against 322–330 for `mlp` and `feudal_film_zerogoal`.
+  - **The interface and the worker are sufficient.** A scripted manager that
+    stages below the nearest undelivered box and then pushes up, issuing
+    ordinary R-limited waypoints every c=32 steps to each seed's TRAINED worker,
+    delivers **3.00/3** boxes (return ~329) on every seed. It still delivers
+    2.92–3.00 with the stochastic worker. Re-deciding every 8 steps adds nothing.
+  - **The manager's actions saturate.** `waypoint_from_action` clips a raw
+    Gaussian sample to [-1, 1]. The trained manager's mean lies far outside
+    that range: median |mu| is 1–4 per axis, p90 is 2–7, and 86–99% of decisions
+    have a clipped axis. Only **14–51%** of sampled actions per axis land inside
+    the clip; the rest all give the same corner waypoint and carry no signal.
+    The training-time symptom is `waypoint_offset` rising 0.69 → 1.07–1.29,
+    toward the corner value sqrt(2) ≈ 1.41.
+  - **What it learned: push up only.** When the agent is below its target box,
+    waypoints go up (+0.86–0.92 R). Otherwise they do not go down: mean dy is
+    ≈0 on seeds 0–2, and on seeds 3–4 only 27–36% of those waypoints go down.
+    Agents spawn below every box, so the first box is delivered and the agent is
+    then stuck above the rest. Of 320 episodes, one delivered 2 boxes.
+  - **⚠ Saturation is NOT irreversible, so it does not explain the failure on
+    its own.** An earlier version of this note said a clipped mean "cannot come
+    back". A toy check with the real `ppo_update` disproves that: one 2-D action,
+    manager-sized batches (33 x 32), reward `+b(a)_y` for 400 updates and then
+    `-b(a)_y`. Updates after the flip until the mean turned around, at reward
+    noise std 0 / 1 / 3:
+
+    | bound | updates to turn around | mean at the flip |
+    |---|---|---|
+    | `clip` | 110 / 40 / 66 | 5.2 / 2.2 / 2.0 |
+    | `tanh` + squashed entropy | **22 / 36 / 33** | 9.0 / 2.7 / 2.0 |
+    | `tanh` + plain Gaussian entropy | 116 / 242 / 167 | 11.7 / 3.6 / 2.9 |
+
+    Per-stream advantage normalization amplifies the few in-range samples, which
+    is how `clip` recovers. The real manager had ~3000 updates. The leading
+    untested cause is therefore the **delayed payoff of repositioning**: getting
+    back below the next box takes several windows with no shaping reward before
+    any +100.
+  - The worker saturates too: median |mu| is 5–29 and sigma reaches the
+    `LOG_STD_MAX` clamp (7.39) on two seeds. This is harmless for waypoint
+    reaching (bang-bang force), as the scripted-manager runs show.
+  - The `tanh` arm (`simplified_feudal_tanh`, above) is the fix the toy favours.
+    **No training result.** Probe scripts are not in the repo.
+- **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
+  28 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
+  - waypoints are fixed within a window and redrawn between windows;
+  - the worker reward telescopes;
+  - freeze + reset at the boundary;
+  - both truncation bootstraps are exact;
+  - the PPO ratio is exactly 1 at both levels;
+  - end-to-end collect/update/eval;
+  - the ratio and end-to-end tests under both `manager_action_bound` values;
+  - `tanh` moves the waypoint where `clip` is flat;
+  - the squashed entropy matches Monte Carlo, pulls a saturated mean toward 0,
+    and leaves the log-prob unchanged;
+  - an unknown bound is rejected;
+  - `keep_output_axis` is inert by default;
+  - `model=mlp` is rejected.
+
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 
 A FeUdal-Networks (Vezhnevets et al. 2017) hierarchy on top of a **copy** of
@@ -1257,6 +1545,65 @@ gradient trains, the intrinsic-reward path is implemented but ships **off**
 uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o \
     model=feudal trial_id=0
 ```
+
+- **Model-group hierarchy: every arm is `defaults: [<nearest ancestor>, _self_]`
+  plus the ONE key that makes it distinct** (normalized 2026-09-22). The forks,
+  outermost first, are fusion (`feudal` / `feudal_film`) → alpha (`_n001` /
+  `_n01` / `_n05`) → latent (`_local`, `_local_private`, then `_local_global*`
+  chained off those) → the extra axis (`_shared`, `_dilated`). So
+  `feudal_film_n01_local_global_private` resolves through
+  `feudal_film_n01_local_private` → `feudal_film_n01` → `feudal_film`, and the
+  file itself contains exactly `manager_latent: local_global_private`.
+  - **`feudal_n01_c50` / `feudal_n05_c50`** (added 2026-09-23) are the concat
+    alpha arms with `params.goal_horizon` 10 → 50 (cosine lag, pooling window
+    and r^I window all move together). Only meaningful on long-episode groups
+    (`valid_fraction` measured 0.951 at `mjx_16a_4o_trunc_1024`; on a
+    wall-terminating ~43-step group almost no horizon is valid). ⚠ r^I's
+    `_intrinsic_window` vmaps over all c offsets, so **GPU memory scales
+    linearly in c**: measured peak 4.7 GB at c=10 vs 10.8 GB at c=50 on 16a/4o
+    (incl. ~1.2 GB desktop baseline). No training result yet.
+  - **Why it matters, not style:** the flat files hand-copied `hidden_dim: 168`
+    and `worker_fusion: film` into 17 places, so a change to the base arm reached
+    the alpha arms only if you remembered all 17 — the same silent-divergence
+    shape as the `# @package _global_` omission that cost 12 runs. Verified
+    value-neutral: resolving all 43 feudal groups before and after the
+    restructure gives **0 differences** across every `params` / `model_params`
+    key, so no checkpoint or result is invalidated.
+  - ⚠ **A duplicate top-level key does NOT merge — OmegaConf rejects the file**
+    (`ConstructorError: found duplicate key model_params`), and it dies during
+    Hydra composition, before any banner names the arm you launched. Two
+    `model_params:` blocks in one file is the way this is written by accident;
+    `uv run python -c "from omegaconf import OmegaConf; OmegaConf.load(p)"` over
+    `conf/**/*.yaml` is the lint (PyYAML's `SafeLoader` is permissive and will
+    NOT catch it).
+  - **`feudal_n05_shared` was renamed to `feudal_n05_local_shared`** and given
+    `manager_latent: local`. Under its old name it set `worker_encoder: shared`
+    while inheriting the default `centralized` latent, which
+    `validate_worker_encoder` rejects — the arm could not run at all, and it had
+    no results on disk. It is now the exact alpha=0.5 twin of
+    `feudal_n01_local_shared`. All 43 groups now pass both
+    `validate_worker_encoder` and `validate_worker_objective`; the only arms that
+    warn are the four concat+shared-encoder ones and `feudal_intrinsic`, both
+    deliberate contrasts.
+  - ⚠ **`feudal_film_dilated` WAS INERT AND ITS RESULTS ARE STALE (found
+    2026-09-22).** Commit `9c0c1b3` created it by copying `feudal_film.yaml`
+    wholesale and never added `manager_core: dilated_lstm`, so the arm was a
+    byte-for-byte duplicate of `feudal_film` under a name claiming recurrence —
+    the same silent-inert shape as the `# @package _global_` omission, and again
+    nothing warned. Every sibling (`feudal_film_n0*_dilated`,
+    `feudal_film_zerogoal_dilated`) set the key correctly, so it was the lone
+    miss. **Diagnose these from the checkpoint, not the yaml**:
+    `manager/params/core` is a single `Dense(384, 256)` for the mlp core and
+    `LSTMCell_0/{ii,if,ig,io,hi,hf,hg,ho}` gates for `dilated_lstm`. The 6
+    affected trials (`mjx_12a_3o_trunc_1024` + `mjx_12a_3o_partition_1024`,
+    seeds 0-2) are valid `feudal_film` runs and worthless as recurrence
+    evidence; the key is now set, so a `checkpoint=true` resume fails loudly on
+    the core shape mismatch instead of continuing. **Re-run them.**
+  - ⚠ **`intrinsic_anneal` is `none`, not `linear`,** for every `_n0*` arm
+    (changed in `eddd654`). The `feudal_n01`/`feudal_n05` headers documented the
+    anneal for a while after that and were simply wrong; they now say so. Alpha
+    is held for the whole run, so these arms measure a **sustained** `r^I`, not
+    an early-exploration bonus — `alpha_current` is flat in the stats.
 
 - **⚠ Always pair with `model=feudal`, never `model=mlp`.** `train.py` builds
   `experiments/results/<env>/<model>/` and the **algorithm is not in that path**,
@@ -1522,6 +1869,78 @@ uv run python train.py algorithm=feudal_mappo_jax env=mjx_16a_4o \
   MUJOCO_GL=egl SDL_VIDEODRIVER=dummy uv run python train.py \
       algorithm=feudal_mappo_jax env=mjx_16a_4o model=feudal trial_id=0 view=true
   ```
+
+#### Goal-following video + raster (`view()`, on by default)
+
+Per episode, `view()` also writes `goal_following_episode_<i>.png` and (MJX only)
+`episode_<i>_goals.mp4`; the plain `episode_<i>.mp4` / `_native.mp4` /
+`task_vs_alignment*` outputs are unchanged. Code: `goal_visualization.py`
+(`frame_alignment`, `goal_following_figure`, the shared color scale) and
+`goal_video.py` (overlay, panel, writer).
+
+- **What the marks mean** (`s` = the goal-space state: learned latent, or the
+  env's `goal_state` readout on grounded arms; `c` = `goal_horizon`):
+  - **ring** (outer band) = horizon alignment `cos(g_(d-c), s_d - s_(d-c))`, i.e.
+    whether the goal issued `c` steps ago was followed. This is the manager's own
+    objective. A thin gray outline means undefined (the first `c` steps,
+    inactive, or a zero vector);
+  - **dot** (centre) = one-step `cos(w_(d-1), s_d - s_(d-1))`: did the last move
+    follow the goal the worker held?
+  - **black arrow** = the goal-induced action,
+    `clip(mu(obs, w)) - clip(mu(obs, 0))`, drawn at a FIXED scale (full force = 3
+    ring radii). Continuous-action envs only (macro/SMAX pick discrete skills).
+    The null is the zero goal, the per-step analogue of the probe's `zeroed`
+    variant: exact for FiLM (the unmodulated trunk), off-distribution for concat,
+    and "arrived" for waypoints. So it shows sensitivity, not causal value. It is
+    **exactly 0** on a `zero_goal` arm (the positive control; `view()` prints
+    `max |action change|` per episode);
+  - **violet** (grounded arms only) = the goal in the arena: a heading arrow for
+    `position_direction`; for `position_waypoint`, the latched waypoint
+    `w = s + R·pooled` (x marker), a line to it, and the path since the latch.
+    Mapped by `env.goal_state_to_world`, the inverse kept beside `goal_state` in
+    both MJX envs. A **latent goal gets no arena mark**: any latent-to-world
+    decode would be a fabricated picture;
+  - **side panel** = reward plus agents × time heatmaps of the ring and dot
+    values, with a cursor at the current frame; the top band shows the per-frame
+    numbers (mean cosines, number of agents above +0.5).
+- **Scale**: diverging blue (+1 follows) ↔ orange (−1 opposes) around a neutral
+  gray. Orange rather than red because MJX agents are red discs; both poles are
+  at OKLCH L ≈ 0.576. `alignment_rgb` samples the same colormap the heatmaps use,
+  so a color means the same thing in the video and in the PNG.
+- **Why post hoc**: a horizon score exists only `c` steps after its goal. So
+  `view()` records per-frame agent positions (`MJXRenderer.agent_positions`) and
+  `frame_decision` (constant over a macro window), then draws on the buffered
+  frames via `MJXRenderer.annotate` after the episode. Every mark reads one
+  `frame_alignment` array, which is **causal**: frame `d` uses only
+  `s_0..s_d`, the state it shows. On waypoint arms the ring holds the last
+  completed latch `(d // c) * c - c`, since waypoints are scored only at latches.
+- ⚠ **Following ≠ useful.** A high ring is exactly what the measured decorative
+  goal channel looks like (`feudal_film_n01_local`: the goals are followed and
+  worth nothing). Read the video for *where and when* goals are followed, and
+  settle usefulness with between-arm returns.
+- ⚠ pygame rejects numpy **float32** scalars as coordinates (JAX actions are
+  f32), so `draw_goal_overlay` casts its inputs to float64. Keep that cast.
+- SMAX (`_view_with_env_renderer`) gets the raster only: jaxmarl's visualizer
+  draws the GIF and has no hook for per-agent marks.
+- The goals video is drawn on a **second, overlay-free render** of each step
+  (`goal_frames`). The focus agent's lidar, sector wedges and arrows otherwise
+  buried its goal marks, and with one agent that agent is the whole picture. The
+  cost is up to ~1.5 GB extra RAM on a 1024-step episode (700² RGB frames).
+  Arena marks carry a surface-colored halo so the violet arrows read over the
+  colored boxes.
+- When another job holds the GPU, `JAX_PLATFORMS=cpu` runs `view` fine: it steps
+  one unbatched env. This took ~2–3 min per arm for 10 episodes at 1a/3o.
+- **Verified 2026-09-24 on `mjx_1a_3o_111_1024_gs`, trial 0, 7 arms** (all exit 0,
+  10 goal videos + rasters each):
+  - `feudal_film_zerogoal` reads `max |action change|` **0** in every episode
+    (the positive control); every other arm reaches **2**, the full −1 → +1 swing;
+  - `goal_horizon: 50` (`feudal_n01_c50`) hatches exactly the first 50 steps;
+  - both grounded arms (`feudal_film_waypoint`, `feudal_film_direction`) show
+    **long stretches of horizon cos ≈ −1**. The agent drives against its goal for
+    60–120 steps at a time while fetching a box: e.g. the latched waypoint sits
+    in the drop zone while the agent heads down to the box. These alternate with
+    stretches of ≈ +1. Returns are ~327–333 on all 7 arms, `zerogoal` included,
+    so none of this goal-following shows up in return at 1a/3o.
 
 ### Diagnostics (load-bearing — both failure modes are self-sealing)
 
@@ -2004,8 +2423,9 @@ established that survive the bug: the MJX env is **bit-identical across vmap
 lanes** (96 lanes, tiled reset keys, identical actions, 1024 steps -> `max|obs
 diff| = 0.0`), so a nonzero gap can only come from the policy and there is **no
 chaotic noise floor** to blame; and `goal_dependence_probe.py`'s positive-control
-assertion keys on the literal model name `feudal_zerogoal`, so every
-`*_zerogoal*` variant slips past it — check the gaps by hand for renamed arms.
+assertion used to key on the literal model name `feudal_zerogoal`, so every
+renamed `*_zerogoal*` arm slipped past it. Since 2026-09-24 it matches any model
+name containing `zerogoal` (e.g. `feudal_film_zerogoal`).
 
 ⚠ **The eval-level pre-flight "all variants agree at init" is VACUOUS — do not
 use it.** At init the actor head is `orthogonal(0.01)`, so the policy is inert:
@@ -2047,6 +2467,265 @@ time the key is simply *absent* — there is nothing to pad, and padding it ther
 would need a hardcoded key list that rots on the next new metric. Empty lists are
 skipped (`action_distribution` is legitimately length 0 for continuous runs, and
 padding it would make it ragged). Pinned by `test_to_dict_left_pads_short_series`.
+
+#### Grounded goals (`goal_space`) — wired, UNRUN
+
+`model_params.goal_space` replaces the manager's **learned** latent `s` with a
+**zero-parameter readout of the environment**, so a goal stops being a direction
+in an unobservable space and becomes a physical quantity.
+
+```
+goal_space: latent              # default, BIT-IDENTICAL to the pre-flag code
+goal_space: position_waypoint   # g = a target (x,y), latched for `goal_horizon`
+goal_space: position_direction  # g = a unit direction in world (x,y)
+```
+
+- **Why.** Under `latent` the manager owns **both** arguments of its own
+  objective — it picks the measuring stick `s` *and* the target `g`. That is why
+  `d_cos_mean`'s level is uninterpretable, why the collapse detectors exist, and
+  why every measurement says the channel is decorative (`gap_permuted ≈ 0` on 40
+  of 45 non-control trials; `gap_zeroed` systematically negative; the best arm in
+  `mjx_12a_3o_trunc_1024` is `feudal_film_zerogoal_dilated`, whose goals are
+  provably disconnected). With `s = env.goal_state(state)` the yardstick has no
+  parameters: the detach rule is satisfied **structurally** (verified: gradient
+  into `Transition.state_latent` is exactly 0.0), rank-1 latent collapse is
+  **impossible** rather than guarded, `d s[i]/d obs_j` is exactly 0 for `j != i`
+  for **every** `manager_latent`, and progress is measurable in metres.
+- **The env hook is `env.goal_state(state) -> (n_agents, 2)` + `goal_state_dim`,
+  and it is an UNCONDITIONAL method** — unlike `global_state`, whose instance-dict
+  binding exists because `hasattr(env, "global_state")` is the *trainers'* switch
+  and a class method would flip every arm's critic width. `goal_state` has **no
+  `hasattr` consumer**: the only switch is `config.goal_space`, which defaults to
+  `latent`. Pinned by `test_goal_state_hook_presence_is_inert` (hooked vs
+  hookless env, 0.0 diff on all 18 `Transition` fields, every loss key and every
+  post-update param leaf). Published by `MultiBoxPushMJX` and
+  `MultiBoxMultiGoalPushMJX`, **forwarded** by `SyncMacroMJX` via `base_state()`
+  (forwarded, not refused like `global_state`, because a missing `goal_state`
+  *raises* rather than silently changing a width). **SMAX does not have one** —
+  `_inner(state.env_state).unit_positions[:n_allies]` is reachable but the
+  normalization is a separate question, so the validator raises.
+- **⚠ `goal_dim` is DERIVED, not configured.** `resolve_goal_space(config, env)`
+  overwrites it with `env.goal_state_dim`. A grounded arm inheriting
+  `goal_dim: 32` from `feudal_film` would make the manager emit a 32-vector
+  "direction in R²"; that *does* raise, but inside `cosine_similarity` in
+  `manager_update` — **after `ppo_update` already trained the worker on a 32-wide
+  error vector for a full update**. Under `latent` the function returns the
+  **identical object**, so the default path is a python-level no-op.
+- **⚠ `manager_latent_dim` is mandatory on a grounded arm, and it is not a
+  tuning knob.** `manager.py`'s core reads `s.reshape(..., n_agents*latent_dim)`,
+  so that width is the manager's *entire information channel* — the module
+  docstring already said so. Fused with `goal_dim: 2` the core would see
+  `2*n_agents` numbers (24 at N=12) as its only view of the world. `None`
+  resolves to `goal_dim`, which is **byte-identical** to the pre-split module
+  (verified: 0.0 max diff on every param leaf, all five latents).
+- **`GoalChannel` (`manager.goal_channel`) is the one definition of how a
+  directive reaches the worker**, with `init/write/pool/reset` closures. The ring
+  branch wraps the **unmodified** `goal_ring_*` helpers; the waypoint branch
+  latches. ⚠ **This fixed a live bug**: `view()` called `goal_ring_*` *directly*,
+  so under a waypoint goal it would have rendered a policy that never trained —
+  the exact failure the ring consolidation exists to prevent. All three consumers
+  (training scan, eval scan, both `view()` paths) now route through
+  `build_goal_channel`.
+- **`position_waypoint`** — `w_i = stop_grad(s_t,i) + R*unit(ghat_i)`, latched for
+  `goal_horizon` steps; the worker eats the **live error** `(w - s_t)/R`, stored
+  as `pooled_goal` (it must be stored, or the PPO ratio is invalid).
+  `Transition.goal` keeps the **raw** `unit(ghat)`, since `w` is exactly
+  reconstructible as `state_latent + R*pooled_goal`.
+  `R = model_params.waypoint_radius`, default `1/3` = exactly
+  `sector_sensor_radius / world_width` in **both** MJX envs.
+  - `latch_waypoints` is the whole-trajectory oracle (the analogue of
+    `pool_goals` for the ring) and is **closed-form, no scan**, so
+    `manager_update` stays scan-free on the mlp core. Verified in-scan vs oracle:
+    **exactly 0.0**.
+  - **Manager PG** `(‖w−s_t‖ − ‖w−s_{t+c}‖)/R`, **scored at LATCH STEPS ONLY**
+    (folded into `valid`, so the permutation nulls share one mask). At a
+    non-latch `t` the window runs past the waypoint's own expiry. At a latch step
+    `‖w−s_t‖ ≡ R`, so it reduces to `1 − ‖w−s_{t+c}‖/R`. **⚠ `valid_fraction`
+    therefore falls to ~1/c** (measured 0.300 at c=3, vs 0.700 latent) — correct,
+    but it cuts the manager's effective sample count, so `manager_lr` /
+    `n_manager_critic_epochs` may need revisiting.
+  - **`r^I` TELESCOPES, and that is the reason this mode leads.**
+    `‖pg_t‖ − ‖pg_t − (s⁺_t−s_t)/R‖`, transition-aligned by construction (a
+    function of `next_state_latent`), needing no episode mask and paying no
+    boundary zero. Summed over a latch block it collapses to `1 − ‖w−s_end‖/R ≤ 1`
+    — verified exactly, block sums ≤ 1. CLAUDE.md names non-saturation as one of
+    three compounding causes of the α>0 absorbing state; `d_cos` has no such
+    bound. **⚠ Consequently `intrinsic_reward_abs` reads much smaller** (measured
+    0.0018 vs the cosine's 0.119). α is a gradient fraction over unit-std
+    advantages so the mixing is unaffected, but read as a magnitude it looks dead.
+  - **⚠ `normalize_pooled_goal` RAISES here.** The error vector's magnitude *is*
+    the distance to go — the entire content of a waypoint. Normalizing it leaves a
+    latched direction, i.e. a worse `position_direction`, while every shape, loss
+    and diagnostic stays healthy. The default is `True` and every `feudal_film*`
+    ancestor inherits it, so the arm must set it false explicitly.
+  - **⚠ `gap_zeroed` does not grade a waypoint arm.** A zero error vector is not
+    "no directive" — it is the specific, **in-distribution** directive "you have
+    arrived". Of the three acceptance conditions in `conf/model/feudal_film.yaml`,
+    read `gap_constant` as the content test here.
+- **⚠ `position_direction` is MORE exposed to the shared-objective degeneracy
+  than `latent`, not less** — it is the **attribution rung and test fixture**,
+  not the arm expected to win. Manager and worker still climb one objective
+  *through the environment*. Under `latent` the degenerate fixed point was
+  "freeze on one direction and drive `s` along it" (measured: `dir_count` 1.45 at
+  return 1.4); the physical analogue "everyone go north-east" is *easier*,
+  because a force-controlled agent achieves any heading trivially and no bounded
+  resource is consumed. Its uses are real but narrow: it isolates "grounded
+  objective" from "latch + saturating reward", and it exercises the grounded path
+  without the latch. ⚠ Also note **near-stationary agents dilute `d_cos`** —
+  `_unit` is zero-safe, so a mechanically dead agent scores `cos ≈ 0` and is
+  indistinguishable from a disobedient one.
+- **Diagnostics.** `goal_direction_count` is **bounded by `min(N, goal_dim) = 2`
+  and SATURATES**: N evenly-spaced headings score exactly 2.0, and so does "half
+  at 0°, half at 90°" — it cannot tell a uniform fan from two perpendicular
+  clusters. Replaced under a grounded goal space by **`goal_heading_dispersion`**
+  = `1 − ‖mean unit goal over agents‖` (and `_axial`, the sign-blind companion).
+  **Its baseline depends only on N, not on `goal_dim`** — exactly the property
+  the participation ratio lacked: `E[R̄] ≈ 0.886/√N`, so **0.744 at N=12** and
+  **0.778 at N=16** (measured 0.740 / 0.774). On the discriminating pair it reads
+  1.000 vs 0.293. Watch it trend toward 0 across the **whole** run.
+  - ⚠ **Emitted whenever the goal is 2-wide, NOT only when grounded.** The
+    saturation is a property of the geometry: a random 2-wide *latent* goal at
+    N=12 also scores 1.85 against its ceiling of 2. Gating on `grounded` left
+    `feudal_film_narrow` reading only the saturated metric — blind on the one
+    thing it exists to show.
+  - ⚠ **`state_pairwise_cos` / `state_latent_erank` keep reading `s_learned`**, the
+    manager's internal bottleneck, not the objective's `s` — on a 2-d readout an
+    erank is bounded by 2 and would read as permanently collapsed.
+  - ⚠ **`manager_cosine_metrics` takes a `score_fn`** so the nulls are computed
+    with the **same objective and the same mask** as the loss. Real and null
+    scored by different functions is a difference of two quantities in different
+    spaces: finite, plausible, meaningless.
+  - **Waypoint achievement (`position_waypoint` only)**: `waypoint_error_norm` =
+    distance left when a waypoint EXPIRES, `‖w − s_{τ+c}‖/R` (1.0 = no net
+    progress, 0 = arrived, >1 = ended further away), and
+    `waypoint_reached_frac` = share of commitments whose **closest approach** came
+    within `WAYPOINT_REACHED_TOL` (0.1) × R — closest approach, so an agent that
+    passes through its waypoint and overshoots still counts. Both come from
+    `manager.waypoint_achievement` over the **stored** rollout
+    (`Transition.goal` + `state_latent`, via `latch_waypoints`), averaged over the
+    same complete commitments as the manager's objective (the shared
+    `_complete_commitments` mask, factored out of `waypoint_progress`). In units
+    of R, not world units, so they compare across arena sizes. No other goal space
+    gains a column.
+    - ⚠ **`waypoint_error_norm` is exactly `1 − d_cos_mean` on a waypoint arm**
+      (at a latch step `‖w − s_τ‖ = R`, so progress = 1 − error). It adds a
+      readable name and a stored-data computation, not new information;
+      `waypoint_reached_frac` is the one that does add something.
+    - ⚠ **At the shipped `goal_horizon: 10` / `waypoint_radius: 1/3` NO POLICY
+      CAN REACH A WAYPOINT (measured 2026-09-23).** Driving every agent flat out
+      from reset on `MultiBoxPushMJX` covers only **6–12% of R in 10 steps**
+      (6a/4o: 0.080 axis / 0.113 diagonal; 12a/3o: 0.064 / 0.091; 2a/4o:
+      0.088 / 0.125). Terminal speed is `F/(damping·mass)` = 10 units/s, i.e.
+      0.167/step, with a 6-step velocity time constant, while R is 10–13.7 world
+      units. Reaching R takes **~50–90 steps** (diagonal is fastest, the larger
+      12a arena slowest). So `waypoint_error_norm` cannot
+      fall below ~0.85, `waypoint_reached_frac` is 0 for every policy, and the
+      waypoint's magnitude (the distance to go, the content that separates it
+      from `position_direction`) is effectively constant. R = 1/3 was chosen to
+      match `sector_sensor_radius`, a perception scale, not a reachability one.
+      Making the waypoint reachable from rest along an axis means
+      `waypoint_radius ≲ 0.02` (12a/3o) to `0.03` (2a/4o) at c=10, or
+      `goal_horizon` of ~70–90 at R = 1/3.
+    - **Confirmed on `mjx_1a_3o_111_1024_gs` (2026-09-24):** every trained
+      waypoint seed logged `waypoint_reached_frac` = 0.0 and
+      `waypoint_error_norm` ≈ 1.0. Measured there (flat-out agent, 64 resets,
+      8 directions; R = 10 world units in the 30-wide arena), 0.9 R takes **60
+      steps along an axis and 45 on a diagonal** (1.0 R: 66 / 49), so c=50 still
+      misses axis waypoints (0.73 R) and c=80 covers 1.21 / 1.66 R. Hence
+      **`feudal_film_waypoint_c80`** (α=0 control) and
+      **`feudal_film_n01_waypoint_c80`** (primary), each `goal_horizon: 80` on
+      its c=10 parent and nothing else. At c=80 `valid_fraction` is ~1/c
+      (0.0115 measured), about 400 manager samples per update at 32 envs; GPU
+      memory does not grow with c on this goal space (the waypoint r^I has no
+      c-offset window). The latent `_c50` arms do NOT test this — they are
+      `goal_space: latent`, where a cosine objective has no reachability.
+      `goal_heading_dispersion` is NaN at every logged point on 1-agent arms.
+- **⚠ `goal_dependence_probe._dims_from_checkpoint` now reads `goal_dim` off the
+  GOAL HEAD**, never off `f_Mspace` (which emits the bottleneck after the split),
+  and returns `manager_latent_dim`. Left stale it would rebuild a wrongly-shaped
+  target tree and fail `from_bytes` **at the arm being measured**. ⚠ The two
+  grounded modes are **indistinguishable from the checkpoint** — same param trees
+  — so `goal_space` / `waypoint_radius` are recorded in the probe's provenance
+  dict, like `worker_objective`.
+- **The latent probes REFUSE a grounded arm**
+  (`latent_locality_probe.unsupported_goal_space_reason`, checked in the shared
+  `collect_states` choke point): locality there is exact *by construction*, so
+  reporting it would be reporting the definition, and the `s` they would measure
+  is the bottleneck, not comparable to the recorded 8.9–9.2 / 1.0–2.9 figures.
+- **Arms**, all descending from `feudal_film` directly and each setting
+  `manager_latent_dim: 32` (REQUIRED — see below; `validate_goal_space` raises
+  without it, which is how four of them were found not to run at all):
+  `feudal_film_waypoint.yaml`, **`feudal_film_n01_waypoint.yaml` (the primary
+  arm)**, `feudal_film_n05_waypoint.yaml`, `feudal_film_direction.yaml`,
+  `feudal_film_n01_direction.yaml`.
+  ⚠ They deliberately do **not** descend from `feudal_film_narrow`: that arm
+  cannot hold the bottleneck fixed (see the confound note below), so inheriting
+  from it would imply a control relationship its own header disclaims.
+  - ⚠ **THE GOAL-WIDTH CONFOUND IS IRREDUCIBLE — an earlier version of this note
+    claimed `feudal_film_narrow` controlled for it, and that arm DID NOT EVEN
+    RUN.** A grounded arm changes two things against `feudal_film`: the goal
+    becomes physical *and* 2-wide, which under FiLM drops the γ/β modulation from
+    rank-32 to **rank-2** (γ = `Dense(hidden)(goal)` over a 2-d input, so
+    achievable gains span a 2-d subspace of `R^hidden`). The intended control was
+    a latent arm at `goal_dim: 2, manager_latent_dim: 32`. **That configuration
+    is ill-posed**: under FuN a goal is a *direction in* the latent state space,
+    so `s` and `g` are the same space by construction and `transition_cosine`
+    contracts them on the last axis — `s ∈ R^32` against `g ∈ R^2` is not a
+    narrow goal, it is a broken objective. It died as a bare `TypeError: mul got
+    incompatible shapes for broadcasting: (T,E,N,32), (T,E,N,2)` inside
+    `manager_update`, naming neither key. `validate_goal_space` now **raises** on
+    it at build time.
+    - So under `latent`, `goal_dim` controls the goal width **and** the manager's
+      whole bottleneck as one knob (`manager.py`: "shrinking it throttles the
+      goal RNN too"), and a 2-wide-goal/32-wide-bottleneck arm is reachable
+      **only** by grounding. No width control exists in the latent mode. Measured
+      on the corrected arm: `state_latent_erank` 1.91, i.e. the bottleneck really
+      is strangled to 2.
+    - `goal_embed_dim` does not rescue it either — a bias-free linear map out of
+      `R^2` still has rank ≤ 2. **State the limitation; do not manufacture a
+      control that cannot exist.** Rank-2 is part of what "a grounded (x, y)
+      goal" *means*, not a nuisance to subtract.
+    - `feudal_film_narrow` survives as a coherent arm at `goal_dim: 2` alone
+      (bottleneck narrows with it). It answers "how much width does the feudal
+      channel need?" — a real question — but it is **not** the control for the
+      grounded arms.
+  - ⚠ **FiLM is NOT required — and the width argument for it is one I got wrong
+    and then measured.** `goal_space` and `worker_fusion` are orthogonal;
+    `validate_goal_space` *warns* on concat, it does not raise. The goal's share
+    of the worker's layer-1 preactivation variance is **9.8% at goal_dim 32, 16
+    and 2 alike**, because `normalize_pooled_goal` fixes `‖w‖ = 1` and that share
+    is set by the block's NORM, not its width (same measurement reproduces the
+    recorded **91.6%** for the pre-normalization raw sum, which validates it). So
+    narrowing the goal does **not** starve it of scale, and an earlier claim here
+    that the share collapses to ~1% was false. The real concat cost is the
+    structural one this file already records: swapping the goal moves the
+    **untrained** action mean by 47.3% of its own RMS at `goal_dim=32` and 20.3%
+    at 2, against **exactly 0.000** for FiLM at both — influence is concat's
+    default and goal-agnosticism must be learned. Plus concat can only
+    *translate* the policy (`∂z₁/∂obs = W_obs` carries no goal term), so a 2-d
+    directive cannot change *which* observation features matter, only where the
+    operating point sits.
+  - ⚠ **Under `position_waypoint` + concat the goal's scale is non-stationary
+    within a latch block**, because `normalize_pooled_goal` is forbidden there
+    and `‖pooled_goal‖` decays from 1 at latch to 0 on arrival: measured goal
+    share 9.8% → 3.8% (at `‖w‖ = 0.6`) → 0%. That "the directive fades as you
+    arrive" is arguably correct behaviour, but it is exactly the kind of
+    episode-phase-dependent scale `normalize_pooled_goal` was introduced to
+    remove for the ring. FiLM gets the same fade *cleanly*, since bias-free γ/β
+    give `γ(0) = β(0) = 0` exactly.
+  - ⚠ **For waypoint the α=0.1 arm is PRIMARY and α=0 is its control.** At α=0
+    there is no `r^I`, so the saturation property that justifies the mode is
+    inactive and it differs from the direction arm only in the manager's PG.
+- Checks: `uv run pytest algorithms/tests/test_feudal_seams.py -q` (**196**
+  collected, of which 31 are the grounded-goal seams, incl. 5 pinning the
+  waypoint-achievement metrics), plus
+  `test_feudal_goal_visualization.py` (20 — three of which were failing at HEAD,
+  a `SimpleNamespace` config stub missing `worker_encoder`).
+- **⚠ No training result.** Everything above is a mechanism check. Acceptance is
+  the **between-arm** return against `feudal_film` (the wide-goal latent arm),
+  `feudal_film_zerogoal` (the goal-free floor) and `mlp` on the same env group
+  and seeds — NOT against `feudal_film_narrow`, which varies the bottleneck too — not the
+  goal-dependence probe, which rules an arm out cheaply but never in.
 
 #### Shared perceptual encoder (`worker_encoder: shared`) — wired, UNRUN
 
@@ -2848,7 +3527,10 @@ are provably disconnected). The opposite extreme had never been run.
   construction). Three **raise** (unknown value; `intrinsic_coef == 0`;
   `intrinsic_anneal != "none"`); the fourth **warns** — a non-local
   `manager_latent`, membership tested against the existing `manager.LOCAL_LATENTS`
-  tuple rather than a hardcoded list.
+  tuple rather than a hardcoded list. The warning is **latent-goal-space only**
+  (skipped for any `GROUNDED_GOAL_SPACES` member since 2026-09-24): under a
+  grounded goal `r^I` is scored on `env.goal_state`, agent *i*'s own position,
+  which is agent-local for every `manager_latent`, so its premise is false there.
 - **⚠ The latent is a PRECONDITION, not a preference.** `r^I` scores
   `d_cos(s_t[i] − s_{t−k}[i], g_{t−k}[i])`, so whatever `s[i]` responds to is what
   agent *i* is paid for. Under `centralized` that is **not agent-local at all**
@@ -2905,6 +3587,28 @@ are provably disconnected). The opposite extreme had never been run.
   uv run python train.py algorithm=feudal_mappo_jax env=mjx_12a_3o_trunc_1024 \
       model=feudal_film_intrinsic_only_local_private trial_id=0
   ```
+- **Waypoint arms: `feudal_intrinsic_waypoint` / `feudal_intrinsic_local_private_waypoint`**
+  (`defaults: [feudal_film_waypoint, feudal_intrinsic{,_local_private}, _self_]`
+  + `goal_horizon: 80`). Here `r^I` is the saturating waypoint reward (≤ 1 per
+  latch block), so the worker's only job is to reach the manager's waypoints and
+  it cannot farm `r^I` indefinitely the way it can under the latent `d_cos`.
+  - **They are FiLM**, although `feudal_intrinsic` is concat: it sets no fusion
+    key, so `feudal_film_waypoint`'s `worker_fusion: film` survives.
+    `feudal_intrinsic` re-includes `feudal` after the waypoint chain. That is
+    harmless while `feudal.yaml` sets only `hidden_dim`.
+  - **Not a one-key delta** from the `feudal_film{,_n01}_waypoint_c80` controls:
+    the resolved configs also differ in `ent_coef` 0.01 → 0.1 (from
+    `feudal_intrinsic`). A gap is objective + entropy, unseparated.
+  - **The latent pair is not a locality contrast** on a grounded goal space. It
+    changes only what the manager reads. On `mjx_1a_3o_111_1024_gs` that is the
+    22-dim compact state for `centralized` against the 40-dim egocentric obs for
+    `local_private`.
+  - Verified 2026-09-24 on `mjx_1a_3o_111_1024_gs`: both compose, train,
+    checkpoint and resume. The checkpoints show FiLM (`film_0`, actor `Dense_0`
+    `(40, 168)`), a 2-wide goal head, an `intrinsic_critic` tree, and the
+    expected manager tree per latent. Stats show `adv_ext_weight` 0.0 /
+    `adv_int_weight` 1.0 and `valid_fraction` 0.0115 ≈ 1/80. **No training
+    result.**
 
 ### Recurrent manager (`manager_core: dilated_lstm`) — works end-to-end
 

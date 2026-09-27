@@ -99,6 +99,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             manager=manager,
             goal_horizon=horizon,
             waypoint_radius=float(self.model_params.waypoint_radius),
+            manager_action_bound=self.model_params.manager_action_bound,
         )
         # The inherited train loop reads n_steps / n_envs / n_total_steps here.
         self.config = worker
@@ -108,6 +109,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             f"n_agents={self.env.n_agents} | n_envs={worker.n_envs} | "
             f"n_steps={n_steps} ({n_steps // horizon} windows of {horizon}) | "
             f"waypoint_radius={self.feudal_config.waypoint_radius} | "
+            f"manager_action_bound={self.feudal_config.manager_action_bound} | "
             f"manager_gamma={manager.gamma:.4f} | total={worker.n_total_steps} | "
             f"backend={jax.default_backend()}"
         )

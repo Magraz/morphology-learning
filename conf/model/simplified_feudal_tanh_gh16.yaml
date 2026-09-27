@@ -1,0 +1,34 @@
+# @package _global_
+# Delta: `manager_action_bound` clip -> tanh (a squashed-Gaussian manager).
+#
+# Why: on `mjx_1a_3o_111_1024_gs` the `clip` manager's Gaussian mean ran far past
+# the +-1 clip (median |mu| 1-4 per axis, only 14-51% of samples inside it).
+# Clipped samples all give the same waypoint, so only the in-range samples carry
+# signal. The manager learned "push up when below a box", delivered the box it
+# spawned under, and never learned to get back below the others (at most one
+# box, 5 seeds). A scripted manager with the same trained worker delivers all
+# three, so the interface and the worker are not the problem.
+#
+# `tanh` maps the sample strictly monotonically, so every sample moves the
+# waypoint, and the manager's entropy bonus becomes the entropy of the squashed
+# action, which falls as |mu| grows. The worker is unchanged.
+#
+# ⚠ This is a partial fix, not a proven one. In a toy check with the real
+# `ppo_update` (reward flips from "up pays" to "down pays"), clip ALSO recovered,
+# in 40-110 updates; tanh with the squashed entropy took 22-36, and still
+# saturated (mean 2-9). tanh with the plain Gaussian entropy took 116-242, worse
+# than clip, so the entropy change is required. Saturation therefore slows the
+# manager but does not by itself explain ~3000 updates without learning to
+# reposition; the delayed payoff of repositioning is the leading untested cause.
+#
+# ⚠ Not comparable across the two arms: `manager_entropy_loss` (the squashed
+# entropy is lower than the Gaussian one at the same std). Comparable:
+# `manager_action_saturation`, the share of action components at the edge of the
+# R-square, and `waypoint_offset`.
+defaults:
+  - simplified_feudal
+  - _self_
+
+model_params:
+  manager_action_bound: tanh
+  goal_horizon: 16

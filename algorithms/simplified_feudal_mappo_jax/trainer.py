@@ -5,7 +5,8 @@ Two PPO policies on two timescales, both trained by the UNMODIFIED
 
 * **Manager** — acts once per window of `c = goal_horizon` env steps. Its action
   is one 2-D Gaussian sample per agent, turned into a waypoint
-  `w_i = s_i + R * clip(a_i, -1, 1)` (see `waypoints.waypoint_from_action`). Its
+  `w_i = s_i + R * b(a_i)`, where `b` is `clip(., -1, 1)` or `tanh` per
+  `manager_action_bound` (see `waypoints.waypoint_from_action`). Its
   reward is the discounted TEAM reward over the window,
   `sum_{k<c} gamma^k r_{t+k}`, with discount `gamma^c` per decision, so it is
   trained on exactly "which waypoints led to high env return".
@@ -53,6 +54,9 @@ from algorithms.simplified_feudal_mappo_jax.types import (
 # A waypoint counts as reached when the agent's closest approach during its
 # commitment comes within this fraction of R.
 WAYPOINT_REACHED_TOL = 0.1
+# A manager action component counts as saturated when its bounded value is
+# within 1% of +-1, i.e. the waypoint offset sits on the edge of the R-square.
+SATURATION_TOL = 0.99
 
 
 class HierTrainState(NamedTuple):
@@ -144,6 +148,8 @@ class Policy(NamedTuple):
 
 def make_policy(config: FeudalConfig, env) -> Policy:
     horizon, radius = config.goal_horizon, config.waypoint_radius
+    bound = config.manager_action_bound
+    wp.validate_action_bound(bound)
     v_pos = jax.vmap(env.goal_state)
     global_state = global_state_fn(env)
 
@@ -154,7 +160,7 @@ def make_policy(config: FeudalConfig, env) -> Policy:
         actor_in = wp.manager_actor_input(gs, pos)
         critic_in = wp.manager_critic_input(gs, pos)
         action, log_prob = _act(manager_ts, actor_in, rng, deterministic)
-        waypoint = wp.waypoint_from_action(pos, action, radius)
+        waypoint = wp.waypoint_from_action(pos, action, radius, bound)
         return waypoint, actor_in, critic_in, action, log_prob
 
     def act(worker_ts, obs, pos, waypoint, k, rng, deterministic=False):
@@ -402,6 +408,10 @@ def make_train(config: FeudalConfig, env):
             "waypoint_final_error": diag["final_error"].mean(),
             "waypoint_offset": diag["offset"].mean(),
             "manager_window_return": m_traj.reward.mean(),
+            "manager_action_saturation": (
+                jnp.abs(wp.bounded_action(m_traj.action, config.manager_action_bound))
+                >= SATURATION_TOL
+            ).mean(),
             "rollout_team_reward": w_traj.team_reward.sum() / active_env_steps,
         }
         rollout_stats = {
@@ -427,7 +437,7 @@ def make_train(config: FeudalConfig, env):
         )
         manager, manager_losses = ppo_update(
             train_state.manager, manager_rng, rollout.manager, last_values.manager,
-            mcfg, discrete=False,
+            mcfg, discrete=False, squash=config.manager_action_bound == "tanh",
         )
         losses = {f"worker_{k}": v for k, v in worker_losses.items()}
         losses.update({f"manager_{k}": v for k, v in manager_losses.items()})

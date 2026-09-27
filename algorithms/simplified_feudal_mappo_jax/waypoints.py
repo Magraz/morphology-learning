@@ -15,16 +15,41 @@ import jax.numpy as jnp
 # `goal_state` is normalized by the arena extent about its centre.
 ARENA_HALF_EXTENT = 0.5
 
+# How the manager's raw Gaussian action is mapped into [-1, 1] per axis.
+#   clip — the original. Past +-1 every sample gives the same waypoint, so only
+#          the samples inside the range inform that axis. The trained 1a/3o
+#          managers sit mostly outside it (14-51% of samples inside).
+#   tanh — a squashed Gaussian. Strictly monotonic, and trained with the squashed
+#          entropy (`ppo_update(squash=True)`). In a toy check the mean still
+#          saturates, but it turns around 1-5x faster than under `clip` once the
+#          reward flips. tanh with the plain Gaussian entropy was slower than clip.
+ACTION_BOUNDS = ("clip", "tanh")
 
-def waypoint_from_action(pos, action, radius):
+
+def validate_action_bound(bound: str) -> None:
+    if bound not in ACTION_BOUNDS:
+        raise ValueError(
+            f"unknown manager_action_bound {bound!r}; expected one of {ACTION_BOUNDS}"
+        )
+
+
+def bounded_action(action, bound):
+    """The manager's raw action mapped into [-1, 1] per axis (see ACTION_BOUNDS)."""
+    validate_action_bound(bound)
+    if bound == "tanh":
+        return jnp.tanh(action)
+    return jnp.clip(action, -1.0, 1.0)
+
+
+def waypoint_from_action(pos, action, radius, bound):
     """`(..., N, 2)` waypoints from the manager's raw Gaussian action.
 
-    The action is clipped to [-1, 1] per axis and scaled by R, so the manager
-    picks both the direction AND the distance of each agent's next target, up to
-    R per axis. The result is clipped to the arena so no waypoint is placed
-    outside it.
+    The action is bounded to [-1, 1] per axis (`bounded_action`) and scaled by R,
+    so the manager picks both the direction AND the distance of each agent's next
+    target, up to R per axis. The result is clipped to the arena so no waypoint
+    is placed outside it.
     """
-    offset = radius * jnp.clip(action, -1.0, 1.0)
+    offset = radius * bounded_action(action, bound)
     return jnp.clip(pos + offset, -ARENA_HALF_EXTENT, ARENA_HALF_EXTENT)
 
 
