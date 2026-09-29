@@ -255,7 +255,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         def decide_fn(obs, env_state):
             gs, pos = policy.observe(obs, env_state)
             return policy.decide(
-                train_state.manager, gs, pos, env_state, no_rng, True
+                train_state.manager, obs, gs, pos, env_state, no_rng, True
             )[0]
 
         @jax.jit

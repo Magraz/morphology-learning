@@ -23,8 +23,10 @@ model_params:
   # group name, and a checkpoint cannot tell you which bound trained it.
   manager_action_bound: clip
   # What the manager ACTOR reads (waypoints.MANAGER_INPUTS): `global` (the team
-  # view: global state + every agent's position, the original) or `relative`
-  # (each agent's view measured from itself, delivered boxes removed). The
-  # `relative` input is a different width, so its checkpoints do not load here.
+  # view: global state + every agent's position, the original), `relative`
+  # (each agent's view measured from itself, delivered boxes removed) or `local`
+  # (each agent's own observation only, the input the flat mappo_jax actor reads;
+  # the only information-matched mode). `relative` and `local` are different
+  # widths, so their checkpoints do not load here.
   # Switch it with the model group, like manager_action_bound.
   manager_input: global

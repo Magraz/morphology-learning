@@ -641,7 +641,12 @@ uv run python train.py algorithm=mappo_jax env=mjx_1a_3o_111_1024_gs \
   `GLOBAL_STATE_BOX_FEATURES` **are** the layout — `compact_global_state_dim`
   derives from them and the builder uses them, so the declared and emitted widths
   cannot disagree; `__init__` also checks it via `jax.eval_shape` (abstract, so no
-  FLOPs and no MJX compile).
+  FLOPs and no MJX compile). The two blocks themselves come from
+  `entity_state(state) -> (agents (A,4), boxes (O,6))`, and
+  `_compact_global_state` is their flattened concatenation (refactored
+  2026-09-27, bit-identical). `entity_state` is an unconditional method with no
+  `hasattr` consumer; `simplified_feudal_mappo_jax`'s `manager_input: relative`
+  reads it.
 
 - **⚠ What it buys is EXACTNESS AND WIDTH, NOT INFORMATION.** A *linear* readout
   already recovers agent world coordinates from the 640-dim concat to **3.36**
@@ -1343,7 +1348,7 @@ drop-in comparable:
 
 ## Simplified Feudal MAPPO (`algorithms/simplified_feudal_mappo_jax/`)
 
-A deliberately small (~970 lines with docstrings, added 2026-09-25) waypoint hierarchy.
+A deliberately small (~1170 lines with docstrings, added 2026-09-25) waypoint hierarchy.
 - **Relation to `feudal_mappo_jax`:** it is not a copy. It keeps none of that
   stack's variants: latents, FiLM, LSTM, alpha mixing, permutation nulls, probes.
 - **Relation to `mappo_jax`:** built on top of it, reusing its code unmodified.
@@ -1356,22 +1361,41 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 # squashed-Gaussian manager (see manager_action_bound below):
 uv run python train.py algorithm=simplified_feudal_mappo_jax \
     env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh trial_id=0
+# the two one-key arms on top of it (added 2026-09-27, see the 2026-09-27 block):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_relative_input trial_id=0
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_manager_gamma trial_id=0
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_low_manager_entropy trial_id=0
+# c=16 with R rescaled to the 16-step reach (one per gh16 parent):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_gh16_scaled_radius trial_id=0
+# information-matched to mappo_jax: the manager reads only its own obs (2026-09-28):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_local_input trial_id=0
 ```
 
 - **Manager: PPO, one decision per window of `c = goal_horizon` env steps**
   (a semi-Markov decision).
-  - Actor: shared across agents, reads `concat(M, one_hot(i))`, where
-    `M = concat(global_state, every agent's goal_state)`.
-  - Critic: scalar `V^M(M)`.
+  - Actor: shared across agents. Under `manager_input: global` (the default) it
+    reads `concat(M, one_hot(i))`, where
+    `M = concat(global_state, every agent's goal_state)`. Under `relative` it
+    reads each agent's own view measured from itself (see Config below).
+  - Critic: scalar `V^M(M)`, under either input.
   - Action: a 2-D Gaussian per agent, mapped to `w_i = clip(s_i + R*clip(a_i, -1, 1), -0.5, 0.5)`,
     where `s_i = env.goal_state(state)[i]` (normalized position) and
     `R = waypoint_radius`.
   - **The manager picks direction AND distance** (up to R per axis), so it can
     learn reachable waypoints. The feudal waypoint arm used a unit direction ×
     fixed R, which no policy could reach at c=10.
-  - Reward: `sum_{k<c} gamma^k r_{t+k}` of the TEAM reward
+  - Reward: `sum_{k<c} gamma_M^k r_{t+k}` of the TEAM reward
     (`info["task_reward"]`, so any `reward_mode` works).
-  - Discount: **`gamma^c` per decision, derived** (no knob).
+  - Discount: **`gamma_M^c` per decision**, where `gamma_M` is the manager's
+    per-env-step discount: `params.manager_gamma`, or the worker's `gamma` when
+    that is `null` (the default, and the original behaviour). The same
+    `gamma_M` sums the window reward and bootstraps a truncation;
+    `make_train` raises if `manager.gamma != gamma_M ** c`.
   - Chosen over FeUdal's transition gradient (`-A^M * progress`) because PPO
     optimizes "waypoints that led to env return" directly, without assuming the
     worker follows its goals.
@@ -1415,13 +1439,31 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 - **Config:**
   - Algorithm group: `conf/algorithm/simplified_feudal_mappo_jax.yaml`, with the
     `mappo_jax` PPO block for the worker plus `manager_lr` / `manager_n_epochs` /
-    `manager_n_minibatches`. The manager sees ~c x fewer samples.
+    `manager_n_minibatches` / `manager_gamma` / `manager_ent_coef`. The manager
+    sees ~c x fewer samples. `run.make_feudal_config(params, model_params,
+    n_envs)` is the one place these are resolved into the `FeudalConfig`; it is
+    pure (no env) so the seam tests check it, and every existing arm was
+    verified to resolve to the same config as the runner's old inline code.
+    - `manager_ent_coef` (default `null` = the shared `ent_coef`) replaces the
+      entropy coefficient for the manager's PPO update only. The logged
+      `manager_entropy_loss` is coefficient-free, so it stays comparable.
+    - `manager_gamma` (default `null`) is a **per-env-step** discount, so one
+      value means the same horizon at any `goal_horizon`. Set it in a model
+      group, never on the CLI (the results path carries only the model group).
+      Checkpoints are shape-identical across values, so the path is the only
+      record of which discount trained a run.
   - Model group: `conf/model/simplified_feudal.yaml`, with `hidden_dim: 168`,
     `goal_horizon: 32`, `waypoint_radius: 0.15`.
     - These two keys are **required** in `Model_Params`, so `model=mlp` raises a
       `TypeError` before any results directory is created.
     - The defaults come from the measured agent speed: flat out, ~4.3 world units
-      in 32 steps, ~0.145 of a 30-wide arena.
+      in 32 steps, ~0.145 of a 30-wide arena. Re-measured 2026-09-27 per axis
+      (both 30-wide `_gs` arenas, 64 resets): 32 steps 0.145 from rest,
+      ~0.175 moving; **16 steps 0.058 from rest, 0.086 moving**. Speed ramps up
+      from rest (6-step time constant), so halving c more than halves the
+      from-rest reach. R = 0.15 at c=32 sits at the from-rest reach; the
+      `*_gh16_scaled_radius` arms apply that calibration at c=16 (R = 0.06).
+      The original `*_gh16` arms kept R = 0.15, i.e. ~2.6x the reach.
     - `manager_action_bound: clip | tanh` (default `clip`, the original) sets how
       the manager's raw Gaussian action is bounded to [-1, 1] before scaling by R.
       `conf/model/simplified_feudal_tanh.yaml` is the one-key `tanh` arm. Switch it
@@ -1436,6 +1478,76 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       quadrature. `squash=False` is the original code path; the 222
       `test_feudal_seams` / `test_smax_seams` / `test_mjx_global_state` tests pass.
       `manager_entropy_loss` is therefore not comparable between the two arms.
+    - `manager_input: global | relative | local` (default `global`, the
+      original) sets what the manager ACTOR reads. `relative`
+      (`waypoints.manager_actor_input_relative`) gives each agent, in order:
+      own position + velocity (4); every box as `box - own position` (2), goal
+      distance, touch fraction, coupling fraction and a 1.0 (6 per box), sorted
+      nearest first, with **delivered boxes zeroed and sorted last**; teammates
+      as relative position + velocity (4 each), nearest first, self excluded;
+      the one-hot index. Width `4 + 6*O + 4*(N-1) + N` (23 at 1a/3o, 34 at
+      2a/4o, against 25 / 38 for `global` on the `_gs` groups), read off the
+      builder by `jax.eval_shape` (`trainer.manager_actor_dim`). The critic
+      input is unchanged. Residual: the zeroed tail still reveals how many
+      boxes are delivered.
+    - `relative` needs the env's `entity_state(state) -> (agents (A,4), boxes
+      (O,6))` hook, the per-entity blocks that `_compact_global_state` now
+      flattens (refactored 2026-09-27; verified bit-identical over a 30-step
+      rollout at 1a/3o and 2a/4o). Only `MultiBoxPushMJX` has it;
+      `trainer.validate_manager_input` raises elsewhere. It is an unconditional
+      method, unlike `global_state`, because nothing tests for it with
+      `hasattr` to size a critic.
+    - **`local` is the only information-matched mode** (added 2026-09-28, arm
+      `simplified_feudal_tanh_local_input`, one key from `simplified_feudal_tanh`
+      and from `_relative_input`). The actor reads agent i's own observation,
+      the 40-dim vector the flat `mappo_jax` actor reads, with **no one-hot**:
+      the baseline shares parameters without an agent index, and `obs_i`
+      already differs per agent (`waypoints.manager_actor_input_local`). Both
+      critics keep their centralized inputs, which are used only in training, as
+      the baseline critic's is. Width 40 at every N, so checkpoints do not load
+      across modes.
+      - **Why: `global` and `relative` act on state the baseline's policy never
+        sees.** Both read every box and teammate at any range; the baseline sees
+        that state only in its critic, during training. Measured on the trained
+        `mlp` baseline's own trajectories (both `_gs` batches, 5 seeds × 64
+        deterministic episodes, steps with an undelivered box left):
+
+        | | 1a/3o | 2a/4o |
+        |---|---|---|
+        | undelivered boxes within `sector_sensor_radius` (7.5), on-policy | 56.7% | 53.8% |
+        | steps with no box sensed, on-policy | 24.4% | 21.7% |
+        | the same two at spawn | 5.6% / 84.4% | 5.9% / 81.1% |
+        | teammate within range | — | 77.1% (sector centroid only) |
+
+        The `global`/`relative` managers see 100%, plus `delivered`, touch counts,
+        coupling and teammate velocities, none of which is in the observation. So
+        an arm reading them beating `mlp` is not attributable to the hierarchy.
+        Read `local` vs `mlp` for that; `relative` vs `local` measures what
+        privileged manager information buys. The probe script is not in the repo.
+      - **What the hierarchy still has, none of it teammate or global state:**
+        (1) c-step memory: the latched waypoint encodes `obs_i` at the window
+        start, and the worker's error `b(a) − (s_t − s_start)/R` carries its own
+        displacement since then (odometry, not absolute position). Deliberately
+        not controlled: it is what temporal abstraction is. (2) The arena clip in
+        `waypoint_from_action` shortens the error within `R·world_width` of a
+        wall. That is 4.5 units at R=0.15 in the 30-wide `_gs` arenas, inside
+        `lidar_range` 7.5, whose axial rays already report the wall.
+        `trainer.validate_manager_input` warns under `local` when
+        `R·world_width >= lidar_range`. (3) Two actors, ~2x the baseline's actor
+        parameters (capacity, not information).
+      - Note the observation's `nearest_box_vec` is already identity-free and
+        drops delivered boxes, i.e. the mechanism credited to `relative` below,
+        but only within range.
+      - Smoke-verified 2026-09-28 at 2a/4o (2e5 steps): train, resume,
+        `evaluate=true` and `view()` run. The checkpoint's manager actor
+        `Dense_0` is `(40, 168)`, the manager critic `(36, 336)`. **No training
+        result.**
+    - `Policy.decide(manager_ts, obs, gs, pos, env_state, ...)`: the actor reads
+      `obs` only under `local` and `env_state` only under `relative`; all three
+      callers (collect, eval, `view()`) pass both.
+    - Both knobs are verified inert at their defaults: rollout fields, losses,
+      post-update parameters and eval returns are **bit-identical** to the
+      pre-change code on the stub env (N=1 and 3, `clip` and `tanh`).
   - `n_steps` is rounded **up** to a multiple of `c` (1048 -> 1056), with a
     printed notice.
   - A rollout needs >= 2 windows, because `ppo_update`'s unbiased std over one
@@ -1443,7 +1555,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 - **Scope:** envs with a `goal_state` hook and continuous actions, i.e.
   `multi_box_push_mjx` and `multi_box_multi_goal_push_mjx`, at any `n_agents`
   including 1. `validate_env` rejects SMAX (no positions) and the macro env
-  (discrete).
+  (discrete). `manager_input: relative` additionally needs `entity_state`, so
+  `multi_box_push_mjx` only; `local` needs no extra hook.
 - **Logged series (per update):**
   - `worker_*` / `manager_*` `{policy,value,entropy,total}_loss` and
     `explained_variance`: the PPO health signals at each level.
@@ -1515,9 +1628,154 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     `LOG_STD_MAX` clamp (7.39) on two seeds. This is harmless for waypoint
     reaching (bang-bang force), as the scripted-manager runs show.
   - The `tanh` arm (`simplified_feudal_tanh`, above) is the fix the toy favours.
-    **No training result.** Probe scripts are not in the repo.
+    It has since been trained; it does not fix the failure (next block). Probe
+    scripts are not in the repo.
+- **MEASURED 2026-09-27: every learned manager caps at ONE box, on both `_gs`
+  batches, in all four arms** (`simplified_feudal`, `_tanh`, `_gh16`,
+  `_tanh_gh16`; 5 seeds each, 64 deterministic episodes per seed). Mean boxes
+  per episode: 0.31–0.70 of 3 at `mjx_1a_3o_111_1024_gs` and 0.44–0.98 of 4 at
+  `mjx_2a_4o_1122_1024_gs`, against 2.95 / 3.87 for `mlp`. At most 3.1% of
+  episodes reach 2 boxes in any arm; `mlp` reaches 2 in 99%.
+  - **The worker and the interface are ruled out on every arm.** The scripted
+    manager above, driving each arm's own trained worker, delivers 2.92–3.00 of
+    3 and 3.03–3.97 of 4 (it sends both agents to one box, so < 4 at 2a/4o is
+    the script's limit), still 3.81–3.98 with the stochastic worker.
+  - **Not time:** when a first box is delivered it lands at step ~125–160
+    (`mlp`: ~130), leaving ~870 steps.
+  - **Cause 1, a reward desert after the first box.** In training-time
+    (stochastic) rollouts a second delivery happens in 0–3.1% of episodes, and
+    windows after the first delivery earn ≈0 whether the manager sends agents
+    down or up (6-window discounted return ≈0). Nothing in the manager's
+    gradient says "go to the next box".
+  - **Cause 2, the global input lets the manager learn a separate policy there.**
+    Before the first delivery its waypoints track the box direction
+    (correlation +0.4–0.5); after it, ≈0. Editing the input at spawn states:
+    the approach survives moving the agent to the top or marking a box
+    delivered, and is lost only in the states actually visited after a
+    delivery. The flat policy escapes this because `nearest_box_vec` simply
+    drops a delivered box, so its first-box reflex fires on the next one.
+    ⇒ `simplified_feudal_tanh_relative_input`.
+  - **Cause 3, the `tanh` entropy parks the agents.** With zero advantage the
+    only pull on the mean is the squashed entropy, which peaks at mean 0, i.e.
+    offset 0: post-delivery offsets fall to 0.08–0.36 R (from ~1 R), agents sit
+    at the top wall and are below an undelivered box < 2% of the time (`mlp`:
+    20–36%). `clip` managers keep moving (~1.2 R) but not toward boxes.
+  - **Cause 4, the zero-box seeds only ever push up** (pre-delivery x-tracking
+    0.04–0.17), so they deliver only a box in their spawn column. At 2a/4o the
+    first box needs one agent in 97–100% of episodes and the two agents never
+    split up.
+  - **Structural, untested: the manager's horizon equals the worker's** (γ^c
+    per decision is ~100 env steps, ~3.6 windows at c=32). `mlp`'s next box is
+    ~125–165 steps away, so its +100 is worth ~0.2 when repositioning should
+    start and GAE credit 5 windows back is 0.16.
+    ⇒ `simplified_feudal_tanh_manager_gamma` (0.997/step: 0.64 and 0.48).
+  - ⚠ The `gh16` arms halve c without scaling R, so their waypoints are mostly
+    unreachable (`clip` reaches 0.3–0.6% of them). Not the cap (the scripted
+    manager still works with those workers), but not a clean test of c either.
+  - ⇒ Cause 3: `simplified_feudal_tanh_low_manager_entropy`
+    (`manager_ent_coef` 0.001, 10x below the shared 0.01). Not 0: that would
+    leave nothing against a collapsing spread, and the toy check above found the
+    squashed entropy is what lets a saturated `tanh` mean turn around.
+  - ⇒ `gh16` confound: `simplified_feudal_gh16_scaled_radius` and
+    `simplified_feudal_tanh_gh16_scaled_radius` (R = 0.06, see the reach
+    measurement under Config).
+  - **The new arms.** Each is one key on its parent (`simplified_feudal_tanh`,
+    or the matching `*_gh16`). Smoke (2e5 steps): train, resume and evaluate
+    work; at 2a/4o the checkpoint's manager actor `Dense_0` is `(34, 168)` under
+    `relative` and `(38, 168)` under the discount arm, the critic `(36, 336)` in
+    both.
+- **MEASURED 2026-09-28: the four new arms that ran do not break the one-box
+  cap.** `_gh16_scaled_radius` (clip and tanh), `_low_manager_entropy` and
+  `_manager_gamma`, 5 seeds × both `_gs` batches, 1e8 steps, 64 deterministic +
+  64 stochastic episodes per seed. At 1a/3o, 0 of 2560 deterministic and 0 of
+  2560 stochastic episodes deliver 2 boxes; at 2a/4o, at most 1.3%. No `reward`
+  eval point of any seed of any simplified arm ever exceeded 150.
+  (`simplified_feudal_tanh_relative_input` arrived later; see the next block.)
+  Figure: `plotting/feudal_goal_analysis/simplified_feudal_boxes_2026-09-28.png`.
+  - **First-box reliability did improve.** Mean boxes, 1a/3o / 2a/4o:
+    `tanh` 0.70 / 0.84, `_manager_gamma` 0.79 / **0.99 (5/5 seeds)**,
+    `_tanh_gh16_scaled_radius` 0.78 / 0.92, `_low_manager_entropy` 0.36 / 0.34,
+    `_gh16_scaled_radius` (clip) 0.42 / 0.38. `_manager_gamma` learns the first
+    box sooner (median first eval >= 100: 27M vs 84M steps at 1a/3o, 46M vs 84M
+    at 2a/4o) and `V^M` at pre-delivery states doubles (29 -> 75). `mlp` reaches
+    one box at 12M and three at 14.8M (1a/3o): its later boxes cost ~1.3M steps
+    each, i.e. they transfer.
+  - **Discount (cause "structural horizon"): refuted as the binding cause.** A
+    second delivery never occurs in training-distribution rollouts, so there is
+    no reward for a longer discount to propagate. `V^M` after the first delivery
+    is 0.0 in every arm (correct, on-policy).
+  - **Entropy parking (cause 3): symptom, not cause.** At manager entropy 0.001,
+    post-delivery offsets return to 0.82 R (from 0.14), but the waypoints point
+    AWAY from the remaining boxes (cosine with the nearest-box direction -0.79),
+    and fewer seeds learn even the first box.
+  - **Scaled radius:** R = 0.06 at c = 16 makes waypoints reachable
+    (`waypoint_reached_frac` 0.95 / 0.84), so c = 16 with reachable waypoints
+    performs like c = 32. The window length is not the cap.
+  - **Hand-off test (the generalization cause, measured):** the learned manager
+    runs to the first delivery, a scripted manager puts the team under the next
+    undelivered box, then the learned manager resumes. It adds 0.01-0.17
+    boxes/episode, against 2.5-3.2 when the scripted manager keeps control. The
+    same hand-off BEFORE any delivery ends in a delivery in 94-100% of episodes
+    (the placed-under box itself only ~31%; the manager re-targets its preferred
+    box). Per-window traces: after the hand-back the manager issues one "up"
+    waypoint (+0.9 R), the agent slides off within one window, and it never
+    re-acquires the box, while before a delivery it keeps re-approaching until
+    delivery. So after a delivery the manager has neither the push nor the
+    approach competence. This is the region problem `relative_input` targets.
+  - **2a/4o has a second cap: the two-agent boxes.** The first delivered box
+    needs one agent in 100% of episodes. Placed under a coupling-2 box, the
+    learned manager delivers it 0% before a delivery and 0-3% after. Even a fixed
+    post-delivery policy would stop at the two coupling-1 boxes.
+  - Probe scripts (deterministic/stochastic rollouts, hand-off) are not in the
+    repo.
+- **MEASURED 2026-09-28: `simplified_feudal_tanh_relative_input` BREAKS the
+  one-box cap.** 5 seeds per batch; at the time of measurement 1a/3o seeds 0-2
+  were at 36-73M steps and 2a/4o seed 4 at 33M (probed from
+  `models_checkpoint.msgpack`), the rest finished. Deterministic boxes per
+  episode: 1a/3o 2.92 / 2.86 / 2.83 / 2.92 / **0.95** (seed 4), 2a/4o
+  2.73 / 2.97 / 2.67 / 2.58 / 1.95. Sampled episodes reaching two boxes:
+  83-98% (0% for every global arm). Two-agent boxes at 2a/4o are delivered in
+  50-69% of episodes (0% before). Mean eval return at 30M steps: 268 at 1a/3o
+  (`mlp` 245, best global arm 65) and 134 at 2a/4o (`mlp` 365, best global 17).
+  At 1a/3o the second box appears 0.3-1.4M steps after the first, the same
+  transfer signature as `mlp`. At 2a/4o the fourth box lands at a median step
+  of ~870 of 1024, so part of the gap to `mlp` is time.
+  ⚠ **The margin over `mlp` is not information-matched**: this manager reads
+  every box at any range, while `mlp`'s observation senses ~55% of them (see
+  `manager_input: local` above). `simplified_feudal_tanh_local_input` is the
+  control.
+  - **Why the global managers cap at one box (measured): each seed learns
+    "fetch box k", with k a fixed input index.** Every global-input seed
+    delivers one fixed box index first in 96-100% of episodes, whatever that
+    box's spawn position. The nearest box at spawn is chosen at chance (25-44%
+    at 1a/3o, 17-36% at 2a/4o). Once box k is delivered the rule has no target;
+    the other boxes sit in input blocks the policy never learned to read. This
+    is also why the earlier pre-delivery hand-off pushed the placed box only
+    ~31% (≈ 1/3) of the time. The relative input has no box identity: slot 0 is
+    always the nearest undelivered box, so the simplest learnable rule
+    ("waypoint toward slot 0, then push up") is "nearest box". Delivering a box
+    removes it from slot 0 and the same rule re-targets. The relative arm's
+    first box is spread evenly over indices, and it is the nearest one in 86-97%
+    of episodes at 1a/3o.
+  - After a delivery: waypoint cosine with the direction to the nearest
+    remaining box is +0.80-0.89 (global arms -0.79 to -0.01); the agent is
+    under a remaining box 40-53% of the time (0%); `V^M` is 24-43 (0.0). The
+    hand-off test after a delivery succeeds 88-100% (global 0-21%), and the
+    placed-under box itself is delivered 97% at 2a/4o, 91% for two-agent boxes.
+  - Two-agent boxes need no dedicated mechanism: when the agents are near each
+    other their slot 0 is the same box, and both apply the same rule. Sharing a
+    target is not new (global arms share one 35-82% of the time); the change is
+    that the relative manager actually pushes the shared box.
+  - **The residual: the blanked tail slot leaks the delivery count, and one
+    seed uses it.** 1a/3o seed 4 fails exactly like the global arms (cosine
+    -0.71 after a delivery with the box below the agent, +0.46 before). Input
+    edits on its trained manager: moving its own position to mid-arena changes
+    nothing (-0.74 -> -0.67), while refilling the blanked slot with a
+    live-looking box flips it to +0.68. The four working seeds are insensitive
+    to both edits. Hiding the count (e.g. only the K nearest undelivered boxes,
+    or blanking random far boxes before any delivery) would close that channel.
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
-  28 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
+  57 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;
   - the worker reward telescopes;
   - freeze + reset at the boundary;
@@ -1530,7 +1788,26 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     and leaves the log-prob unchanged;
   - an unknown bound is rejected;
   - `keep_output_axis` is inert by default;
-  - `model=mlp` is rejected.
+  - `model=mlp` is rejected;
+  - the ratio and end-to-end tests under all three `manager_input` values;
+  - the local input: the stored manager input is the observation the worker
+    read at the window start, and agent 0's decision is unchanged by editing
+    its teammates or its absolute position and changed by editing its own
+    observation (`global` is the positive control; in the stub the observation
+    contains the position, so this pins the plumbing, not partial
+    observability);
+  - the relative input: nearest undelivered box first, delivered boxes zeroed,
+    invariant to box order and to where a delivered box is, teammates nearest
+    first without self, and the stored manager input equals the relative view
+    of the true state (a box delivered mid-rollout drops out);
+  - `relative` without `entity_state`, or an unknown mode, is rejected; `local`
+    builds without it;
+  - `manager_step_gamma` is used for the window return and the truncation
+    bootstrap while the worker keeps its own gamma, and a `manager.gamma` that
+    disagrees with it is rejected;
+  - `make_feudal_config` wires `manager_gamma` / `manager_ent_coef` to the
+    manager only, and a different manager entropy coefficient leaves the
+    worker's update bit-identical while changing the manager's.
 
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 

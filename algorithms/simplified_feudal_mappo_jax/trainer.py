@@ -11,8 +11,9 @@ Two PPO policies on two timescales, both trained by the UNMODIFIED
   `sum_{k<c} gamma_M^k r_{t+k}`, with discount `gamma_M^c` per decision, so it
   is trained on exactly "which waypoints led to high env return". `gamma_M` is
   the manager's per-step discount (`manager_step_gamma`), the worker's `gamma`
-  unless set. The actor reads the team view (`manager_input: global`) or each
-  agent's own relative view (`relative`); the critic always reads the team view.
+  unless set. The actor reads the team view (`manager_input: global`), each
+  agent's own relative view (`relative`), or each agent's own observation
+  (`local`, the information-matched mode); the critic always reads the team view.
 * **Worker** — acts every env step on `(obs_i, (w_i - s_i)/R, time left)`. Its
   ONLY reward is the distance to its waypoint closed by the step
   (`waypoints.intrinsic_reward`). Each commitment is one worker episode: `done`
@@ -29,6 +30,7 @@ Like `mappo_jax`, every rollout starts from freshly reset envs.
 """
 
 import math
+import warnings
 from functools import partial
 from typing import NamedTuple
 
@@ -83,7 +85,13 @@ def validate_env(env) -> None:
 
 
 def validate_manager_input(config: FeudalConfig, env) -> None:
-    """`manager_input: relative` needs the env's per-entity readout."""
+    """`manager_input: relative` needs the env's per-entity readout.
+
+    `local` needs no hook. It warns when the waypoint's arena clip would reveal
+    more of the agent's position than its own lidar does: the clip shortens the
+    error within `R * world_width` of a wall, and the axial lidar rays report a
+    wall only within `lidar_range`.
+    """
     wp.validate_manager_input(config.manager_input)
     if config.manager_input == "relative" and not hasattr(env, "entity_state"):
         raise ValueError(
@@ -91,14 +99,33 @@ def validate_manager_input(config: FeudalConfig, env) -> None:
             f"hook (per-agent and per-box blocks); {type(env).__name__} has none. "
             "Supported: multi_box_push_mjx."
         )
+    world_width = getattr(env, "world_width", None)
+    lidar_range = getattr(env, "lidar_range", None)
+    if (
+        config.manager_input == "local"
+        and world_width is not None
+        and lidar_range is not None
+        and config.waypoint_radius * world_width >= lidar_range
+    ):
+        warnings.warn(
+            f"manager_input='local' with waypoint_radius={config.waypoint_radius}: "
+            f"the arena clip acts within {config.waypoint_radius * world_width:.2f} "
+            f"world units of a wall, beyond lidar_range={lidar_range:.2f}, so the "
+            "worker's error reveals wall distances its observation does not. The "
+            "arm is no longer information-matched to the flat baseline.",
+            stacklevel=2,
+        )
 
 
 def manager_actor_dim(config: FeudalConfig, env):
     """Manager actor input width. None under `global` (input_dims' formula);
-    under `relative`, read off the builder by abstract evaluation (no FLOPs), so
-    the declared width is by construction the width the builder emits."""
+    the observation width under `local`; under `relative`, read off the builder
+    by abstract evaluation (no FLOPs), so the declared width is by construction
+    the width the builder emits."""
     if config.manager_input == "global":
         return None
+    if config.manager_input == "local":
+        return int(env.observation_dim)
 
     def build(key):
         _, state = env.reset(key)
@@ -167,9 +194,10 @@ class Policy(NamedTuple):
     """The hierarchy's forward pass, shared by training, eval and `view()`.
 
     `observe(obs, env_state) -> (global_state, pos)`
-    `decide(manager_ts, global_state, pos, env_state, rng, deterministic)
+    `decide(manager_ts, obs, global_state, pos, env_state, rng, deterministic)
         -> (waypoint, actor_in, critic_in, action, log_prob)`
-        — `env_state` is read only under `manager_input: relative`.
+        — the actor reads `obs` only under `manager_input: local` and
+        `env_state` only under `relative`.
     `act(worker_ts, obs, pos, waypoint, k, rng, deterministic)
         -> (action, log_prob, actor_in)`  — `k` is the step within the window.
 
@@ -186,17 +214,19 @@ def make_policy(config: FeudalConfig, env) -> Policy:
     bound = config.manager_action_bound
     wp.validate_action_bound(bound)
     validate_manager_input(config, env)
-    relative = config.manager_input == "relative"
+    mode = config.manager_input
     v_pos = jax.vmap(env.goal_state)
-    v_entity = jax.vmap(env.entity_state) if relative else None
+    v_entity = jax.vmap(env.entity_state) if mode == "relative" else None
     global_state = global_state_fn(env)
 
     def observe(obs, env_state):
         return global_state(obs, env_state), v_pos(env_state)
 
-    def decide(manager_ts, gs, pos, env_state, rng, deterministic=False):
-        if relative:
+    def decide(manager_ts, obs, gs, pos, env_state, rng, deterministic=False):
+        if mode == "relative":
             actor_in = wp.manager_actor_input_relative(*v_entity(env_state))
+        elif mode == "local":
+            actor_in = wp.manager_actor_input_local(obs)
         else:
             actor_in = wp.manager_actor_input(gs, pos)
         critic_in = wp.manager_critic_input(gs, pos)
@@ -372,7 +402,7 @@ def make_train(config: FeudalConfig, env):
 
         gs, pos = policy.observe(obs, env_state)
         waypoint, m_actor_in, m_critic_in, m_action, m_log_prob = policy.decide(
-            train_state.manager, gs, pos, env_state, manager_rng
+            train_state.manager, obs, gs, pos, env_state, manager_rng
         )
         m_value = _value(train_state.manager, m_critic_in)  # (E,)
 
@@ -527,7 +557,7 @@ def make_train(config: FeudalConfig, env):
             obs, env_state, _, _ = carry
             gs, pos = policy.observe(obs, env_state)
             waypoint = policy.decide(
-                train_state.manager, gs, pos, env_state, no_rng, True
+                train_state.manager, obs, gs, pos, env_state, no_rng, True
             )[0]
             carry, _ = jax.lax.scan(
                 partial(_eval_step, waypoint), carry, jnp.arange(horizon)

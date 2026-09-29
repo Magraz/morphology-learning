@@ -47,8 +47,9 @@ class Model_Params:
     # "clip" | "tanh": how the manager's Gaussian action is bounded to [-1, 1]
     # (waypoints.ACTION_BOUNDS). "clip" is the original behaviour.
     manager_action_bound: str = "clip"
-    # "global" | "relative": what the manager ACTOR reads
-    # (waypoints.MANAGER_INPUTS). "global" is the original behaviour.
+    # "global" | "relative" | "local": what the manager ACTOR reads
+    # (waypoints.MANAGER_INPUTS). "global" is the original behaviour; "local"
+    # (own observation only) is the one information-matched to flat mappo_jax.
     manager_input: str = "global"
 
 

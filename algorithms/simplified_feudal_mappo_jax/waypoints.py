@@ -119,7 +119,11 @@ def manager_actor_input(global_state, pos):
 #              shared by all agents, plus a one-hot agent index.
 #   relative — per agent, everything measured FROM that agent, with delivered
 #              boxes removed rather than flagged (`manager_actor_input_relative`).
-MANAGER_INPUTS = ("global", "relative")
+#   local    — per agent, only that agent's own observation, i.e. exactly what
+#              the flat `mappo_jax` actor reads (`manager_actor_input_local`).
+#              The only mode whose policy is decentralized at execution time;
+#              `global` and `relative` both act on privileged state.
+MANAGER_INPUTS = ("global", "relative", "local")
 
 
 def validate_manager_input(mode: str) -> None:
@@ -192,6 +196,36 @@ def manager_actor_input_relative(agents, boxes):
         [agents, box_feat.reshape(b, n, -1), mate_feat.reshape(b, n, -1), agent_id],
         axis=-1,
     )
+
+
+def manager_actor_input_local(obs):
+    """`(B, N, obs_dim)` — each agent's own observation, and nothing else.
+
+    The information-matched input: the flat `mappo_jax` actor reads exactly this,
+    with parameter sharing and no agent index, so there is no one-hot here
+    either (`obs_i` already differs per agent). Both critics keep their
+    centralized inputs; they are used only in training, as the baseline critic
+    is.
+
+    Why: under `global` / `relative` the manager's decision reads every box and
+    teammate at any range. Measured 2026-09-28 on the trained `mlp` baseline's
+    own trajectories (both `_gs` batches, 5 seeds x 64 episodes), its 40-dim
+    observation senses ~55% of the undelivered boxes and none on ~22-24% of
+    steps, so a feudal arm reading them cannot be compared with it.
+
+    What the hierarchy still has beyond the baseline, none of it teammate or
+    global state:
+      * c-step memory: the latched waypoint encodes `obs_i` at the window start,
+        and the worker's error `b(a) - (s_t - s_start)/R` carries the agent's
+        own displacement since then (odometry, not absolute position);
+      * the arena clip in `waypoint_from_action` shortens the error within
+        `R * world_width` of a wall, which the axial lidar rays already report
+        while that is below `lidar_range` (`trainer.validate_manager_input`
+        warns otherwise);
+      * a second actor, i.e. ~2x the actor parameters (capacity, not
+        information).
+    """
+    return obs
 
 
 def worker_actor_input(obs, error, remaining):

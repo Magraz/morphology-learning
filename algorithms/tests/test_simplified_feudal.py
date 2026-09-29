@@ -26,6 +26,8 @@ from algorithms.mappo_jax.network import (
 from algorithms.mappo_jax.types import MAPPOConfig
 from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 from algorithms.simplified_feudal_mappo_jax.trainer import (
+    create_hier_train_state,
+    make_policy,
     make_train,
     validate_env,
 )
@@ -269,7 +271,7 @@ def test_time_limit_mid_window_bootstraps_both_levels(n_agents):
     )
 
 
-@pytest.mark.parametrize("manager_input", ["global", "relative"])
+@pytest.mark.parametrize("manager_input", ["global", "relative", "local"])
 @pytest.mark.parametrize("bound", ["clip", "tanh"])
 @pytest.mark.parametrize("n_agents", [1, 3])
 def test_ppo_ratio_is_exactly_one_before_update_at_both_levels(
@@ -297,7 +299,7 @@ def test_ppo_ratio_is_exactly_one_before_update_at_both_levels(
         )
 
 
-@pytest.mark.parametrize("manager_input", ["global", "relative"])
+@pytest.mark.parametrize("manager_input", ["global", "relative", "local"])
 @pytest.mark.parametrize("bound", ["clip", "tanh"])
 @pytest.mark.parametrize("n_agents", [1, 3])
 def test_collect_update_eval_end_to_end(n_agents, bound, manager_input):
@@ -456,11 +458,67 @@ def test_relative_input_needs_entity_state_and_a_known_mode():
     with pytest.raises(ValueError, match="entity_state"):
         make_train(_config(manager_input="relative"), NoEntities(2))
     make_train(_config(), NoEntities(2))  # the global input never asks for it
+    make_train(_config(manager_input="local"), NoEntities(2))  # nor does local
     with pytest.raises(ValueError, match="manager_input"):
         make_train(_config(manager_input="egocentric"), StubEnv(2))
     assert Model_Params(
         hidden_dim=8, goal_horizon=4, waypoint_radius=0.1
     ).manager_input == "global"
+
+
+# ---------------------------------------------------------- local manager input
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_local_manager_stores_its_own_observation(n_agents):
+    """The stored manager input is the env observation the worker read on the
+    first step of the same window: no one-hot, no global state, no position."""
+    _, _, (_, rollout, _, _), _ = _collect(StubEnv(n_agents), manager_input="local")
+    m_obs = np.asarray(rollout.manager.obs)  # (windows, E, N, OBS_DIM)
+    assert m_obs.shape[-1] == OBS_DIM
+    w_obs = np.asarray(rollout.worker.obs)[..., :OBS_DIM]
+    np.testing.assert_array_equal(m_obs, _windows(w_obs)[:, 0])
+
+
+def _agent0_action(manager_input, obs, state):
+    """Deterministic manager action of agent 0, (E, 2), from a fresh manager."""
+    env = StubEnv(3)
+    config = _config(manager_input=manager_input)
+    policy = make_policy(config, env)
+    manager_ts = create_hier_train_state(jax.random.PRNGKey(0), config, env).manager
+    gs, pos = policy.observe(obs, state)
+    action = policy.decide(
+        manager_ts, obs, gs, pos, state, jax.random.PRNGKey(1), True
+    )[3]
+    return np.asarray(action[:, 0])
+
+
+def test_local_manager_reads_only_its_own_observation():
+    """Under `local` agent 0's decision is a function of agent 0's observation
+    alone: moving its teammates (their observations and state), or shifting its
+    absolute position while holding its observation fixed, leaves it unchanged,
+    and editing its observation changes it. `global` is the positive control:
+    it reads the teammates, so the same edit moves its decision.
+
+    In the stub the observation contains the position, so this pins the
+    plumbing (what the actor is handed), not partial observability."""
+    obs, state = jax.vmap(StubEnv(3).reset)(
+        jax.random.split(jax.random.PRNGKey(2), N_ENVS)
+    )
+    mates_obs = obs.at[:, 1:].add(0.1)
+    mates_state = state._replace(pos=state.pos.at[:, 1:].add(0.1))
+    shifted_state = state._replace(pos=state.pos + 0.05)
+    own_obs = obs.at[:, 0].add(0.1)
+
+    base = _agent0_action("local", obs, state)
+    np.testing.assert_array_equal(
+        _agent0_action("local", mates_obs, mates_state), base
+    )
+    np.testing.assert_array_equal(_agent0_action("local", obs, shifted_state), base)
+    assert np.any(_agent0_action("local", own_obs, state) != base)
+
+    global_base = _agent0_action("global", obs, state)
+    assert np.any(_agent0_action("global", mates_obs, mates_state) != global_base)
 
 
 # ------------------------------------------------------------ manager discount

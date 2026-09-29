@@ -1,0 +1,40 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh`: manager_input global -> local.
+#
+# The manager ACTOR reads only each agent's own observation, the 40-dim vector
+# the flat `mappo_jax` actor reads, with no agent index (the baseline shares
+# parameters without one, and each agent's observation already differs)
+# (waypoints.manager_actor_input_local). Both critics keep their centralized
+# inputs, which are used only in training, as the baseline critic's is. So this
+# is the one simplified feudal arm whose policy is decentralized at execution.
+#
+# Why (measured 2026-09-28, both `_gs` batches, trained `mlp` baseline's own
+# trajectories, 5 seeds x 64 episodes): the baseline's observation senses ~55%
+# of the undelivered boxes and none on ~22-24% of steps (5.6% / 84% at spawn),
+# while the `global` and `relative` managers see every box and teammate at any
+# range. A win for those arms over `mlp` cannot be credited to the hierarchy.
+# Read this arm against `mlp` for the fair comparison, and against
+# `simplified_feudal_tanh_relative_input` (one key apart) for what privileged
+# manager information buys.
+#
+# Residuals, none of them teammate or global state:
+#   * c-step memory: the latched waypoint encodes the observation at the window
+#     start, and the worker's error vector carries the agent's own displacement
+#     since then;
+#   * the waypoint's arena clip, subsumed by the lidar while
+#     waypoint_radius * world_width < lidar_range (4.5 < 7.5 on the `_gs`
+#     groups; the trainer warns otherwise);
+#   * two actors, ~2x the baseline's actor parameters.
+#
+# The manager actor's input is 40 wide at every N (25 / 38 for `global`, 23 / 34
+# for `relative` at 1a/3o / 2a/4o), so checkpoints are NOT interchangeable with
+# either.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_local_input trial_id=0
+defaults:
+  - simplified_feudal_tanh
+  - _self_
+
+model_params:
+  manager_input: local
