@@ -1,0 +1,36 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input`: manager_credit team ->
+# counterfactual.
+#
+# The manager's PPO normally gives every agent's waypoint the same TEAM
+# advantage. Here each agent gets its own:
+#   A_i = A_team - beta * c_i,
+#   c_i = mean over K draws of agent i's OWN policy of Â(x, joint goals with only
+#         agent i's goal replaced),
+# where Â is a learned goal-conditioned advantage model (counterfactual.py).
+# c_i is what the team would have scored whatever agent i had picked, so
+# subtracting it removes the teammates' share of the outcome from agent i's
+# signal. It never reads agent i's own goal, so it is a baseline: it changes the
+# variance of the gradient, not its expectation, however inaccurate Â is.
+#
+# Why (2026-09-29): the relative-input manager matches mlp at 1a/3o but is about
+# one box short at 2a/4o. Team credit reinforces a free rider's goal whenever a
+# teammate delivers, and punishes an agent waiting at a two-agent box when its
+# partner never comes. With one agent there is nothing to remove, so at 1a/3o
+# this arm is the negative control and should match its parent.
+#
+# Â's head starts at exactly zero and beta (fitted per batch, in [0, 1]) is 0
+# until Â learns goal dependence, so the arm starts as exact team credit. Read
+# `manager_cf_beta` first: 0 means no correction is being applied.
+#
+# The checkpoint gains a `manager_adv` tree, so it does not load into the parent
+# arm's target and vice versa.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_cf trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input
+  - _self_
+
+model_params:
+  manager_credit: counterfactual

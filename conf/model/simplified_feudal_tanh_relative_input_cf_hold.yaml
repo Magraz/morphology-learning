@@ -1,0 +1,22 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_cf`: counterfactual_default
+# sampled -> hold.
+#
+# The parent averages the baseline over K draws of each agent's own policy
+# (Wolpert & Tumer's aristocrat utility). Here the single counterfactual goal is
+# the zero offset, "stay where you are" (their wonderful life utility, i.e. a
+# difference reward with holding position as the default action):
+#   c_i = Â(x, joint goals with agent i's goal replaced by holding still).
+# Still a valid baseline (it never reads agent i's own goal), but it compares
+# against one fixed alternative rather than the agent's typical goal, so its
+# variance can be higher. The ablation asks which counterfactual goal gives
+# better credit.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_cf_hold trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_cf
+  - _self_
+
+model_params:
+  counterfactual_default: hold

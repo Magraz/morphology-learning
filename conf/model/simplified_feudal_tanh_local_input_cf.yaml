@@ -1,0 +1,18 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_local_input`: manager_credit team ->
+# counterfactual.
+#
+# The information-matched twin of `simplified_feudal_tanh_relative_input_cf`:
+# the manager actor reads only each agent's own observation, as the flat
+# mappo_jax actor does. The counterfactual advantage model, like both critics,
+# reads the centralized team view; it is used only in training. See
+# `simplified_feudal_tanh_relative_input_cf` for the mechanism.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_local_input_cf trial_id=0
+defaults:
+  - simplified_feudal_tanh_local_input
+  - _self_
+
+model_params:
+  manager_credit: counterfactual

@@ -51,6 +51,16 @@ class Model_Params:
     # (waypoints.MANAGER_INPUTS). "global" is the original behaviour; "local"
     # (own observation only) is the one information-matched to flat mappo_jax.
     manager_input: str = "global"
+    # "team" | "counterfactual": how each agent's waypoint is credited
+    # (counterfactual.MANAGER_CREDITS). "team" is the original behaviour: every
+    # agent gets the team advantage. "counterfactual" subtracts a per-agent
+    # baseline from a learned goal-conditioned advantage model.
+    manager_credit: str = "team"
+    # "sampled" | "hold": the counterfactual goals that baseline averages over
+    # (counterfactual.COUNTERFACTUAL_DEFAULTS). Read only under "counterfactual".
+    counterfactual_default: str = "sampled"
+    # K, the number of draws per agent under "sampled" (ignored by "hold").
+    counterfactual_samples: int = 16
 
 
 @dataclass
@@ -79,6 +89,20 @@ class FeudalConfig:
     # bootstrap a truncation. None = `worker.gamma` (the original code path).
     # `manager.gamma` must equal this ** goal_horizon; `make_train` checks it.
     manager_step_gamma: Optional[float] = None
+    # Manager credit assignment (see Model_Params and `counterfactual.py`).
+    # "team" is the original code path.
+    manager_credit: str = "team"
+    counterfactual_default: str = "sampled"
+    counterfactual_samples: int = 16
+
+
+class ManagerGoal(NamedTuple):
+    """Per-decision goal record, stored only under `manager_credit:
+    counterfactual` (the advantage model's goal input and the counterfactual
+    goals' reference point). Leading dims `(n_windows, n_envs, n_agents)`."""
+
+    pos: jax.Array  # (..., 2) each agent's goal_state position at the decision
+    offset: jax.Array  # (..., 2) realized waypoint offset (w - s) / R
 
 
 class Rollout(NamedTuple):
@@ -92,6 +116,7 @@ class Rollout(NamedTuple):
     worker: object  # mappo_jax Transition, leading dim n_steps
     manager: object  # mappo_jax Transition, leading dim n_windows
     diagnostics: dict  # scalar rollout diagnostics, merged into the losses
+    manager_goal: object = None  # ManagerGoal under counterfactual credit, else None
 
 
 class LastValues(NamedTuple):

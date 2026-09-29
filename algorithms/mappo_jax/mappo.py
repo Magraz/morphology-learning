@@ -19,7 +19,7 @@ Parity notes (vs. the torch implementation):
 - ``explained_variance`` is the same pre-update diagnostic vanilla computes.
 """
 
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -165,6 +165,7 @@ def ppo_update(
     config: MAPPOConfig,
     discrete: bool,
     squash: bool = False,
+    advantage_correction: Optional[jnp.ndarray] = None,
 ) -> Tuple[ActorCriticTrainState, dict]:
     """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
 
@@ -178,6 +179,14 @@ def ppo_update(
         squash: the env applies `tanh` to the stored Gaussian sample, so the
             entropy bonus is the squashed entropy (`evaluate_action`). Off by
             default; off is byte-identical to the code before the flag.
+        advantage_correction: optional (n_steps, n_envs, n_agents) per-agent
+            baseline subtracted from the TEAM advantage, giving each agent its
+            own actor advantage while the critic keeps regressing the team
+            return. Team rewards only. The caller must guarantee that agent i's
+            correction does not depend on agent i's own action, or the policy
+            gradient is biased (the simplified feudal stack's counterfactual
+            credit, `simplified_feudal_mappo_jax.counterfactual`). None (the
+            default) is byte-identical to the code before the argument.
 
     Returns:
         updated train_state, loss metrics dict
@@ -186,6 +195,15 @@ def ppo_update(
     obs_dim = trajectory.obs.shape[3]
     # Static: (n_steps, n_envs, n_agents) rewards => per-agent credit path.
     per_agent = trajectory.reward.ndim == 3
+    # Static: a per-agent correction of the team advantage => per-agent ACTOR
+    # advantages over the unchanged scalar critic.
+    corrected = advantage_correction is not None
+    if corrected and per_agent:
+        raise ValueError(
+            "advantage_correction corrects a TEAM advantage; it cannot be combined "
+            "with per-agent rewards"
+        )
+    per_agent_adv = per_agent or corrected
     # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked categorical.
     # Envs without `avail_actions` store a scalar placeholder, so this is False and the
     # update is byte-identical to the pre-masking code.
@@ -206,12 +224,25 @@ def ppo_update(
         jnp.var(returns, ddof=1) + 1e-8
     )
 
-    # Advantage normalization per stream over the rollout steps: per-env for the
-    # team reward, per-(env, agent) under per-agent rewards — which is exactly
-    # vanilla's per-(env, agent) normalization.
-    adv = (advantages - advantages.mean(axis=0)) / (
-        advantages.std(axis=0, ddof=1) + 1e-8
-    )
+    if corrected:
+        # Each agent's advantage is the team advantage minus its own correction,
+        # centred per (env, agent) stream but scaled by the TEAM advantage's
+        # per-env std. A per-agent std would rescale a free rider's residual
+        # (close to 0 once the correction works) back to unit variance, i.e.
+        # re-amplify the noise the correction removed; the team std keeps every
+        # agent's signal on the team-credit scale. A zero correction therefore
+        # reproduces the team normalization, broadcast over agents.
+        agent_adv = advantages[..., None] - advantage_correction
+        adv = (agent_adv - agent_adv.mean(axis=0)) / (
+            advantages.std(axis=0, ddof=1)[..., None] + 1e-8
+        )
+    else:
+        # Advantage normalization per stream over the rollout steps: per-env for
+        # the team reward, per-(env, agent) under per-agent rewards — which is
+        # exactly vanilla's per-(env, agent) normalization.
+        adv = (advantages - advantages.mean(axis=0)) / (
+            advantages.std(axis=0, ddof=1) + 1e-8
+        )
 
     # --- Timestep-centric flattening: one sample per (step, env) ---
     total_ts = n_steps * n_envs
@@ -229,11 +260,13 @@ def ppo_update(
     mask_ts = (
         trajectory.action_mask.reshape(total_ts, n_agents, -1) if use_mask else None
     )
-    if per_agent:
+    if per_agent_adv:
         adv_ts = adv.reshape(total_ts, n_agents)
-        ret_ts = returns.reshape(total_ts, n_agents)
     else:
         adv_ts = adv.reshape(total_ts)
+    if per_agent:
+        ret_ts = returns.reshape(total_ts, n_agents)
+    else:
         ret_ts = returns.reshape(total_ts)
 
     # minibatch_size agent-samples => minibatch_size // n_agents timesteps
@@ -263,7 +296,7 @@ def ppo_update(
             # Same mask the actions were sampled under — without it the ratio compares
             # two different distributions and PPO's importance weight is meaningless.
             mb_mask = mask_ts[mb_ids].reshape(n_flat, -1) if use_mask else None
-            if per_agent:
+            if per_agent_adv:
                 # Each agent carries its own advantage. `.reshape(-1)` is
                 # agent-major within a timestep, matching mb_obs' flattening.
                 mb_adv = adv_ts[mb_ids].reshape(n_flat)

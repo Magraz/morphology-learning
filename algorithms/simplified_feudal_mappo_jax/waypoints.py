@@ -62,6 +62,17 @@ def goal_error(waypoint, pos, radius):
     return (waypoint - pos) / radius
 
 
+def waypoint_offset(pos, action, radius, bound):
+    """`(..., N, 2)` the offset a raw manager action actually produces, in units
+    of R: `(w - s) / R` after the bound AND the arena clip.
+
+    The goal input of the counterfactual advantage model, for the actual goals
+    and the counterfactual ones alike, so the two cannot be measured
+    differently. It equals the worker's goal error at the window's first step.
+    """
+    return goal_error(waypoint_from_action(pos, action, radius, bound), pos, radius)
+
+
 def distance_to_waypoint(waypoint, pos, radius):
     """`(..., N)` distance to the waypoint, in units of R."""
     return jnp.linalg.norm(waypoint - pos, axis=-1) / radius

@@ -74,11 +74,17 @@ class MAPPOCritic(nn.Module):
     otherwise a one-agent per-agent head squeezes to `(E,)` and broadcasts
     against `(E, 1)` rewards into `(E, E)`. It only skips the squeeze, so the
     parameter tree is identical either way.
+
+    `head_init_scale` scales the orthogonal init of the output layer. The default
+    1.0 is the original init. 0.0 gives an exactly-zero head, so the network
+    outputs 0 for every input until it trains: the simplified feudal stack's
+    counterfactual advantage model uses it to start as exact team credit.
     """
 
     hidden_dim: int = 256
     n_outputs: int = 1
     keep_output_axis: bool = False
+    head_init_scale: float = 1.0
 
     @nn.compact
     def __call__(self, global_state: jnp.ndarray):
@@ -96,7 +102,7 @@ class MAPPOCritic(nn.Module):
         x = nn.tanh(x)
         value = nn.Dense(
             self.n_outputs,
-            kernel_init=nn.initializers.orthogonal(1.0),
+            kernel_init=nn.initializers.orthogonal(self.head_init_scale),
             bias_init=nn.initializers.constant(0.0),
         )(x)
         if self.n_outputs == 1 and not self.keep_output_axis:

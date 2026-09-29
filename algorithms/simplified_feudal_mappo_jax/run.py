@@ -3,7 +3,8 @@
 Subclasses `MAPPO_JAX_Runner`, so the train loop, stats tracking, checkpoint
 cadence, resume and `evaluate()` are inherited unchanged. This class only
 supplies the hierarchy's config, its jitted functions (`_make_train`), the
-four-train-state checkpoint format, and a `view()` that draws the waypoints.
+four-train-state checkpoint format (five under `manager_credit: counterfactual`,
+which adds the advantage model), and a `view()` that draws the waypoints.
 """
 
 import dataclasses
@@ -50,6 +51,9 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
       gamma unless `manager_gamma` gives the manager a longer horizon.
     * `manager_ent_coef` replaces the worker's entropy coefficient for the
       manager only; None keeps the shared value (the original behaviour).
+    * `manager_credit` / `counterfactual_default` / `counterfactual_samples`
+      select the manager's credit assignment (`counterfactual.py`); "team" is
+      the original behaviour.
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
@@ -89,6 +93,9 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
         manager_action_bound=model_params.manager_action_bound,
         manager_input=model_params.manager_input,
         manager_step_gamma=params.manager_gamma,
+        manager_credit=model_params.manager_credit,
+        counterfactual_default=model_params.counterfactual_default,
+        counterfactual_samples=int(model_params.counterfactual_samples),
     )
 
 
@@ -143,6 +150,13 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             f"({'own' if own_entropy else 'worker'}) | "
             f"total={worker.n_total_steps} | backend={jax.default_backend()}"
         )
+        credit = self.feudal_config.manager_credit
+        if credit == "counterfactual":
+            credit += (
+                f" ({self.feudal_config.counterfactual_default}, "
+                f"samples={self.feudal_config.counterfactual_samples})"
+            )
+        print(f"  manager_credit={credit}")
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
             f"(env hook: {hasattr(self.env, 'global_state')})"
@@ -153,14 +167,22 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
 
     # ------------------------------------------------------------------ io
 
+    # The counterfactual advantage model (`manager_credit: counterfactual`) is an
+    # extra entry in both trees, present only when the model exists. flax's
+    # `from_bytes` raises only when the TARGET has a key the file lacks, so a
+    # default run's checkpoints are unchanged and load exactly as before.
+
     @staticmethod
     def _params_tree(train_state: HierTrainState) -> dict:
-        return {
+        tree = {
             "worker_actor": train_state.worker.actor_ts.params,
             "worker_critic": train_state.worker.critic_ts.params,
             "manager_actor": train_state.manager.actor_ts.params,
             "manager_critic": train_state.manager.critic_ts.params,
         }
+        if train_state.manager_adv is not None:
+            tree["manager_adv"] = train_state.manager_adv.params
+        return tree
 
     def save_params(self, train_state, path):
         with open(path, "wb") as f:
@@ -169,7 +191,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
     @staticmethod
     def _checkpoint_tree(runner_state, eval_rng) -> dict:
         ts = runner_state.train_state
-        return {
+        tree = {
             "worker_actor_ts": ts.worker.actor_ts,
             "worker_critic_ts": ts.worker.critic_ts,
             "manager_actor_ts": ts.manager.actor_ts,
@@ -177,6 +199,9 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             "rng": runner_state.rng,
             "eval_rng": eval_rng,
         }
+        if ts.manager_adv is not None:
+            tree["manager_adv_ts"] = ts.manager_adv
+        return tree
 
     def _save_train_checkpoint(self, runner_state, eval_rng, path):
         with open(path, "wb") as f:
@@ -198,6 +223,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 actor_ts=loaded["manager_actor_ts"],
                 critic_ts=loaded["manager_critic_ts"],
             ),
+            manager_adv=loaded.get("manager_adv_ts"),
         )
         return RunnerState(train_state=train_state, rng=loaded["rng"]), loaded[
             "eval_rng"
@@ -214,6 +240,9 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             params = from_bytes(self._params_tree(train_state), f.read())
         print(f"Params loaded from {path}")
         worker, manager = train_state.worker, train_state.manager
+        manager_adv = train_state.manager_adv
+        if manager_adv is not None:
+            manager_adv = manager_adv.replace(params=params["manager_adv"])
         return HierTrainState(
             worker=worker._replace(
                 actor_ts=worker.actor_ts.replace(params=params["worker_actor"]),
@@ -223,6 +252,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 actor_ts=manager.actor_ts.replace(params=params["manager_actor"]),
                 critic_ts=manager.critic_ts.replace(params=params["manager_critic"]),
             ),
+            manager_adv=manager_adv,
         )
 
     # ------------------------------------------------------------------ view

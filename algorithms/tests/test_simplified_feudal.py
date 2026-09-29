@@ -13,17 +13,21 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
+from flax.training.train_state import TrainState
 
-from algorithms.mappo_jax.mappo import create_train_state
+from algorithms.mappo_jax.mappo import create_train_state, ppo_update
 from algorithms.mappo_jax.network import (
     MAPPOActor,
     MAPPOCritic,
     _gaussian_entropy,
     _squashed_gaussian_entropy,
     evaluate_action,
+    sample_action,
 )
 from algorithms.mappo_jax.types import MAPPOConfig
+from algorithms.simplified_feudal_mappo_jax import counterfactual as cf
 from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 from algorithms.simplified_feudal_mappo_jax.trainer import (
     create_hier_train_state,
@@ -122,7 +126,15 @@ class StubEnv:
         return agents, boxes
 
 
-def _config(n_steps=N_STEPS, bound="clip", manager_input="global", manager_step_gamma=None):
+def _config(
+    n_steps=N_STEPS,
+    bound="clip",
+    manager_input="global",
+    manager_step_gamma=None,
+    manager_credit="team",
+    counterfactual_default="sampled",
+    counterfactual_samples=4,
+):
     worker = MAPPOConfig(
         n_steps=n_steps,
         n_envs=N_ENVS,
@@ -144,6 +156,9 @@ def _config(n_steps=N_STEPS, bound="clip", manager_input="global", manager_step_
         manager_action_bound=bound,
         manager_input=manager_input,
         manager_step_gamma=manager_step_gamma,
+        manager_credit=manager_credit,
+        counterfactual_default=counterfactual_default,
+        counterfactual_samples=counterfactual_samples,
     )
 
 
@@ -715,3 +730,327 @@ def test_model_group_without_hierarchy_keys_is_rejected():
     the mappo_jax baseline's results directory."""
     with pytest.raises(TypeError):
         Model_Params(hidden_dim=168)
+
+
+# ---------------------------------------------------------------------------
+# Counterfactual-goal credit (`manager_credit: counterfactual`)
+# ---------------------------------------------------------------------------
+
+
+def _tree_max_diff(a, b):
+    """Largest absolute difference over the leaves of two pytrees (bool/int as
+    floats). Compares leaves, not structure: TrainStates from two `make_train`
+    calls hold different optimizer objects as static metadata."""
+    la, lb = jax.tree.leaves(a), jax.tree.leaves(b)
+    assert len(la) == len(lb)
+    return max(
+        (
+            float(np.abs(np.asarray(x, np.float64) - np.asarray(y, np.float64)).max())
+            for x, y in zip(la, lb)
+        ),
+        default=0.0,
+    )
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_counterfactual_credit_is_off_by_default(n_agents):
+    config, _, (runner_state, rollout, last, _), (update_fn, _) = _collect(
+        StubEnv(n_agents)
+    )
+    assert config.manager_credit == "team"
+    assert runner_state.train_state.manager_adv is None
+    assert rollout.manager_goal is None
+    new_state, losses = update_fn(runner_state, rollout, last)
+    assert new_state.train_state.manager_adv is None
+    assert not [key for key in losses if key.startswith("manager_cf_")]
+    defaults = {f.name: f.default for f in dataclasses.fields(Model_Params)}
+    assert defaults["manager_credit"] == "team"
+    assert defaults["counterfactual_default"] == "sampled"
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_zero_advantage_correction_is_team_credit(n_agents):
+    """A zero per-agent correction reproduces the team-credit update: the same
+    normalization and the same advantage for every agent."""
+    config, _, (runner_state, rollout, last, _), _ = _collect(StubEnv(n_agents))
+    ts, m = runner_state.train_state.manager, rollout.manager
+    key = jax.random.PRNGKey(3)
+    team = ppo_update(ts, key, m, last.manager, config.manager, discrete=False)
+    zero = ppo_update(
+        ts, key, m, last.manager, config.manager, discrete=False,
+        advantage_correction=jnp.zeros(m.log_prob.shape),
+    )
+    assert _tree_max_diff(team[0], zero[0]) < 1e-5
+    for key_name in team[1]:
+        np.testing.assert_allclose(
+            team[1][key_name], zero[1][key_name], atol=1e-5, err_msg=key_name
+        )
+
+
+def test_advantage_correction_needs_a_team_reward():
+    config, _, (runner_state, rollout, last, _), _ = _collect(StubEnv(3))
+    w = rollout.worker  # per-agent rewards
+    with pytest.raises(ValueError, match="per-agent rewards"):
+        ppo_update(
+            runner_state.train_state.worker, jax.random.PRNGKey(0), w, last.worker,
+            config.worker, discrete=False,
+            advantage_correction=jnp.zeros(w.log_prob.shape),
+        )
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_counterfactual_arm_starts_as_exact_team_credit(n_agents):
+    """At init the advantage model outputs exactly 0, so beta is 0 and the first
+    update equals the team-credit arm's. The rollout is identical too: the model's
+    key comes from fold_in and collection never reads it."""
+    env = StubEnv(n_agents)
+    _, _, (rs_team, ro_team, last_team, _), (update_team, _) = _collect(env)
+    _, _, (rs_cf, ro_cf, last_cf, _), (update_cf, _) = _collect(
+        env, manager_credit="counterfactual"
+    )
+    assert _tree_max_diff(
+        (ro_team.worker, ro_team.manager), (ro_cf.worker, ro_cf.manager)
+    ) == 0.0
+    adv = rs_cf.train_state.manager_adv
+    in_dim = adv.params["params"]["Dense_0"]["kernel"].shape[0]
+    x = jax.random.normal(jax.random.PRNGKey(5), (7, in_dim))
+    assert float(jnp.abs(adv.apply_fn(adv.params, x)).max()) == 0.0
+
+    new_team, _ = update_team(rs_team, ro_team, last_team)
+    new_cf, losses = update_cf(rs_cf, ro_cf, last_cf)
+    assert float(losses["manager_cf_beta"]) == 0.0
+    assert float(losses["manager_cf_correction_std"]) == 0.0
+    assert _tree_max_diff(new_team.train_state.worker, new_cf.train_state.worker) == 0.0
+    assert _tree_max_diff(
+        new_team.train_state.manager, new_cf.train_state.manager
+    ) < 1e-5
+    # ...while the model itself trained on the batch.
+    assert _tree_max_diff(adv.params, new_cf.train_state.manager_adv.params) > 0.0
+
+
+def _nonzero_adv_model(in_dim, seed=0):
+    """An advantage model with an ordinary (nonzero) head, for function tests."""
+    model = MAPPOCritic(hidden_dim=16)
+    params = model.init(jax.random.PRNGKey(seed), jnp.zeros(in_dim))
+    return TrainState.create(apply_fn=model.apply, params=params, tx=optax.sgd(0.0))
+
+
+def _credit_inputs(n_agents=3, T=2, E=2, C=5, K=4, seed=0):
+    keys = jax.random.split(jax.random.PRNGKey(seed), 3)
+    critic_in = jax.random.normal(keys[0], (T, E, C))
+    offsets = jax.random.uniform(keys[1], (T, E, n_agents, 2), minval=-1, maxval=1)
+    cf_off = jax.random.uniform(keys[2], (T, E, n_agents, K, 2), minval=-1, maxval=1)
+    return critic_in, offsets, cf_off
+
+
+def test_own_slot_joint_replaces_only_the_agents_own_slot():
+    _, offsets, cf_off = _credit_inputs()
+    n = offsets.shape[-2]
+    for i in range(n):
+        joint = np.asarray(cf.own_slot_joint(offsets, cf_off[..., i, :, :], i))
+        for j in range(n):
+            expected = (
+                cf_off[..., i, :, :]
+                if j == i
+                else jnp.broadcast_to(offsets[..., None, j, :], joint[..., j, :].shape)
+            )
+            np.testing.assert_array_equal(joint[..., j, :], np.asarray(expected))
+
+
+def test_counterfactual_correction_never_reads_the_agents_own_goal():
+    """The unbiasedness precondition: agent i's correction depends only on its
+    teammates' goals. Editing agent 1's actual goal leaves c_1 bit-identical and
+    moves c_0 and c_2 (the positive control: the model does read goals)."""
+    critic_in, offsets, cf_off = _credit_inputs()
+    model = _nonzero_adv_model(critic_in.shape[-1] + 2 * offsets.shape[-2])
+    c_before, _ = cf.correction(model, critic_in, offsets, cf_off)
+    c_after, _ = cf.correction(
+        model, critic_in, offsets.at[..., 1, :].add(0.5), cf_off
+    )
+    np.testing.assert_array_equal(
+        np.asarray(c_before[..., 1]), np.asarray(c_after[..., 1])
+    )
+    assert float(jnp.abs(c_before[..., [0, 2]] - c_after[..., [0, 2]]).max()) > 0.0
+
+
+def test_counterfactual_offsets_are_draws_of_the_given_policy():
+    """`sampled` draws come from the actor passed in, on the stored inputs: with
+    the policy's std at its floor every draw lands next to the deterministic
+    waypoint. `hold` is the zero offset."""
+    _, _, (runner_state, rollout, _, _), _ = _collect(
+        StubEnv(3), manager_credit="counterfactual"
+    )
+    actor = runner_state.train_state.manager.actor_ts
+    params = jax.tree.map(lambda p: p, actor.params)
+    params["params"]["log_action_std"] = jnp.full_like(
+        params["params"]["log_action_std"], -20.0
+    )  # clamped to LOG_STD_MIN: std ~ 0.0067
+    tight = actor.replace(params=params)
+    m, goal = rollout.manager, rollout.manager_goal
+    key = jax.random.PRNGKey(0)
+    drawn = cf.counterfactual_offsets(
+        tight, m.obs, goal.pos, key, 5, RADIUS, "clip", "sampled"
+    )
+    assert drawn.shape == goal.pos.shape[:-1] + (5, 2)
+    assert float(drawn.std(axis=-2).max()) > 0.0  # K distinct draws
+    mean_action, _ = sample_action(
+        key, tight.apply_fn, tight.params, m.obs.reshape(-1, m.obs.shape[-1]),
+        discrete=False, deterministic=True,
+    )
+    deterministic = wp.waypoint_offset(
+        goal.pos, mean_action.reshape(goal.pos.shape), RADIUS, "clip"
+    )
+    np.testing.assert_allclose(
+        drawn, np.broadcast_to(deterministic[..., None, :], drawn.shape), atol=0.05
+    )
+    hold = cf.counterfactual_offsets(tight, m.obs, goal.pos, key, 5, RADIUS, "clip", "hold")
+    assert hold.shape == goal.pos.shape[:-1] + (1, 2)
+    assert float(jnp.abs(hold).max()) == 0.0
+
+
+def test_fit_beta_is_the_clipped_control_variate_coefficient():
+    a = jax.random.normal(jax.random.PRNGKey(0), (50, 4))
+    ones = jnp.ones((50, 4, 3))
+    assert float(cf.fit_beta(a, a[..., None] * ones)) == pytest.approx(1.0, abs=1e-5)
+    assert float(cf.fit_beta(a, 2.0 * a[..., None] * ones)) == pytest.approx(0.5, abs=1e-5)
+    assert float(cf.fit_beta(a, -a[..., None] * ones)) == 0.0  # never flips sign
+    assert float(cf.fit_beta(a, 3.0 * ones)) == 0.0  # constant: no NaN
+    assert float(cf.fit_beta(a, jnp.zeros((50, 4, 3)))) == 0.0
+
+
+def test_counterfactual_credit_isolates_each_agents_contribution_on_a_toy_batch():
+    """Synthetic batch: team advantage = f(agent 0's goal) + g(agent 1's goal) +
+    noise. After fitting the advantage model, agent 0's corrected advantage
+    tracks its own term f much better than the team advantage does, with less
+    variance: the teammate's term g has been removed."""
+    T, E, N, C = 64, 8, 2, 3
+    keys = jax.random.split(jax.random.PRNGKey(0), 6)
+    critic_in = 0.1 * jax.random.normal(keys[0], (T, E, C))
+    offsets = jax.random.uniform(keys[1], (T, E, N, 2), minval=-1, maxval=1)
+    f = 2.0 * jnp.sin(2.0 * offsets[..., 0, 0])
+    g = 2.0 * jnp.sin(2.0 * offsets[..., 1, 1])
+    a_team = f + g + 0.3 * jax.random.normal(keys[2], (T, E))
+
+    model = cf.create_adv_model(
+        keys[3], MAPPOConfig(hidden_dim=16, lr=3e-3, grad_clip=10.0), C + 2 * N
+    )
+    model, _ = cf.fit_adv_model(
+        model, cf.adv_model_input(critic_in, offsets), a_team, keys[4],
+        n_epochs=300, n_minibatches=4,
+    )
+    # Counterfactual goals from the synthetic "policy", uniform on [-1, 1]^2.
+    cf_off = jax.random.uniform(keys[5], (T, E, N, 32, 2), minval=-1, maxval=1)
+    c, _ = cf.correction(model, critic_in, offsets, cf_off)
+    beta = float(cf.fit_beta(a_team, c))
+    a0 = a_team - beta * c[..., 0]
+
+    def corr(x, y):
+        return float(jnp.corrcoef(x.ravel(), y.ravel())[0, 1])
+
+    assert beta > 0.5
+    assert corr(a0, f) > corr(a_team, f) + 0.2
+    assert float(jnp.var(a0)) < 0.7 * float(jnp.var(a_team))
+
+
+@pytest.mark.parametrize("default", ["sampled", "hold"])
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_counterfactual_collect_update_eval_end_to_end(n_agents, default):
+    _, _, (runner_state, rollout, last, _), (update_fn, eval_fn) = _collect(
+        StubEnv(n_agents, max_steps=10),
+        manager_credit="counterfactual",
+        counterfactual_default=default,
+    )
+    n_windows = N_STEPS // HORIZON
+    goal, m = rollout.manager_goal, rollout.manager
+    assert goal.pos.shape == goal.offset.shape == (n_windows, N_ENVS, n_agents, 2)
+    # The stored offset is the one the stored action produces.
+    np.testing.assert_allclose(
+        goal.offset, wp.waypoint_offset(goal.pos, m.action, RADIUS, "clip"), atol=1e-6
+    )
+    # The first update fits the model from zero, so the second one applies a
+    # nonzero correction through ppo_update.
+    state, _ = update_fn(runner_state, rollout, last)
+    state, losses = update_fn(state, rollout, last)
+    for key in (
+        "manager_cf_beta", "manager_cf_correction_std", "manager_cf_adv_var_ratio",
+        "manager_cf_model_ev", "manager_cf_goal_sensitivity", "manager_cf_model_loss",
+        "manager_policy_loss", "manager_value_loss",
+    ):
+        assert np.isfinite(float(losses[key])), key
+    assert 0.0 <= float(losses["manager_cf_beta"]) <= 1.0
+    assert float(losses["manager_cf_correction_std"]) > 0.0
+    assert _tree_max_diff(
+        runner_state.train_state.manager_adv.params, state.train_state.manager_adv.params
+    ) > 0.0
+    assert np.isfinite(float(eval_fn(state.train_state, jax.random.PRNGKey(1))))
+
+
+def test_manager_credit_is_validated():
+    for field, value in (
+        ("manager_credit", "bogus"),
+        ("counterfactual_default", "bogus"),
+        ("counterfactual_samples", 0),
+    ):
+        bad = dataclasses.replace(
+            _config(manager_credit="counterfactual"), **{field: value}
+        )
+        with pytest.raises(ValueError, match=field):
+            make_train(bad, StubEnv(2))
+    with pytest.warns(UserWarning, match="one agent"):
+        make_train(_config(manager_credit="counterfactual"), StubEnv(1))
+
+
+def test_make_feudal_config_wires_the_manager_credit():
+    from algorithms.simplified_feudal_mappo_jax.run import make_feudal_config
+
+    base = dict(hidden_dim=8, goal_horizon=32, waypoint_radius=0.15)
+    default = make_feudal_config(_params(), Model_Params(**base), n_envs=32)
+    assert (
+        default.manager_credit,
+        default.counterfactual_default,
+        default.counterfactual_samples,
+    ) == ("team", "sampled", 16)
+    own = make_feudal_config(
+        _params(),
+        Model_Params(
+            **base, manager_credit="counterfactual", counterfactual_default="hold",
+            counterfactual_samples=4,
+        ),
+        n_envs=32,
+    )
+    assert (own.manager_credit, own.counterfactual_default, own.counterfactual_samples) == (
+        "counterfactual", "hold", 4,
+    )
+    assert own.worker == default.worker and own.manager == default.manager
+
+
+def test_checkpoint_trees_carry_the_advantage_model_only_when_enabled():
+    from flax.serialization import from_bytes, to_bytes
+
+    from algorithms.simplified_feudal_mappo_jax.run import (
+        Simplified_Feudal_MAPPO_JAX_Runner as Runner,
+    )
+
+    eval_rng = jax.random.PRNGKey(7)
+    team = make_train(_config(), StubEnv(3))[0](jax.random.PRNGKey(0))
+    assert "manager_adv" not in Runner._params_tree(team.train_state)
+    assert "manager_adv_ts" not in Runner._checkpoint_tree(team, eval_rng)
+    # The default format round-trips unchanged.
+    from_bytes(
+        Runner._checkpoint_tree(team, eval_rng),
+        to_bytes(Runner._checkpoint_tree(team, eval_rng)),
+    )
+
+    rs = make_train(_config(manager_credit="counterfactual"), StubEnv(3))[0](
+        jax.random.PRNGKey(0)
+    )
+    assert "manager_adv" in Runner._params_tree(rs.train_state)
+    moved_adv = rs.train_state.manager_adv.replace(
+        params=jax.tree.map(lambda p: p + 1.0, rs.train_state.manager_adv.params)
+    )
+    moved = rs._replace(train_state=rs.train_state._replace(manager_adv=moved_adv))
+    restored = from_bytes(
+        Runner._checkpoint_tree(rs, eval_rng),
+        to_bytes(Runner._checkpoint_tree(moved, eval_rng)),
+    )
+    assert _tree_max_diff(restored["manager_adv_ts"].params, moved_adv.params) == 0.0
