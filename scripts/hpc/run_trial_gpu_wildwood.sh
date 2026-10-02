@@ -20,7 +20,7 @@ sbatch <<EOT
 #SBATCH -c 4
 #SBATCH --cpu-freq=high
 #SBATCH --mem=16G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --requeue

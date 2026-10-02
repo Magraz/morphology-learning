@@ -1,0 +1,23 @@
+# @package _global_
+# Twin of mjx_2a_4o_1122_1024_gs differing in exactly one key: arena_scale.
+#
+# The arena is 1.5x wider (30 -> 45) and the agent/box spawn regions and goal
+# band stretch with it, but the sensing ranges (sector sensors, lidar,
+# nearest_box_vec cap) stay at the unscaled 7.5. Agents therefore start farther
+# from the boxes and see a smaller share of the arena. Measured over 2048
+# resets: 94.0% of agents sense no box at spawn (79.5% at scale 1).
+#
+# Travel distances grow with the arena too: a scripted controller that knows
+# every box position takes ~1.6x as long to its first delivery (154 -> 247
+# steps). max_steps is still 1024, so part of any return gap can be time,
+# not search.
+env:
+  environment: multi_box_push_mjx
+  n_envs: 32
+  n_agents: 2
+  n_objects: 4
+  reward_mode: dense
+  variant: trunc
+  use_global_state: true
+  coupling_def: [1,1,2,2]
+  arena_scale: 1.5

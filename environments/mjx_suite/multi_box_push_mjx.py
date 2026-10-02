@@ -175,6 +175,7 @@ class MultiBoxPushMJX:
         reward_mode: str = "dense",
         variant: str = None,
         use_global_state: bool = False,
+        arena_scale: float = 1.0,
     ):
         if reward_mode not in ("dense", "sparse", "difference_rewards"):
             raise ValueError(
@@ -199,9 +200,18 @@ class MultiBoxPushMJX:
         self._dense = reward_mode in ("dense", "difference_rewards")
         self._difference = reward_mode == "difference_rewards"
 
-        # --- world geometry (identical to the Box2D env) ---
+        # --- world geometry (identical to the Box2D env at arena_scale=1) ---
+        # `arena_scale` enlarges the arena and everything laid out in proportion
+        # to it (agent/box spawn regions, goal band), but NOT the sensing
+        # ranges, which stay at the unscaled arena's values. So agents start
+        # farther from the boxes and see a smaller share of the arena, i.e. the
+        # boxes are harder to find. 1.0 is bit-identical to the pre-flag env.
+        if arena_scale < 1.0:
+            raise ValueError(f"arena_scale must be >= 1.0, got {arena_scale}")
+        self.arena_scale = float(arena_scale)
         total_entities = n_agents + n_objects
-        self.world_width = int(30 * max(1.0, total_entities / 8) ** 0.5)
+        self.base_world_width = int(30 * max(1.0, total_entities / 8) ** 0.5)
+        self.world_width = int(round(self.base_world_width * self.arena_scale))
         self.world_height = self.world_width
         self.world_center_x = self.world_width // 2
         self.world_center_y = self.world_height // 2
@@ -209,9 +219,9 @@ class MultiBoxPushMJX:
 
         self.velocity_norm = _FORCE_MULTIPLIER / (_AGENT_DAMPING * _AGENT_MASS)
         self.neighbor_detection_range = 3.0
-        self.sector_sensor_radius = self.world_width / 4.0
+        self.sector_sensor_radius = self.base_world_width / 4.0
         self.lidar_range = self.sector_sensor_radius
-        self.comm_radius = self.world_width / 4.0
+        self.comm_radius = self.base_world_width / 4.0
         self.force_multiplier = _FORCE_MULTIPLIER
 
         # Position normalization, ONE definition shared by `_compact_global_state`
@@ -1492,6 +1502,12 @@ if __name__ == "__main__":
     parser.add_argument("--n-agents", type=int, default=9)
     parser.add_argument("--n-objects", type=int, default=3)
     parser.add_argument("--n-envs", type=int, default=32, help="vmap batch size")
+    parser.add_argument(
+        "--arena-scale",
+        type=float,
+        default=1.0,
+        help="enlarge the arena (sensing ranges stay at the unscaled size)",
+    )
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--debug", type=bool, default=True)
     parser.add_argument(
@@ -1519,9 +1535,12 @@ if __name__ == "__main__":
     if args.debug:
         jax.config.update("jax_disable_jit", True)
 
-    env = MultiBoxPushMJX(n_agents=args.n_agents, n_objects=args.n_objects)
+    env = MultiBoxPushMJX(
+        n_agents=args.n_agents, n_objects=args.n_objects, arena_scale=args.arena_scale
+    )
     print(
-        f"world {env.world_width}x{env.world_height}, "
+        f"world {env.world_width}x{env.world_height} "
+        f"(arena_scale {env.arena_scale}, sensor radius {env.sector_sensor_radius}), "
         f"coupling {list(env.objects_push_coupling_list)}, "
         f"box half-extents {list(env.box_half_extents)}"
     )

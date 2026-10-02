@@ -1,0 +1,35 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Introduction}
+
+%% The 8 questions
+% 1. What is the problem and why do I care?
+Teams of autonomous agents have been a key component in problems such as planetary exploration, drone package delivery, warehouse robotics, and  traffic control. Training agent policies for these problems can be done using Multiagent Reinforcement Learning algorithms. 
+% 2. Why is it important/difficult?
+However, when the problem is a long-horizon, multi-step task, that requires varying degrees of coordination such as object manipulation with multiple agents, current MARL methods struggle to properly assign credit.
+
+
+% 3. What has been done already in this problem area?
+Current approaches apply hierarchical and structural biases to decompose the problem into multiple learners, a manager and a worker. These operate at different timescales and action spaces. This decomposition reduces the action space at the higher levels of the hierarchy leading to more stable learning. 
+
+% 4. What particular problem remains unsolved?
+Credit assignment between the higher and lower levels of the hierarchies still remains challenging since current methods rely on domain specific reward definitions for each level, or on experience relabeling which cannot isolate the effects of other agent's goals on each agent's actions. This can lead to suboptimal learning when the environment's reward signal is shared among all levels of the hierarchy.
+
+% 5. How did you solve it?
+We introduce a counterfactual-based Feudal MARL framework, that can distill a signal that captures how good a particular agent's goal is, given that other agent's goals stay fixed. We use this signal to train the manager model to produce goals that guide the workers towards effective cooperation policies.
+
+% 6. What is cool about your approach?
+ -Idea 1: Our key insight is a goal-aware counterfactual baseline that allows us to capture how an agent's assigned goal will impact the team's performance. The main difference with approaches such as COMA, is that we utilize a counterfactual direction in the manager's latent space to measure how much better a goal change is. Inspired by Feudal Networks, we train our manager by extending the transition policy gradient to a multiagent transition policy gradient that allows our manager to capture the semantics of the team task.
+
+The main difference with approaches such as COMA, is that we utilize a counterfactual direction in the manager's latent space to measure how much better a goal change is. Inspired by Feudal Networks, we train our manager by extending the transition policy gradient to a multiagent transition policy gradient that allows our manager to capture the semantics of the team task.
+
+% - Idea 2: Our key insight is a manager produced intrinsic reward that guides the agents before any extrinsic reward is obtained. The manager produces a vector in latent space for each worker, the workers then get a bonus reward based on how close they got to matching their assigned goal. By decoupling the manager from the agent's state, the agents can execute their policies in a decentralized fashion. The manager optimizes its goals based on how each goal contributed to improving the extrinsic reward.
+ 
+
+
+% 7. What were your key results?
+
+
+% 8. What are the contributions of this paper?
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

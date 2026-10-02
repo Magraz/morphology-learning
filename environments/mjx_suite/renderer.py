@@ -389,7 +389,9 @@ def manual_control(
         f" variant={getattr(env, 'variant', None)} "
         f"drift={getattr(env, 'box_drift_speed', 0.0)} "
         f"walls_end_episode={getattr(env, 'boundary_ends_episode', True)}\n"
-        f" sensing radius {radius:.1f} (group control range)\n"
+        f" arena {env.world_width}x{env.world_height} "
+        f"(arena_scale={getattr(env, 'arena_scale', 1.0)}), "
+        f"sensing radius {radius:.1f} (group control range)\n"
         f"{'-' * 62}\n"
         "  [ARROWS] move        [SPACE] switch agent   [G] group toggle\n"
         "  [R]      reset       [TAB]   overlay agent  [ESC] quit\n"
@@ -601,6 +603,9 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=["drift", "trunc"], default=None,
                         help="env variant preset (square env only; "
                              "default: baseline)")
+    parser.add_argument("--arena-scale", type=float, default=1.0,
+                        help="enlarge the arena; sensing ranges stay at the "
+                             "unscaled size (square env only)")
     args = parser.parse_args()
 
     if args.env == "circular":
@@ -608,6 +613,8 @@ if __name__ == "__main__":
         # docstring) — a wall touch always ends the episode there.
         if args.variant is not None:
             parser.error("--variant is only supported by --env square")
+        if args.arena_scale != 1.0:
+            parser.error("--arena-scale is only supported by --env square")
         from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
             MultiBoxMultiGoalPushMJX,
             scripted_push_action,
@@ -620,7 +627,10 @@ if __name__ == "__main__":
         from environments.mjx_suite.multi_box_push_mjx import scripted_push_action
 
         env = MultiBoxPushMJX(
-            n_agents=args.n_agents, n_objects=args.n_objects, variant=args.variant
+            n_agents=args.n_agents,
+            n_objects=args.n_objects,
+            variant=args.variant,
+            arena_scale=args.arena_scale,
         )
     if args.manual:
         manual_control(env, seed=args.seed)

@@ -155,6 +155,7 @@ class Feudal_MAPPO_JAX_Runner:
                 reward_mode=reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
+                arena_scale=env_config.get("arena_scale", 1.0),
                 use_global_state=env_config.get("use_global_state", False),
             )
         elif environment == EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX:
@@ -189,6 +190,7 @@ class Feudal_MAPPO_JAX_Runner:
                 reward_mode=base_reward_mode,
                 variant=env_config.get("variant"),
                 coupling_def=env_config.get("coupling_def", "even"),
+                arena_scale=env_config.get("arena_scale", 1.0),
             )
             self.env = SyncMacroMJX(
                 base_env,

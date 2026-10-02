@@ -12,8 +12,8 @@ base_path: "/home/magraz/morphology-learning/experiments/results"
 # batches: ["smaclite_3s_vs_5z"]
 # batches: ["macro_mjx_16a_4o","mjx_16a_4o", "macro_mjx_16a_4o_dr", "macro_mjx_16a_4o_wdr", "macro_mjx_16a_4o_stagger", "macro_mjx_16a_4o_stagger_wdr", "macro_mjx_16a_4o_stagger_wdr_aligned"]
 # batches: ["mjx_6a_4o_1024_gs"]
-batches: ["mjx_1a_3o_111_1024_gs"]
-# batches: ["mjx_2a_4o_1122_1024"]
+# batches: ["mjx_1a_3o_111_1024_gs_sparse"]
+batches: ["mjx_2a_4o_1111_1024_gs"]
 
 # batches: ["smax_10m_vs_11m"]
 
@@ -23,9 +23,14 @@ batches: ["mjx_1a_3o_111_1024_gs"]
 # experiments: ["mlp", "feudal_film", "feudal_film_n001", "feudal_film_n001_dilated", "feudal_film_zerogoal", "feudal_film_n01", "feudal_film_n05", "feudal_film_zerogoal_dilated", "feudal_film_n01_dilated", "feudal_film_n05_dilated"]
 # experiments: ["mlp","feudal_film_local", "feudal_film_n01_local", "feudal_film_n05_local", "feudal_film_n001_local", "feudal_film_n01", "feudal_film_n05", "feudal_film_n001"]
 # experiments: ["mlp","feudal_film_local", "feudal_film_n01_local"]
-experiments: ["mlp", "feudal_film_zerogoal", "feudal_intrinsic", "feudal_intrinsic_local_private", 
-"feudal_n01", "feudal_n05", "feudal_film_n01_direction", "feudal_film_n01_waypoint",
-"feudal_n01_c50", "feudal_n05_c50"]
+experiments: ["mlp",
+# "feudal_n01", "feudal_n05", "feudal_film_n01_direction", "feudal_film_n01_waypoint",
+# "feudal_n01_c50", "feudal_n05_c50",
+# "simplified_feudal", "simplified_feudal_tanh", "simplified_feudal_gh16", "simplified_feudal_tanh_gh16",
+# "simplified_feudal_gh16_scaled_radius", "simplified_feudal_tanh_gh16_scaled_radius", "simplified_feudal_tanh_low_manager_entropy", "simplified_feudal_tanh_manager_gamma", 
+"simplified_feudal_tanh_relative_input", "simplified_feudal_tanh_local_input",
+"simplified_feudal_tanh_relative_input_cf", "simplified_feudal_tanh_relative_input_cf_hold", "simplified_feudal_tanh_local_input_cf"
+]
 
 # "feudal_n01", "feudal_n01_local_private", "feudal_n01_local_shared",
 # "feudal_n05", "feudal_n05_local_private", "feudal_n05_local_shared", "feudal_n05_local_private_shared",

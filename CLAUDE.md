@@ -722,6 +722,63 @@ uv run python train.py algorithm=mappo_jax env=mjx_1a_3o_111_1024_gs \
   compact state helps return needs full-length paired runs against
   `mjx_16a_4o_trunc_1024` at the same seeds.
 
+#### Larger arena (`arena_scale`, default 1.0, added 2026-10-01)
+
+`env.arena_scale` (>= 1.0) makes the boxes harder to find. The arena width is
+`round(base_world_width * arena_scale)`, where `base_world_width` is the usual
+`int(30 * max(1, (A+O)/8) ** 0.5)`. Everything laid out relative to the width
+scales with it: the agent spawn grid (bottom third), the box spawn band (middle
+30% of the height, 80% of the width), the goal band (`max(5, 5H/30)` tall), the
+wall planes, and position normalization (`_centre`/`_extent`, so `goal_state`
+and the compact global state stay in [-0.5, 0.5]).
+
+The sensing ranges do **not** scale. `sector_sensor_radius`, `lidar_range` and
+`comm_radius` stay at `base_world_width / 4`. Agent radius, box sizes, forces and
+speeds are unchanged.
+
+- **`arena_scale: 1.0` is bit-identical to the pre-flag env.** Verified over
+  1a/3o, 2a/4o, 6a/4o, 9a/3o, 12a/3o and 16a/4o, each with `variant` None and
+  `trunc`: 24 fields per config (geometry, both MuJoCo XMLs, spawn tables,
+  reset `qpos`, global state) have 0 differences.
+- **Plumbing:** forwarded at all four `MultiBoxPushMJX` construction sites
+  (bare + macro base, in `mappo_jax/run.py` and the `feudal_mappo_jax` copy),
+  so `simplified_feudal_mappo_jax` gets it through `make_env`. MJX-only; the
+  Box2D env and `MultiBoxMultiGoalPushMJX` have no equivalent. Both the renderer
+  CLI and the env demo take `--arena-scale`, e.g.
+  `uv run python -m environments.mjx_suite.renderer --manual --arena-scale 2`.
+- **Use a twin env group, never a CLI override.** Observation and global-state
+  widths do not change, so a `checkpoint=true` resume into the baseline's results
+  directory would load without error and keep training a different task. The
+  example arm is `conf/env/mjx_2a_4o_1122_1024_gs_arena1p5.yaml`, which
+  differs from `mjx_2a_4o_1122_1024_gs` only in `arena_scale: 1.5`.
+- **Measured effect** (2048 resets for sensing; 64 rollouts of a scripted team
+  that reads true box positions for travel time; `trunc`):
+
+  | config | scale | width / sensing radius | agents sensing no box at spawn | whole team blind at spawn | median step of first delivery (scripted) |
+  |---|---|---|---|---|---|
+  | 1a/3o | 1.0 / 1.5 / 2.0 | 30 / 45 / 60, R 7.5 | 83.1 / 95.1 / 98.8% | same | 139 / 211 / 299 |
+  | 2a/4o | 1.0 / 1.5 / 2.0 | 30 / 45 / 60, R 7.5 | 79.5 / 94.0 / 98.4% | 63.0 / 88.5 / 96.8% | 154 / 247 / 324 |
+  | 6a/4o | 1.0 / 1.5 / 2.0 | 33 / 50 / 66, R 8.25 | 73.6 / 94.9 / 98.3% | 18.3 / 74.4 / 90.8% | 171 / 271 / 365 |
+
+- **⚠ Travel time grows with the arena, and `max_steps` is not reachable from
+  Hydra.** None of the `run.py` branches forward `max_steps`, so every group runs
+  at the constructor default of 1024. A scripted team that knows every box
+  position takes ~1.6x / ~2.1x as long to its first delivery at scale 1.5 / 2.0,
+  before any search cost. A return gap against the scale-1 twin can therefore be
+  time as well as search. Raising `max_steps` also requires `params.n_steps >=
+  max_steps`, because `collect_fn` resets every env at the top of every rollout,
+  and that changes the per-update batch.
+- **Feature-scale side effects:** `nearest_box_vec` is divided by
+  `world_width` but capped at the fixed sensing radius, so its maximum magnitude
+  falls from 0.25 to `0.25 / arena_scale`. `goal_distance` keeps its [-1, 1]
+  range. Simplified feudal's `waypoint_radius` is a fraction of the width, so its
+  reach in world units grows with the scale. R = 0.15 was calibrated to the
+  32-step reach in a 30-wide arena; rescale it to `0.15 / arena_scale` to keep
+  the same reach. `validate_manager_input`'s `R*W >= lidar_range` warning fires
+  sooner, correctly.
+- Smoke-verified 2026-10-01 on the 1.5 group: `mappo_jax` train,
+  `checkpoint=true` resume and `evaluate=true` all run. **No training result.**
+
 #### `reward_mode="sparse"` (implemented, arm added 2026-09-04)
 
 One branch, no plumbing: `task_reward = completion + (shaping if self._dense
@@ -1374,6 +1431,9 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 # information-matched to mappo_jax: the manager reads only its own obs (2026-09-28):
 uv run python train.py algorithm=simplified_feudal_mappo_jax \
     env=mjx_1a_3o_111_1024_gs model=simplified_feudal_tanh_local_input trial_id=0
+# counterfactual-goal credit for the manager (2026-09-29, see its block below):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_cf trial_id=0
 ```
 
 - **Manager: PPO, one decision per window of `c = goal_horizon` env steps**
@@ -1430,7 +1490,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
   - The runner **subclasses `MAPPO_JAX_Runner`**, so the train loop, stats,
     checkpoint cadence, resume and `evaluate()` are inherited.
   - It overrides only `_make_train`, the four-train-state msgpack I/O
-    (`worker_*` / `manager_*` keys), and `view()`.
+    (`worker_*` / `manager_*` keys, plus `manager_adv*` under counterfactual
+    credit), and `view()`.
   - `collect_fn` returns a `Rollout(worker, manager, diagnostics)` bundle that the
     inherited loop passes through untouched. `update_fn` merges the diagnostics
     into the losses dict, which is how they reach the stats pickle.
@@ -1774,8 +1835,140 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     live-looking box flips it to +0.68. The four working seeds are insensitive
     to both edits. Hiding the count (e.g. only the K nearest undelivered boxes,
     or blanking random far boxes before any delivery) would close that channel.
+- **MEASURED 2026-09-29: eval returns per seed** (mean of the last 10 `reward`
+  evals, seeds 0-4; `*` = still a checkpoint, steps in brackets).
+  - **Dense, 1a/3o:** `relative_input` matches `mlp` on 4 of 5 seeds.
+    - `relative_input`: 315 / 313* (45M) / 307* (41M) / 328 / **107**. Seed 4
+      is the delivery-count leak above.
+    - `mlp`: 322-329.
+  - **Dense, 2a/4o:** `relative_input` does **not** match `mlp`; the ranges do
+    not overlap.
+    - `relative_input`: 309 / 298 / 291 / 299 / 181* (33M).
+    - `mlp`: 412-429.
+  - **Sparse twins:** `mjx_1a_3o_111_1024_gs_sparse` and
+    `mjx_2a_4o_1122_1024_gs_sparse` are the `_gs` groups with the one key
+    `reward_mode: sparse`. The maximum return is 300 / 400.
+  - **Sparse, 1a/3o:**
+    - `relative_input`: 291 / 290 / 291 / **0** / 284.
+    - `local_input`: 287 / 267 / 265 / 253 / 277. Every seed works, and it is
+      information-matched to `mlp`.
+    - `mlp`: 297 / 300 / 297 / **16** / 297.
+    - Every other simplified arm gets at most 100, i.e. one box.
+  - **Sparse, 2a/4o:** `mlp` reaches 343-390 at 73-81M steps (still running).
+    `relative_input` and `local_input` have not been run there, and
+    `local_input` has not been run on either dense group.
+- **Counterfactual-goal credit (`manager_credit: counterfactual`, added
+  2026-09-29): wired, verified, UNRUN.**
+  - **The problem it targets.** Under `team` credit (the default) `ppo_update`
+    copies the manager's one team advantage to every agent's waypoint
+    (`jnp.repeat`). That reinforces a free rider's waypoint whenever a teammate
+    delivers, and under tight coupling it punishes an agent waiting at a
+    two-agent box when its partner never comes.
+  - **The mechanism** (`counterfactual.py`):
+    ```
+    A_i = A_team − β·c_i
+    c_i = mean over K draws o'_i of Â_φ(x, o with only slot i replaced by o'_i)
+    ```
+    - `Â_φ` is a learned estimate of the team advantage from the manager
+      critic's input `x` and every agent's realized waypoint offset `o`
+      (`(w − s)/R`, from `waypoints.waypoint_offset`).
+    - `o'_i` are counterfactual goals for agent i alone, with teammates' goals
+      held fixed: K draws of its own rollout policy (`sampled`, the aristocrat
+      utility) or the zero offset (`hold`, the wonderful life utility with
+      "stay where you are" as the default action).
+    - β is a per-batch control-variate coefficient `Cov(A_team, c)/Var(c)`,
+      clipped to [0, 1] and 0 when `Var(c) < 1e-8`.
+  - **Why it is safe.**
+    - `c_i` never reads agent i's own goal, and the manager policy factors over
+      agents. So `c_i` is a baseline: it changes the variance of agent i's
+      gradient, never its expectation, however wrong `Â_φ` is (Wu et al., ICLR
+      2018). COMA uses its critic for the whole advantage instead.
+    - `Â_φ` is queried only on goal joints the policy could have produced.
+    - `Â_φ`'s head starts at exactly 0, so the arm starts as exact team credit.
+    - Both critics keep regressing the team return; only the actor's advantage
+      changes.
+  - **Knobs** (`Model_Params` → `FeudalConfig`, defaults = the original):
+    `manager_credit: team | counterfactual`, `counterfactual_default: sampled |
+    hold`, `counterfactual_samples` (K, default 16).
+  - **Arms** (one key each on their parents):
+    - `simplified_feudal_tanh_relative_input_cf`;
+    - `..._relative_input_cf_hold` (the `hold` ablation);
+    - `simplified_feudal_tanh_local_input_cf` (the information-matched twin).
+
+    Testbed: the `_gs` groups at N = 1 (negative control), 2 and 6
+    (`mjx_6a_4o_1024_gs`, couplings [4,3,3,2]). `mlp` exists on all three; the
+    team-credit parent still needs its 6a/4o seeds.
+  - **Wiring:**
+    - `ppo_update(advantage_correction=None)` in the SHARED `mappo_jax.mappo`
+      (the `squash=` precedent), and `MAPPOCritic.head_init_scale` (default
+      1.0; 0.0 = zero head). Both defaults are byte-identical.
+    - `HierTrainState.manager_adv` (None unless enabled) and
+      `Rollout.manager_goal` (`ManagerGoal(pos, offset)`).
+    - The branch `update_fn._counterfactual_credit`.
+    - Checkpoints gain `manager_adv` / `manager_adv_ts` only when enabled.
+      flax's `from_bytes` raises only when the TARGET has a key the file lacks,
+      so default checkpoints are unchanged.
+  - **Load-bearing details** (each pinned by a seam test):
+    - **Normalization.** Centre per (env, agent) stream but divide by the TEAM
+      advantage's per-env std. A per-(env, agent) std would rescale a free
+      rider's near-zero residual back to unit variance, re-amplifying the noise
+      the correction removed.
+    - **Ordering.** The counterfactual goals come from the PRE-update manager
+      actor, and are scored by the PRE-update `Â_φ` (fitted on earlier batches,
+      so c cannot fit this batch's noise). `Â_φ` is refitted last, on the raw
+      `A_team` (the same `compute_gae` call `ppo_update` makes), at the
+      manager's epoch and minibatch counts.
+    - **Random numbers.** The model's init and sampling keys come from
+      `fold_in`, so the default path's splits are unchanged.
+    - **Memory.** `correction` runs `jax.lax.map` over agents, so memory is
+      O(T·E·K·N), not O(T·E·K·N²).
+  - **Logged per update:**
+    - `manager_cf_beta` (read first: 0 = no correction applied);
+    - `manager_cf_correction_std`;
+    - `manager_cf_adv_var_ratio` (`Var(A_team − βc)/Var(A_team)`, below 1 =
+      variance removed);
+    - `manager_cf_model_ev` (explained variance of the pre-update `Â_φ` on
+      `A_team`);
+    - `manager_cf_goal_sensitivity`;
+    - `manager_cf_model_loss`.
+  - **⚠ β is ill-conditioned while the correction is tiny.** In the smoke run
+    below it jumped 0 → 0.55 → 0.09 → 0 → 0.75 → 1 → 1 → 0 with a correction
+    std of ~0.007, while `adv_var_ratio` stayed at 0.97–1.0. Read β together
+    with `adv_var_ratio`, not alone.
+  - **Verified 2026-09-29:**
+    - **Default paths.** A before/after snapshot on the CPU stub is
+      bit-identical: 0.0 max difference over simplified feudal init → collect →
+      update → eval (N ∈ {1, 3} × clip/tanh × all three `manager_input`s),
+      `ppo_update` (scalar/per-agent × continuous/discrete) and `MAPPOCritic`
+      init.
+    - **Tests.** 19 new seam tests (below). 102 pass across
+      `test_simplified_feudal.py` + `test_smax_seams.py` +
+      `test_mjx_global_state.py`.
+    - **Toy check** (team advantage = f(agent 0's goal) + g(agent 1's goal) +
+      noise, equal variances). After fitting:
+      - correlation with the agent's own term: 0.69–0.70 → 0.97;
+      - correlation with the teammate's term: 0.69–0.70 → 0.04;
+      - variance ratio 0.53–0.55;
+      - β = 0.95;
+      - model explained variance 0.98.
+    - **MJX smoke** (`mjx_2a_4o_1122_1024_gs`, `trial_id=smoke_cf`, 8 updates):
+      - train, `checkpoint=true` resume (the first five history entries kept)
+        and `evaluate=true` all work;
+      - the checkpoint's advantage model `Dense_0` is `(40, 336)`: 32 global
+        state + 4 positions + 4 offsets;
+      - a warm update takes 0.03–0.04 s against 0.6–0.9 s of collection.
+    - ⚠ A numeric `trial_id` indexes `conf/seeds/standard.yaml` (30 seeds), so
+      use a non-numeric id (seed 118) for smoke runs.
+  - **⚠ No training result.** Acceptance:
+    - `_cf` ≥ its parent at matched seeds with a paired confidence interval at
+      N ≥ 2, and no difference at N = 1;
+    - `manager_cf_beta` > 0 and `adv_var_ratio` < 1 once the model has signal.
+
+    Expect little at N = 2 (one teammate to remove). In a reward desert `Â_φ`
+    learns nothing and this is team credit. The fork-based audit (learned `c_i`
+    vs the simulator's exact counterfactual) is deliberately not built yet.
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
-  57 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
+  76 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;
   - the worker reward telescopes;
   - freeze + reset at the boundary;
@@ -1807,7 +2000,24 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     disagrees with it is rejected;
   - `make_feudal_config` wires `manager_gamma` / `manager_ent_coef` to the
     manager only, and a different manager entropy coefficient leaves the
-    worker's update bit-identical while changing the manager's.
+    worker's update bit-identical while changing the manager's;
+  - counterfactual credit (19 tests):
+    - it is off by default;
+    - a zero `advantage_correction` reproduces the team update, and a
+      correction on per-agent rewards is rejected;
+    - the counterfactual arm starts as exact team credit: the same rollout, a
+      zero model output, β = 0, a bit-identical worker update and a manager
+      update within 1e-5;
+    - agent i's correction is bit-identical when its own goal is edited and
+      moves for its teammates (the unbiasedness precondition);
+    - `own_slot_joint` changes only slot i;
+    - `sampled` draws come from the given actor, and `hold` is zero;
+    - `fit_beta` scales, clips and handles a constant correction;
+    - the toy mechanism check;
+    - end-to-end collect/update/eval under both defaults;
+    - config validation and the one-agent warning;
+    - `make_feudal_config` wiring;
+    - checkpoint trees carry the model only when it is enabled.
 
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 
