@@ -16,8 +16,8 @@ env:
   n_envs: 32
   n_agents: 2
   n_objects: 4
-  reward_mode: dense
+  reward_mode: sparse
   variant: trunc
   use_global_state: true
   coupling_def: [1,1,2,2]
-  arena_scale: 1.5
+  arena_scale: 2.0

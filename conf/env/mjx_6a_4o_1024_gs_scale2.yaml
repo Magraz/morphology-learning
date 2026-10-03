@@ -33,3 +33,5 @@ env:
   variant: trunc
   use_global_state: true
   coupling_def: [4,3,3,2]
+  arena_scale: 2.0
+
