@@ -180,12 +180,15 @@ def ppo_update(
             entropy bonus is the squashed entropy (`evaluate_action`). Off by
             default; off is byte-identical to the code before the flag.
         advantage_correction: optional (n_steps, n_envs, n_agents) per-agent
-            baseline subtracted from the TEAM advantage, giving each agent its
-            own actor advantage while the critic keeps regressing the team
-            return. Team rewards only. The caller must guarantee that agent i's
-            correction does not depend on agent i's own action, or the policy
-            gradient is biased (the simplified feudal stack's counterfactual
-            credit, `simplified_feudal_mappo_jax.counterfactual`). None (the
+            term SUBTRACTED from the TEAM advantage, giving each agent its own
+            actor advantage while the critic keeps regressing the team return.
+            Team rewards only. Two uses, which differ in what they promise:
+            a correction that does not depend on agent i's own action is a
+            baseline and leaves the expected policy gradient unchanged (the
+            simplified feudal stack's `counterfactual` credit); one that does
+            depend on it is SHAPING and changes the objective on purpose (its
+            `dpp` credit, which passes the negated D++ term so that it is
+            added). See `simplified_feudal_mappo_jax.counterfactual`. None (the
             default) is byte-identical to the code before the argument.
 
     Returns:

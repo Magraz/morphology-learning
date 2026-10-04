@@ -1,4 +1,5 @@
-"""Counterfactual-goal credit for the manager (`manager_credit: counterfactual`).
+"""Counterfactual-goal credit for the manager (`manager_credit: counterfactual`
+or `dpp`).
 
 By default the manager's PPO gives every agent's waypoint the same TEAM advantage
 (`ppo_update` repeats the env-level GAE advantage over agents). That has two
@@ -38,6 +39,27 @@ Why this is safe:
 What it cannot do: create a signal where no team reward was observed. If no
 coalition ever paid off, `Â_φ` stays flat, `beta` -> 0, and this is team credit.
 
+`manager_credit: dpp` uses the same model `Â_φ` for a D++ term instead (after
+Rahmattalabi, Chung, Colby and Tumer, IROS 2016, which adds n hypothetical copies
+of agent i and asks how much the team objective would rise):
+
+    A_i      = A_team + eta * max(0, D++_i)
+    D++_i    = max over n = 1..n_max of D++_i(n)
+    D++_i(n) = [Â(x, o++(i, n)) - Â(x, o)] / n
+
+* `o++(i, n)` is the realized joint goal with agent i's own goal kept and its n
+  nearest teammates' goals replaced by a waypoint toward agent i's position,
+  bounded exactly like a manager waypoint (`support_offsets`).
+* `Â(x, o') - Â(x, o) = Q(x, o') - Q(x, o)`: the state value cancels, so the
+  advantage model serves as the joint-goal critic. No simulator is forked.
+* Unlike `counterfactual`, this term READS agent i's own goal (kept in `o++`, and
+  part of `o`). It is shaping, not a baseline: it changes the expected gradient,
+  crediting a goal that would pay off if teammates came to it before any of
+  them does (D++'s stepping-stone signal). The objective is therefore biased
+  toward supportable goals by design.
+* The clip at zero mirrors D++'s fall-back to the plain difference reward when
+  adding agents does not help: agent i then gets the team advantage.
+
 Everything here is pure and jittable; the trainer calls it once per update.
 """
 
@@ -54,7 +76,11 @@ from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 # How each agent's waypoint is credited.
 #   team           — the original: every agent gets the team advantage.
 #   counterfactual — the team advantage minus the agent's counterfactual baseline.
-MANAGER_CREDITS = ("team", "counterfactual")
+#   dpp            — the team advantage plus the agent's D++ term (shaping).
+MANAGER_CREDITS = ("team", "counterfactual", "dpp")
+# The modes that build, train and query the joint-goal advantage model `Â_φ`,
+# and store each decision's goals (`ManagerGoal`) for it.
+GOAL_MODEL_CREDITS = ("counterfactual", "dpp")
 # Which counterfactual goals the baseline averages over.
 #   sampled — K draws from the agent's own rollout policy (aristocrat utility).
 #   hold    — the zero offset: the agent stays where it is (wonderful life utility).
@@ -79,11 +105,24 @@ def validate_manager_credit(config, n_agents: int) -> None:
         raise ValueError(
             f"counterfactual_samples must be >= 1, got {config.counterfactual_samples}"
         )
+    if config.dpp_coef < 0:
+        raise ValueError(f"dpp_coef must be >= 0, got {config.dpp_coef}")
+    if config.dpp_max_recruits is not None and config.dpp_max_recruits < 1:
+        raise ValueError(
+            f"dpp_max_recruits must be >= 1 or None, got {config.dpp_max_recruits}"
+        )
     if config.manager_credit == "counterfactual" and n_agents == 1:
         warnings.warn(
             "manager_credit='counterfactual' with one agent: there are no teammates "
             "to remove, so the correction is only a learned state baseline and the "
             "arm should match team credit (useful as the negative control).",
+            stacklevel=2,
+        )
+    if config.manager_credit == "dpp" and n_agents == 1:
+        warnings.warn(
+            "manager_credit='dpp' with one agent: there are no teammates to recruit, "
+            "so the D++ term is exactly 0 and the arm equals team credit (useful as "
+            "the negative control).",
             stacklevel=2,
         )
 
@@ -214,6 +253,12 @@ def fit_adv_model(adv_ts, inputs, targets, rng, n_epochs, n_minibatches):
     return adv_ts, losses.mean()
 
 
+def model_explained_variance(a_team, fitted):
+    """Explained variance of the PRE-update `Â_φ(x, o)` on this batch's `A_team`:
+    how much of the team advantage the goals predict at all."""
+    return 1.0 - jnp.var(a_team - fitted) / (jnp.var(a_team) + 1e-8)
+
+
 def credit_diagnostics(a_team, c, beta, sensitivity, fitted):
     """Scalars logged per update (prefixed `manager_cf_` by the trainer).
 
@@ -232,6 +277,112 @@ def credit_diagnostics(a_team, c, beta, sensitivity, fitted):
         "beta": beta,
         "correction_std": jnp.std(c),
         "adv_var_ratio": jnp.var(a - beta * c) / var_a,
-        "model_ev": 1.0 - jnp.var(a_team - fitted) / (jnp.var(a_team) + 1e-8),
+        "model_ev": model_explained_variance(a_team, fitted),
         "goal_sensitivity": sensitivity.mean(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# D++ (`manager_credit: dpp`)
+# ---------------------------------------------------------------------------
+
+
+def support_offsets(pos, i, radius, direction=1.0):
+    """`(..., N, 2)` every agent's offset `(w - s) / R` for a waypoint toward agent
+    i's position: `clip(s_j + R * clip((s_i - s_j) / R, -1, 1), arena)`.
+    `direction=-1.0` mirrors the step AWAY from agent i, the same move in the
+    opposite direction; it exists only as `dpp_probe`'s control.
+
+    Built by `waypoints.waypoint_offset` with the `clip` bound, i.e. exactly as a
+    manager waypoint is bounded, so every support goal is a legal manager output
+    and `Â_φ` is queried inside its input range. Agent i's own entry is 0 (it is
+    already there) and is never used: `dpp_joint` keeps agent i's real goal.
+    `i` may be traced.
+    """
+    focal = jnp.take(pos, i, axis=-2)[..., None, :]  # (..., 1, 2)
+    step = direction * (focal - pos) / radius
+    return wp.waypoint_offset(pos, step, radius, "clip")
+
+
+def recruit_mask(pos, i, n):
+    """`(..., N)` bool — agent i's n nearest teammates (never agent i itself).
+    `i` and `n` may be traced; ties are broken by agent index."""
+    focal = jnp.take(pos, i, axis=-2)[..., None, :]
+    dist = jnp.linalg.norm(pos - focal, axis=-1)  # (..., N)
+    dist = jnp.where(jnp.arange(pos.shape[-2]) == i, jnp.inf, dist)
+    rank = jnp.argsort(jnp.argsort(dist, axis=-1), axis=-1)  # 0 = nearest
+    return rank < n
+
+
+def dpp_joint(offsets, pos, i, n, radius, direction=1.0):
+    """`(..., N, 2)` the D++ counterfactual joint goal `o++(i, n)`: the realized
+    offsets with agent i's n nearest teammates sent toward agent i
+    (`support_offsets`). Agent i's own goal and every other teammate's are kept."""
+    support = support_offsets(pos, i, radius, direction)
+    return jnp.where(recruit_mask(pos, i, n)[..., None], support, offsets)
+
+
+def dpp_credit(
+    adv_ts, critic_in, offsets, pos, radius, max_recruits=None, direction=1.0
+):
+    """`(dpp, best_n)`, each `(T, E, N)` — agent i's D++ term and the recruit
+    count that achieves it.
+
+        D++_i(n) = [Â(x, o++(i, n)) - Â(x, o)] / n,   D++_i = max over n of D++_i(n)
+
+    for n = 1 .. min(max_recruits, N - 1). Unclipped: `dpp_correction` applies the
+    clip and the coefficient. Exactly 0 (and `best_n` 0) when there are no
+    teammates. Pure critic forward passes, `N * n_max` per decision; `jax.lax.map`
+    over agents and recruit counts keeps memory at O(T*E*N). `direction` is
+    `support_offsets`'; training always uses the default 1.0.
+    """
+    n_agents = offsets.shape[-2]
+    n_max = n_agents - 1 if max_recruits is None else min(max_recruits, n_agents - 1)
+    if n_max < 1:
+        zeros = jnp.zeros(offsets.shape[:-1], critic_in.dtype)
+        return zeros, zeros
+
+    base = adv_ts.apply_fn(adv_ts.params, adv_model_input(critic_in, offsets))  # (T, E)
+    counts = jnp.arange(1, n_max + 1)
+
+    def one_agent(i):
+        def one_count(n):
+            joint = dpp_joint(offsets, pos, i, n, radius, direction)
+            value = adv_ts.apply_fn(adv_ts.params, adv_model_input(critic_in, joint))
+            return (value - base) / n
+
+        return jax.lax.map(one_count, counts)  # (n_max, T, E)
+
+    gains = jax.lax.map(one_agent, jnp.arange(n_agents))  # (N, n_max, T, E)
+    dpp = jnp.moveaxis(gains.max(axis=1), 0, -1)  # (T, E, N)
+    best_n = jnp.moveaxis(gains.argmax(axis=1) + 1, 0, -1).astype(dpp.dtype)
+    return dpp, best_n
+
+
+def dpp_correction(dpp, coef):
+    """The `advantage_correction` handed to `ppo_update`, which SUBTRACTS it from
+    the team advantage: `-coef * max(0, D++_i)`, so that
+    `A_i = A_team + coef * max(0, D++_i)`."""
+    return -coef * jnp.maximum(dpp, 0.0)
+
+
+def dpp_diagnostics(a_team, dpp, best_n, coef):
+    """Scalars logged per update (prefixed `manager_dpp_` by the trainer).
+
+    * `mean` / `std` — of the clipped term `max(0, D++_i)`.
+    * `positive_frac` — share of (decision, agent) entries where support would
+      help, i.e. where the term is applied at all. Read this first: 0 means the
+      arm is team credit.
+    * `mean_best_n` — mean recruit count over those entries.
+    * `adv_shift` — `std(coef * clipped) / std(A_team)`: how much of each agent's
+      advantage signal the term supplies.
+    """
+    clipped = jnp.maximum(dpp, 0.0)
+    positive = (dpp > 0.0).astype(dpp.dtype)
+    return {
+        "mean": clipped.mean(),
+        "std": clipped.std(),
+        "positive_frac": positive.mean(),
+        "mean_best_n": (best_n * positive).sum() / jnp.maximum(positive.sum(), 1.0),
+        "adv_shift": jnp.std(coef * clipped) / (jnp.std(a_team) + 1e-8),
     }

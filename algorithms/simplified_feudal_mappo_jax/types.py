@@ -51,16 +51,24 @@ class Model_Params:
     # (waypoints.MANAGER_INPUTS). "global" is the original behaviour; "local"
     # (own observation only) is the one information-matched to flat mappo_jax.
     manager_input: str = "global"
-    # "team" | "counterfactual": how each agent's waypoint is credited
+    # "team" | "counterfactual" | "dpp": how each agent's waypoint is credited
     # (counterfactual.MANAGER_CREDITS). "team" is the original behaviour: every
     # agent gets the team advantage. "counterfactual" subtracts a per-agent
-    # baseline from a learned goal-conditioned advantage model.
+    # baseline from a learned goal-conditioned advantage model. "dpp" adds a
+    # per-agent D++ term from the same model (shaping, not a baseline).
     manager_credit: str = "team"
     # "sampled" | "hold": the counterfactual goals that baseline averages over
     # (counterfactual.COUNTERFACTUAL_DEFAULTS). Read only under "counterfactual".
     counterfactual_default: str = "sampled"
     # K, the number of draws per agent under "sampled" (ignored by "hold").
     counterfactual_samples: int = 16
+    # eta, the weight of the D++ term: A_i = A_team + eta * max(0, D++_i). Read
+    # only under "dpp". 1.0 credits each goal with the better of the realized
+    # joint outcome and the outcome had teammates come to the agent.
+    dpp_coef: float = 1.0
+    # Largest number of recruits the D++ search tries. None = every teammate
+    # (N - 1). Read only under "dpp".
+    dpp_max_recruits: Optional[int] = None
 
 
 @dataclass
@@ -94,12 +102,15 @@ class FeudalConfig:
     manager_credit: str = "team"
     counterfactual_default: str = "sampled"
     counterfactual_samples: int = 16
+    dpp_coef: float = 1.0
+    dpp_max_recruits: Optional[int] = None
 
 
 class ManagerGoal(NamedTuple):
     """Per-decision goal record, stored only under `manager_credit:
-    counterfactual` (the advantage model's goal input and the counterfactual
-    goals' reference point). Leading dims `(n_windows, n_envs, n_agents)`."""
+    counterfactual` or `dpp` (the advantage model's goal input and the
+    counterfactual goals' reference point). Leading dims
+    `(n_windows, n_envs, n_agents)`."""
 
     pos: jax.Array  # (..., 2) each agent's goal_state position at the decision
     offset: jax.Array  # (..., 2) realized waypoint offset (w - s) / R
@@ -116,7 +127,7 @@ class Rollout(NamedTuple):
     worker: object  # mappo_jax Transition, leading dim n_steps
     manager: object  # mappo_jax Transition, leading dim n_windows
     diagnostics: dict  # scalar rollout diagnostics, merged into the losses
-    manager_goal: object = None  # ManagerGoal under counterfactual credit, else None
+    manager_goal: object = None  # ManagerGoal under counterfactual / dpp credit, else None
 
 
 class LastValues(NamedTuple):

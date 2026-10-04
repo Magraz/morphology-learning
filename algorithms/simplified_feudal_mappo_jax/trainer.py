@@ -31,7 +31,9 @@ Like `mappo_jax`, every rollout starts from freshly reset envs.
 Manager credit (`manager_credit`): under `team` (the default) every agent's
 waypoint gets the team advantage. Under `counterfactual` each agent's advantage
 is corrected by a baseline from a learned goal-conditioned advantage model,
-averaged over counterfactual goals for that agent alone (`counterfactual.py`).
+averaged over counterfactual goals for that agent alone. Under `dpp` the same
+model supplies a D++ term instead: the gain had the agent's nearest teammates
+been sent toward it (`counterfactual.py`).
 """
 
 import math
@@ -75,9 +77,10 @@ SATURATION_TOL = 0.99
 class HierTrainState(NamedTuple):
     worker: ActorCriticTrainState
     manager: ActorCriticTrainState
-    # The counterfactual advantage model (a flax TrainState), built only under
-    # `manager_credit: counterfactual`. None (an empty pytree) otherwise, so the
-    # default train state, and every checkpoint written from it, is unchanged.
+    # The joint-goal advantage model (a flax TrainState), built only under
+    # `manager_credit: counterfactual` or `dpp`. None (an empty pytree)
+    # otherwise, so the default train state, and every checkpoint written from
+    # it, is unchanged.
     manager_adv: object = None
 
 
@@ -153,7 +156,7 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
     The worker critic has one value head per agent (each agent has its own
     waypoint and hence its own return) and keeps that axis at one agent. The
     manager critic is a scalar team value. Under `manager_credit:
-    counterfactual` a third network, the advantage model, reads the manager
+    counterfactual` or `dpp` a third network, the advantage model, reads the manager
     critic's input plus every agent's goal offset; its key comes from `fold_in`,
     so the worker and manager initializations are the same in either mode.
     """
@@ -185,7 +188,7 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
         discrete=False,
     )
     manager_adv = None
-    if config.manager_credit == "counterfactual":
+    if config.manager_credit in cf.GOAL_MODEL_CREDITS:
         manager_adv = cf.create_adv_model(
             jax.random.fold_in(rng, 2),
             config.manager,
@@ -258,9 +261,7 @@ def make_policy(config: FeudalConfig, env) -> Policy:
 
     def act(worker_ts, obs, pos, waypoint, k, rng, deterministic=False):
         error = wp.goal_error(waypoint, pos, radius)
-        actor_in = wp.worker_actor_input(
-            obs, error, wp.remaining_fraction(k, horizon)
-        )
+        actor_in = wp.worker_actor_input(obs, error, wp.remaining_fraction(k, horizon))
         action, log_prob = _act(worker_ts, actor_in, rng, deterministic)
         return action, log_prob, actor_in
 
@@ -295,7 +296,7 @@ def make_train(config: FeudalConfig, env):
     horizon, radius = config.goal_horizon, config.waypoint_radius
     # Static: store each decision's goals and correct the manager's per-agent
     # advantages (counterfactual.py). False is the original code path.
-    credit_on = config.manager_credit == "counterfactual"
+    credit_on = config.manager_credit in cf.GOAL_MODEL_CREDITS
     if wcfg.n_steps % horizon:
         raise ValueError(
             f"n_steps ({wcfg.n_steps}) must be a multiple of goal_horizon "
@@ -357,9 +358,7 @@ def make_train(config: FeudalConfig, env):
             train_state.worker, obs, pos, waypoint, k, action_rng
         )
 
-        next_obs, next_state, _, terminated, truncated, info = v_step(
-            env_state, action
-        )
+        next_obs, next_state, _, terminated, truncated, info = v_step(env_state, action)
         team_reward = info["task_reward"]
         done = terminated | truncated
         # No reset happens inside a window, so this is the TRUE successor.
@@ -492,7 +491,10 @@ def make_train(config: FeudalConfig, env):
             m_done.any(), _restart, lambda operand: operand, (obs, env_state)
         )
         return (train_state, env_state, obs, rng), (
-            w_traj, m_transition, diagnostics, goal
+            w_traj,
+            m_transition,
+            diagnostics,
+            goal,
         )
 
     @jax.jit
@@ -538,7 +540,9 @@ def make_train(config: FeudalConfig, env):
         return (
             RunnerState(train_state=train_state, rng=rng),
             Rollout(
-                worker=w_traj, manager=m_traj, diagnostics=diagnostics,
+                worker=w_traj,
+                manager=m_traj,
+                diagnostics=diagnostics,
                 manager_goal=goal,
             ),
             last_values,
@@ -547,63 +551,112 @@ def make_train(config: FeudalConfig, env):
 
     # ------------------------------------------------------------------ update
 
-    def _counterfactual_credit(train_state, rollout, last_values, rng):
-        """Per-agent correction of the manager's team advantage (counterfactual.py).
+    def _manager_credit(train_state, rollout, last_values, rng):
+        """Per-agent correction of the manager's team advantage, from the
+        joint-goal advantage model `Â_φ` (counterfactual.py).
 
-        Returns `(beta * c, refitted advantage model, logged scalars)`. Order
-        matters: the counterfactual goals are drawn from the PRE-update manager
-        actor (the policy that acted), and they are scored by the PRE-update
-        advantage model, which was fitted on earlier batches, so the correction
-        cannot fit this batch's noise. The model is refitted on this batch last.
+        `counterfactual`: `beta * c`, a baseline (never reads the agent's own goal).
+        `dpp`: `-eta * max(0, D++_i)`, shaping (`ppo_update` subtracts the
+        correction, so the D++ term is ADDED to the agent's advantage).
+
+        Returns `(correction, refitted advantage model, logged scalars)`. Order
+        matters: the correction is scored by the PRE-update model, fitted on
+        earlier batches, so it cannot fit this batch's noise; under
+        `counterfactual` the counterfactual goals are also drawn from the
+        PRE-update manager actor (the policy that acted). The model is refitted
+        on this batch last, in both modes.
         """
         m, goal = rollout.manager, rollout.manager_goal
         # The same team advantage `ppo_update` computes internally.
         a_team, _ = compute_gae(
-            m.reward, m.value, m.done.astype(jnp.float32), last_values.manager,
-            mcfg.gamma, mcfg.gae_lambda,
+            m.reward,
+            m.value,
+            m.done.astype(jnp.float32),
+            last_values.manager,
+            mcfg.gamma,
+            mcfg.gae_lambda,
         )
-        cf_offsets = cf.counterfactual_offsets(
-            train_state.manager.actor_ts, m.obs, goal.pos,
-            jax.random.fold_in(rng, 1), config.counterfactual_samples,
-            radius, config.manager_action_bound, config.counterfactual_default,
-        )
-        c, sensitivity = cf.correction(
-            train_state.manager_adv, m.global_state, goal.offset, cf_offsets
-        )
-        beta = cf.fit_beta(a_team, c)
         inputs = cf.adv_model_input(m.global_state, goal.offset)
         fitted = train_state.manager_adv.apply_fn(
             train_state.manager_adv.params, inputs
         )
-        stats = cf.credit_diagnostics(a_team, c, beta, sensitivity, fitted)
+        if config.manager_credit == "counterfactual":
+            cf_offsets = cf.counterfactual_offsets(
+                train_state.manager.actor_ts,
+                m.obs,
+                goal.pos,
+                jax.random.fold_in(rng, 1),
+                config.counterfactual_samples,
+                radius,
+                config.manager_action_bound,
+                config.counterfactual_default,
+            )
+            c, sensitivity = cf.correction(
+                train_state.manager_adv, m.global_state, goal.offset, cf_offsets
+            )
+            beta = cf.fit_beta(a_team, c)
+            correction = beta * c
+            stats = {
+                f"manager_cf_{k}": v
+                for k, v in cf.credit_diagnostics(
+                    a_team, c, beta, sensitivity, fitted
+                ).items()
+            }
+        else:  # dpp
+            dpp, best_n = cf.dpp_credit(
+                train_state.manager_adv,
+                m.global_state,
+                goal.offset,
+                goal.pos,
+                radius,
+                config.dpp_max_recruits,
+            )
+            correction = cf.dpp_correction(dpp, config.dpp_coef)
+            stats = {
+                f"manager_dpp_{k}": v
+                for k, v in cf.dpp_diagnostics(
+                    a_team, dpp, best_n, config.dpp_coef
+                ).items()
+            }
+            # The critic's own fit, under the same key as the counterfactual arm.
+            stats["manager_cf_model_ev"] = cf.model_explained_variance(a_team, fitted)
         manager_adv, model_loss = cf.fit_adv_model(
-            train_state.manager_adv, inputs, a_team, jax.random.fold_in(rng, 2),
-            mcfg.n_epochs, mcfg.n_minibatches,
+            train_state.manager_adv,
+            inputs,
+            a_team,
+            jax.random.fold_in(rng, 2),
+            mcfg.n_epochs,
+            mcfg.n_minibatches,
         )
-        stats["model_loss"] = model_loss
-        return (
-            beta * c,
-            manager_adv,
-            {f"manager_cf_{k}": v for k, v in stats.items()},
-        )
+        stats["manager_cf_model_loss"] = model_loss
+        return correction, manager_adv, stats
 
     @jax.jit
     def update_fn(runner_state: RunnerState, rollout: Rollout, last_values):
         train_state, rng = runner_state
         rng, worker_rng, manager_rng = jax.random.split(rng, 3)
         worker, worker_losses = ppo_update(
-            train_state.worker, worker_rng, rollout.worker, last_values.worker,
-            wcfg, discrete=False,
+            train_state.worker,
+            worker_rng,
+            rollout.worker,
+            last_values.worker,
+            wcfg,
+            discrete=False,
         )
         correction, manager_adv, credit_stats = None, train_state.manager_adv, {}
         if credit_on:
             # Keys come from fold_in, so the default path's splits are unchanged.
-            correction, manager_adv, credit_stats = _counterfactual_credit(
+            correction, manager_adv, credit_stats = _manager_credit(
                 train_state, rollout, last_values, manager_rng
             )
         manager, manager_losses = ppo_update(
-            train_state.manager, manager_rng, rollout.manager, last_values.manager,
-            mcfg, discrete=False, squash=config.manager_action_bound == "tanh",
+            train_state.manager,
+            manager_rng,
+            rollout.manager,
+            last_values.manager,
+            mcfg,
+            discrete=False,
+            squash=config.manager_action_bound == "tanh",
             advantage_correction=correction,
         )
         losses = {f"worker_{k}": v for k, v in worker_losses.items()}

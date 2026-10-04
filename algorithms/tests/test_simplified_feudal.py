@@ -134,6 +134,8 @@ def _config(
     manager_credit="team",
     counterfactual_default="sampled",
     counterfactual_samples=4,
+    dpp_coef=1.0,
+    dpp_max_recruits=None,
 ):
     worker = MAPPOConfig(
         n_steps=n_steps,
@@ -159,6 +161,8 @@ def _config(
         manager_credit=manager_credit,
         counterfactual_default=counterfactual_default,
         counterfactual_samples=counterfactual_samples,
+        dpp_coef=dpp_coef,
+        dpp_max_recruits=dpp_max_recruits,
     )
 
 
@@ -763,9 +767,12 @@ def test_counterfactual_credit_is_off_by_default(n_agents):
     new_state, losses = update_fn(runner_state, rollout, last)
     assert new_state.train_state.manager_adv is None
     assert not [key for key in losses if key.startswith("manager_cf_")]
+    assert not [key for key in losses if key.startswith("manager_dpp_")]
     defaults = {f.name: f.default for f in dataclasses.fields(Model_Params)}
     assert defaults["manager_credit"] == "team"
     assert defaults["counterfactual_default"] == "sampled"
+    assert defaults["dpp_coef"] == 1.0
+    assert defaults["dpp_max_recruits"] is None
 
 
 @pytest.mark.parametrize("n_agents", [1, 3])
@@ -977,6 +984,7 @@ def test_counterfactual_collect_update_eval_end_to_end(n_agents, default):
         "manager_policy_loss", "manager_value_loss",
     ):
         assert np.isfinite(float(losses[key])), key
+    assert not [key for key in losses if key.startswith("manager_dpp_")]
     assert 0.0 <= float(losses["manager_cf_beta"]) <= 1.0
     assert float(losses["manager_cf_correction_std"]) > 0.0
     assert _tree_max_diff(
@@ -1054,3 +1062,255 @@ def test_checkpoint_trees_carry_the_advantage_model_only_when_enabled():
         to_bytes(Runner._checkpoint_tree(moved, eval_rng)),
     )
     assert _tree_max_diff(restored["manager_adv_ts"].params, moved_adv.params) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# D++ credit (`manager_credit: dpp`)
+# ---------------------------------------------------------------------------
+
+
+class _IndicatorCritic(NamedTuple):
+    """A hand-built joint-goal critic for exact checks of the D++ arithmetic.
+
+    Its value is `sum_j w_j * [agent j's goal differs from ORIGINAL]`, so the gain
+    of recruiting a set of teammates is the sum of their weights, known in
+    closed form. `params` are the weights `w`; the input layout is
+    `adv_model_input`'s (critic input of width `C`, then every agent's offset).
+    """
+
+    params: jnp.ndarray
+    C: int
+
+    def apply_fn(self, w, x):
+        off = x[..., self.C :].reshape(x.shape[:-1] + (-1, 2))
+        changed = jnp.linalg.norm(off - ORIGINAL, axis=-1) > 1e-6
+        return (changed * w).sum(axis=-1)
+
+
+ORIGINAL = 0.9  # every realized offset in the hand-built batch is (0.9, 0.9)
+# Agent 1 is nearest agent 0 and agent 2 is farther; agent 0 is nearest agent 1.
+DPP_POS = jnp.array([[[[0.0, 0.0], [0.05, 0.0], [0.3, 0.0]]]])  # (T=1, E=1, N=3, 2)
+
+
+def _dpp_batch(weights, max_recruits=None):
+    critic = _IndicatorCritic(params=jnp.asarray(weights, jnp.float32), C=2)
+    critic_in = jnp.zeros((1, 1, 2))
+    offsets = jnp.full((1, 1, 3, 2), ORIGINAL)
+    dpp, best_n = cf.dpp_credit(
+        critic, critic_in, offsets, DPP_POS, RADIUS, max_recruits
+    )
+    return np.asarray(dpp[0, 0]), np.asarray(best_n[0, 0])
+
+
+def test_support_offsets_point_at_the_focal_agent_within_radius_and_arena():
+    pos = jax.random.uniform(jax.random.PRNGKey(0), (5, 4, 2), minval=-0.5, maxval=0.5)
+    for i in range(4):
+        off = np.asarray(cf.support_offsets(pos, i, RADIUS))
+        assert np.abs(off).max() <= 1.0 + 1e-6  # within R per axis
+        waypoint = np.asarray(pos) + RADIUS * off
+        assert np.abs(waypoint).max() <= wp.ARENA_HALF_EXTENT + 1e-6
+        to_focal = np.asarray(pos[:, i : i + 1] - pos)
+        others = [j for j in range(4) if j != i]
+        # Each axis moves toward the focal agent, by the full gap when it is
+        # within R and by exactly R otherwise.
+        np.testing.assert_allclose(
+            off[:, others],
+            np.clip(to_focal[:, others] / RADIUS, -1.0, 1.0),
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(off[:, i], 0.0, atol=1e-6)
+
+
+def test_dpp_joint_keeps_the_focal_goal_and_changes_only_the_nearest_teammates():
+    keys = jax.random.split(jax.random.PRNGKey(1), 2)
+    pos = jax.random.uniform(keys[0], (6, 4, 2), minval=-0.4, maxval=0.4)
+    offsets = jax.random.uniform(keys[1], (6, 4, 2), minval=-1, maxval=1)
+    for i in range(4):
+        support = np.asarray(cf.support_offsets(pos, i, RADIUS))
+        dist = np.linalg.norm(np.asarray(pos - pos[:, i : i + 1]), axis=-1)
+        dist[:, i] = np.inf
+        order = np.argsort(dist, axis=-1)
+        for n in (1, 2, 3):
+            joint = np.asarray(cf.dpp_joint(offsets, pos, i, n, RADIUS))
+            for b in range(pos.shape[0]):
+                recruits = set(order[b, :n].tolist())
+                assert i not in recruits
+                for j in range(4):
+                    expected = support[b, j] if j in recruits else offsets[b, j]
+                    np.testing.assert_array_equal(joint[b, j], np.asarray(expected))
+
+
+def test_dpp_divides_by_the_recruit_count_and_takes_the_best_count():
+    # Focal 0: n=1 recruits agent 1 (gain w1), n=2 adds agent 2 ((w1 + w2) / 2).
+    dpp, best_n = _dpp_batch([0.0, 2.0, 6.0])
+    assert dpp[0] == pytest.approx(4.0) and best_n[0] == 2
+    # Focal 1: n=1 recruits agent 0 (w0 = 0), n=2 adds agent 2 ((0 + 6) / 2).
+    assert dpp[1] == pytest.approx(3.0) and best_n[1] == 2
+    dpp, best_n = _dpp_batch([0.0, 2.0, 1.0])
+    assert dpp[0] == pytest.approx(2.0) and best_n[0] == 1  # (2 + 1) / 2 < 2
+    dpp, best_n = _dpp_batch([0.0, 2.0, 6.0], max_recruits=1)
+    assert dpp[0] == pytest.approx(2.0) and best_n[0] == 1
+    # A recruitment that hurts: the raw term is negative, the correction is 0.
+    dpp, _ = _dpp_batch([0.0, -2.0, -6.0])
+    assert dpp[0] == pytest.approx(-2.0)
+    assert float(jnp.abs(cf.dpp_correction(jnp.asarray(dpp), 1.0)).max()) == 0.0
+
+
+def test_dpp_correction_adds_the_clipped_term_to_the_advantage():
+    """`ppo_update` subtracts the correction, so it is minus the clipped term."""
+    dpp = jnp.array([-1.0, 0.0, 0.5, 2.0])
+    np.testing.assert_array_equal(
+        np.asarray(cf.dpp_correction(dpp, 0.5)), [0.0, 0.0, -0.25, -1.0]
+    )
+
+
+def test_dpp_is_zero_without_teammates_and_with_a_zero_model():
+    critic_in, offsets, _ = _credit_inputs(n_agents=1)
+    model = cf.create_adv_model(
+        jax.random.PRNGKey(0), MAPPOConfig(hidden_dim=16), critic_in.shape[-1] + 2
+    )
+    pos = jax.random.uniform(jax.random.PRNGKey(1), offsets.shape, minval=-0.4, maxval=0.4)
+    dpp, best_n = cf.dpp_credit(model, critic_in, offsets, pos, RADIUS)
+    assert dpp.shape == offsets.shape[:-1]
+    assert float(jnp.abs(dpp).max()) == 0.0 and float(jnp.abs(best_n).max()) == 0.0
+
+    critic_in, offsets, _ = _credit_inputs(n_agents=3)
+    model = cf.create_adv_model(
+        jax.random.PRNGKey(0), MAPPOConfig(hidden_dim=16), critic_in.shape[-1] + 6
+    )
+    pos = jax.random.uniform(jax.random.PRNGKey(1), offsets.shape, minval=-0.4, maxval=0.4)
+    dpp, _ = cf.dpp_credit(model, critic_in, offsets, pos, RADIUS)
+    assert float(jnp.abs(dpp).max()) == 0.0  # the zero-initialized head
+
+
+def test_dpp_reads_the_agents_own_goal_so_it_is_shaping():
+    """The property that separates `dpp` from `counterfactual` (whose correction
+    is bit-identical under this edit): agent 1's own goal is kept in o++ and is
+    part of o, so editing it moves D++_1."""
+    critic_in, offsets, _ = _credit_inputs()
+    model = _nonzero_adv_model(critic_in.shape[-1] + 2 * offsets.shape[-2])
+    pos = jax.random.uniform(jax.random.PRNGKey(2), offsets.shape, minval=-0.4, maxval=0.4)
+    before, _ = cf.dpp_credit(model, critic_in, offsets, pos, RADIUS)
+    after, _ = cf.dpp_credit(
+        model, critic_in, offsets.at[..., 1, :].add(0.5), pos, RADIUS
+    )
+    assert float(jnp.abs(before[..., 1] - after[..., 1]).max()) > 0.0
+
+
+def test_a_positive_dpp_term_raises_the_agents_advantage():
+    """Sign check through the real `ppo_update`: crediting agent 0's goals with a
+    D++ term on alternate windows makes those actions more likely than
+    debiting the same amount does."""
+    config, _, (runner_state, rollout, last, _), _ = _collect(StubEnv(3))
+    ts, m = runner_state.train_state.manager, rollout.manager
+    bonus = jnp.zeros(m.log_prob.shape).at[::2, :, 0].set(5.0)
+    key = jax.random.PRNGKey(3)
+    credited, _ = ppo_update(
+        ts, key, m, last.manager, config.manager, discrete=False,
+        advantage_correction=cf.dpp_correction(bonus, 1.0),
+    )
+    debited, _ = ppo_update(
+        ts, key, m, last.manager, config.manager, discrete=False,
+        advantage_correction=-cf.dpp_correction(bonus, 1.0),
+    )
+
+    def log_prob(state):
+        obs = m.obs[::2, :, 0].reshape(-1, m.obs.shape[-1])
+        action = m.action[::2, :, 0].reshape(-1, m.action.shape[-1])
+        lp, _ = evaluate_action(
+            state.actor_ts.apply_fn, state.actor_ts.params, obs, action, False
+        )
+        return float(lp.mean())
+
+    assert log_prob(credited) > log_prob(debited)
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_dpp_arm_starts_as_exact_team_credit(n_agents):
+    """At init `Â_φ` outputs exactly 0, so the D++ term is 0 and the first update
+    equals the team-credit arm's; the rollout is identical too."""
+    env = StubEnv(n_agents)
+    _, _, (rs_team, ro_team, last_team, _), (update_team, _) = _collect(env)
+    _, _, (rs_dpp, ro_dpp, last_dpp, _), (update_dpp, _) = _collect(
+        env, manager_credit="dpp"
+    )
+    assert _tree_max_diff(
+        (ro_team.worker, ro_team.manager), (ro_dpp.worker, ro_dpp.manager)
+    ) == 0.0
+    new_team, _ = update_team(rs_team, ro_team, last_team)
+    new_dpp, losses = update_dpp(rs_dpp, ro_dpp, last_dpp)
+    assert float(losses["manager_dpp_positive_frac"]) == 0.0
+    assert float(losses["manager_dpp_mean"]) == 0.0
+    assert _tree_max_diff(new_team.train_state.worker, new_dpp.train_state.worker) == 0.0
+    assert _tree_max_diff(
+        new_team.train_state.manager, new_dpp.train_state.manager
+    ) < 1e-5
+    assert _tree_max_diff(
+        rs_dpp.train_state.manager_adv.params, new_dpp.train_state.manager_adv.params
+    ) > 0.0
+
+
+@pytest.mark.parametrize("n_agents", [1, 3])
+def test_dpp_collect_update_eval_end_to_end(n_agents):
+    _, _, (runner_state, rollout, last, _), (update_fn, eval_fn) = _collect(
+        StubEnv(n_agents, max_steps=10), manager_credit="dpp"
+    )
+    n_windows = N_STEPS // HORIZON
+    assert rollout.manager_goal.pos.shape == (n_windows, N_ENVS, n_agents, 2)
+    # The first update fits the model from zero, so the second one scores with a
+    # nonzero model and applies the term through ppo_update.
+    state, _ = update_fn(runner_state, rollout, last)
+    state, losses = update_fn(state, rollout, last)
+    dpp_keys = (
+        "manager_dpp_mean", "manager_dpp_std", "manager_dpp_positive_frac",
+        "manager_dpp_mean_best_n", "manager_dpp_adv_shift",
+    )
+    for key in dpp_keys + (
+        "manager_cf_model_ev", "manager_cf_model_loss", "manager_policy_loss",
+    ):
+        assert np.isfinite(float(losses[key])), key
+    assert "manager_cf_beta" not in losses
+    assert 0.0 <= float(losses["manager_dpp_positive_frac"]) <= 1.0
+    if n_agents == 1:
+        assert all(float(losses[key]) == 0.0 for key in dpp_keys)
+    else:
+        assert float(losses["manager_dpp_positive_frac"]) > 0.0
+        assert 1.0 <= float(losses["manager_dpp_mean_best_n"]) <= n_agents - 1
+    assert _tree_max_diff(
+        runner_state.train_state.manager_adv.params, state.train_state.manager_adv.params
+    ) > 0.0
+    assert np.isfinite(float(eval_fn(state.train_state, jax.random.PRNGKey(1))))
+
+
+def test_dpp_credit_is_validated():
+    for field, value in (("dpp_coef", -0.1), ("dpp_max_recruits", 0)):
+        bad = dataclasses.replace(_config(manager_credit="dpp"), **{field: value})
+        with pytest.raises(ValueError, match=field):
+            make_train(bad, StubEnv(2))
+    with pytest.warns(UserWarning, match="no teammates to recruit"):
+        make_train(_config(manager_credit="dpp"), StubEnv(1))
+
+
+def test_make_feudal_config_wires_the_dpp_knobs():
+    from algorithms.simplified_feudal_mappo_jax.run import make_feudal_config
+
+    base = dict(hidden_dim=8, goal_horizon=32, waypoint_radius=0.15)
+    default = make_feudal_config(_params(), Model_Params(**base), n_envs=32)
+    assert (default.dpp_coef, default.dpp_max_recruits) == (1.0, None)
+    own = make_feudal_config(
+        _params(),
+        Model_Params(**base, manager_credit="dpp", dpp_coef=0.5, dpp_max_recruits=2),
+        n_envs=32,
+    )
+    assert (own.manager_credit, own.dpp_coef, own.dpp_max_recruits) == ("dpp", 0.5, 2)
+    assert own.worker == default.worker and own.manager == default.manager
+
+
+def test_dpp_checkpoint_carries_the_advantage_model():
+    from algorithms.simplified_feudal_mappo_jax.run import (
+        Simplified_Feudal_MAPPO_JAX_Runner as Runner,
+    )
+
+    rs = make_train(_config(manager_credit="dpp"), StubEnv(3))[0](jax.random.PRNGKey(0))
+    assert "manager_adv" in Runner._params_tree(rs.train_state)
+    assert "manager_adv_ts" in Runner._checkpoint_tree(rs, jax.random.PRNGKey(7))

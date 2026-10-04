@@ -3,8 +3,9 @@
 Subclasses `MAPPO_JAX_Runner`, so the train loop, stats tracking, checkpoint
 cadence, resume and `evaluate()` are inherited unchanged. This class only
 supplies the hierarchy's config, its jitted functions (`_make_train`), the
-four-train-state checkpoint format (five under `manager_credit: counterfactual`,
-which adds the advantage model), and a `view()` that draws the waypoints.
+four-train-state checkpoint format (five under `manager_credit: counterfactual`
+or `dpp`, which add the advantage model), and a `view()` that draws the
+waypoints.
 """
 
 import dataclasses
@@ -51,9 +52,9 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
       gamma unless `manager_gamma` gives the manager a longer horizon.
     * `manager_ent_coef` replaces the worker's entropy coefficient for the
       manager only; None keeps the shared value (the original behaviour).
-    * `manager_credit` / `counterfactual_default` / `counterfactual_samples`
-      select the manager's credit assignment (`counterfactual.py`); "team" is
-      the original behaviour.
+    * `manager_credit` / `counterfactual_default` / `counterfactual_samples` /
+      `dpp_coef` / `dpp_max_recruits` select the manager's credit assignment
+      (`counterfactual.py`); "team" is the original behaviour.
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
@@ -96,6 +97,12 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
         manager_credit=model_params.manager_credit,
         counterfactual_default=model_params.counterfactual_default,
         counterfactual_samples=int(model_params.counterfactual_samples),
+        dpp_coef=float(model_params.dpp_coef),
+        dpp_max_recruits=(
+            None
+            if model_params.dpp_max_recruits is None
+            else int(model_params.dpp_max_recruits)
+        ),
     )
 
 
@@ -156,6 +163,12 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 f" ({self.feudal_config.counterfactual_default}, "
                 f"samples={self.feudal_config.counterfactual_samples})"
             )
+        elif credit == "dpp":
+            max_recruits = self.feudal_config.dpp_max_recruits
+            credit += (
+                f" (coef={self.feudal_config.dpp_coef}, max_recruits="
+                f"{self.env.n_agents - 1 if max_recruits is None else max_recruits})"
+            )
         print(f"  manager_credit={credit}")
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
@@ -167,8 +180,8 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
 
     # ------------------------------------------------------------------ io
 
-    # The counterfactual advantage model (`manager_credit: counterfactual`) is an
-    # extra entry in both trees, present only when the model exists. flax's
+    # The joint-goal advantage model (`manager_credit: counterfactual` or `dpp`)
+    # is an extra entry in both trees, present only when the model exists. flax's
     # `from_bytes` raises only when the TARGET has a key the file lacks, so a
     # default run's checkpoints are unchanged and load exactly as before.
 

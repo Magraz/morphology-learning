@@ -1,0 +1,38 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input`: manager_credit team -> dpp.
+#
+# The manager's PPO normally gives every agent's waypoint the same TEAM
+# advantage. Here each agent also gets a D++ term from the joint-goal advantage
+# model Â (counterfactual.py), the same model the `_cf` arm trains:
+#   A_i      = A_team + dpp_coef * max(0, D++_i)
+#   D++_i(n) = [Â(x, o++(i, n)) - Â(x, o)] / n,  maximized over n = 1..N-1
+# where o++(i, n) keeps agent i's goal and sends its n nearest teammates toward
+# agent i's position. With dpp_coef 1 each goal is credited with the better of
+# what happened and what would have happened had teammates come to it, so a
+# goal that pays only when supported (waiting at a two-agent box) is reinforced
+# before any partner arrives: D++'s stepping-stone signal, in goal space.
+#
+# Unlike `_cf`, the term reads agent i's own goal, so it is SHAPING, not a
+# baseline: it changes the objective on purpose (the true baseline in `_cf`
+# changed nothing). Execution is untouched and no simulator is forked; only the
+# manager's training signal differs from the parent.
+#
+# Why (2026-10-03): tight coupling costs the hierarchy 122 (dense) / 250
+# (sparse) return at 2a/4o against 16 / 20 for mlp (1111 vs 1122 groups).
+# Plan: plans/goal_recruitment_critic_2026-10-02.md. With one agent there is no
+# teammate to recruit, so at 1a/3o this arm equals its parent.
+#
+# Â's head starts at exactly zero, so the arm starts as exact team credit. Read
+# `manager_dpp_positive_frac` and `manager_dpp_adv_shift` before return.
+#
+# The checkpoint carries `manager_adv`, the same tree as the `_cf` arm; only
+# this model group's name records which credit trained it.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_dpp trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input
+  - _self_
+
+model_params:
+  manager_credit: dpp
