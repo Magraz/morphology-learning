@@ -107,6 +107,7 @@ from environments.box2d_suite.utils import (
 )
 from environments.mjx_suite.observation import (
     MJXObservationBuilder,
+    box_surface_distance,
     geom_index_maps,
 )
 from environments.mjx_suite.physics_options import physics_xml
@@ -123,6 +124,10 @@ _FORCE_MULTIPLIER = 100.0
 _TIME_STEP = 1.0 / 60.0
 _WALL_EPS = 0.01  # boundary-contact slack, ~Box2D contact slop
 _DEFAULT_DRIFT_SPEED = 0.5
+# `teleport_agents`: clearance kept around a placed agent (beyond contact), and
+# the number of candidate positions tried per placed agent.
+_TELEPORT_MARGIN = 0.05
+_TELEPORT_CANDIDATES = 32
 
 # --- compact global state (opt-in via `use_global_state`; see `_compact_global_state`)
 # These two widths ARE the layout: `global_state_dim` is derived from them and the
@@ -973,6 +978,90 @@ class MultiBoxPushMJX:
         if self._difference:
             reward = self._difference_rewards(state, actions, reward)
         return obs, new_state, reward, terminated, truncated, info
+
+    def teleport_agents(self, state, focal, recruit_mask, offset, key, radius):
+        """Move the recruited agents next to agent `focal`, for one UNBATCHED state.
+
+        The simplified feudal stack's training forks (`simplified_feudal_mappo_jax
+        /interventions.py`) call this. Returns `(obs, state, valid)`.
+
+        * Each recruit (`recruit_mask` (A,) bool, never the focal agent) is placed
+          in the annulus between `2 * agent_radius + margin` and `radius` (world
+          units, centre to centre) around the focal agent, clear of the walls,
+          every box surface and every agent that stays put or was already placed.
+          Recruits are placed in index order, each at the first valid one of
+          `_TELEPORT_CANDIDATES` positions drawn uniformly over the annulus' area.
+        * A candidate is also rejected when its translated waypoint,
+          `goal_state(candidate) + offset`, would leave the arena `[-0.5, 0.5]`:
+          the caller copies the focal agent's goal-state `offset` to every
+          recruit, and clipping one would break that equality.
+        * If any recruit finds no valid candidate, `valid` is False and the state
+          and observation are returned unchanged. The radius is never enlarged
+          and no recruit is dropped.
+        * Only the recruits' `qpos` change. Velocities, box poses, `t`,
+          `delivered` and `prev_box_goal_dist` are kept (no box moved, so no
+          reward rebase is needed, and teleporting pays nothing). One
+          `mjx.forward` under the coupling-adjusted model refreshes kinematics,
+          contacts and the contact-force observation with the masses a step
+          would use, and the solver's warm start is set from it. `_pose` is not
+          reused: it zeroes every velocity and rebases the reward history.
+        """
+        margin = _TELEPORT_MARGIN
+        r_min = 2 * _AGENT_RADIUS + margin
+        if radius <= r_min:
+            raise ValueError(
+                f"teleport radius {radius} must exceed {r_min:.2f} world units "
+                "(two agent radii plus the placement margin)"
+            )
+        n, k = self.n_agents, _TELEPORT_CANDIDATES
+        d = state.data
+        pos = self._agent_pos(d)  # (A, 2)
+        box_pos, box_yaw = self._box_pose(d)
+        lo = self.boundary_thickness + _AGENT_RADIUS + margin
+        hi = jnp.array([self.world_width - lo, self.world_height - lo])
+
+        k_r, k_theta = jax.random.split(key)
+        u = jax.random.uniform(k_r, (n, k))
+        r = jnp.sqrt(r_min**2 + u * (radius**2 - r_min**2))  # uniform over area
+        theta = jax.random.uniform(k_theta, (n, k), maxval=2 * jnp.pi)
+        cand = pos[focal] + r[..., None] * jnp.stack(
+            [jnp.cos(theta), jnp.sin(theta)], axis=-1
+        )  # (A, K, 2): a fresh candidate set per agent slot
+        ids = jnp.arange(n)
+
+        def place(carry, j):
+            new_pos, placed, ok = carry
+            c = cand[j]  # (K, 2)
+            valid = jnp.all((c >= lo) & (c <= hi), axis=-1)
+            if self.n_objects:
+                gap = box_surface_distance(c, box_pos, box_yaw, self._box_half)
+                valid &= jnp.all(gap >= _AGENT_RADIUS + margin, axis=-1)
+            # Obstacles: every agent that stays put, and recruits already placed.
+            obstacle = (~recruit_mask | placed) & (ids != j)
+            dist = jnp.linalg.norm(c[:, None, :] - new_pos[None], axis=-1)  # (K, A)
+            valid &= jnp.all((dist >= 2 * _AGENT_RADIUS + margin) | ~obstacle, axis=-1)
+            waypoint = (c - self._centre) / self._extent + offset
+            valid &= jnp.all(jnp.abs(waypoint) <= 0.5, axis=-1)
+            found = valid.any()
+            moves = recruit_mask[j]
+            new_pos = new_pos.at[j].set(
+                jnp.where(moves & found, c[jnp.argmax(valid)], new_pos[j])
+            )
+            return (new_pos, placed.at[j].set(moves), ok & (found | ~moves)), None
+
+        (new_pos, _, valid), _ = jax.lax.scan(
+            place, (pos, jnp.zeros(n, dtype=bool), jnp.array(True)), ids
+        )
+
+        moved = d.replace(qpos=d.qpos.at[self._agent_qadr].set(new_pos))
+        moved = mjx.forward(self._model_for(self._coupling_met(moved)), moved)
+        moved = moved.replace(qacc_warmstart=moved.qacc)
+        data = jax.tree.map(lambda a, b: jnp.where(valid, a, b), moved, d)
+        return (
+            self._get_obs(data, state.delivered),
+            dataclasses.replace(state, data=data),
+            valid,
+        )
 
 
 def scripted_push_action(env: MultiBoxPushMJX, state: EnvState, box_idx=0):

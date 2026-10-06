@@ -55,6 +55,8 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
     * `manager_credit` / `counterfactual_default` / `counterfactual_samples` /
       `dpp_coef` / `dpp_max_recruits` select the manager's credit assignment
       (`counterfactual.py`); "team" is the original behaviour.
+    * `interventions` / `intervention_radius` / `intervention_interval` switch
+      on the training forks (`interventions.py`); off is the original behaviour.
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
@@ -103,6 +105,9 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
             if model_params.dpp_max_recruits is None
             else int(model_params.dpp_max_recruits)
         ),
+        interventions=bool(model_params.interventions),
+        intervention_radius=float(model_params.intervention_radius),
+        intervention_interval=int(model_params.intervention_interval),
     )
 
 
@@ -170,6 +175,12 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 f"{self.env.n_agents - 1 if max_recruits is None else max_recruits})"
             )
         print(f"  manager_credit={credit}")
+        if self.feudal_config.interventions:
+            print(
+                f"  interventions: every {self.feudal_config.intervention_interval} "
+                f"decision(s), one fork per agent, N ~ U{{1..{self.env.n_agents - 1}}}, "
+                f"radius={self.feudal_config.intervention_radius} world units"
+            )
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
             f"(env hook: {hasattr(self.env, 'global_state')})"

@@ -153,6 +153,39 @@ def compute_gae(
 
 
 # ---------------------------------------------------------------------------
+# Masked statistics (`ppo_update(masked_statistics=True)`)
+# ---------------------------------------------------------------------------
+
+
+def masked_mean_std(x, weight, axis=0):
+    """`(mean, std, count)` of `x` over `axis`, counting only rows whose 0/1
+    `weight` is 1. The std is unbiased (ddof=1), like the unmasked path."""
+    count = weight.sum(axis=axis)
+    mean = (x * weight).sum(axis=axis) / jnp.maximum(count, 1.0)
+    sq = ((x - jnp.expand_dims(mean, axis)) ** 2) * weight
+    var = sq.sum(axis=axis) / jnp.maximum(count - 1.0, 1.0)
+    return mean, jnp.sqrt(var), count
+
+
+def masked_normalize(advantages, weight):
+    """Per-stream normalization over the time axis, over weighted rows only. A
+    stream with fewer than two weighted rows is left as it is: an unbiased std
+    over one sample is undefined."""
+    mean, std, count = masked_mean_std(advantages, weight)
+    return jnp.where(count >= 2, (advantages - mean) / (std + 1e-8), advantages)
+
+
+def masked_explained_variance(returns, values, weight):
+    """`1 - Var(returns - values) / Var(returns)` over weighted rows only."""
+    w = jnp.broadcast_to(weight, returns.shape).reshape(-1)
+
+    def var(x):
+        return masked_mean_std(x.reshape(-1), w)[1] ** 2
+
+    return 1.0 - var(returns - values) / (var(returns) + 1e-8)
+
+
+# ---------------------------------------------------------------------------
 # PPO update
 # ---------------------------------------------------------------------------
 
@@ -166,6 +199,7 @@ def ppo_update(
     discrete: bool,
     squash: bool = False,
     advantage_correction: Optional[jnp.ndarray] = None,
+    masked_statistics: bool = False,
 ) -> Tuple[ActorCriticTrainState, dict]:
     """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
 
@@ -190,6 +224,17 @@ def ppo_update(
             `dpp` credit, which passes the negated D++ term so that it is
             added). See `simplified_feudal_mappo_jax.counterfactual`. None (the
             default) is byte-identical to the code before the argument.
+        masked_statistics: let `active_mask` also govern three quantities that
+            are otherwise plain means over every row: the per-stream advantage
+            normalization (per (env, agent) under per-agent rewards, per env
+            over rows with any active agent otherwise; a stream with fewer than
+            two active rows is left unnormalized), the explained variance, and
+            the scalar team critic's loss (the per-agent critic is always
+            masked). Needed when a batch carries rows that are not samples at
+            all, e.g. the simplified feudal stack's placeholder fork rows, which
+            would otherwise shrink each stream's std and inflate its advantages.
+            Team rewards without `advantage_correction` only. Off (the default)
+            is byte-identical to the code before the argument.
 
     Returns:
         updated train_state, loss metrics dict
@@ -207,6 +252,10 @@ def ppo_update(
             "with per-agent rewards"
         )
     per_agent_adv = per_agent or corrected
+    if masked_statistics and corrected:
+        raise ValueError(
+            "masked_statistics is not supported together with advantage_correction"
+        )
     # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked categorical.
     # Envs without `avail_actions` store a scalar placeholder, so this is False and the
     # update is byte-identical to the pre-masking code.
@@ -222,12 +271,23 @@ def ppo_update(
         config.gae_lambda,
     )
 
-    # Pre-update explained variance of the stored critic predictions
-    explained_variance = 1.0 - jnp.var(returns - trajectory.value, ddof=1) / (
-        jnp.var(returns, ddof=1) + 1e-8
-    )
+    if masked_statistics:
+        # Which rows are samples: per (step, env, agent) under per-agent rewards,
+        # per (step, env) row with any active agent for the team reward.
+        active = trajectory.active_mask.astype(jnp.float32)
+        stat_weight = active if per_agent else active.max(axis=-1)
+        explained_variance = masked_explained_variance(
+            returns, trajectory.value, stat_weight
+        )
+    else:
+        # Pre-update explained variance of the stored critic predictions
+        explained_variance = 1.0 - jnp.var(returns - trajectory.value, ddof=1) / (
+            jnp.var(returns, ddof=1) + 1e-8
+        )
 
-    if corrected:
+    if masked_statistics:
+        adv = masked_normalize(advantages, stat_weight)
+    elif corrected:
         # Each agent's advantage is the team advantage minus its own correction,
         # centred per (env, agent) stream but scaled by the TEAM advantage's
         # per-env std. A per-agent std would rescale a free rider's residual
@@ -349,6 +409,13 @@ def ppo_update(
                     value_loss = (sq * mb_active_pa).sum() / jnp.maximum(
                         mb_active_pa.sum(), 1.0
                     )
+                elif masked_statistics:
+                    # Scalar team critic: only rows with an active agent are
+                    # samples (a row of placeholders has no target).
+                    row_valid = mb_active_pa.max(axis=-1)
+                    value_loss = (
+                        (values - mb_returns) ** 2 * row_valid
+                    ).sum() / jnp.maximum(row_valid.sum(), 1.0)
                 else:
                     value_loss = jnp.mean((values - mb_returns) ** 2)
                 return config.val_coef * value_loss, value_loss

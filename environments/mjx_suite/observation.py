@@ -47,6 +47,7 @@ __all__ = [
     "N_LIDAR_RAYS",
     "OBS_DIM",
     "MJXObservationBuilder",
+    "box_surface_distance",
     "geom_index_maps",
     "mjx_data_impl",
 ]
@@ -55,6 +56,27 @@ N_SECTORS = 8
 AGENT_SECTOR_COUNT_SCALE = 4.0  # fixed across team sizes; values are not clipped
 TOUCH_EPS = 0.2  # agent counts as touching within radius + eps of a box face
 LIDAR_EPS = 1e-3  # ray origin offset past the agent surface (self-hit guard)
+
+
+def box_surface_distance(points, box_pos, box_yaw, box_half):
+    """(P, O) distance from each point to each (rotated, square) box's surface;
+    0 inside a box. ``box_half`` is the per-box half-extent (O,).
+
+    Port of ``ObservationManager._agent_object_distance`` for the polygon case:
+    rotate into the box frame, clamp to the half extents, measure to the clamped
+    point. Shared by the touch test (``MJXObservationBuilder.touch_matrix``) and
+    agent placement (``MultiBoxPushMJX.teleport_agents``), so "touching" and
+    "clear of a box" use one definition.
+    """
+    rel = points[:, None, :] - box_pos[None, :, :]  # (P, O, 2)
+    c, s = jnp.cos(box_yaw), jnp.sin(box_yaw)  # (O,)
+    local = jnp.stack(
+        [c * rel[..., 0] + s * rel[..., 1], -s * rel[..., 0] + c * rel[..., 1]],
+        axis=-1,
+    )  # (P, O, 2)
+    half = jnp.asarray(box_half)[None, :, None]
+    clamped = jnp.clip(local, -half, half)
+    return jnp.linalg.norm(local - clamped, axis=-1)  # (P, O)
 
 
 def mjx_data_impl(data):
@@ -160,15 +182,7 @@ class MJXObservationBuilder:
         """
         if self.n_objects == 0:
             return jnp.zeros((self.n_agents, 0), dtype=bool)
-        rel = agent_pos[:, None, :] - box_pos[None, :, :]  # (A, O, 2)
-        c, s = jnp.cos(box_yaw), jnp.sin(box_yaw)  # (O,)
-        local = jnp.stack(
-            [c * rel[..., 0] + s * rel[..., 1], -s * rel[..., 0] + c * rel[..., 1]],
-            axis=-1,
-        )  # (A, O, 2)
-        half = jnp.asarray(box_half)[None, :, None]
-        clamped = jnp.clip(local, -half, half)
-        dist = jnp.linalg.norm(local - clamped, axis=-1)  # (A, O)
+        dist = box_surface_distance(agent_pos, box_pos, box_yaw, box_half)  # (A, O)
         return dist <= self.agent_radius + self.touch_eps
 
     def density_sensors(self, agent_pos, box_pos):

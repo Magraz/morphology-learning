@@ -1,35 +1,72 @@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
 \section{Introduction}
+\label{sec:introduction}
 
-%% The 8 questions
-% 1. What is the problem and why do I care?
-Teams of autonomous agents have been a key component in problems such as planetary exploration, drone package delivery, warehouse robotics, and  traffic control. Training agent policies for these problems can be done using Multiagent Reinforcement Learning algorithms. 
-% 2. Why is it important/difficult?
-However, when the problem is a long-horizon, multi-step task, that requires varying degrees of coordination such as object manipulation with multiple agents, current MARL methods struggle to properly assign credit.
+% Questions 1--2: problem, significance, and difficulty.
+Cooperative multiagent reinforcement learning (MARL) offers a way to train
+robot teams for tasks that require coordinated physical interaction, such as
+transporting an object that one robot cannot move alone. Learning this
+coordination is difficult when agents receive a shared reward after a sequence
+of joint actions: the outcome obscures which decisions helped the team and
+which depended on teammates' behavior~\cite{foerster2018coma}. In tightly
+coupled tasks, a useful individual decision can receive little feedback until
+other agents discover complementary behavior~\cite{rahmattalabi2016dpp}.
+Cooperative box pushing illustrates this difficulty. Reaching a box is
+insufficient; agents must establish compatible contact and act together to
+move it. An agent approaching a useful pushing position may therefore receive
+the same unsuccessful outcome as one pursuing an unrelated task. Effective
+credit assignment must distinguish an unproductive decision from one whose
+value has yet to be realized through cooperation.
 
+% Questions 3--4: prior work and the specific remaining problem.
+Hierarchical reinforcement learning separates goal selection from primitive
+control on different timescales, as in FeUdal
+Networks~\cite{vezhnevets2017fun}. Feudal Multi-Agent Hierarchies apply this
+manager--worker organization to teams~\cite{ahilan2019fmh}.
+Counterfactual methods address attribution from another direction: COMA
+compares one agent's action with alternatives while holding teammates' actions
+fixed~\cite{foerster2018coma}, whereas D++ evaluates hypothetical additional
+agents to reward behavior that could become useful with
+support~\cite{rahmattalabi2016dpp}. Goal interactions and effects over time
+are also addressed by CM3's multi-goal credit function~\cite{yang2020cm3} and
+MACD's imagined counterfactual trajectories~\cite{chai2024macd}. For Feudal
+coordination, the remaining challenge is crediting a manager-generated goal
+for the future return it could produce under alternative teammate commitments.
+In dynamic manipulation, this requires considering the behavior induced by
+joint goals, including the time needed to provide support and the assignments
+teammates would abandon.
 
-% 3. What has been done already in this problem area?
-Current approaches apply hierarchical and structural biases to decompose the problem into multiple learners, a manager and a worker. These operate at different timescales and action spaces. This decomposition reduces the action space at the higher levels of the hierarchy leading to more stable learning. 
+% Questions 5--6: proposed method and its central insight.
+We introduce a D++-inspired method for assigning credit to goals in Feudal
+MARL. A manager assigns each worker a bounded spatial waypoint for a fixed
+horizon. Workers learn from intrinsic rewards for reducing their distance to
+the waypoint, while the manager learns from team rewards; both levels use
+proximal policy optimization~\cite{schulman2017ppo}. A centralized model
+learns to predict team advantage from the joint state and waypoint assignments.
+For each focal agent, we retain its assigned goal and construct counterfactual
+joint assignments that redirect its nearest teammates toward its current
+position, leaving the remaining goals unchanged. The largest positive
+predicted gain per redirected teammate augments the focal agent's manager
+advantage. This formulation asks whether a goal would be more valuable with
+support, using goals as compact descriptions of behavior over time. Because
+support comes from reassigning existing teammates, the comparison asks the
+model to account for travel and forgone assignments. The resulting term
+deliberately shapes the manager's objective toward goals with predicted
+cooperative potential. Counterfactual assignments are evaluated through model
+queries during training; workers execute the manager's original waypoints.
 
-% 4. What particular problem remains unsolved?
-Credit assignment between the higher and lower levels of the hierarchies still remains challenging since current methods rely on domain specific reward definitions for each level, or on experience relabeling which cannot isolate the effects of other agent's goals on each agent's actions. This can lead to suboptimal learning when the environment's reward signal is shared among all levels of the hierarchy.
-
-% 5. How did you solve it?
-We introduce a counterfactual-based Feudal MARL framework, that can distill a signal that captures how good a particular agent's goal is, given that other agent's goals stay fixed. We use this signal to train the manager model to produce goals that guide the workers towards effective cooperation policies.
-
-% 6. What is cool about your approach?
- -Idea 1: Our key insight is a goal-aware counterfactual baseline that allows us to capture how an agent's assigned goal will impact the team's performance. The main difference with approaches such as COMA, is that we utilize a counterfactual direction in the manager's latent space to measure how much better a goal change is. Inspired by Feudal Networks, we train our manager by extending the transition policy gradient to a multiagent transition policy gradient that allows our manager to capture the semantics of the team task.
-
-The main difference with approaches such as COMA, is that we utilize a counterfactual direction in the manager's latent space to measure how much better a goal change is. Inspired by Feudal Networks, we train our manager by extending the transition policy gradient to a multiagent transition policy gradient that allows our manager to capture the semantics of the team task.
-
-% - Idea 2: Our key insight is a manager produced intrinsic reward that guides the agents before any extrinsic reward is obtained. The manager produces a vector in latent space for each worker, the workers then get a bonus reward based on how close they got to matching their assigned goal. By decoupling the manager from the agent's state, the agents can execute their policies in a decentralized fashion. The manager optimizes its goals based on how each goal contributed to improving the extrinsic reward.
- 
-
-
-% 7. What were your key results?
-
-
-% 8. What are the contributions of this paper?
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Questions 7--8: empirical findings and contributions.
+We plan to evaluate this mechanism in continuous-control cooperative box
+pushing, comparing it with flat multiagent PPO (MAPPO)~\cite{yu2022mappo},
+a Feudal hierarchy using shared team credit, and a counterfactual baseline
+that replaces only the focal worker's goal. Dense and sparse rewards, uncoupled
+controls, and larger coalitions will test whether the signal for cooperative
+potential improves coordinated task completion.
+\textit{[Results pending: report the principal measured outcome against these
+baselines, with agent counts, reward conditions, and uncertainty across
+training seeds.]}
+The methodological contributions are a formulation of counterfactual teammate
+support through temporally extended waypoint assignments and a learned
+credit signal that incorporates their predicted benefit into the manager's
+policy update. The planned empirical analysis will examine when these
+counterfactual predictions identify useful cooperation and whether they
+translate into improved team performance.

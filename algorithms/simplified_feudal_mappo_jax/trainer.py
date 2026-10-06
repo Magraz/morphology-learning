@@ -34,6 +34,13 @@ is corrected by a baseline from a learned goal-conditioned advantage model,
 averaged over counterfactual goals for that agent alone. Under `dpp` the same
 model supplies a D++ term instead: the gain had the agent's nearest teammates
 been sent toward it (`counterfactual.py`).
+
+Training forks (`interventions: true`, `interventions.py`): at every
+`intervention_interval`-th decision each env is also forked once per agent i,
+with teammates teleported next to agent i and given its waypoint offset. Each
+fork runs one window as its own episode under the same frozen policies, and its
+transitions are appended to both levels' batches as extra env columns. The main
+rollout is unchanged by them (separate random keys), and so is evaluation.
 """
 
 import math
@@ -48,6 +55,8 @@ from algorithms.mappo_jax.mappo import (
     ActorCriticTrainState,
     compute_gae,
     create_train_state,
+    masked_explained_variance,
+    masked_mean_std,
     ppo_update,
 )
 from algorithms.mappo_jax.network import sample_action
@@ -58,9 +67,11 @@ from algorithms.mappo_jax.trainer import (
 )
 from algorithms.mappo_jax.types import Transition
 from algorithms.simplified_feudal_mappo_jax import counterfactual as cf
+from algorithms.simplified_feudal_mappo_jax import interventions as iv
 from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 from algorithms.simplified_feudal_mappo_jax.types import (
     FeudalConfig,
+    Intervention,
     LastValues,
     ManagerGoal,
     Rollout,
@@ -159,6 +170,8 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
     counterfactual` or `dpp` a third network, the advantage model, reads the manager
     critic's input plus every agent's goal offset; its key comes from `fold_in`,
     so the worker and manager initializations are the same in either mode.
+    Under `interventions: true` the manager critic also reads the fork context
+    block (`interventions.critic_context`); the actor parameters are unchanged.
     """
     validate_manager_input(config, env)
     dims = wp.input_dims(
@@ -167,6 +180,7 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
         env.n_agents,
         env.goal_state_dim,
         manager_actor_dim=manager_actor_dim(config, env),
+        manager_context_dim=iv.context_dim(config, env.n_agents),
     )
     worker_rng, manager_rng = jax.random.split(rng)
     worker = create_train_state(
@@ -268,6 +282,25 @@ def make_policy(config: FeudalConfig, env) -> Policy:
     return Policy(observe=observe, decide=decide, act=act)
 
 
+def _source_stats(traj, last_value, config):
+    """`(raw advantage std, explained variance)` of one source's batch, over its
+    active rows only: the pre-update critic's fit per source, for logging."""
+    adv, ret = compute_gae(
+        traj.reward,
+        traj.value,
+        traj.done.astype(jnp.float32),
+        last_value,
+        config.gamma,
+        config.gae_lambda,
+    )
+    active = traj.active_mask.astype(jnp.float32)
+    weight = active if traj.reward.ndim == 3 else active.max(axis=-1)
+    _, std, _ = masked_mean_std(
+        adv.reshape(-1), jnp.broadcast_to(weight, adv.shape).reshape(-1)
+    )
+    return std, masked_explained_variance(ret, traj.value, weight)
+
+
 def _select(mask, new, old):
     """Per-env `where` over a pytree whose leaves lead with the env axis."""
 
@@ -312,6 +345,11 @@ def make_train(config: FeudalConfig, env):
         )
 
     n_envs, n_agents = wcfg.n_envs, env.n_agents
+    # Static: training forks (interventions.py). False is the original code path.
+    iv.validate_interventions(config, env, n_windows)
+    forks_on = config.interventions
+    interval = config.intervention_interval
+    n_lanes = n_envs * n_agents  # one fork lane per (env, focal agent)
     gamma = wcfg.gamma
     # The manager's per-step discount: it sums the team reward within a window
     # and bootstraps a truncation, and `ppo_update` discounts decisions with
@@ -328,6 +366,22 @@ def make_train(config: FeudalConfig, env):
     policy = make_policy(config, env)
     v_reset = jax.vmap(env.reset)
     v_step = jax.vmap(env.step)
+    v_teleport = (
+        jax.vmap(partial(env.teleport_agents, radius=config.intervention_radius))
+        if forks_on
+        else None
+    )
+    # Fork diagnostics report recruit distance in world units (square arenas).
+    world_scale = float(getattr(env, "world_width", 1.0))
+
+    def m_critic_input(critic_base, context=None):
+        """The manager critic's input. Under forks it carries the context block,
+        all zeros for main rows (`interventions.critic_context`)."""
+        if not forks_on:
+            return critic_base
+        if context is None:
+            context = iv.critic_context(n_agents, critic_base.shape[0])
+        return jnp.concatenate([critic_base, context], axis=-1)
     # No action masking: `ppo_update` switches on `action_mask.ndim == 4`, and a
     # scalar placeholder stacks to a 1-D array.
     no_mask = jnp.zeros(())
@@ -343,8 +397,13 @@ def make_train(config: FeudalConfig, env):
 
     # ------------------------------------------------------------------ collect
 
-    def _worker_step(train_state, waypoint, carry, k):
-        """One env step inside a window, under a fixed set of waypoints."""
+    def _worker_step(train_state, waypoint, carry, k, bootstrap=True):
+        """One env step inside a window, under a fixed set of waypoints.
+
+        Batch-width agnostic (main envs or fork lanes). `bootstrap=False` (the
+        forks) drops both time-limit value additions: a fork is its own episode
+        and ends with the window, so no value may be added to its rewards.
+        """
         env_state, obs, alive, m_reward, m_done, closest, rng = carry
         rng, action_rng = jax.random.split(rng)
         alive_f = alive.astype(jnp.float32)
@@ -371,27 +430,34 @@ def make_train(config: FeudalConfig, env):
         # limit that cuts the commitment short is a truncation, so it bootstraps
         # (SB3-style, as in mappo_jax) instead of being treated as worth 0.
         last = k == horizon - 1
-        next_value = _value(
-            train_state.worker,
-            wp.worker_critic_input(
-                next_gs,
-                wp.goal_error(waypoint, next_pos, radius),
-                wp.remaining_fraction(k + 1, horizon),
-            ),
-        )
-        w_bootstrap = (time_limit & ~last).astype(jnp.float32)[:, None]
-        reward = r_int + gamma * w_bootstrap * next_value
+        if bootstrap:
+            next_value = _value(
+                train_state.worker,
+                wp.worker_critic_input(
+                    next_gs,
+                    wp.goal_error(waypoint, next_pos, radius),
+                    wp.remaining_fraction(k + 1, horizon),
+                ),
+            )
+            w_bootstrap = (time_limit & ~last).astype(jnp.float32)[:, None]
+            reward = r_int + gamma * w_bootstrap * next_value
+        else:
+            reward = r_int
         w_done = last | done | ~alive
 
         # --- Manager: discounted team reward over the window, plus the same
         # truncation bootstrap with its own critic.
         m_reward = m_reward + alive_f * jnp.power(m_gamma, k) * team_reward
-        m_next_value = _value(
-            train_state.manager, wp.manager_critic_input(next_gs, next_pos)
-        )
-        m_reward = m_reward + (
-            time_limit.astype(jnp.float32) * jnp.power(m_gamma, k + 1) * m_next_value
-        )
+        if bootstrap:
+            m_next_value = _value(
+                train_state.manager,
+                m_critic_input(wp.manager_critic_input(next_gs, next_pos)),
+            )
+            m_reward = m_reward + (
+                time_limit.astype(jnp.float32)
+                * jnp.power(m_gamma, k + 1)
+                * m_next_value
+            )
         m_done = m_done | (alive & done)
 
         closest = jnp.where(
@@ -409,7 +475,7 @@ def make_train(config: FeudalConfig, env):
             log_prob=log_prob,
             value=value,
             team_reward=team_reward * alive_f,
-            active_mask=jnp.broadcast_to(alive_f[:, None], (n_envs, n_agents)),
+            active_mask=jnp.broadcast_to(alive_f[:, None], (alive.shape[0], n_agents)),
             action_mask=no_mask,
         )
 
@@ -420,16 +486,108 @@ def make_train(config: FeudalConfig, env):
         carry = (env_state, obs, alive, m_reward, m_done, closest, rng)
         return carry, (transition, r_int)
 
-    def _window(carry, _):
-        """One manager decision followed by `horizon` worker steps."""
+    def _fork(operand):
+        """One window of every fork lane, from the main decision's start state.
+
+        Returns `(worker Transition (H, L, ...), manager Transition (L, ...),
+        N (L,), valid (L,), recruit distance (L,))`. The manager record is the
+        decision sampled in the ORIGINAL state (stored actor input, action and
+        log-prob), with agent i's actor weight only; the critic reads the fork
+        context.
+        """
+        (train_state, env_state, obs, waypoint, pos, m_actor_in, m_critic_base,
+         m_action, m_log_prob, key) = operand
+        k_recruit, k_place, k_scan = jax.random.split(key, 3)
+        focal = iv.focal_agents(n_envs, n_agents)  # (L,)
+        n_recruits, recruit = iv.sample_recruits(k_recruit, focal, n_agents)
+        lane = jnp.arange(n_lanes)
+        state_l, obs_l, waypoint_l, pos_l = iv.to_lanes(
+            (env_state, obs, waypoint, pos), n_agents
+        )
+        # Agent i's realized offset (after the bound and arena clip), copied to
+        # every recruit relative to its new position.
+        offset = waypoint_l[lane, focal] - pos_l[lane, focal]  # (L, 2)
+        obs_l, state_l, valid = v_teleport(
+            state_l, focal, recruit, offset, jax.random.split(k_place, n_lanes)
+        )
+        _, new_pos = policy.observe(obs_l, state_l)
+        f_waypoint = jnp.where(
+            recruit[..., None], new_pos + offset[:, None, :], waypoint_l
+        )
+        inner = (
+            state_l,
+            obs_l,
+            valid,  # a failed placement never runs: masked from the start
+            jnp.zeros(n_lanes),
+            jnp.zeros(n_lanes, dtype=bool),
+            wp.distance_to_waypoint(f_waypoint, new_pos, radius),
+            k_scan,
+        )
+        (_, _, _, f_m_reward, _, _, _), (f_w_traj, _) = jax.lax.scan(
+            partial(_worker_step, train_state, f_waypoint, bootstrap=False),
+            inner,
+            jnp.arange(horizon),
+        )
+        f_critic_in = m_critic_input(
+            iv.to_lanes(m_critic_base, n_agents),
+            iv.critic_context(n_agents, n_lanes, focal, n_recruits),
+        )
+        valid_f = valid.astype(jnp.float32)
+        f_m = Transition(
+            obs=iv.to_lanes(m_actor_in, n_agents),
+            global_state=f_critic_in,
+            action=iv.to_lanes(m_action, n_agents),
+            reward=f_m_reward,
+            done=jnp.ones(n_lanes, dtype=bool),
+            log_prob=iv.to_lanes(m_log_prob, n_agents),
+            value=_value(train_state.manager, f_critic_in),
+            team_reward=f_w_traj.team_reward.sum(axis=0),
+            active_mask=jax.nn.one_hot(focal, n_agents) * valid_f[:, None],
+            action_mask=no_mask,
+        )
+        moved = jnp.linalg.norm(new_pos - new_pos[lane, focal][:, None], axis=-1)
+        recruit_distance = world_scale * (moved * recruit).sum(-1) / n_recruits
+        return f_w_traj, f_m, n_recruits, valid, recruit_distance
+
+    def _skip(operand):
+        """`_fork`'s output for a window the interval skips: fully masked
+        placeholder rows (`done`, zero weight, zero reward and value)."""
+        out = jax.tree.map(
+            lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(_fork, operand)
+        )
+        f_w, f_m = out[0], out[1]
+        return (
+            f_w._replace(done=jnp.ones_like(f_w.done)),
+            f_m._replace(done=jnp.ones_like(f_m.done)),
+        ) + out[2:]
+
+    def _window(carry, w):
+        """One manager decision followed by `horizon` worker steps (and, on an
+        intervention window, the forks)."""
         train_state, env_state, obs, rng = carry
         rng, manager_rng, reset_rng = jax.random.split(rng, 3)
 
         gs, pos = policy.observe(obs, env_state)
-        waypoint, m_actor_in, m_critic_in, m_action, m_log_prob = policy.decide(
+        waypoint, m_actor_in, m_critic_base, m_action, m_log_prob = policy.decide(
             train_state.manager, obs, gs, pos, env_state, manager_rng
         )
+        m_critic_in = m_critic_input(m_critic_base)
         m_value = _value(train_state.manager, m_critic_in)  # (E,)
+
+        fork = None
+        if forks_on:
+            operand = (
+                train_state, env_state, obs, waypoint, pos, m_actor_in,
+                m_critic_base, m_action, m_log_prob,
+                # fold_in, so the main path's splits are unchanged.
+                jax.random.fold_in(manager_rng, iv.FORK_KEY_NAMESPACE),
+            )
+            if interval == 1:
+                fork = _fork(operand)
+            else:
+                # The window scan is not vmapped, so a skipped window runs no
+                # fork physics.
+                fork = jax.lax.cond(w % interval == 0, _fork, _skip, operand)
 
         inner = (
             env_state,
@@ -495,6 +653,7 @@ def make_train(config: FeudalConfig, env):
             m_transition,
             diagnostics,
             goal,
+            fork,
         )
 
     @jax.jit
@@ -503,20 +662,29 @@ def make_train(config: FeudalConfig, env):
         rng, reset_rng = jax.random.split(rng)
         obs, env_state = v_reset(jax.random.split(reset_rng, n_envs))
 
-        (_, env_state, obs, rng), (w_traj, m_traj, diag, goal) = jax.lax.scan(
-            _window, (train_state, env_state, obs, rng), None, length=n_windows
+        (_, env_state, obs, rng), (w_traj, m_traj, diag, goal, fork) = jax.lax.scan(
+            _window,
+            (train_state, env_state, obs, rng),
+            jnp.arange(n_windows) if forks_on else None,
+            length=n_windows,
         )
-        # (n_windows, horizon, E, ...) -> (n_steps, E, ...)
-        w_traj = jax.tree.map(
-            lambda x: x.reshape((n_windows * horizon,) + x.shape[2:]), w_traj
-        )
+
+        def flatten_windows(traj):
+            # (n_windows, horizon, B, ...) -> (n_steps, B, ...)
+            return jax.tree.map(
+                lambda x: x.reshape((n_windows * horizon,) + x.shape[2:]), traj
+            )
+
+        w_traj = flatten_windows(w_traj)
 
         gs, pos = policy.observe(obs, env_state)
         last_values = LastValues(
             # The rollout's last step is always a window end, i.e. a worker
             # terminal, so the worker bootstrap is masked out by GAE.
             worker=jnp.zeros((n_envs, n_agents)),
-            manager=_value(train_state.manager, wp.manager_critic_input(gs, pos)),
+            manager=_value(
+                train_state.manager, m_critic_input(wp.manager_critic_input(gs, pos))
+            ),
         )
 
         active_agent_steps = jnp.maximum(w_traj.active_mask.sum(), 1.0)
@@ -533,6 +701,30 @@ def make_train(config: FeudalConfig, env):
             ).mean(),
             "rollout_team_reward": w_traj.team_reward.sum() / active_env_steps,
         }
+        intervention = None
+        if forks_on:
+            f_w_traj, f_m_traj, n_recruits, valid, recruit_distance = fork
+            intervention = Intervention(
+                worker=flatten_windows(f_w_traj),
+                manager=f_m_traj,
+                focal=jnp.broadcast_to(
+                    iv.focal_agents(n_envs, n_agents), (n_windows, n_lanes)
+                ),
+                n_recruits=n_recruits,
+                valid=valid,
+            )
+            diagnostics.update(
+                iv.fork_diagnostics(intervention, recruit_distance, interval, horizon)
+            )
+            diagnostics.update(
+                {
+                    "worker_eligible_main": w_traj.active_mask.sum(),
+                    "worker_eligible_fork": intervention.worker.active_mask.sum(),
+                    "manager_eligible_main": m_traj.active_mask.sum(),
+                    "manager_eligible_fork": intervention.manager.active_mask.sum(),
+                }
+            )
+        # Main rollout only: forks are not episodes of the task.
         rollout_stats = {
             "mean_reward": diagnostics["rollout_team_reward"],
             "episode_count": m_traj.done.sum(),
@@ -544,6 +736,7 @@ def make_train(config: FeudalConfig, env):
                 manager=m_traj,
                 diagnostics=diagnostics,
                 manager_goal=goal,
+                intervention=intervention,
             ),
             last_values,
             rollout_stats,
@@ -635,13 +828,39 @@ def make_train(config: FeudalConfig, env):
     def update_fn(runner_state: RunnerState, rollout: Rollout, last_values):
         train_state, rng = runner_state
         rng, worker_rng, manager_rng = jax.random.split(rng, 3)
+        worker_batch, worker_last = rollout.worker, last_values.worker
+        manager_batch, manager_last = rollout.manager, last_values.manager
+        source_stats = {}
+        if forks_on:
+            # Fork columns join the main batch along the env axis. Each fork ends
+            # in a terminal, so GAE never crosses into another fork or into main,
+            # and their last values are never read.
+            fork = rollout.intervention
+            for level, main, f, last, cfg in (
+                ("worker", rollout.worker, fork.worker, last_values.worker, wcfg),
+                ("manager", rollout.manager, fork.manager, last_values.manager, mcfg),
+            ):
+                for source, traj, lv in (
+                    ("main", main, last),
+                    ("fork", f, jnp.zeros((n_lanes,) + last.shape[1:])),
+                ):
+                    std, ev = _source_stats(traj, lv, cfg)
+                    source_stats[f"{level}_adv_std_{source}"] = std
+                    source_stats[f"{level}_explained_variance_{source}"] = ev
+            worker_batch = iv.append_columns(rollout.worker, fork.worker)
+            worker_last = jnp.concatenate(
+                [worker_last, jnp.zeros((n_lanes, n_agents))], axis=0
+            )
+            manager_batch = iv.append_columns(rollout.manager, fork.manager)
+            manager_last = jnp.concatenate([manager_last, jnp.zeros(n_lanes)])
         worker, worker_losses = ppo_update(
             train_state.worker,
             worker_rng,
-            rollout.worker,
-            last_values.worker,
+            worker_batch,
+            worker_last,
             wcfg,
             discrete=False,
+            masked_statistics=forks_on,
         )
         correction, manager_adv, credit_stats = None, train_state.manager_adv, {}
         if credit_on:
@@ -652,17 +871,19 @@ def make_train(config: FeudalConfig, env):
         manager, manager_losses = ppo_update(
             train_state.manager,
             manager_rng,
-            rollout.manager,
-            last_values.manager,
+            manager_batch,
+            manager_last,
             mcfg,
             discrete=False,
             squash=config.manager_action_bound == "tanh",
             advantage_correction=correction,
+            masked_statistics=forks_on,
         )
         losses = {f"worker_{k}": v for k, v in worker_losses.items()}
         losses.update({f"manager_{k}": v for k, v in manager_losses.items()})
         losses.update(rollout.diagnostics)
         losses.update(credit_stats)
+        losses.update(source_stats)
         return (
             RunnerState(
                 train_state=HierTrainState(

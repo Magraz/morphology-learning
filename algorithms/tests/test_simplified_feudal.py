@@ -70,6 +70,8 @@ class StubEnv:
     `goal_state` is the position itself, and the observation begins with it, so a
     test can reconstruct positions (and hence waypoints) from stored inputs.
     `terminate_at` / `max_steps` place a termination / truncation mid-window.
+    `teleport_agents` is the training-fork hook (`interventions.py`);
+    `fail_teleport` makes every placement fail.
     """
 
     observation_dim = OBS_DIM
@@ -77,10 +79,11 @@ class StubEnv:
     discrete = False
     goal_state_dim = 2
 
-    def __init__(self, n_agents, max_steps=100, terminate_at=None):
+    def __init__(self, n_agents, max_steps=100, terminate_at=None, fail_teleport=False):
         self.n_agents = n_agents
         self.max_steps = max_steps
         self.terminate_at = terminate_at
+        self.fail_teleport = fail_teleport
 
     def _obs(self, state):
         return jnp.concatenate([state.pos, jnp.sin(3.0 * state.pos)], axis=-1)
@@ -105,6 +108,20 @@ class StubEnv:
 
     def goal_state(self, state):
         return state.pos
+
+    def teleport_agents(self, state, focal, recruit_mask, offset, key, radius):
+        """Put each recruit `radius` from the focal agent at a random bearing.
+        Invalid when `fail_teleport` is set or a recruit's translated waypoint
+        `pos + offset` would leave [-0.5, 0.5]; the state is then unchanged."""
+        angle = jax.random.uniform(key, (self.n_agents,), maxval=2 * jnp.pi)
+        target = state.pos[focal] + radius * jnp.stack(
+            [jnp.cos(angle), jnp.sin(angle)], axis=-1
+        )
+        moved = jnp.where(recruit_mask[:, None], target, state.pos)
+        in_bounds = jnp.where(recruit_mask[:, None], jnp.abs(moved + offset) <= 0.5, True)
+        valid = jnp.all(in_bounds) & (not self.fail_teleport)
+        new = StubState(pos=jnp.where(valid, moved, state.pos), t=state.t)
+        return self._obs(new), new, valid
 
     # Two fixed boxes for `manager_input: relative`; box 0 counts as delivered
     # from step 6 on, so the masking is exercised mid-rollout.
@@ -136,6 +153,9 @@ def _config(
     counterfactual_samples=4,
     dpp_coef=1.0,
     dpp_max_recruits=None,
+    interventions=False,
+    intervention_radius=0.05,
+    intervention_interval=1,
 ):
     worker = MAPPOConfig(
         n_steps=n_steps,
@@ -163,6 +183,9 @@ def _config(
         counterfactual_samples=counterfactual_samples,
         dpp_coef=dpp_coef,
         dpp_max_recruits=dpp_max_recruits,
+        interventions=interventions,
+        intervention_radius=intervention_radius,
+        intervention_interval=intervention_interval,
     )
 
 

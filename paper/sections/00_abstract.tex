@@ -1,24 +1,12 @@
 \begin{abstract}
-Learning to coordinate in long-horizon cooperative tasks is difficult when
-agents share a reward that obscures their individual contributions. Feudal
-hierarchies structure these tasks through goals assigned by a manager to
-workers, but shared feedback does not distinguish useful goal assignments
-from progress produced by teammates. We introduce a counterfactual-goal
-framework for credit assignment in Feudal multiagent reinforcement learning
-with simple spatial waypoint goals. A manager assigns each worker a waypoint
-for a fixed horizon, while workers learn control policies using an intrinsic
-reward based on reducing their distance to the assigned waypoint. Both levels
-are trained with proximal policy optimization. To assign credit to the
-manager's decisions, a learned advantage model evaluates alternative
-waypoints for one worker while holding the other workers' waypoints fixed.
-The resulting counterfactual baseline adjusts the team advantage to provide
-a separate learning signal for each worker's goal assignment. This connects
-credit assignment across agents and hierarchical levels while retaining an
-explicit, interpretable goal definition. We evaluate the approach on a
-tightly coupled continuous-control multiagent task involving cooperative
-object pushing, where successful manipulation requires coordinated physical
-interactions among agents. Our results show that our algorithm can scale to larger agent counts and handle sparse rewards better than the baselines.
-% TODO: Replace the placeholder with validated findings for this method.
-\textit{[Results pending: specify the comparison methods and principal
-empirical finding, including a quantitative result.]}
+Learning cooperation in tightly coupled multiagent tasks is difficult because
+useful individual behavior may yield little reward until teammates discover
+complementary behavior. When success requires coordinated physical interaction
+over multiple timesteps, agents may rarely encounter examples of cooperation
+early in training. Feudal hierarchies structure exploration through
+manager-assigned goals, but discovering the joint behavior needed to achieve
+those goals remains a challenge. We introduce a heuristic for training interventions that creates opportunities for cooperation by placing existing teammates next to a focal agent and aligning their goals. These counterfactual configurations are instantiated in simulator
+rollouts, and the resulting trajectories provide additional experience for
+training both manager and worker policies using the existing reward signals. Our key insight is that the teammate-placement heuristic accelerates learning by generating cooperative experiences that would
+otherwise depend on agents independently discovering compatible positions and goals. We evaluate our interventions on a continuous-control cooperative object pushing task. Where we show that interventions lead to faster convergence under the same training budget when compared to state of the art baselines.
 \end{abstract}

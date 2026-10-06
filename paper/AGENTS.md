@@ -2,6 +2,8 @@ Keywords: Feudal Reinforcement Learning, Multiagent Reinforcement Learning, Coun
 
 This folder called "paper" lies within the codebase of my current research code. The focus of this research paper is to develop an multiagent learning algorithm that uses the Feudal framework to produce goals for worker agents to achieve the environment's task. The key contribution this work aims to produce is a clever use of counterfactual goals to promote better credit assignment as well as better coordination.
 
+
+
 Main inspirations for this work:
 @article{DBLP:journals/corr/VezhnevetsOSHJS17,
   author       = {Alexander Sasha Vezhnevets and
@@ -44,28 +46,41 @@ The main TEX file is called root.tex, it uses the aamas.cls styling.
 When looking for sources make sure to verify that the source exists, and that the provided citations are correct.
 
 The following is guidance for writing the sections of the paper:
+
+ABSTRACT
+The abstract should answer the same questions as the introduction but on a concise manner. Around 1 sentence per question.
+
 INTRODUCTION
 When writing the introduction and abstract, make sure the content reflects the answers to these 8 questions:
 
+First paragraph should cover:
 1. What is the problem and why do I care?
 2. Why is it important/difficult?
+
+Second paragraph should cover:
 3. What has been done already in this problem area?
 4. What particular problem remains unsolved?
+
+Third paragraph should cover:
 5. How did you solve it?
 6. What is cool about your approach?
+
+Fourth paragraph should cover:
 7. What were your key results?
 8. What are the contributions of this paper?
 
+
 BACKGROUND
 The background section should include the following subsections:
+- Interventions in RL
 - Hierarchical Multiagent RL
 - Feudal Multiagent RL
 - Counterfactuals for credit assignment
 
 Guidance on sections ends here.
 
-Idea:
+<!-- Idea:
 Here's a thought dump on why i think goals and the feudal architecture are necessary. For D++ calculation we need a G function that is a 1 to 1 mapping of joint state ->reward. Not only that but the majority of the reward structure has to be instantaneous. This makes it hard to calculate D++ in settings where just "being there" is not enough. Not only the state has to be aligned, but also the actions. That's what the box pushing enables, just being there touching the box won't solve the task. You need to take actions together to push the box. The goals are a proxy of action alignment, without caring about all the intermediate actions. 
 So the question the new D++ would answer is not just, what if more agents where with me? but what if more agents where taking actions/following goals with me?
 So i don´t know if this should be a reward shaping term or part of the advantage. But the goals would enable me to calculate two things, the cost of abandonding my goal and moving towards you, and the benefit of once being there taking the following the same goal.
-For this I need to use a critic that can calculate V_i(s, gi, g++) where g_++ is the counterfactual goal all other agents would take.
+For this I need to use a critic that can calculate V_i(s, gi, g++) where g_++ is the counterfactual goal all other agents would take. -->

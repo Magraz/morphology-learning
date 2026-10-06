@@ -146,6 +146,22 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   launchers still reference the removed `run_trial.py` and must be updated to
   `train.py` before use.
 
+## Plotting (`plotting/plot_training_stats.ipynb` + `plotting/config.yaml`)
+
+`config.yaml` selects runs as `batches` × `experiments` × `trials` under
+`base_path`. Cell 0 defines `load_reward_runs(batches)` and
+`summarize_rewards(df, group_cols)`, which give the mean ± standard error of the
+mean over trials at each exact `total_steps`. Both reward figures use them.
+- **Single reward plot:** every batch in `batches` goes on one axis.
+- **Multi-batch reward grid:** one subplot per batch in `multi_batches`. The
+  grid has up to 3 columns, and each subplot shows the same `experiments` and
+  `trials`. The figure has one shared legend. Each experiment keeps one color
+  across subplots, assigned by its position in `experiments`. `plot_colors` can
+  override that color by experiment name, but a `batch/experiment` key has no
+  effect here. Y axes are not shared, because reward scales differ between
+  batches. The cell prints a table of the trials found for each batch and
+  experiment. If `multi_batches` is absent, the cell skips the plot.
+
 ## Single-agent FeUdal runs
 
 `mjx_1a_3o_111_1024` is a valid sequential-delivery task: its one agent can
@@ -1434,6 +1450,13 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 # counterfactual-goal credit for the manager (2026-09-29, see its block below):
 uv run python train.py algorithm=simplified_feudal_mappo_jax \
     env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_cf trial_id=0
+# D++ credit for the manager (2026-10-03, see its block below):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_2a_4o_1122_1024_gs model=simplified_feudal_tanh_relative_input_dpp trial_id=0
+# training forks with teleported recruits (2026-10-05, see its block below):
+uv run python train.py algorithm=simplified_feudal_mappo_jax \
+    env=mjx_2a_4o_1122_1024_gs \
+    model=simplified_feudal_tanh_relative_input_interventions trial_id=0
 ```
 
 - **Manager: PPO, one decision per window of `c = goal_horizon` env steps**
@@ -1484,7 +1507,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
   - Residual: advantage normalization in `ppo_update` is not masked, so frozen
     steps enter the per-stream mean/std.
 - **Reuse:**
-  - From `mappo_jax`: `ppo_update` ×2, `create_train_state`,
+  - From `mappo_jax`: `ppo_update` ×2 (the fork arm adds its default-off
+    `masked_statistics` flag), `create_train_state`,
     `sample_action`/`evaluate_action`, `global_state_fn`/`global_state_dim`
     (so `_gs` twin groups work), `Transition` and `make_env`.
   - The runner **subclasses `MAPPO_JAX_Runner`**, so the train loop, stats,
@@ -1858,7 +1882,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     `relative_input` and `local_input` have not been run there, and
     `local_input` has not been run on either dense group.
 - **Counterfactual-goal credit (`manager_credit: counterfactual`, added
-  2026-09-29): wired, verified, UNRUN.**
+  2026-09-29): wired, verified, and a measured NULL on return at 2a/4o
+  (2026-10-02, see the end of this block).**
   - **The problem it targets.** Under `team` credit (the default) `ppo_update`
     copies the manager's one team advantage to every agent's waypoint
     (`jnp.repeat`). That reinforces a free rider's waypoint whenever a teammate
@@ -1967,8 +1992,231 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     Expect little at N = 2 (one teammate to remove). In a reward desert `Â_φ`
     learns nothing and this is team credit. The fork-based audit (learned `c_i`
     vs the simulator's exact counterfactual) is deliberately not built yet.
+  - **MEASURED 2026-10-02: no return change at 2a/4o, although the correction is
+    active.** 5 seeds per arm at 1e8 steps, mean of the last 10 evals. At the end
+    of training `manager_cf_beta` is 0.93–0.99 (`hold`: 0.27–0.79),
+    `adv_var_ratio` 0.74–0.87 (`hold`: 0.94–0.97) and `model_ev` 0.13–0.27, on
+    all three groups.
+
+    | group | parent `_relative_input` | `_cf` | `_cf_hold` | `mlp` |
+    |---|---|---|---|---|
+    | `mjx_2a_4o_1111_1024_gs` | 399–431 | 423–435 | 375–432 | 437–438 |
+    | `mjx_2a_4o_1122_1024_gs` | 281–320 | 248–320 | 175–319 | 418–429 |
+    | `mjx_2a_4o_1122_1024_gs_sparse` | 116–160 | 118–163 | 123–275 | 370–387 |
+
+    `_local_input_cf` likewise matches `_local_input`. A baseline changes the
+    variance of the gradient, not its expectation, so it cannot create the
+    coordinated goal pairs that tight coupling needs. The 1111-vs-1122 pair
+    differs only in `coupling_def` (box sizes are identical), and coupling costs
+    the hierarchy 122 (dense) / 250 (sparse) points against 16 / 20 for `mlp`.
+    The follow-up design is `plans/goal_recruitment_critic_2026-10-02.md`.
+- **D++ credit (`manager_credit: dpp`, added 2026-10-03): wired, verified,
+  and its offline critic check FAILS. No training run.** Plan:
+  `plans/goal_recruitment_critic_2026-10-02.md`.
+  - **The term.** It reuses the counterfactual arm's joint-goal advantage model
+    `Â_φ` unchanged (same network, training, update order and checkpoint entry).
+    ```
+    A_i      = A_team + dpp_coef · max(0, D++_i)
+    D++_i(n) = [Â(x, o++(i, n)) − Â(x, o)] / n,   D++_i = max over n = 1..N−1
+    ```
+    `o++(i, n)` keeps agent i's goal and replaces its n nearest teammates' goals
+    with an R-bounded waypoint toward agent i's position
+    (`counterfactual.support_offsets`, built by `waypoints.waypoint_offset` so it
+    is a legal manager output). The state value cancels in the difference, so
+    `Â_φ` serves as the Q critic. Only critic forward passes, no simulator fork,
+    and execution is unchanged. The `/n` and the search over `n` follow D++
+    (Rahmattalabi, Chung, Colby and Tumer, IROS 2016); the clip mirrors D++'s
+    fall-back to the difference reward. With `dpp_coef: 1`, `A_i ≈ max(Q(x, o),
+    Q(x, o++)) − V(x)`.
+  - **It is shaping, not a baseline.** The term reads agent i's own goal, so it
+    changes the expected gradient on purpose (the true baseline of `_cf` changed
+    nothing). `ppo_update`'s `advantage_correction` docstring now says so. The
+    trainer passes `counterfactual.dpp_correction` = `−coef · max(0, D++)`
+    because that argument is subtracted.
+  - **Knobs** (`Model_Params` → `FeudalConfig`): `manager_credit: dpp`,
+    `dpp_coef` (default 1.0) and `dpp_max_recruits` (default None = N − 1).
+    `validate_manager_credit` rejects a negative coefficient and a zero recruit
+    cap, and warns at N = 1, where the term is exactly 0.
+  - **Arms**, one key each on their parents:
+    `simplified_feudal_tanh_relative_input_dpp` and
+    `simplified_feudal_tanh_local_input_dpp`. The checkpoint tree equals the
+    `_cf` arm's (both carry `manager_adv`, `(40, 336)` at 2a/4o), so only the
+    model group name records which credit trained it.
+  - **Wiring.** `trainer._manager_credit` (formerly `_counterfactual_credit`)
+    computes the team advantage, scores with the pre-update model, branches on
+    the mode, and refits the model last. `counterfactual.GOAL_MODEL_CREDITS`
+    decides when the model and `ManagerGoal` exist.
+  - **Logged per update:** `manager_dpp_{mean, std, positive_frac,
+    mean_best_n, adv_shift}` (`adv_shift` = std of the applied term / std of the
+    team advantage), plus `manager_cf_model_ev` and `manager_cf_model_loss` for
+    the critic's own fit. Read `positive_frac` and `adv_shift` before return.
+  - **Verified 2026-10-03:**
+    - `team` and `counterfactual` are bit-identical to the pre-change code: 0.0
+      maximum difference over 36 CPU-stub configurations (N ∈ {1, 3}, both
+      bounds, all three manager inputs, both counterfactual defaults), covering
+      the rollout, two updates, every logged loss and eval.
+    - 14 new seam tests; 116 pass across `test_simplified_feudal.py` +
+      `test_smax_seams.py` + `test_mjx_global_state.py`.
+    - Smoke on `mjx_2a_4o_1122_1024_gs`, both arms: train to 2e5, `checkpoint=true`
+      resume to 3e5 (all 8 history entries kept) and `evaluate=true` work. The
+      term is exactly 0 on the first update (zero-initialized head) and its
+      `positive_frac` is 0.2–0.6 afterwards. One local-arm resume attempt exited
+      1 with its log lost; an identical rerun succeeded.
+  - **⚠ The offline critic check FAILS (`dpp_probe.py`, 2026-10-03).** It loads
+    each finished `_cf` checkpoint's trained `Â_φ`, rolls out that trial's
+    manager (stochastic, 64 episodes), and compares the clipped term when the
+    agent waits alone (touching an undelivered box whose coupling ≥ 2 is unmet)
+    with all other decisions. Intervals bootstrap over episodes.
+
+    | 1122 group | relative `_cf` (alone − other) | local `_cf` |
+    |---|---|---|
+    | dense | −0.70 / −0.80 / +0.05 / −0.91 / −1.04 | −0.30 / −0.47 / −0.49 / −0.29 / −0.56 |
+    | sparse | −0.13 / −0.96 / −1.02 / −0.14 / −2.06 | −0.34 / −0.39 / −0.26 / −0.33 / −0.34 |
+
+    Seeds 0–4 per cell. 0 of 20 intervals lie above zero; 19 lie below it. The
+    existing critics rate sending a teammate toward a waiting agent LOWER than
+    at other decisions. The control mirrors the same move away from the agent:
+    when an agent waits alone, "toward minus away" is negative on 17 of 20
+    (16 intervals below zero). The exceptions are relative dense seed 1
+    (interval includes zero) and relative sparse seeds 0 and 3, which have the
+    fewest waiting cases (151 and 72). So the critics do not merely penalize
+    leaving the policy's own goals; they actively prefer the teammate not to
+    come.
+    - **Unresolved, and it decides what to fix.** The probe cannot tell whether
+      the critic is wrong or right. It may be right that a ONE-window detour
+      toward a waiting agent costs the teammate its own task while the manager
+      abandons the coalition at the next boundary. Heading for the agent's
+      position may also approach the box from the wrong side. Or the critic
+      may encode the parent's own failure, since it is trained on on-policy
+      advantages from policies that rarely complete coalitions. Separating these
+      needs a simulator audit of the same counterfactual, or another recruit
+      target.
+    - **Do not launch the full `_dpp` runs on the strength of this mechanism**
+      until the check passes. The plan's rule is to fix the critic first.
+    ```
+    uv run python -m algorithms.simplified_feudal_mappo_jax.dpp_probe \
+        --batch mjx_2a_4o_1122_1024_gs \
+        --model simplified_feudal_tanh_relative_input_cf --trials 0,1,2,3,4
+    ```
+    MJX is not reproducible across processes, so a rerun moves the numbers
+    slightly (seed 0 dense relative read −0.77 in a first run); the signs held.
+- **Training forks (`interventions: true`, added 2026-10-05): wired and
+  smoke-tested. No training result.** Plan:
+  `plans/simplified_feudal_interventions_2026-10-05.md`; code:
+  `interventions.py` plus branches in `trainer.py`.
+  - **The mechanism.** At every `intervention_interval`-th manager decision
+    (default 1), each env is forked once per agent i, before the window's first
+    worker step:
+    - N ~ U{1..n_agents−1} teammates, drawn without replacement, are teleported
+      within `intervention_radius` (default 1.5 world units, centre to centre)
+      of agent i.
+    - Each recruit gets agent i's realized waypoint offset `w_i − s_i` (after
+      the bound and arena clip), measured from its own new position. Agent i
+      and the other agents keep their positions and waypoints.
+    - The fork runs one window under the same frozen policies and is then
+      discarded. Its worker steps end with `done` at the window end. Its one
+      manager transition is a terminal whose return is the discounted team
+      reward of its live steps. Neither level adds a time-limit bootstrap
+      (`_worker_step(bootstrap=False)`).
+    - Execution, `eval_fn` and `view()` are unchanged. `total_steps`,
+      `episode_count` and `rollout_team_reward` count the main rollout only.
+  - **Who is trained on what.**
+    - Manager: the fork's record is the main decision itself (stored actor
+      input, action and log-prob, so the PPO ratio is 1). Only agent i carries
+      actor weight (`active_mask` = one-hot(i) × valid), because the recruits'
+      goals were imposed.
+    - Worker: every live agent's fork action is a real sample.
+    - The manager critic reads a context block appended to its input,
+      `[is_intervention, one_hot(i), N/(n_agents−1)]`, all zeros on main rows,
+      so it can tell a continuing return from a one-window fork return. N is
+      drawn independently of the action, so the baseline does not depend on it.
+      The critic is `n_agents + 2` inputs wider: `(40, 336)` at 2a/4o against 36
+      for the parent, so checkpoints do not load across.
+  - **Layout: forks are extra env COLUMNS** (`types.Intervention`). Fork (w, e,
+    i) is column `e·A + i` in the rows of its source window, so the fork buffers
+    keep the main buffers' time length. `update_fn` appends them along the env
+    axis (`iv.append_columns`) and calls `ppo_update` once per level. Every fork
+    ends in a terminal, so GAE never crosses between forks or into main (pinned
+    column for column). Windows skipped by the interval hold fully masked
+    placeholder rows; the fork branch sits under `lax.cond`, so they run no
+    physics.
+  - **Shared change: `ppo_update(masked_statistics=False)`** in
+    `mappo_jax/mappo.py`. When on, `active_mask` also governs the per-stream
+    advantage normalization (a stream with fewer than two active rows is left
+    unnormalized), the explained variance and the scalar critic loss. The
+    variant turns it on for both levels. Without it, interval-k placeholder rows
+    would shrink each fork column's std by ~√k, and failed placements would
+    train the scalar critic. It also excludes frozen MAIN rows from the
+    statistics, a small difference from the parent: on `trunc` groups a main row
+    freezes only after a mid-window all-delivered termination. Helpers
+    `masked_mean_std` / `masked_normalize` / `masked_explained_variance`. Off is
+    byte-identical.
+  - **Env hook `MultiBoxPushMJX.teleport_agents(state, focal, recruit_mask,
+    offset, key, radius) -> (obs, state, valid)`**:
+    - Recruits go in the annulus between 0.85 and `radius` around agent i, in
+      index order, each at the first valid one of 32 candidates.
+    - A candidate must clear the walls, every box surface and every agent that
+      stays put or is already placed, each by a 0.05 margin.
+    - It must also keep its translated waypoint inside `[-0.5, 0.5]`.
+    - If any recruit fails, `valid` is False and the state is returned
+      unchanged. The radius is never enlarged and N is never reduced.
+    - Only recruit `qpos` changes. Velocities, box poses, `t`, `delivered` and
+      `prev_box_goal_dist` are kept, so teleporting pays nothing.
+    - One `mjx.forward` under `_model_for(_coupling_met(.))` refreshes contacts
+      and the contact-force observation, and the warm start is set from it.
+    - The rotated-box distance is shared with `touch_matrix` through
+      `observation.box_surface_distance` (refactor verified bit-identical).
+    - No other env has the hook; the validator raises for them.
+  - **Validation** (`iv.validate_interventions`):
+    - `manager_credit: team` only;
+    - `n_agents >= 2`, radius > 0, the env hook present;
+    - integer interval >= 1 with `ceil(n_windows/interval) >= 2`;
+    - an interval other than 1 without `interventions` raises, rather than
+      silently training the parent.
+  - **Arm** `simplified_feudal_tanh_relative_input_interventions`: one key on
+    its parent, and it declares the radius and interval defaults. Interval and
+    radius leave checkpoints shape-identical, so set them in a child model
+    group, never on the CLI.
+  - **Extra-data control** `conf/env/mjx_2a_4o_1122_1024_gs_n96.yaml` (96 envs,
+    3e8 steps), run under the PARENT model. It matches interval 1 on three
+    counts: updates (2959), worker rows per update and simulator steps. For
+    interval k use `32·(1 + 2/k)` envs and `1e8·(1 + 2/k)` steps.
+  - **Logged per update:**
+    - `intervention_attempted`, `_valid_frac`, and both per N (`_n{N}`);
+    - `intervention_recruit_distance` (world units), `_fork_length`,
+      `_window_return`, `_worker_progress`;
+    - `intervention_sim_steps` (live) and `_stepped_lanes`;
+    - `{worker,manager}_eligible_{main,fork}`;
+    - `{worker,manager}_{adv_std,explained_variance}_{main,fork}`, from
+      separate per-source GAE.
+
+    Read placement success per N first: the geometric filter can reshape the
+    realized N distribution.
+  - **Verified 2026-10-05:**
+    - The default path is bit-identical to the pre-change code: 0.0 maximum
+      difference over 6,498 arrays. That covers 36 CPU-stub configurations
+      (N ∈ {1, 3} × both bounds × three manager inputs × three credits; rollout,
+      two updates, losses, parameters, eval) and four direct `ppo_update` cases.
+    - With forks on, the main rollout is bit-identical to the parent's at the
+      same seed, at intervals 1 and 2, including when every placement fails.
+    - 42 seam tests in `algorithms/tests/test_simplified_feudal_interventions.py`.
+    - MJX placement on random-action states, 150 steps in: 93% valid at 2a/4o;
+      83% at 6a/4o (N=1..5: 92 / 88 / 83 / 75 / 77%).
+    - Smoke on `mjx_2a_4o_1122_1024_gs` at 2e5 steps: train,
+      `checkpoint=true` resume to 3e5 (8 aligned history entries) and
+      `evaluate=true` all work, and every placement was valid. Interval 2 forks
+      at 17 of 33 windows.
+    - **Measured cost:** warm collection 1.5–2.1 s per update at interval 1,
+      1.0–1.4 s at interval 2, against 0.6–0.8 s for the parent. The update
+      takes 0.06 against 0.03 s. Physics alone at 3× lanes in one batch costs
+      only ~1.06×, so the gap most likely comes from the fork scan running
+      after the main scan in every window (not separately measured). Merging
+      both into one lane batch is the optimization if it matters.
+  - ⚠ **On sparse groups a one-window fork carries almost no task reward.** A
+    box at spawn height needs at least ~40 steps of pushing to reach the band.
+    Pilot on dense groups.
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
-  76 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
+  90 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;
   - the worker reward telescopes;
   - freeze + reset at the boundary;
@@ -2018,6 +2266,24 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     - config validation and the one-agent warning;
     - `make_feudal_config` wiring;
     - checkpoint trees carry the model only when it is enabled.
+  - D++ credit (14 tests):
+    - support offsets step toward the focal agent, within R per axis and the
+      arena;
+    - `dpp_joint` keeps the focal goal and changes exactly the n nearest
+      teammates;
+    - a hand-built indicator critic pins the `/n` division, the maximum over n,
+      `dpp_max_recruits`, and the clip of a harmful recruitment to 0;
+    - the correction's sign, both directly and through the real `ppo_update`
+      (crediting an agent's goals raises their log-probability against debiting
+      them);
+    - the term is 0 at N = 1 and with a zero-initialized critic, and the arm
+      starts as exact team credit (bit-identical worker update, manager within
+      1e-5);
+    - editing agent i's own goal moves D++_i, the shaping property that
+      separates it from `counterfactual`;
+    - end-to-end collect/update/eval at N = 1 and 3, config validation and the
+      one-agent warning, `make_feudal_config` wiring, and the checkpoint carrying
+      `manager_adv`.
 
 ## Feudal MAPPO (`algorithms/feudal_mappo_jax/`)
 

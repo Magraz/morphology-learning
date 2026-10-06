@@ -69,6 +69,18 @@ class Model_Params:
     # Largest number of recruits the D++ search tries. None = every teammate
     # (N - 1). Read only under "dpp".
     dpp_max_recruits: Optional[int] = None
+    # Training-time simulator forks (`interventions.py`). At every
+    # `intervention_interval`-th manager decision each env is forked once per
+    # agent i; in fork i, N ~ U{1..n_agents-1} teammates are teleported within
+    # `intervention_radius` WORLD units of agent i and given i's waypoint offset.
+    # Each fork is a one-window episode whose transitions join both levels' PPO
+    # batches. Execution and evaluation are unchanged. False is the original
+    # code path. Set all three in a model group, never on the CLI: the interval
+    # and radius leave checkpoints shape-identical, so the model group name in
+    # the results path is the only record of them.
+    interventions: bool = False
+    intervention_radius: float = 1.5
+    intervention_interval: int = 1
 
 
 @dataclass
@@ -104,6 +116,11 @@ class FeudalConfig:
     counterfactual_samples: int = 16
     dpp_coef: float = 1.0
     dpp_max_recruits: Optional[int] = None
+    # Training-time forks (see Model_Params and `interventions.py`). False is the
+    # original code path.
+    interventions: bool = False
+    intervention_radius: float = 1.5
+    intervention_interval: int = 1
 
 
 class ManagerGoal(NamedTuple):
@@ -128,6 +145,21 @@ class Rollout(NamedTuple):
     manager: object  # mappo_jax Transition, leading dim n_windows
     diagnostics: dict  # scalar rollout diagnostics, merged into the losses
     manager_goal: object = None  # ManagerGoal under counterfactual / dpp credit, else None
+    intervention: object = None  # Intervention under `interventions: true`, else None
+
+
+class Intervention(NamedTuple):
+    """The training forks of one rollout (`interventions.py`), laid out as extra
+    env COLUMNS with the main buffers' time length, so `update_fn` can append
+    them to the main batch along the env axis. Fork (window w, env e, focal
+    agent i) is column `e * n_agents + i`; a window skipped by
+    `intervention_interval` holds fully masked placeholder rows."""
+
+    worker: object  # mappo_jax Transition, (n_steps, n_envs * n_agents, ...)
+    manager: object  # mappo_jax Transition, (n_windows, n_envs * n_agents, ...)
+    focal: jax.Array  # (n_windows, L) int — agent i of each fork lane
+    n_recruits: jax.Array  # (n_windows, L) int — N, 0 on skipped windows
+    valid: jax.Array  # (n_windows, L) bool — placement succeeded (False if skipped)
 
 
 class LastValues(NamedTuple):

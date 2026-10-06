@@ -255,11 +255,20 @@ def worker_critic_input(global_state, error, remaining):
     return jnp.concatenate([global_state, error.reshape(b, -1), rem], axis=-1)
 
 
-def input_dims(obs_dim, global_state_dim, n_agents, goal_dim, manager_actor_dim=None):
+def input_dims(
+    obs_dim,
+    global_state_dim,
+    n_agents,
+    goal_dim,
+    manager_actor_dim=None,
+    manager_context_dim=0,
+):
     """Widths of the four network inputs above, for building train states.
 
     `manager_actor_dim` overrides the manager actor's width; the trainer passes it
     under `manager_input: relative`, whose width it reads off the builder itself.
+    `manager_context_dim` widens the manager critic by the fork context block
+    (`interventions.critic_context`); 0 unless `interventions: true`.
     """
     if manager_actor_dim is None:
         manager_actor_dim = global_state_dim + goal_dim * n_agents + n_agents
@@ -267,5 +276,5 @@ def input_dims(obs_dim, global_state_dim, n_agents, goal_dim, manager_actor_dim=
         "worker_actor": obs_dim + goal_dim + 1,
         "worker_critic": global_state_dim + goal_dim * n_agents + 1,
         "manager_actor": manager_actor_dim,
-        "manager_critic": global_state_dim + goal_dim * n_agents,
+        "manager_critic": global_state_dim + goal_dim * n_agents + manager_context_dim,
     }
