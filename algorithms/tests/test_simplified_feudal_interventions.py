@@ -528,6 +528,45 @@ def test_masked_statistics_rejects_an_advantage_correction():
 
 
 @pytest.mark.parametrize("interval", [1, 2])
+def test_n_total_steps_caps_simulator_steps(interval):
+    """Under forks an update charges its main rollout plus every stepped fork
+    lane to `n_total_steps`, and that charge equals the logged fork lanes. Off,
+    the charge is the main rollout, as before."""
+    n_agents = 3
+    config = _config(interventions=True, intervention_interval=interval)
+    main = N_STEPS * N_ENVS
+    per_update = iv.simulator_steps_per_update(config, n_agents)
+    assert per_update == main + math.ceil(N_WINDOWS / interval) * N_ENVS * n_agents * HORIZON
+    assert make_train(config, StubEnv(n_agents))[-1] == (
+        config.worker.n_total_steps // per_update
+    )
+    _, _, (_, rollout, _, _), _ = _forks(StubEnv(n_agents), intervention_interval=interval)
+    assert main + float(rollout.diagnostics["intervention_stepped_lanes"]) == per_update
+
+    off = _config()
+    assert iv.simulator_steps_per_update(off, n_agents) == main
+    assert make_train(off, StubEnv(n_agents))[-1] == off.worker.n_total_steps // main
+
+
+def test_the_runner_charges_what_the_budget_charges():
+    """The runner's per-update step count (logged `total_steps`, resume index)
+    is the same function `make_train` divides the budget by."""
+    from algorithms.mappo_jax.run import MAPPO_JAX_Runner
+    from algorithms.simplified_feudal_mappo_jax.run import (
+        Simplified_Feudal_MAPPO_JAX_Runner as Runner,
+    )
+
+    runner = Runner.__new__(Runner)
+    runner.feudal_config, runner.env = _config(interventions=True), StubEnv(3)
+    assert runner._steps_per_update() == iv.simulator_steps_per_update(
+        runner.feudal_config, 3
+    )
+    base = MAPPO_JAX_Runner.__new__(MAPPO_JAX_Runner)
+    base.config = runner.feudal_config.worker
+    assert base._steps_per_update() == N_STEPS * N_ENVS
+
+
+@pytest.mark.parametrize("interval", [1, 2])
 @pytest.mark.parametrize("n_agents", [2, 3])
 def test_fork_collect_update_eval_end_to_end(n_agents, interval):
     _, runner_state, (rs, rollout, last, _), (update_fn, eval_fn) = _forks(

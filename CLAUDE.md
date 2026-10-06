@@ -2118,8 +2118,21 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       manager transition is a terminal whose return is the discounted team
       reward of its live steps. Neither level adds a time-limit bootstrap
       (`_worker_step(bootstrap=False)`).
-    - Execution, `eval_fn` and `view()` are unchanged. `total_steps`,
-      `episode_count` and `rollout_team_reward` count the main rollout only.
+    - Execution, `eval_fn` and `view()` are unchanged. `episode_count` and
+      `rollout_team_reward` count the main rollout only.
+  - **`n_total_steps` caps SIMULATOR steps (changed 2026-10-05, at the author's
+    request).** One update charges its main `n_steps * n_envs` plus every fork
+    lane on every intervention window for `goal_horizon` steps. Frozen and
+    failed lanes count because they are stepped; skipped windows do not
+    (`iv.simulator_steps_per_update`).
+    - `make_train`'s `num_updates` and the runner's `_steps_per_update` (a new
+      default-identity hook on `MAPPO_JAX_Runner`, i.e. the logged `total_steps`
+      and the resume index) both call that function, so they cannot disagree.
+    - At 2a/4o, interval 1, an update is 101,376 steps (33,792 main), so a 1e8
+      budget gives **986 updates against the parent's 2959**.
+    - Curves of this arm against the parent at equal `total_steps` are
+      therefore equal-SIMULATOR-step comparisons. For equal main steps, divide
+      this arm's `total_steps` by `1 + A * ceil(W/k) / W`.
   - **Who is trained on what.**
     - Manager: the fork's record is the main decision itself (stored actor
       input, action and log-prob, so the PPO ratio is 1). Only agent i carries
@@ -2178,9 +2191,10 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     radius leave checkpoints shape-identical, so set them in a child model
     group, never on the CLI.
   - **Extra-data control** `conf/env/mjx_2a_4o_1122_1024_gs_n96.yaml` (96 envs,
-    3e8 steps), run under the PARENT model. It matches interval 1 on three
-    counts: updates (2959), worker rows per update and simulator steps. For
-    interval k use `32·(1 + 2/k)` envs and `1e8·(1 + 2/k)` steps.
+    same `n_total_steps`), run under the PARENT model. At the same budget it
+    matches interval 1 on three counts: updates (986 at 1e8), worker rows per
+    update and simulator steps. For interval k use about
+    `32·(1 + 2·ceil(33/k)/33)` envs.
   - **Logged per update:**
     - `intervention_attempted`, `_valid_frac`, and both per N (`_n{N}`);
     - `intervention_recruit_distance` (world units), `_fork_length`,
@@ -2199,13 +2213,17 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       two updates, losses, parameters, eval) and four direct `ppo_update` cases.
     - With forks on, the main rollout is bit-identical to the parent's at the
       same seed, at intervals 1 and 2, including when every placement fails.
-    - 42 seam tests in `algorithms/tests/test_simplified_feudal_interventions.py`.
+    - 45 seam tests in `algorithms/tests/test_simplified_feudal_interventions.py`,
+      including the budget arithmetic and its agreement with the runner hook.
     - MJX placement on random-action states, 150 steps in: 93% valid at 2a/4o;
       83% at 6a/4o (N=1..5: 92 / 88 / 83 / 75 / 77%).
-    - Smoke on `mjx_2a_4o_1122_1024_gs` at 2e5 steps: train,
-      `checkpoint=true` resume to 3e5 (8 aligned history entries) and
+    - Smoke on `mjx_2a_4o_1122_1024_gs`: train, `checkpoint=true` resume and
       `evaluate=true` all work, and every placement was valid. Interval 2 forks
       at 17 of 33 windows.
+    - Under the simulator-step budget, 3e5 gives 2 updates of 101,376 steps.
+      The resume to 5e5 picked up at update 2, and every `total_steps`
+      increment equals 33,792 main steps plus the logged
+      `intervention_stepped_lanes`.
     - **Measured cost:** warm collection 1.5–2.1 s per update at interval 1,
       1.0–1.4 s at interval 2, against 0.6–0.8 s for the parent. The update
       takes 0.06 against 0.03 s. Physics alone at 3× lanes in one batch costs

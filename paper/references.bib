@@ -1,5 +1,5 @@
-% Verified literature for waypoint-goal Feudal multiagent reinforcement learning.
-% Literature search and verification date: 2026-10-02.
+% Literature for training interventions in waypoint-goal Feudal multiagent RL.
+% Original collection verified 2026-10-02; intervention supplement 2026-10-05.
 % Entries are grouped by topic, then year and citation key.
 % IMPORTANT: abstract fields contain ORIGINAL PARAPHRASES of author abstracts,
 % not verbatim publisher abstracts. abstract_url links to the original text.
@@ -9,7 +9,292 @@
 % urldate records the research date; verification_url records the primary source.
 % Optional identifiers and pagination are included only when verified.
 % Custom fields are ignored by the standard ACM bibliography style.
-% See literature_review.md for the reading order and citation guidance.
+% literature_review.md describes the original credit-assignment collection.
+% The three sections below supplement it for the revised intervention focus.
+% All 13 additions were checked against proceedings, author/institutional
+% records, or arXiv. Unverified pagination and identifiers are omitted.
+% Suggested starting points for the revised paper:
+%   Intervention design: florensa2017reverse, ryu2022remax, chen2021vacl.
+%   Cooperative exploration: liu2021cmae, wang2020influence, mahajan2019maven.
+%   Counterfactual support inspiration: rahmattalabi2016dpp.
+%   Architecture: vezhnevets2017fun, ahilan2019fmh, yang2020hsd.
+%   Counterfactual data comparisons: pitis2020coda, pitis2022mocoda.
+% These references establish related mechanisms, not novelty or performance
+% of the proposed teammate-placement heuristic. Count intervention rollouts
+% when comparing simulator sample budgets; evaluate without supplied support.
+
+% ======================================================================
+% TOPIC: Training interventions, state resets, and multiagent curricula
+% keyword: training_interventions
+% ======================================================================
+
+@inproceedings{florensa2017reverse,
+  title              = {{Reverse Curriculum Generation for Reinforcement Learning}},
+  author             = {Florensa, Carlos and Held, David and Wulfmeier, Markus and Zhang, Michael and Abbeel, Pieter},
+  year               = {2017},
+  booktitle          = {Proceedings of the 1st Annual Conference on Robot Learning},
+  publisher          = {PMLR},
+  series             = {Proceedings of Machine Learning Research},
+  volume             = {78},
+  pages              = {482--495},
+  url                = {https://proceedings.mlr.press/v78/florensa17a.html},
+  abstract_url       = {https://proceedings.mlr.press/v78/florensa17a.html},
+  verification_url   = {https://proceedings.mlr.press/v78/florensa17a.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {Starting from a known successful state, the method builds an adaptive curriculum of initial conditions that gradually increases the difficulty of reaching a goal. It enables learning navigation and manipulation with sparse task feedback, without demonstrations or a manually designed shaping reward.},
+  annotation         = {Foundational comparison for changing the states from which actual training rollouts begin. Its curriculum expands around a known goal state; the proposed intervention instead supplies nearby teammates around a focal agent encountered during training.},
+  keywords           = {training_interventions, initial states, curriculum learning, sparse rewards},
+  priority           = {essential},
+  publication_status = {Conference paper},
+}
+
+@misc{resnick2018backplay,
+  title              = {{Backplay: ``Man muss immer umkehren''}},
+  author             = {Resnick, Cinjon and Raileanu, Roberta and Kapoor, Sanyam and Peysakhovich, Alexander and Cho, Kyunghyun and Bruna, Joan},
+  year               = {2018},
+  eprint             = {1807.06919},
+  archivePrefix      = {arXiv},
+  primaryClass       = {cs.LG},
+  doi                = {10.48550/arXiv.1807.06919},
+  url                = {https://arxiv.org/abs/1807.06919},
+  abstract_url       = {https://arxiv.org/abs/1807.06919},
+  verification_url   = {https://arxiv.org/abs/1807.06919},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {Backplay builds a training curriculum from one demonstration by initializing episodes near its end and progressively moving the initial state toward its beginning. The paper analyzes when this improves learning and evaluates the method in grid worlds and the multiplayer game Pommerman.},
+  annotation         = {Useful precedent for making successful experience accessible through simulator initialization. It requires a demonstration and follows visited states, whereas teammate placement constructs support configurations. The arXiv record notes an AAAI-19 Reinforcement Learning in Games workshop presentation; this entry cites the preprint first posted in 2018, not an AAAI main-track paper.},
+  keywords           = {training_interventions, initial states, curriculum learning, demonstrations},
+  priority           = {supporting},
+  publication_status = {Preprint; workshop presentation noted in author record},
+}
+
+@inproceedings{turchetta2020cisr,
+  title              = {{Safe Reinforcement Learning via Curriculum Induction}},
+  author             = {Turchetta, Matteo and Kolobov, Andrey and Shah, Shital and Krause, Andreas and Agarwal, Alekh},
+  year               = {2020},
+  booktitle          = {Advances in Neural Information Processing Systems},
+  publisher          = {Curran Associates, Inc.},
+  volume             = {33},
+  url                = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/8df6a65941e4c9da40a4fb899de65c55-Abstract.html},
+  abstract_url       = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/8df6a65941e4c9da40a4fb899de65c55-Abstract.html},
+  verification_url   = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/8df6a65941e4c9da40a4fb899de65c55-Abstract.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {An automated instructor intervenes during training through a library of reset controllers that prevent constraint violations. The instructor learns which interventions to apply from observations of learner progress, producing curricula intended to improve final policy performance while maintaining safety during learning.},
+  annotation         = {Background for interventions that actually change the learner's training trajectory and for choosing when to remove assistance. The paper targets safety in constrained RL; it does not propose cooperative teammate placement, and its safety assumptions are not guarantees for this project.},
+  keywords           = {training_interventions, reset controllers, curriculum learning, safe reinforcement learning},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+@inproceedings{chen2021vacl,
+  title              = {{Variational Automatic Curriculum Learning for Sparse-Reward Cooperative Multi-Agent Problems}},
+  author             = {Chen, Jiayu and Zhang, Yuanxin and Xu, Yuanfan and Ma, Huimin and Yang, Huazhong and Song, Jiaming and Wang, Yu and Wu, Yi},
+  year               = {2021},
+  booktitle          = {Advances in Neural Information Processing Systems},
+  publisher          = {Curran Associates, Inc.},
+  volume             = {34},
+  url                = {https://proceedings.neurips.cc/paper/2021/hash/503e7dbbd6217b9a591f3322f39b5a6c-Abstract.html},
+  abstract_url       = {https://proceedings.neurips.cc/paper/2021/hash/503e7dbbd6217b9a591f3322f39b5a6c-Abstract.html},
+  verification_url   = {https://proceedings.neurips.cc/paper/2021/hash/503e7dbbd6217b9a591f3322f39b5a6c-Abstract.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {VACL derives a curriculum update from a variational learning objective and expands the distribution of training tasks as agents improve. Its task-generation and entity-curriculum components vary configurations and entity counts to solve cooperative multiagent problems with sparse rewards.},
+  annotation         = {Close cooperative MARL comparison for deliberately changing training configurations to improve learning. Distinguish a curriculum over task configurations and entity counts from relocating existing teammates around a focal agent in a simulator fork.},
+  keywords           = {training_interventions, cooperative exploration, multiagent curricula, sparse rewards},
+  priority           = {essential},
+  publication_status = {Conference paper},
+}
+
+@article{ecoffet2021goexplore,
+  title              = {{First return, then explore}},
+  author             = {Ecoffet, Adrien and Huizinga, Joost and Lehman, Joel and Stanley, Kenneth O. and Clune, Jeff},
+  year               = {2021},
+  journal            = {Nature},
+  volume             = {590},
+  pages              = {580--586},
+  doi                = {10.1038/s41586-020-03157-9},
+  url                = {https://www.nature.com/articles/s41586-020-03157-9},
+  abstract_url       = {https://arxiv.org/abs/2004.12919},
+  verification_url   = {https://adrien.ecoffet.com/files/go-explore-nature.pdf},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {Go-Explore stores promising states, returns to them, and then explores further, addressing failures to revisit useful experience. The paper studies difficult Atari games and a sparse-reward robotic task, and introduces a goal-conditioned version that can return through policy execution in stochastic environments.},
+  annotation         = {Supports the exploration rationale for exploiting simulator state access during training. Compare returning to archived states with constructing new teammate-support configurations. Distinguish the reset-based and policy-based variants, and assess transfer to ordinary execution.},
+  keywords           = {training_interventions, state resets, exploration, sparse rewards},
+  priority           = {high},
+  publication_status = {Journal article},
+}
+
+@inproceedings{ryu2022remax,
+  title              = {{REMAX: Relational Representation for Multi-Agent Exploration}},
+  author             = {Ryu, Heechang and Shin, Hayong and Park, Jinkyoo},
+  year               = {2022},
+  booktitle          = {Proceedings of the 21st International Conference on Autonomous Agents and Multiagent Systems},
+  publisher          = {IFAAMAS},
+  pages              = {1137--1145},
+  url                = {https://www.ifaamas.org/Proceedings/aamas2022/pdfs/p1137.pdf},
+  abstract_url       = {https://arxiv.org/abs/2008.05214},
+  verification_url   = {https://pure.kaist.ac.kr/en/publications/remax-relational-representation-for-multi-agent-exploration/},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {REMAX learns a relational latent representation of multiagent states and a surrogate exploration score. It searches this representation to generate initial simulator states from which agents can encounter useful new experience, improving training without designing an additional intrinsic reward.},
+  annotation         = {Especially close AAMAS prior work: training from generated multiagent configurations to improve exploration without intrinsic reward design. Compare its learned state generator and exploration score with the explicit heuristic of relocating teammates near a focal agent and aligning their goals.},
+  keywords           = {training_interventions, initial state generation, cooperative exploration, multiagent learning},
+  priority           = {essential},
+  publication_status = {Conference paper},
+}
+
+@inproceedings{uchendu2023jsrl,
+  title              = {{Jump-Start Reinforcement Learning}},
+  author             = {Uchendu, Ikechukwu and Xiao, Ted and Lu, Yao and Zhu, Banghua and Yan, Mengyuan and Simon, Jos{\'e}phine and Bennice, Matthew and Fu, Chuyuan and Ma, Cong and Jiao, Jiantao and Levine, Sergey and Hausman, Karol},
+  year               = {2023},
+  booktitle          = {Proceedings of the 40th International Conference on Machine Learning},
+  publisher          = {PMLR},
+  series             = {Proceedings of Machine Learning Research},
+  volume             = {202},
+  pages              = {34556--34583},
+  url                = {https://proceedings.mlr.press/v202/uchendu23a.html},
+  abstract_url       = {https://proceedings.mlr.press/v202/uchendu23a.html},
+  verification_url   = {https://proceedings.mlr.press/v202/uchendu23a.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {JSRL uses a guide policy to create a curriculum of states from which another policy explores and learns. It can incorporate existing policies or demonstrations, improves learning on simulated robotic tasks, and analyzes sample-complexity benefits under assumptions on the guide.},
+  annotation         = {Comparison for accelerating discovery by supplying useful training conditions. Its assistance is executed by a guide policy, whereas the proposed method directly changes teammate configurations in simulation; do not transfer JSRL's theoretical guarantees to the placement heuristic.},
+  keywords           = {training_interventions, guided exploration, initial states, curriculum learning},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+@article{chen2024sacl,
+  title              = {{Accelerate Multi-Agent Reinforcement Learning in Zero-Sum Games with Subgame Curriculum Learning}},
+  author             = {Chen, Jiayu and Xu, Zelai and Li, Yunfei and Yu, Chao and Song, Jiaming and Yang, Huazhong and Fang, Fei and Wang, Yu and Wu, Yi},
+  year               = {2024},
+  journal            = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume             = {38},
+  number             = {10},
+  pages              = {11320--11328},
+  doi                = {10.1609/aaai.v38i10.29011},
+  url                = {https://ojs.aaai.org/index.php/AAAI/article/view/29011},
+  abstract_url       = {https://ojs.aaai.org/index.php/AAAI/article/view/29011},
+  verification_url   = {https://ojs.aaai.org/index.php/AAAI/article/view/29011},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {SACL accelerates multiagent learning in zero-sum games by selecting previously visited states as starting points for subgames. A selection metric and particle-based sampler adapt the initial-state distribution, and experiments study the resulting curricula with MARL learners including MAPPO.},
+  annotation         = {Recent precedent for actual state resets during MARL training and their integration with MAPPO. Its objective is equilibrium learning in zero-sum games, not shared-reward cooperation; compare the reset mechanism without treating its guarantees as cooperative-task results.},
+  keywords           = {training_interventions, state resets, multiagent curricula, zero-sum games},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+@inproceedings{zhao2025spmarl,
+  title              = {{Learning Progress Driven Multi-Agent Curriculum}},
+  author             = {Zhao, Wenshuai and Li, Zhiyuan and Pajarinen, Joni},
+  year               = {2025},
+  booktitle          = {Proceedings of the 42nd International Conference on Machine Learning},
+  publisher          = {PMLR},
+  series             = {Proceedings of Machine Learning Research},
+  volume             = {267},
+  pages              = {77572--77588},
+  url                = {https://proceedings.mlr.press/v267/zhao25o.html},
+  abstract_url       = {https://proceedings.mlr.press/v267/zhao25o.html},
+  verification_url   = {https://proceedings.mlr.press/v267/zhao25o.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {The method adapts a distribution over agent counts using temporal-difference errors as a measure of learning progress. This addresses problems with curriculum decisions based on absolute returns, including cases where adding agents raises reward while making credit assignment harder. Experiments use sparse-reward multiagent benchmarks.},
+  annotation         = {Recent cooperative curriculum comparison for controlling teammate availability during learning. It changes the number of agents across training tasks; the proposed heuristic relocates existing teammates in individual rollouts. Cite the verified ICML 2025 publication rather than dating it by the 2022 preprint.},
+  keywords           = {training_interventions, multiagent curricula, learning progress, sparse rewards},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+% ======================================================================
+% TOPIC: Counterfactual experience generation and data augmentation
+% keyword: counterfactual_experience
+% ======================================================================
+
+@inproceedings{pitis2020coda,
+  title              = {{Counterfactual Data Augmentation using Locally Factored Dynamics}},
+  author             = {Pitis, Silviu and Creager, Elliot and Garg, Animesh},
+  year               = {2020},
+  booktitle          = {Advances in Neural Information Processing Systems},
+  publisher          = {Curran Associates, Inc.},
+  volume             = {33},
+  url                = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/294e09f267683c7ddc6cc5134a7e68a8-Abstract.html},
+  abstract_url       = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/294e09f267683c7ddc6cc5134a7e68a8-Abstract.html},
+  verification_url   = {https://proceedings.neurips.cc/paper_files/paper/2020/hash/294e09f267683c7ddc6cc5134a7e68a8-Abstract.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {CoDA identifies local independence among components of a dynamical system and uses that structure to recombine replayed experience into valid counterfactual transitions. The resulting augmented data improves off-policy learning in tasks whose dynamics admit the required local factorization.},
+  annotation         = {Important prior work for counterfactuals used to generate learning examples rather than only credit signals. CoDA recombines existing transitions under local causal assumptions; the proposed approach executes simulator rollouts after changing teammate positions and goals, including their physical interactions.},
+  keywords           = {counterfactual_experience, data augmentation, local causal models, sample efficiency},
+  priority           = {essential},
+  publication_status = {Conference paper},
+}
+
+@inproceedings{pitis2022mocoda,
+  title              = {{MoCoDA: Model-based Counterfactual Data Augmentation}},
+  author             = {Pitis, Silviu and Creager, Elliot and Mandlekar, Ajay and Garg, Animesh},
+  year               = {2022},
+  booktitle          = {Advances in Neural Information Processing Systems},
+  publisher          = {Curran Associates, Inc.},
+  volume             = {35},
+  doi                = {10.52202/068431-1319},
+  url                = {https://proceedings.neurips.cc/paper_files/paper/2022/hash/7314e20a73542bbfff25030d1185ce88-Abstract-Conference.html},
+  abstract_url       = {https://proceedings.neurips.cc/paper_files/paper/2022/hash/7314e20a73542bbfff25030d1185ce88-Abstract-Conference.html},
+  verification_url   = {https://proceedings.neurips.cc/paper_files/paper/2022/hash/7314e20a73542bbfff25030d1185ce88-Abstract-Conference.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {MoCoDA trains a locally factored dynamics model and applies it to an augmented distribution of states and actions to generate counterfactual transitions. The paper analyzes generalization to unseen combinations under structural assumptions and demonstrates offline learning for a robotic manipulation task.},
+  annotation         = {Close conceptual comparison for selecting counterfactual training configurations and learning from their consequences. Its transitions are generated by a learned dynamics model; the proposed heuristic uses actual simulator transitions after placing teammates near a focal agent.},
+  keywords           = {counterfactual_experience, data augmentation, model-based reinforcement learning, generalization},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+% ======================================================================
+% TOPIC: Coordinated exploration and discovering cooperative behavior
+% keyword: cooperative_exploration
+% ======================================================================
+
+@inproceedings{wang2020influence,
+  title              = {{Influence-Based Multi-Agent Exploration}},
+  author             = {Wang, Tonghan and Wang, Jianhao and Wu, Yi and Zhang, Chongjie},
+  year               = {2020},
+  booktitle          = {International Conference on Learning Representations},
+  url                = {https://openreview.net/forum?id=BJgy96EYvr},
+  abstract_url       = {https://arxiv.org/abs/1910.05512},
+  verification_url   = {https://github.com/TonghanWang/EITI-EDTI},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {EITI and EDTI encourage coordinated exploration by measuring an agent's influence on teammates' transitions or expected returns. These quantities enter policy learning through intrinsic objectives, helping agents discover useful interactions in tasks with sparse rewards.},
+  annotation         = {Motivates the difficulty of discovering complementary behavior and provides an intrinsic-reward comparison. Its influence objectives modify exploration incentives; the proposed contribution changes training configurations to make cooperative experience available. ICLR 2020 publication is confirmed by the authors' repository and conference-paper record.},
+  keywords           = {cooperative_exploration, intrinsic rewards, agent influence, sparse rewards},
+  priority           = {high},
+  publication_status = {Conference paper},
+}
+
+@inproceedings{liu2021cmae,
+  title              = {{Cooperative Exploration for Multi-Agent Deep Reinforcement Learning}},
+  author             = {Liu, Iou-Jen and Jain, Unnat and Yeh, Raymond A. and Schwing, Alexander G.},
+  year               = {2021},
+  booktitle          = {Proceedings of the 38th International Conference on Machine Learning},
+  publisher          = {PMLR},
+  series             = {Proceedings of Machine Learning Research},
+  volume             = {139},
+  pages              = {6826--6836},
+  url                = {https://proceedings.mlr.press/v139/liu21j.html},
+  abstract_url       = {https://proceedings.mlr.press/v139/liu21j.html},
+  verification_url   = {https://proceedings.mlr.press/v139/liu21j.html},
+  urldate            = {2026-10-05},
+  abstract_type      = {Paraphrased author abstract},
+  abstract           = {CMAE coordinates exploration around a shared goal chosen from projected state spaces using an entropy-based criterion. It trains agents to reach that goal together and evaluates the approach in sparse-reward particle-world tasks and StarCraft micromanagement.},
+  annotation         = {Direct comparison for using aligned goals to coordinate exploration and discover cooperation. Shared exploration goals are prior work; distinguish the proposed spatial placement intervention and the simulator experience it generates from goal selection alone. Author initials are checked against the authors' paper PDF.},
+  keywords           = {cooperative_exploration, shared goals, goal-conditioned learning, sparse rewards},
+  priority           = {essential},
+  publication_status = {Conference paper},
+}
 
 % ======================================================================
 % TOPIC: Counterfactual credit, difference rewards, and coalition attribution
@@ -45,11 +330,11 @@
   doi                = {10.1109/IROS.2016.7759651},
   url                = {https://jenjenchung.github.io/anthropomorphic/Papers/Rahmattalabi2016dppIROS.pdf},
   abstract_url       = {https://jenjenchung.github.io/anthropomorphic/Papers/Rahmattalabi2016dppIROS.pdf},
-  verification_url   = {https://jenjenchung.github.io/anthropomorphic/publications.html},
-  urldate            = {2026-10-02},
+  verification_url   = {https://jenjenchung.github.io/anthropomorphic/Papers/Rahmattalabi2016dppIROS.pdf},
+  urldate            = {2026-10-05},
   abstract_type      = {Paraphrased author abstract},
   abstract           = {D++ modifies counterfactual reward shaping to encourage individually promising actions before teammates have learned complementary behavior. It targets tightly coupled robot teams where ordinary global or difference rewards provide weak learning signals. Coordinated exploration experiments report substantially better performance and faster convergence than those reward alternatives.},
-  annotation         = {Central inspiration for augmenting cooperation counterfactually. Compare instantaneous reward evaluation and hypothetical partners with coordinated waypoint goals and future team return.},
+  annotation         = {Central inspiration for the teammate-support heuristic: useful behavior can be unrewarded until others cooperate. D++ evaluates hypothetical additional agents to construct a reward signal; the proposed method relocates existing teammates and executes simulator rollouts to generate training experience with aligned goals.},
   keywords           = {counterfactual_credit, reinforcement learning, multiagent learning},
   priority           = {essential},
   publication_status = {Conference paper},
@@ -67,10 +352,10 @@
   url                = {https://ojs.aaai.org/index.php/AAAI/article/view/11794},
   abstract_url       = {https://ojs.aaai.org/index.php/AAAI/article/view/11794},
   verification_url   = {https://ojs.aaai.org/index.php/AAAI/article/view/11794},
-  urldate            = {2026-10-02},
+  urldate            = {2026-10-05},
   abstract_type      = {Paraphrased author abstract},
   abstract           = {COMA trains local actors with a centralized action-value critic. Its baseline compares one agent's chosen action against alternatives while retaining teammates' actions, making shared returns more informative for individual updates. An efficient critic computes these comparisons together. StarCraft micromanagement experiments demonstrate improved decentralized cooperative policies.},
-  annotation         = {Core reference for single-agent counterfactual credit. Explain how replacing temporally extended waypoint goals differs from marginalizing primitive actions.},
+  annotation         = {Core background for counterfactual credit assignment. COMA uses action alternatives in a policy-gradient baseline; the revised contribution uses counterfactual teammate configurations to collect actual training trajectories. Keep baseline modification distinct from state interventions.},
   keywords           = {counterfactual_credit, reinforcement learning, multiagent learning},
   priority           = {essential},
   publication_status = {Conference paper},
@@ -362,7 +647,7 @@
   url                = {https://proceedings.mlr.press/v70/vezhnevets17a.html},
   abstract_url       = {https://proceedings.mlr.press/v70/vezhnevets17a.html},
   verification_url   = {https://proceedings.mlr.press/v70/vezhnevets17a.html},
-  urldate            = {2026-10-02},
+  urldate            = {2026-10-05},
   abstract_type      = {Paraphrased author abstract},
   abstract           = {FeUdal Networks split behavior into a slower manager and a worker that produces primitive actions. Manager commands induce goal-conditioned subpolicies, while separate learning across temporal resolutions supports long-term credit. Experiments show advantages on tasks involving delayed consequences and memory.},
   annotation         = {Architectural inspiration, not the paper's current goal representation. Explain the move to explicit waypoints without attributing FuN's latent transition-gradient objective to the new method.},
@@ -379,8 +664,8 @@
   note               = {Workshop paper},
   url                = {https://ala2019.vub.ac.be/papers/ALA2019_paper_5.pdf},
   abstract_url       = {https://ala2019.vub.ac.be/papers/ALA2019_paper_5.pdf},
-  verification_url   = {https://ala2019.vub.ac.be/},
-  urldate            = {2026-10-02},
+  verification_url   = {https://ala2019.vub.ac.be/papers/ALA2019_paper_5.pdf},
+  urldate            = {2026-10-05},
   abstract_type      = {Paraphrased author abstract},
   abstract           = {FMH places a task-reward manager above multiple workers acting simultaneously. The manager communicates subgoals, and workers learn from rewards for meeting those commands. Given an adequate subgoal repertoire, experiments show improved cooperation and scaling relative to approaches that expose every learner to a shared team reward.},
   annotation         = {Closest early architectural precedent for one manager directing multiple workers. Cite the verified AAMAS workshop version rather than claiming an ICLR main-track publication.},

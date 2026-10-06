@@ -250,11 +250,18 @@ class MAPPO_JAX_Runner:
         """
         return make_train(self.config, self.env)
 
+    def _steps_per_update(self) -> int:
+        """Env steps one update consumes from `n_total_steps`: the logged
+        `total_steps` increment, and how a resume finds its update index. A
+        subclass whose updates simulate more than the rollout overrides it, in
+        step with its `make_train`'s `num_updates`."""
+        return self.config.n_steps * self.config.n_envs
+
     def train(self):
         from algorithms.mappo_vanilla.trainer_components import TrainingStatsTracker
 
         init_fn, collect_fn, update_fn, eval_fn, num_updates = self._make_train()
-        steps_per_update = self.config.n_steps * self.config.n_envs
+        steps_per_update = self._steps_per_update()
         total_steps = self.config.n_total_steps
         log_every = 10e3
 

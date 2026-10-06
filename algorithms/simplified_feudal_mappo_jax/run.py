@@ -19,6 +19,7 @@ from flax.serialization import from_bytes, to_bytes
 from algorithms.mappo_jax.run import MAPPO_JAX_Runner, make_env
 from algorithms.mappo_jax.trainer import RunnerState, global_state_dim
 from algorithms.mappo_jax.types import MAPPOConfig
+from algorithms.simplified_feudal_mappo_jax import interventions as iv
 from algorithms.simplified_feudal_mappo_jax.trainer import (
     HierTrainState,
     create_hier_train_state,
@@ -179,7 +180,9 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             print(
                 f"  interventions: every {self.feudal_config.intervention_interval} "
                 f"decision(s), one fork per agent, N ~ U{{1..{self.env.n_agents - 1}}}, "
-                f"radius={self.feudal_config.intervention_radius} world units"
+                f"radius={self.feudal_config.intervention_radius} world units | "
+                f"{self._steps_per_update()} simulator steps per update "
+                f"({n_steps * worker.n_envs} main); n_total_steps caps simulator steps"
             )
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
@@ -188,6 +191,12 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
 
     def _make_train(self):
         return make_train(self.feudal_config, self.env)
+
+    def _steps_per_update(self) -> int:
+        # Main rollout plus fork lanes: the same count `make_train` divides
+        # `n_total_steps` by, so the budget, the logged `total_steps` and the
+        # resume index agree.
+        return iv.simulator_steps_per_update(self.feudal_config, self.env.n_agents)
 
     # ------------------------------------------------------------------ io
 

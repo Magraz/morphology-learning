@@ -361,7 +361,11 @@ def make_train(config: FeudalConfig, env):
             f"manager.gamma ({mcfg.gamma}) must equal the manager's per-step "
             f"discount ({m_gamma}) ** goal_horizon ({horizon}) = {m_gamma**horizon}"
         )
-    num_updates = int(wcfg.n_total_steps) // (wcfg.n_steps * n_envs)
+    # `n_total_steps` caps SIMULATOR steps: under forks an update also steps the
+    # fork lanes, so it consumes more of the budget than its main rollout.
+    num_updates = int(wcfg.n_total_steps) // iv.simulator_steps_per_update(
+        config, n_agents
+    )
 
     policy = make_policy(config, env)
     v_reset = jax.vmap(env.reset)

@@ -134,6 +134,24 @@ def applied_windows(n_windows: int, interval: int) -> np.ndarray:
     return np.arange(n_windows) % interval == 0
 
 
+def simulator_steps_per_update(config, n_agents: int) -> int:
+    """Env step calls one update makes, which is what `n_total_steps` caps and
+    `total_steps` counts.
+
+    The main rollout's `n_steps * n_envs`, plus under forks every fork lane on
+    every intervention window for `goal_horizon` steps. Frozen and
+    failed-placement lanes count: they are stepped, only masked. Windows skipped
+    by the interval run no fork physics and do not count.
+    """
+    worker = config.worker
+    main = worker.n_steps * worker.n_envs
+    if not config.interventions:
+        return main
+    n_windows = worker.n_steps // config.goal_horizon
+    n_forked = int(applied_windows(n_windows, config.intervention_interval).sum())
+    return main + n_forked * worker.n_envs * n_agents * config.goal_horizon
+
+
 def append_columns(main, fork):
     """Append the fork columns to a main `Transition` along the env axis.
 

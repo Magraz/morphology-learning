@@ -7,6 +7,13 @@ Measured collection cost at 2a/4o: 1.5–2.1 s per update at interval 1 and
 1.0–1.4 s at interval 2, against 0.6–0.8 s for the parent (section 2's
 physics-only estimate was optimistic). The full runs in section 9 are not
 launched.
+
+**Changed after implementation, at the author's request:** `n_total_steps`
+caps SIMULATOR steps (main plus every stepped fork lane), and `total_steps`
+counts them. At 2a/4o and interval 1 a 1e8 budget gives 986 updates against the
+parent's 2959. This supersedes "`total_steps` stays main-only" in section 6.
+Under it, the extra-data control runs at the SAME budget as the arm (sections 1
+and 9 are updated).
 Target: `algorithms/simplified_feudal_mappo_jax`.
 
 Scope: one addition. A named variant collects real simulator forks at manager
@@ -404,14 +411,16 @@ distribution, and with it which focal offsets receive extra training.
   dense group; on `_sparse` groups the fork manager rows will mostly carry an
   advantage of `0 - V`.
 - **The extra-data control needs a twin env group, not a CLI override.**
-  At interval k the control is the parent group with `n_envs: 32 * (1 + A/k)`
-  and `n_total_steps: 1e8 * (1 + A/k)`. Run under the parent model, it matches
-  the variant at 1e8 main steps on three counts: number of updates (2959), live
-  worker rows per update, and total simulator steps. For k = 1 at 2a/4o that is
-  `mjx_2a_4o_1122_1024_gs_n96` (`n_envs: 96`, `n_total_steps: 3e8`). An
-  `env.n_envs` override would write into the parent's results directory.
+  At interval k the control is the parent group with about
+  `n_envs: 32 * (1 + A * ceil(W/k) / W)` at the same `n_total_steps` as the
+  arm. Run under the parent model, it matches the arm on three counts: number
+  of updates (986 at 1e8 for k = 1), worker rows per update, and total
+  simulator steps. For k = 1 at 2a/4o that is `mjx_2a_4o_1122_1024_gs_n96`
+  (`n_envs: 96`). An `env.n_envs` override would write into the parent's
+  results directory.
 
-Runs, after the smoke run passes (5 seeds each, 1e8 main steps):
+Runs, after the smoke run passes (5 seeds each, `n_total_steps` 1e8 simulator
+steps):
 
 ```
 uv run python train.py algorithm=simplified_feudal_mappo_jax \
@@ -423,7 +432,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
 ```
 
 Compare with the existing `simplified_feudal_tanh_relative_input` and `mlp`
-seeds on `mjx_2a_4o_1122_1024_gs`, first at equal main steps, then against the
-`_n96` control at equal simulator steps. Run `mjx_6a_4o_1024_gs` only after
+seeds on `mjx_2a_4o_1122_1024_gs` at equal `total_steps`, which is now equal
+simulator steps. Compare with the `_n96` control as well, which also matches
+the arm's updates and rows per update. Run `mjx_6a_4o_1024_gs` only after
 placement success per N and transfer to unassisted evaluation hold at 2a/4o.
 The parent still needs its 6a/4o seeds.

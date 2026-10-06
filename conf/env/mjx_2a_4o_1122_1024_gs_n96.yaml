@@ -2,13 +2,14 @@
 # Extra-data control for `simplified_feudal_tanh_relative_input_interventions`
 # at intervention_interval 1 (plans/simplified_feudal_interventions_2026-10-05.md).
 #
-# `mjx_2a_4o_1122_1024_gs` with n_envs 32 -> 96 and n_total_steps 1e8 -> 3e8.
-# Run under the PARENT model, it matches the intervention arm at 1e8 main steps
-# on three counts: number of updates (2959 at n_steps 1056), worker rows per
-# update (96 env columns vs 32 main + 64 fork columns), and total simulator
-# steps. It separates the benefit of targeted forks from the benefit of more
-# simulation. For interval k use n_envs 32 * (1 + 2/k), n_total_steps
-# 1e8 * (1 + 2/k).
+# `mjx_2a_4o_1122_1024_gs` with n_envs 32 -> 96. Under forks, n_total_steps caps
+# SIMULATOR steps, and one intervention update steps 32 main + 64 fork lanes for
+# 1056 steps, i.e. 101376 simulator steps, as many as one update here. Run under
+# the PARENT model at the same n_total_steps, this group therefore matches the
+# intervention arm on number of updates (986 at 1e8), worker rows per update
+# and total simulator steps. It separates the benefit of targeted forks from the
+# benefit of more data per update. For interval k use n_envs of about
+# 32 * (1 + 2 * ceil(33/k) / 33) (approximate unless that is an integer).
 #
 # A twin group, not a CLI override: `env.n_envs=96` would write into (and a
 # resume would load from) the parent group's results directory.
@@ -21,5 +22,3 @@ env:
   variant: trunc
   use_global_state: true
   coupling_def: [1,1,2,2]
-params:
-  n_total_steps: 300000000.0
