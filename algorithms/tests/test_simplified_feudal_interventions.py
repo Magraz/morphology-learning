@@ -71,10 +71,6 @@ def _parent(env, seed=0, **kwargs):
     return collect_fn(init_fn(jax.random.PRNGKey(seed)))
 
 
-def _lanes(n_agents):
-    return N_ENVS * n_agents
-
-
 # --------------------------------------------------------------------- default
 
 
@@ -107,7 +103,48 @@ def test_make_feudal_config_wires_the_intervention_keys():
     assert (own.interventions, own.intervention_radius, own.intervention_interval) == (
         True, 2.0, 4,
     )
-    assert own.worker == default.worker and own.manager == default.manager
+    # Only the main env count changes: the forks take their share of the batch.
+    main = iv.main_envs(32, default.worker.n_steps // 32, 4)
+    assert own.worker == dataclasses.replace(default.worker, n_envs=main)
+    assert own.manager == dataclasses.replace(default.manager, n_envs=main)
+
+
+@pytest.mark.parametrize(
+    "batch_envs, interval, main, per_update",
+    [
+        (32, 1, 16, 33_792),  # exact: half the envs, one fork lane each
+        (32, 2, 21, 33_600),  # 17 of 33 windows fork; within one env's share
+        (96, 1, 48, 101_376),
+    ],
+)
+def test_forks_fill_the_parents_batch(batch_envs, interval, main, per_update):
+    """At the production rollout (1048 -> 1056 steps, 33 windows of 32) the main
+    rollout shrinks so that main plus fork steps equal the parent's
+    `n_steps * n_envs`: the same updates and simulator steps per update."""
+    from algorithms.simplified_feudal_mappo_jax.run import make_feudal_config
+
+    mp = Model_Params(
+        hidden_dim=8, goal_horizon=32, waypoint_radius=0.15,
+        interventions=True, intervention_interval=interval,
+    )
+    config = make_feudal_config(_params(), mp, n_envs=batch_envs)
+    parent = make_feudal_config(
+        _params(), dataclasses.replace(mp, interventions=False, intervention_interval=1),
+        n_envs=batch_envs,
+    )
+    assert config.worker.n_envs == main
+    assert iv.simulator_steps_per_update(config) == per_update
+    parent_batch = iv.simulator_steps_per_update(parent)
+    assert parent_batch == 1056 * batch_envs
+    # Rounding to whole envs moves the batch by less than one env's share.
+    n_windows = 1056 // 32
+    env_share = 32 * (n_windows + iv.forked_windows(n_windows, interval))
+    assert abs(per_update - parent_batch) < env_share
+
+
+def test_a_bad_interval_is_rejected_before_the_main_envs_are_derived():
+    with pytest.raises(ValueError, match="integer"):
+        iv.main_envs(32, 33, 0)
 
 
 @pytest.mark.parametrize(
@@ -182,16 +219,16 @@ def test_forks_run_exactly_on_the_interval_windows(interval):
     assert (n_rec[applied] >= 1).all() and (n_rec[~applied] == 0).all()
     # Skipped windows hold fully masked placeholder rows.
     w_active = np.asarray(fork.worker.active_mask).reshape(
-        N_WINDOWS, HORIZON, _lanes(n_agents), n_agents
+        N_WINDOWS, HORIZON, N_ENVS, n_agents
     )
     assert w_active[applied].all() and not w_active[~applied].any()
     for traj, shape in (
         (fork.worker, (N_WINDOWS, HORIZON)),
         (fork.manager, (N_WINDOWS,)),
     ):
-        r = np.asarray(traj.reward).reshape(shape + (_lanes(n_agents), -1))
-        v = np.asarray(traj.value).reshape(shape + (_lanes(n_agents), -1))
-        d = np.asarray(traj.done).reshape(shape + (_lanes(n_agents),))
+        r = np.asarray(traj.reward).reshape(shape + (N_ENVS, -1))
+        v = np.asarray(traj.value).reshape(shape + (N_ENVS, -1))
+        d = np.asarray(traj.done).reshape(shape + (N_ENVS,))
         assert (r[~applied] == 0).all() and (v[~applied] == 0).all()
         assert d[~applied].all()
     assert int(stats["episode_count"]) == 0  # forks are not task episodes
@@ -200,9 +237,25 @@ def test_forks_run_exactly_on_the_interval_windows(interval):
 # ------------------------------------------------------- goals and recruitment
 
 
+def test_the_focal_agent_is_drawn_uniformly_per_env():
+    for n_agents in (2, 3, 6):
+        focal = np.asarray(iv.sample_focal(jax.random.PRNGKey(0), 6000, n_agents))
+        assert focal.shape == (6000,) and focal.min() >= 0 and focal.max() < n_agents
+        np.testing.assert_allclose(
+            np.bincount(focal, minlength=n_agents) / 6000, 1 / n_agents, atol=0.03
+        )
+
+
+def test_each_window_draws_its_own_focal_agents():
+    _, _, (_, rollout, _, _), _ = _forks(StubEnv(3))
+    focal = np.asarray(rollout.intervention.focal)
+    assert focal.shape == (N_WINDOWS, N_ENVS)
+    assert len(np.unique(focal)) > 1  # not a fixed agent per lane
+
+
 def test_recruit_sampling_draws_n_distinct_teammates():
     for n_agents in (2, 3, 6):
-        focal = iv.focal_agents(64, n_agents)
+        focal = iv.sample_focal(jax.random.PRNGKey(1), 64, n_agents)
         n, mask = iv.sample_recruits(jax.random.PRNGKey(0), focal, n_agents)
         n, mask = np.asarray(n), np.asarray(mask)
         assert n.min() >= 1 and n.max() <= n_agents - 1
@@ -223,13 +276,13 @@ def test_recruits_get_the_focal_offset_and_everyone_else_keeps_their_goal():
     n_agents = 3
     _, _, (_, rollout, _, _), _ = _forks(StubEnv(n_agents))
     fork = rollout.intervention
-    lanes = _lanes(n_agents)
+    lanes = N_ENVS  # fork lane e is env e's fork
     f_obs = np.asarray(fork.worker.obs).reshape(N_WINDOWS, HORIZON, lanes, n_agents, -1)
     m_obs = np.asarray(rollout.worker.obs).reshape(N_WINDOWS, HORIZON, N_ENVS, n_agents, -1)
     err_f = f_obs[:, 0, ..., OBS_DIM : OBS_DIM + 2]
     pos_f = f_obs[:, 0, ..., :2]
-    err_m = np.repeat(m_obs[:, 0, ..., OBS_DIM : OBS_DIM + 2], n_agents, axis=1)
-    pos_m = np.repeat(m_obs[:, 0, ..., :2], n_agents, axis=1)
+    err_m = m_obs[:, 0, ..., OBS_DIM : OBS_DIM + 2]
+    pos_m = m_obs[:, 0, ..., :2]
     focal = np.asarray(fork.focal)
     for w in range(N_WINDOWS):
         moved = np.abs(pos_f[w] - pos_m[w]).max(-1) > 0  # (L, N)
@@ -262,7 +315,7 @@ def test_the_critic_context_carries_each_forks_own_focal_and_n():
     # The rest of the fork input is the main decision's (pre-teleport) state.
     np.testing.assert_array_equal(
         np.asarray(fork.manager.global_state)[..., :base],
-        np.repeat(np.asarray(rollout.manager.global_state)[..., :base], n_agents, axis=1),
+        np.asarray(rollout.manager.global_state)[..., :base],
     )
 
 
@@ -285,11 +338,10 @@ def test_fork_ratios_are_one_and_only_the_focal_manager_action_is_eligible(bound
             log_prob, np.asarray(traj.log_prob).reshape(-1), atol=1e-5, err_msg=level
         )
     # The fork's manager record is the main decision itself: same input, action
-    # and log-prob, repeated per lane.
+    # and log-prob as its env's main row.
     for field in ("obs", "action", "log_prob"):
         np.testing.assert_array_equal(
-            getattr(fork.manager, field),
-            np.repeat(np.asarray(getattr(rollout.manager, field)), n_agents, axis=1),
+            getattr(fork.manager, field), getattr(rollout.manager, field)
         )
     np.testing.assert_array_equal(
         fork.manager.active_mask, np.eye(n_agents)[np.asarray(fork.focal)]
@@ -324,7 +376,7 @@ def test_fork_columns_are_independent_episodes_under_gae():
     n_agents = 3
     config, _, (_, rollout, last, _), _ = _forks(StubEnv(n_agents))
     fork, cfg = rollout.intervention, config.manager
-    lanes = _lanes(n_agents)
+    lanes = N_ENVS
 
     def gae(traj, last_value):
         return compute_gae(
@@ -419,7 +471,7 @@ def test_one_step_windows_make_one_step_forks():
     rs = init_fn(jax.random.PRNGKey(0))
     rs, rollout, last, _ = collect_fn(rs)
     fork = rollout.intervention
-    assert fork.worker.done.shape == (N_STEPS, _lanes(n_agents))
+    assert fork.worker.done.shape == (N_STEPS, N_ENVS)
     assert np.asarray(fork.worker.done).all() and np.asarray(fork.manager.done).all()
     _, losses = update_fn(rs, rollout, last)
     assert all(np.isfinite(float(v)) for v in losses.values())
@@ -530,13 +582,13 @@ def test_masked_statistics_rejects_an_advantage_correction():
 @pytest.mark.parametrize("interval", [1, 2])
 def test_n_total_steps_caps_simulator_steps(interval):
     """Under forks an update charges its main rollout plus every stepped fork
-    lane to `n_total_steps`, and that charge equals the logged fork lanes. Off,
-    the charge is the main rollout, as before."""
+    lane (one per env) to `n_total_steps`, and that charge equals the logged fork
+    lanes. Off, the charge is the main rollout, as before."""
     n_agents = 3
     config = _config(interventions=True, intervention_interval=interval)
     main = N_STEPS * N_ENVS
-    per_update = iv.simulator_steps_per_update(config, n_agents)
-    assert per_update == main + math.ceil(N_WINDOWS / interval) * N_ENVS * n_agents * HORIZON
+    per_update = iv.simulator_steps_per_update(config)
+    assert per_update == main + math.ceil(N_WINDOWS / interval) * N_ENVS * HORIZON
     assert make_train(config, StubEnv(n_agents))[-1] == (
         config.worker.n_total_steps // per_update
     )
@@ -544,7 +596,7 @@ def test_n_total_steps_caps_simulator_steps(interval):
     assert main + float(rollout.diagnostics["intervention_stepped_lanes"]) == per_update
 
     off = _config()
-    assert iv.simulator_steps_per_update(off, n_agents) == main
+    assert iv.simulator_steps_per_update(off) == main
     assert make_train(off, StubEnv(n_agents))[-1] == off.worker.n_total_steps // main
 
 
@@ -559,7 +611,7 @@ def test_the_runner_charges_what_the_budget_charges():
     runner = Runner.__new__(Runner)
     runner.feudal_config, runner.env = _config(interventions=True), StubEnv(3)
     assert runner._steps_per_update() == iv.simulator_steps_per_update(
-        runner.feudal_config, 3
+        runner.feudal_config
     )
     base = MAPPO_JAX_Runner.__new__(MAPPO_JAX_Runner)
     base.config = runner.feudal_config.worker
@@ -572,7 +624,7 @@ def test_fork_collect_update_eval_end_to_end(n_agents, interval):
     _, runner_state, (rs, rollout, last, _), (update_fn, eval_fn) = _forks(
         StubEnv(n_agents, max_steps=10), intervention_interval=interval
     )
-    lanes = _lanes(n_agents)
+    lanes = N_ENVS
     fork = rollout.intervention
     assert fork.worker.reward.shape == (N_STEPS, lanes, n_agents)
     assert fork.manager.reward.shape == (N_WINDOWS, lanes)

@@ -58,9 +58,16 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
       (`counterfactual.py`); "team" is the original behaviour.
     * `interventions` / `intervention_radius` / `intervention_interval` switch
       on the training forks (`interventions.py`); off is the original behaviour.
+      Under forks `n_envs` is the BATCH's env count: the main rollout runs
+      `interventions.main_envs(...)` of them, and the fork lanes fill the rest,
+      so an update simulates the same steps as the parent's.
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
+    if model_params.interventions:
+        n_envs = iv.main_envs(
+            n_envs, n_steps // horizon, model_params.intervention_interval
+        )
     worker = MAPPOConfig(
         lr=params.lr,
         gamma=params.gamma,
@@ -177,12 +184,16 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             )
         print(f"  manager_credit={credit}")
         if self.feudal_config.interventions:
+            batch_envs = env_config.get("n_envs")
             print(
                 f"  interventions: every {self.feudal_config.intervention_interval} "
-                f"decision(s), one fork per agent, N ~ U{{1..{self.env.n_agents - 1}}}, "
+                f"decision(s), one fork per env around a random agent, "
+                f"N ~ U{{1..{self.env.n_agents - 1}}}, "
                 f"radius={self.feudal_config.intervention_radius} world units | "
+                f"n_envs {batch_envs} -> {worker.n_envs} main | "
                 f"{self._steps_per_update()} simulator steps per update "
-                f"({n_steps * worker.n_envs} main); n_total_steps caps simulator steps"
+                f"({n_steps * worker.n_envs} main; batch target "
+                f"{n_steps * batch_envs})"
             )
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
@@ -196,7 +207,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         # Main rollout plus fork lanes: the same count `make_train` divides
         # `n_total_steps` by, so the budget, the logged `total_steps` and the
         # resume index agree.
-        return iv.simulator_steps_per_update(self.feudal_config, self.env.n_agents)
+        return iv.simulator_steps_per_update(self.feudal_config)
 
     # ------------------------------------------------------------------ io
 

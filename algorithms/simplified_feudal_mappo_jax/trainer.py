@@ -36,11 +36,14 @@ model supplies a D++ term instead: the gain had the agent's nearest teammates
 been sent toward it (`counterfactual.py`).
 
 Training forks (`interventions: true`, `interventions.py`): at every
-`intervention_interval`-th decision each env is also forked once per agent i,
-with teammates teleported next to agent i and given its waypoint offset. Each
-fork runs one window as its own episode under the same frozen policies, and its
-transitions are appended to both levels' batches as extra env columns. The main
-rollout is unchanged by them (separate random keys), and so is evaluation.
+`intervention_interval`-th decision each env is also forked once, around a
+random focal agent i, with teammates teleported next to agent i and given its
+waypoint offset. Each fork runs one window as its own episode under the same
+frozen policies, and its transitions join both levels' batches as extra env
+columns. `worker.n_envs` is then the MAIN env count, already reduced by
+`run.make_feudal_config` so that main plus fork steps fill the parent's batch.
+The main rollout's random keys are unchanged by the forks, and evaluation is
+unchanged.
 """
 
 import math
@@ -349,7 +352,7 @@ def make_train(config: FeudalConfig, env):
     iv.validate_interventions(config, env, n_windows)
     forks_on = config.interventions
     interval = config.intervention_interval
-    n_lanes = n_envs * n_agents  # one fork lane per (env, focal agent)
+    n_lanes = n_envs  # one fork lane per env, around a random focal agent
     gamma = wcfg.gamma
     # The manager's per-step discount: it sums the team reward within a window
     # and bootstraps a truncation, and `ppo_update` discounts decisions with
@@ -363,9 +366,7 @@ def make_train(config: FeudalConfig, env):
         )
     # `n_total_steps` caps SIMULATOR steps: under forks an update also steps the
     # fork lanes, so it consumes more of the budget than its main rollout.
-    num_updates = int(wcfg.n_total_steps) // iv.simulator_steps_per_update(
-        config, n_agents
-    )
+    num_updates = int(wcfg.n_total_steps) // iv.simulator_steps_per_update(config)
 
     policy = make_policy(config, env)
     v_reset = jax.vmap(env.reset)
@@ -492,35 +493,31 @@ def make_train(config: FeudalConfig, env):
 
     def _fork(operand):
         """One window of every fork lane, from the main decision's start state.
+        Lane e forks env e around a focal agent drawn uniformly.
 
         Returns `(worker Transition (H, L, ...), manager Transition (L, ...),
-        N (L,), valid (L,), recruit distance (L,))`. The manager record is the
-        decision sampled in the ORIGINAL state (stored actor input, action and
-        log-prob), with agent i's actor weight only; the critic reads the fork
-        context.
+        focal (L,), N (L,), valid (L,), recruit distance (L,))`. The manager
+        record is the decision sampled in the ORIGINAL state (stored actor input,
+        action and log-prob), with agent i's actor weight only; the critic reads
+        the fork context.
         """
         (train_state, env_state, obs, waypoint, pos, m_actor_in, m_critic_base,
          m_action, m_log_prob, key) = operand
-        k_recruit, k_place, k_scan = jax.random.split(key, 3)
-        focal = iv.focal_agents(n_envs, n_agents)  # (L,)
+        k_focal, k_recruit, k_place, k_scan = jax.random.split(key, 4)
+        focal = iv.sample_focal(k_focal, n_envs, n_agents)  # (L,)
         n_recruits, recruit = iv.sample_recruits(k_recruit, focal, n_agents)
         lane = jnp.arange(n_lanes)
-        state_l, obs_l, waypoint_l, pos_l = iv.to_lanes(
-            (env_state, obs, waypoint, pos), n_agents
-        )
         # Agent i's realized offset (after the bound and arena clip), copied to
         # every recruit relative to its new position.
-        offset = waypoint_l[lane, focal] - pos_l[lane, focal]  # (L, 2)
-        obs_l, state_l, valid = v_teleport(
-            state_l, focal, recruit, offset, jax.random.split(k_place, n_lanes)
+        offset = waypoint[lane, focal] - pos[lane, focal]  # (L, 2)
+        f_obs, f_state, valid = v_teleport(
+            env_state, focal, recruit, offset, jax.random.split(k_place, n_lanes)
         )
-        _, new_pos = policy.observe(obs_l, state_l)
-        f_waypoint = jnp.where(
-            recruit[..., None], new_pos + offset[:, None, :], waypoint_l
-        )
+        _, new_pos = policy.observe(f_obs, f_state)
+        f_waypoint = jnp.where(recruit[..., None], new_pos + offset[:, None, :], waypoint)
         inner = (
-            state_l,
-            obs_l,
+            f_state,
+            f_obs,
             valid,  # a failed placement never runs: masked from the start
             jnp.zeros(n_lanes),
             jnp.zeros(n_lanes, dtype=bool),
@@ -533,17 +530,16 @@ def make_train(config: FeudalConfig, env):
             jnp.arange(horizon),
         )
         f_critic_in = m_critic_input(
-            iv.to_lanes(m_critic_base, n_agents),
-            iv.critic_context(n_agents, n_lanes, focal, n_recruits),
+            m_critic_base, iv.critic_context(n_agents, n_lanes, focal, n_recruits)
         )
         valid_f = valid.astype(jnp.float32)
         f_m = Transition(
-            obs=iv.to_lanes(m_actor_in, n_agents),
+            obs=m_actor_in,
             global_state=f_critic_in,
-            action=iv.to_lanes(m_action, n_agents),
+            action=m_action,
             reward=f_m_reward,
             done=jnp.ones(n_lanes, dtype=bool),
-            log_prob=iv.to_lanes(m_log_prob, n_agents),
+            log_prob=m_log_prob,
             value=_value(train_state.manager, f_critic_in),
             team_reward=f_w_traj.team_reward.sum(axis=0),
             active_mask=jax.nn.one_hot(focal, n_agents) * valid_f[:, None],
@@ -551,7 +547,7 @@ def make_train(config: FeudalConfig, env):
         )
         moved = jnp.linalg.norm(new_pos - new_pos[lane, focal][:, None], axis=-1)
         recruit_distance = world_scale * (moved * recruit).sum(-1) / n_recruits
-        return f_w_traj, f_m, n_recruits, valid, recruit_distance
+        return f_w_traj, f_m, focal, n_recruits, valid, recruit_distance
 
     def _skip(operand):
         """`_fork`'s output for a window the interval skips: fully masked
@@ -707,13 +703,11 @@ def make_train(config: FeudalConfig, env):
         }
         intervention = None
         if forks_on:
-            f_w_traj, f_m_traj, n_recruits, valid, recruit_distance = fork
+            f_w_traj, f_m_traj, focal, n_recruits, valid, recruit_distance = fork
             intervention = Intervention(
                 worker=flatten_windows(f_w_traj),
                 manager=f_m_traj,
-                focal=jnp.broadcast_to(
-                    iv.focal_agents(n_envs, n_agents), (n_windows, n_lanes)
-                ),
+                focal=focal,
                 n_recruits=n_recruits,
                 valid=valid,
             )

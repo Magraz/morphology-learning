@@ -1,8 +1,8 @@
 """Training-time simulator forks for the simplified waypoint hierarchy.
 
 Under `interventions: true`, at every `intervention_interval`-th manager
-decision, `trainer.make_train` forks each env once per agent i before the first
-worker step of the window:
+decision, `trainer.make_train` forks each env once, around one focal agent i
+drawn uniformly per env and window, before the first worker step of the window:
 
 * N ~ U{1 .. n_agents - 1} teammates of agent i, drawn uniformly without
   replacement, are teleported within `intervention_radius` world units of it
@@ -22,6 +22,12 @@ weight there; every live agent's worker action is a real sample. The manager
 critic reads a context block (`critic_context`) so that it can tell a
 continuing main return from a one-window fork return. Execution and evaluation
 are unchanged. Plan: `plans/simplified_feudal_interventions_2026-10-05.md`.
+
+The forks count TOWARD the per-update batch, not on top of it: the main rollout
+runs `main_envs(...)` envs, fewer than the env group's `n_envs`, so that its
+steps plus the fork steps equal the batch the parent collects
+(`n_steps * n_envs`). Updates, gradient steps and simulator steps per update
+then match the parent; the fork arm simply collects fewer fresh episodes.
 """
 
 import math
@@ -103,15 +109,10 @@ def critic_context(n_agents: int, batch: int, focal=None, n_recruits=None):
     )
 
 
-def focal_agents(n_envs: int, n_agents: int):
-    """`(n_envs * n_agents,)` the focal agent of each fork lane: lane
-    `e * n_agents + i` forks env e around agent i (env-major, as `to_lanes`)."""
-    return jnp.tile(jnp.arange(n_agents), n_envs)
-
-
-def to_lanes(tree, n_agents: int):
-    """Repeat every leaf's leading env axis `n_agents` times, env-major."""
-    return jax.tree.map(lambda x: jnp.repeat(x, n_agents, axis=0), tree)
+def sample_focal(key, n_envs: int, n_agents: int):
+    """`(n_envs,)` the focal agent of each env's fork, uniform over agents. Fork
+    lane e is env e's fork."""
+    return jax.random.randint(key, (n_envs,), 0, n_agents)
 
 
 def sample_recruits(key, focal, n_agents: int):
@@ -134,22 +135,44 @@ def applied_windows(n_windows: int, interval: int) -> np.ndarray:
     return np.arange(n_windows) % interval == 0
 
 
-def simulator_steps_per_update(config, n_agents: int) -> int:
+def forked_windows(n_windows: int, interval: int) -> int:
+    """Number of rollout windows that fork."""
+    return int(applied_windows(n_windows, interval).sum())
+
+
+def main_envs(n_envs: int, n_windows: int, interval: int) -> int:
+    """Main-rollout envs under forks, so that main plus fork steps fill the
+    parent's batch of `n_envs` envs.
+
+    Each main env steps every one of the `n_windows` windows, and its fork lane
+    steps every forked window, so E main envs cost `E * (n_windows + forked)`
+    window-lengths against the parent's `n_envs * n_windows`. Rounded to the
+    nearest whole env (exact at interval 1, where it is `n_envs / 2`).
+    """
+    if int(interval) != interval or interval < 1:
+        raise ValueError(f"intervention_interval must be an integer >= 1, got {interval}")
+    forked = forked_windows(n_windows, int(interval))
+    return max(1, round(n_envs * n_windows / (n_windows + forked)))
+
+
+def simulator_steps_per_update(config) -> int:
     """Env step calls one update makes, which is what `n_total_steps` caps and
     `total_steps` counts.
 
-    The main rollout's `n_steps * n_envs`, plus under forks every fork lane on
-    every intervention window for `goal_horizon` steps. Frozen and
+    The main rollout's `n_steps * n_envs`, plus under forks one fork lane per
+    main env on every intervention window for `goal_horizon` steps. Frozen and
     failed-placement lanes count: they are stepped, only masked. Windows skipped
-    by the interval run no fork physics and do not count.
+    by the interval run no fork physics and do not count. With the main env
+    count from `main_envs`, this equals the parent's batch (to within one env's
+    share when the interval does not divide evenly).
     """
     worker = config.worker
     main = worker.n_steps * worker.n_envs
     if not config.interventions:
         return main
     n_windows = worker.n_steps // config.goal_horizon
-    n_forked = int(applied_windows(n_windows, config.intervention_interval).sum())
-    return main + n_forked * worker.n_envs * n_agents * config.goal_horizon
+    n_forked = forked_windows(n_windows, config.intervention_interval)
+    return main + n_forked * worker.n_envs * config.goal_horizon
 
 
 def append_columns(main, fork):

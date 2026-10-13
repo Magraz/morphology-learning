@@ -161,6 +161,14 @@ mean over trials at each exact `total_steps`. Both reward figures use them.
   effect here. Y axes are not shared, because reward scales differ between
   batches. The cell prints a table of the trials found for each batch and
   experiment. If `multi_batches` is absent, the cell skips the plot.
+- **Reward by update:** the cell after the grid redraws both figures with the
+  PPO update number on the x axis. `load_reward_runs` adds an `update` column
+  (the row position: every stats row is one update, and `total_steps` and
+  `reward` are never NaN-padded), and `summarize_rewards(..., x="update")`
+  groups on it, so seeds always align. Use it when arms spend different step
+  budgets per update, e.g. intervention runs from before the 2026-10-12
+  fixed-batch redesign (their `total_steps` include fork steps on top of a full
+  rollout) or the `_n96` groups (~3x the env steps per update).
 
 ## Single-agent FeUdal runs
 
@@ -2100,13 +2108,15 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     ```
     MJX is not reproducible across processes, so a rerun moves the numbers
     slightly (seed 0 dense relative read −0.77 in a first run); the signs held.
-- **Training forks (`interventions: true`, added 2026-10-05): wired and
-  smoke-tested. No training result.** Plan:
-  `plans/simplified_feudal_interventions_2026-10-05.md`; code:
+- **Training forks (`interventions: true`, added 2026-10-05; redesigned
+  2026-10-12 so the forks count toward a fixed per-update batch).** The runs
+  measured WORSE than the no-fork parent (block at the end) all predate the
+  redesign. Plan: `plans/simplified_feudal_interventions_2026-10-05.md`; code:
   `interventions.py` plus branches in `trainer.py`.
   - **The mechanism.** At every `intervention_interval`-th manager decision
-    (default 1), each env is forked once per agent i, before the window's first
-    worker step:
+    (default 1), each env is forked once, around a focal agent i drawn uniformly
+    per env and window, before the window's first worker step. (Until
+    2026-10-12 each env was forked once per agent.)
     - N ~ U{1..n_agents−1} teammates, drawn without replacement, are teleported
       within `intervention_radius` (default 1.5 world units, centre to centre)
       of agent i.
@@ -2120,19 +2130,28 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       (`_worker_step(bootstrap=False)`).
     - Execution, `eval_fn` and `view()` are unchanged. `episode_count` and
       `rollout_team_reward` count the main rollout only.
-  - **`n_total_steps` caps SIMULATOR steps (changed 2026-10-05, at the author's
-    request).** One update charges its main `n_steps * n_envs` plus every fork
-    lane on every intervention window for `goal_horizon` steps. Frozen and
-    failed lanes count because they are stepped; skipped windows do not
-    (`iv.simulator_steps_per_update`).
-    - `make_train`'s `num_updates` and the runner's `_steps_per_update` (a new
-      default-identity hook on `MAPPO_JAX_Runner`, i.e. the logged `total_steps`
-      and the resume index) both call that function, so they cannot disagree.
-    - At 2a/4o, interval 1, an update is 101,376 steps (33,792 main), so a 1e8
-      budget gives **986 updates against the parent's 2959**.
-    - Curves of this arm against the parent at equal `total_steps` are
-      therefore equal-SIMULATOR-step comparisons. For equal main steps, divide
-      this arm's `total_steps` by `1 + A * ceil(W/k) / W`.
+  - **The forks count toward the per-update batch (2026-10-12, at the author's
+    request).** The env group's `n_envs` is the BATCH's env count. The main
+    rollout runs `iv.main_envs(n_envs, W, k) = round(n_envs·W / (W + forked))`
+    of them (`make_feudal_config` resolves it, so `worker.n_envs` is the main
+    count), and one fork lane per main env fills the rest. With W = 33 windows:
+    - interval 1: 16 main envs, exactly 33,792 simulator steps per update;
+    - interval 2: 21 main envs, 33,600 (−0.6%);
+    - the parent: 32 envs, 33,792.
+
+    So updates, gradient steps and simulator steps per update match the parent
+    (2959 / 2976 / 2959 updates at 1e8). The fork arm sees fewer fresh episodes:
+    16 or 21 per update instead of 32. The plain parent on the SAME env group is
+    the matched control.
+    - `n_total_steps` still caps simulator steps: one update charges its main
+      rollout plus every stepped fork lane (`iv.simulator_steps_per_update`).
+      Frozen and failed lanes count; skipped windows do not. `make_train`'s
+      `num_updates` and the runner's `_steps_per_update` (the logged
+      `total_steps` and the resume index) both call that function.
+    - Before the redesign the forks were appended on top of a full 32-env main
+      rollout, one per agent: an update was 33,792 × (1 + A) steps at interval
+      1, i.e. 986 updates at 2a/4o and 422 at 6a/4o against the parent's 2959.
+      Every intervention result before 2026-10-12 was trained that way.
   - **Who is trained on what.**
     - Manager: the fork's record is the main decision itself (stored actor
       input, action and log-prob, so the PPO ratio is 1). Only agent i carries
@@ -2145,9 +2164,10 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       drawn independently of the action, so the baseline does not depend on it.
       The critic is `n_agents + 2` inputs wider: `(40, 336)` at 2a/4o against 36
       for the parent, so checkpoints do not load across.
-  - **Layout: forks are extra env COLUMNS** (`types.Intervention`). Fork (w, e,
-    i) is column `e·A + i` in the rows of its source window, so the fork buffers
-    keep the main buffers' time length. `update_fn` appends them along the env
+  - **Layout: forks are extra env COLUMNS** (`types.Intervention`). Column e
+    holds env e's forks in the rows of their source windows, so the fork buffers
+    keep the main buffers' time length; `Intervention.focal` records each fork's
+    focal agent. `update_fn` appends them along the env
     axis (`iv.append_columns`) and calls `ppo_update` once per level. Every fork
     ends in a terminal, so GAE never crosses between forks or into main (pinned
     column for column). Windows skipped by the interval hold fully masked
@@ -2190,11 +2210,15 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     its parent, and it declares the radius and interval defaults. Interval and
     radius leave checkpoints shape-identical, so set them in a child model
     group, never on the CLI.
-  - **Extra-data control** `conf/env/mjx_2a_4o_1122_1024_gs_n96.yaml` (96 envs,
-    same `n_total_steps`), run under the PARENT model. At the same budget it
-    matches interval 1 on three counts: updates (986 at 1e8), worker rows per
-    update and simulator steps. For interval k use about
-    `32·(1 + 2·ceil(33/k)/33)` envs.
+    - `simplified_feudal_tanh_local_input_interventions` is the same key on
+      `simplified_feudal_tanh_local_input`, the information-matched twin.
+    - Each has a `_k2` child (`intervention_interval: 2`, forks at 17 of 33
+      windows): 21 main envs, 33,600 simulator steps per update, 2976 updates
+      at 1e8.
+  - **The `_n96` groups** (`mjx_2a_4o_1122_1024_gs_n96`, `mjx_6a_4o_1024_gs_n96`)
+    were the extra-data control for the OLD appended design (they matched its
+    2a/4o interval-1 updates and rows per update). Under the redesign they are
+    not needed: the parent on the arm's own env group already matches it.
   - **Logged per update:**
     - `intervention_attempted`, `_valid_frac`, and both per N (`_n{N}`);
     - `intervention_recruit_distance` (world units), `_fork_length`,
@@ -2230,9 +2254,74 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       only ~1.06×, so the gap most likely comes from the fork scan running
       after the main scan in every window (not separately measured). Merging
       both into one lane batch is the optimization if it matters.
+  - **Verified 2026-10-12 (fixed-batch redesign):**
+    - 51 intervention seam tests and 90 base tests pass. New ones pin the
+      production numbers (16 / 21 / 48 main envs; 33,792 / 33,600 / 101,376
+      steps per update), the uniform focal draw, and a fresh focal per window.
+    - MJX smoke, `mjx_2a_4o_1122_1024_gs` interval 1: 16 main envs, every
+      `total_steps` increment 33,792 (16,896 main + 16,896 fork lanes), and the
+      `checkpoint=true` resume continued at the same increment. Worker rows
+      split 50/50 between main and fork; manager actor rows 2:1 (1056 main
+      agent-decisions, 528 focal fork decisions).
+    - MJX smoke, `mjx_6a_4o_1024_gs` interval 2: 21 main envs, 33,600 per
+      update, placement 92–95% valid. Warm collection 1.1–1.5 s per update.
   - ⚠ **On sparse groups a one-window fork carries almost no task reward.** A
     box at spawn height needs at least ~40 steps of pushing to reach the band.
     Pilot on dense groups.
+  - **MEASURED 2026-10-12, UNDER THE OLD APPENDED DESIGN (one fork per agent on
+    top of a full main rollout): the forks lose to their parent, not just to
+    `mlp`.** Rerun under the fixed-batch design before comparing new results to
+    these. 5 seeds per arm at 1e8 simulator steps on the 2a/4o and 6a/4o `_gs`
+    groups (dense, sparse, `scale2`, `_n96`), mean of the last 10 evals.
+    - **Three gaps stack.** On the dense groups, final return:
+
+      | | `mlp` | parent | parent at the arm's update count | interval 1 |
+      |---|---|---|---|---|
+      | 2a/4o relative | 422 | 297 | 146 (`_n96` parent: 148) | 73 |
+      | 2a/4o local | 422 | 205 | 172 (`_n96` parent: 205) | 152 |
+      | 6a/4o relative | 323 | 292 | 23 | 24 |
+      | 6a/4o local | 323 | 140 | 118 | 30 |
+
+      (1) The parent already trails `mlp`. (2) The budget gives the forks 986
+      updates at 2a/4o and 422 at 6a/4o, against 2959. The relative parent
+      needs the updates: at the same data volume and 1/3 of the updates (`_n96`)
+      it falls from 297 to 148, while `mlp` does not move (422 vs 424). At
+      6a/4o relative this is the whole gap. (3) Per update the forks are harmful,
+      and interval 2 is less harmful than interval 1 everywhere.
+    - **The worker is not the cause.** At the same update it reaches its
+      waypoint more often than the parent's (2a/4o relative 0.79 vs 0.70, 6a/4o
+      local 0.72 vs 0.44): it gets 3-7x the rows.
+    - **The manager stops aiming at boxes.** Deterministic rollouts (64 envs, 5
+      seeds; `cos` = cosine of the waypoint offset with the direction to the
+      nearest undelivered box): 2a/4o relative at 986 updates, `_n96` parent
+      return 150, `cos` +0.31, offset 0.48 R; interval 1 return 75, `cos` +0.04,
+      offset 0.30 R (fully trained parent: +0.84, 0.92 R). 6a/4o local: `cos`
+      +0.34 parent vs +0.06. Manager entropy stays higher than the parent's at
+      every matched update, i.e. the tanh mean is parked near offset 0 (the
+      squashed-entropy pull, "Cause 3" above).
+    - **Not "waiting alone for help that never comes".** Agents of fork arms
+      wait alone at an unmet coupled box LESS (2a/4o relative 4.8% vs 17.9% of
+      agent-steps), are not more often near a teammate, and deliver FEWER
+      coupled boxes (2a/4o local: 0.22 vs 0.50 coupling-2 boxes per episode).
+    - **Fork manager rows carry little action signal.** The fork critic
+      explains 0.24-0.50 of fork-return variance on dense groups (negative at
+      6a/4o relative). On sparse groups it is hugely negative, because every
+      fork in many updates returns exactly 0, so those rows are pure critic
+      error rescaled to unit size. Fork rows are ~50% of the manager's actor
+      rows at interval 1 (~34% at interval 2). On 2a/4o dense local the arm
+      tracks the parent's curve at u'/u ≈ 0.5, i.e. the fork rows behave like
+      dead weight. Elsewhere the ratio keeps falling (to 0.07-0.12 at 6a/4o
+      local and on sparse/`scale2` local), i.e. they push the wrong way.
+    - **The counterfactual itself mostly pays nothing.** Fork window returns are
+      70-87% of main window returns on the 2a/4o and 6a/4o dense groups (not
+      `scale2`, where main returns are ~0), so a recruit costs the team on
+      average. Same reading as the 2026-10-05 support audit
+      (`plotting/feudal_goal_analysis/dpp_support_*`): a one-window helper never
+      delivered the selected two-agent box (0/584) and lowered return.
+    - ⚠ The `mjx_6a_4o_1024_gs_n96` control does **not** match the 6a/4o fork
+      arms: interval 1 needs ~224 envs, interval 2 ~131.
+    - Inference, not measured: the separating test is fork rows in the worker
+      update only (manager update on main rows).
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
   90 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;

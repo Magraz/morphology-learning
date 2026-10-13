@@ -2,26 +2,29 @@
 # Delta from `simplified_feudal_tanh_relative_input`: interventions false -> true.
 #
 # Training-time simulator forks (algorithms/simplified_feudal_mappo_jax/
-# interventions.py). At every manager decision each env is forked once per agent
-# i, before the first worker step: N ~ U{1..n_agents-1} teammates are teleported
-# within `intervention_radius` (1.5 world units, centre to centre) of agent i and
-# given agent i's waypoint offset from their new positions. Each fork runs one
-# goal_horizon window under the same frozen policies as its own episode, and its
-# transitions join both levels' PPO batches as extra env columns. Only agent i's
-# manager action is trained on in its fork (the recruits' goals were imposed);
-# every live agent's worker action is. The manager critic reads a context block
+# interventions.py). At every manager decision each env is forked once, around
+# a focal agent i drawn uniformly, before the first worker step: N ~
+# U{1..n_agents-1} teammates are teleported within `intervention_radius` (1.5
+# world units, centre to centre) of agent i and given agent i's waypoint offset
+# from their new positions. Each fork runs one goal_horizon window under the
+# same frozen policies as its own episode, and its transitions join both levels'
+# PPO batches as extra env columns. Only agent i's manager action is trained on
+# in its fork (the recruits' goals were imposed); every live agent's worker
+# action is. The manager critic reads a context block
 # [is_intervention, one_hot(i), N / (n_agents - 1)].
 #
-# Execution and evaluation are unchanged. `n_total_steps` caps SIMULATOR steps
-# (main plus fork lanes) and `total_steps` counts them, so at interval 1 a 2a/4o
-# update consumes 3x the parent's steps and a 1e8 budget gives 986 updates
-# against the parent's 2959. Read `intervention_valid_frac` (and per N) before
-# return.
+# Execution and evaluation are unchanged. The forks count toward the parent's
+# per-update batch: the main rollout runs 16 of the env group's 32 envs and the
+# fork lanes fill the rest, so an update simulates 33,792 steps and a 1e8 budget
+# gives 2959 updates, as for the parent. The matched control is the parent on
+# the same env group. Results trained before 2026-10-12 used the old appended
+# design (one fork per agent on top of a full rollout; 986 updates at 2a/4o).
+# Read `intervention_valid_frac` (and per N) before return.
 #
 # The manager critic is n_agents + 2 inputs wider, so checkpoints do not load
 # into the parent. The interval and radius leave checkpoints shape-identical:
-# set them in a one-key child group (e.g. `..._interventions_every2`), never on
-# the CLI. Plan: plans/simplified_feudal_interventions_2026-10-05.md.
+# set them in a one-key child group (e.g. `..._interventions_k2`), never on the
+# CLI. Plan: plans/simplified_feudal_interventions_2026-10-05.md.
 #
 #   uv run python train.py algorithm=simplified_feudal_mappo_jax \
 #       env=mjx_2a_4o_1122_1024_gs \

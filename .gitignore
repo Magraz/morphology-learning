@@ -6,6 +6,13 @@
 *.venv
 *.pyc
 *.pickle
+*.msgpack
+*.npz
+*.csv
+*.pkl
+*.log
+*.TXT
+*.TXT
 outputs
 logs
 __pycache__

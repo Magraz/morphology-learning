@@ -34,7 +34,7 @@ env:
   n_envs: 32
   n_agents: 1
   n_objects: 3
-  reward_mode: sparse
+  reward_mode: dense
   variant: trunc
   use_global_state: true
   coupling_def: [1,1,1]
