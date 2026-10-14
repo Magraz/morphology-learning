@@ -352,6 +352,9 @@ def make_train(config: FeudalConfig, env):
     iv.validate_interventions(config, env, n_windows)
     forks_on = config.interventions
     interval = config.intervention_interval
+    # Static: who decides a fork's goals (interventions.REDECIDE_MODES). "none"
+    # is the original fork, which credits the goal chosen before the teleport.
+    redecide = config.intervention_redecide if forks_on else "none"
     n_lanes = n_envs  # one fork lane per env, around a random focal agent
     gamma = wcfg.gamma
     # The manager's per-step discount: it sums the team reward within a window
@@ -406,8 +409,10 @@ def make_train(config: FeudalConfig, env):
         """One env step inside a window, under a fixed set of waypoints.
 
         Batch-width agnostic (main envs or fork lanes). `bootstrap=False` (the
-        forks) drops both time-limit value additions: a fork is its own episode
-        and ends with the window, so no value may be added to its rewards.
+        forks under `intervention_redecide` none / focal) drops both time-limit
+        value additions: such a fork is its own episode and ends with the window,
+        so no value may be added to its rewards. The `all` forks bootstrap like
+        the main rollout.
         """
         env_state, obs, alive, m_reward, m_done, closest, rng = carry
         rng, action_rng = jax.random.split(rng)
@@ -496,10 +501,15 @@ def make_train(config: FeudalConfig, env):
         Lane e forks env e around a focal agent drawn uniformly.
 
         Returns `(worker Transition (H, L, ...), manager Transition (L, ...),
-        focal (L,), N (L,), valid (L,), recruit distance (L,))`. The manager
-        record is the decision sampled in the ORIGINAL state (stored actor input,
-        action and log-prob), with agent i's actor weight only; the critic reads
-        the fork context.
+        focal (L,), N (L,), valid (L,), recruit distance (L,))`, plus, unless
+        `redecide` is "none", a dict of `(L,)` per-fork diagnostics. Under
+        "none" the manager record is the decision sampled in the ORIGINAL state
+        (stored actor input, action and log-prob); under "focal" agent i's
+        entries are a fresh decision in the post-teleport state; under either,
+        only agent i carries actor weight. Under "all" every agent's entries are
+        a fresh post-teleport decision, every agent carries actor weight, and
+        the fork bootstraps like the main rollout. The critic reads the fork
+        context in every mode.
         """
         (train_state, env_state, obs, waypoint, pos, m_actor_in, m_critic_base,
          m_action, m_log_prob, key) = operand
@@ -513,8 +523,75 @@ def make_train(config: FeudalConfig, env):
         f_obs, f_state, valid = v_teleport(
             env_state, focal, recruit, offset, jax.random.split(k_place, n_lanes)
         )
-        _, new_pos = policy.observe(f_obs, f_state)
-        f_waypoint = jnp.where(recruit[..., None], new_pos + offset[:, None, :], waypoint)
+        f_gs, new_pos = policy.observe(f_obs, f_state)
+        target = new_pos + offset[:, None, :]  # the recruits' waypoints
+        extras = ()
+        if redecide != "none":
+            # Fresh goals, sampled where the recruits now stand. fold_in leaves
+            # the four splits above, and so the placement, identical to the
+            # default fork's.
+            k_decide = jax.random.fold_in(key, 1)
+            r_waypoint, r_actor_in, r_critic_base, r_action, r_log_prob = (
+                policy.decide(
+                    train_state.manager, f_obs, f_gs, new_pos, f_state, k_decide
+                )
+            )
+            # How far the help moved agent i's MEAN goal, in units of R (bounded
+            # action space, before the arena clip): 0 = the manager ignores it.
+            mean_pre, _ = _act(train_state.manager, m_actor_in, k_decide, True)
+            mean_post, _ = _act(train_state.manager, r_actor_in, k_decide, True)
+            mean_shift = jnp.linalg.norm(
+                wp.bounded_action(mean_post, config.manager_action_bound)
+                - wp.bounded_action(mean_pre, config.manager_action_bound),
+                axis=-1,
+            )[lane, focal]
+            m_critic_base = r_critic_base
+            if redecide == "focal":
+                is_focal = jax.nn.one_hot(focal, n_agents, dtype=bool)  # (L, N)
+
+                def focal_only(new, old):
+                    mask = is_focal.reshape(is_focal.shape + (1,) * (new.ndim - 2))
+                    return jnp.where(mask, new, old)
+
+                waypoint = focal_only(r_waypoint, waypoint)
+                m_actor_in = focal_only(r_actor_in, m_actor_in)
+                m_action = focal_only(r_action, m_action)
+                m_log_prob = focal_only(r_log_prob, m_log_prob)
+                # Agent i did not move, so this is its new offset in either frame.
+                offset = waypoint[lane, focal] - new_pos[lane, focal]
+                target = new_pos + offset[:, None, :]
+                # The placement filter checked the OLD offset, so a recruit's
+                # copy of the new one can leave the arena: clip it, as a manager
+                # waypoint is clipped.
+                clipped = (
+                    jnp.any(jnp.abs(target) > wp.ARENA_HALF_EXTENT, axis=-1) & recruit
+                )
+                target = jnp.clip(target, -wp.ARENA_HALF_EXTENT, wp.ARENA_HALF_EXTENT)
+                extras = (
+                    {
+                        "intervention_redecide_mean_shift": mean_shift,
+                        "intervention_redecide_recruit_clip_frac": (
+                            clipped.sum(-1) / n_recruits
+                        ),
+                    },
+                )
+            else:  # "all": every agent follows its own fresh goal; none imposed.
+                waypoint, m_actor_in, m_action, m_log_prob = (
+                    r_waypoint, r_actor_in, r_action, r_log_prob,
+                )
+                target = waypoint
+                gap = jnp.linalg.norm(
+                    waypoint - waypoint[lane, focal][:, None, :], axis=-1
+                ) / radius  # (L, N): each agent's waypoint to agent i's
+                extras = (
+                    {
+                        "intervention_redecide_mean_shift": mean_shift,
+                        "intervention_redecide_recruit_waypoint_gap": (
+                            (gap * recruit).sum(-1) / n_recruits
+                        ),
+                    },
+                )
+        f_waypoint = jnp.where(recruit[..., None], target, waypoint)
         inner = (
             f_state,
             f_obs,
@@ -524,15 +601,39 @@ def make_train(config: FeudalConfig, env):
             wp.distance_to_waypoint(f_waypoint, new_pos, radius),
             k_scan,
         )
-        (_, _, _, f_m_reward, _, _, _), (f_w_traj, _) = jax.lax.scan(
-            partial(_worker_step, train_state, f_waypoint, bootstrap=False),
-            inner,
-            jnp.arange(horizon),
+        (f_end_state, f_end_obs, f_alive, f_m_reward, _, _, _), (f_w_traj, _) = (
+            jax.lax.scan(
+                partial(
+                    _worker_step, train_state, f_waypoint, bootstrap=redecide == "all"
+                ),
+                inner,
+                jnp.arange(horizon),
+            )
         )
+        if redecide == "all":
+            # The fork is an on-policy window, so its manager target is the true
+            # return: add the continuing value (zero context, as for main rows)
+            # of a lane still alive at the window end. A terminated lane gets
+            # none, and a time limit inside the window was already bootstrapped
+            # in `_worker_step` (the lane is no longer alive).
+            end_gs, end_pos = policy.observe(f_end_obs, f_end_state)
+            end_value = _value(
+                train_state.manager,
+                m_critic_input(wp.manager_critic_input(end_gs, end_pos)),
+            )
+            f_m_reward = f_m_reward + (
+                f_alive.astype(jnp.float32) * jnp.power(m_gamma, horizon) * end_value
+            )
         f_critic_in = m_critic_input(
             m_critic_base, iv.critic_context(n_agents, n_lanes, focal, n_recruits)
         )
         valid_f = valid.astype(jnp.float32)
+        # Manager actor weight: only agent i's sample, unless every goal is one.
+        weight = (
+            jnp.ones((n_lanes, n_agents))
+            if redecide == "all"
+            else jax.nn.one_hot(focal, n_agents)
+        )
         f_m = Transition(
             obs=m_actor_in,
             global_state=f_critic_in,
@@ -542,12 +643,12 @@ def make_train(config: FeudalConfig, env):
             log_prob=m_log_prob,
             value=_value(train_state.manager, f_critic_in),
             team_reward=f_w_traj.team_reward.sum(axis=0),
-            active_mask=jax.nn.one_hot(focal, n_agents) * valid_f[:, None],
+            active_mask=weight * valid_f[:, None],
             action_mask=no_mask,
         )
         moved = jnp.linalg.norm(new_pos - new_pos[lane, focal][:, None], axis=-1)
         recruit_distance = world_scale * (moved * recruit).sum(-1) / n_recruits
-        return f_w_traj, f_m, focal, n_recruits, valid, recruit_distance
+        return (f_w_traj, f_m, focal, n_recruits, valid, recruit_distance) + extras
 
     def _skip(operand):
         """`_fork`'s output for a window the interval skips: fully masked
@@ -703,7 +804,9 @@ def make_train(config: FeudalConfig, env):
         }
         intervention = None
         if forks_on:
-            f_w_traj, f_m_traj, focal, n_recruits, valid, recruit_distance = fork
+            f_w_traj, f_m_traj, focal, n_recruits, valid, recruit_distance, *extras = (
+                fork
+            )
             intervention = Intervention(
                 worker=flatten_windows(f_w_traj),
                 manager=f_m_traj,
@@ -714,6 +817,8 @@ def make_train(config: FeudalConfig, env):
             diagnostics.update(
                 iv.fork_diagnostics(intervention, recruit_distance, interval, horizon)
             )
+            if redecide != "none":
+                diagnostics.update(iv.redecide_diagnostics(valid, extras[0]))
             diagnostics.update(
                 {
                     "worker_eligible_main": w_traj.active_mask.sum(),

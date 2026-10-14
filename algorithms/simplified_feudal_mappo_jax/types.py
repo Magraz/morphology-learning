@@ -83,6 +83,16 @@ class Model_Params:
     interventions: bool = False
     intervention_radius: float = 1.5
     intervention_interval: int = 1
+    # Who decides a fork's goals (`interventions.REDECIDE_MODES`):
+    #   none  — the original fork: agent i's goal as chosen BEFORE the teleport,
+    #           copied to the recruits; only agent i's manager row trains.
+    #   focal — agent i re-samples its goal from the post-teleport state and the
+    #           recruits copy it; only agent i's manager row trains.
+    #   all   — every agent re-samples its own goal from the post-teleport state,
+    #           every manager row trains, and the fork bootstraps like the main
+    #           rollout (an on-policy window from a teleported start state).
+    # Checkpoint-identical across modes: set it in a model group, never on the CLI.
+    intervention_redecide: str = "none"
 
 
 @dataclass
@@ -123,6 +133,7 @@ class FeudalConfig:
     interventions: bool = False
     intervention_radius: float = 1.5
     intervention_interval: int = 1
+    intervention_redecide: str = "none"
 
 
 class ManagerGoal(NamedTuple):

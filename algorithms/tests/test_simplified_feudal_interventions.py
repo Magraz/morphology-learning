@@ -26,6 +26,7 @@ from test_simplified_feudal import (
     N_STEPS,
     OBS_DIM,
     RADIUS,
+    SPEED,
     StubEnv,
     _config,
     _params,
@@ -409,12 +410,16 @@ def test_every_fork_ends_in_a_terminal():
     assert np.asarray(fork.manager.done).all()
 
 
-def test_an_early_termination_ends_the_fork_and_pays_only_live_steps():
+@pytest.mark.parametrize("mode", ["none", "all"])
+def test_an_early_termination_ends_the_fork_and_pays_only_live_steps(mode):
     """Termination at global step 5 (window 1, k=1): fork steps after it are
     frozen (masked, terminal, unpaid) and the fork's manager return is the
-    discounted team reward of its two live steps."""
+    discounted team reward of its two live steps. Under `all` too: a terminal
+    gets no bootstrap."""
     n_agents = 2
-    config, _, (_, rollout, _, _), _ = _forks(StubEnv(n_agents, terminate_at=6))
+    config, _, (_, rollout, _, _), _ = _forks(
+        StubEnv(n_agents, terminate_at=6), intervention_redecide=mode
+    )
     fork = rollout.intervention
     active = np.asarray(fork.worker.active_mask)[..., 0]  # (T, L)
     assert active[4:6].all() and not active[6:8].any()
@@ -679,6 +684,379 @@ def test_fork_checkpoints_round_trip():
     assert _tree_max_diff(
         restored["manager_critic_ts"].params, moved.train_state.manager.critic_ts.params
     ) == 0.0
+
+
+# ------------------------------------------- re-decision (intervention_redecide)
+
+
+class EdgeTeleport(StubEnv):
+    """Stub whose teleport always succeeds and puts every recruit on the arena
+    corner (0.5, 0.5), so a recruit's copy of any offset with a positive
+    component leaves the arena: exercises the clip of the re-decided offset."""
+
+    def teleport_agents(self, state, focal, recruit_mask, offset, key, radius):
+        moved = jnp.where(recruit_mask[:, None], 0.5, state.pos)
+        new = state._replace(pos=moved)
+        return self._obs(new), new, jnp.array(True)
+
+
+def _first_step(traj, n_agents):
+    """`(obs (W, L, N, OBS_DIM), error (W, L, N, 2))` at each window's first
+    worker step: the post-teleport observation and each agent's waypoint error."""
+    x = np.asarray(traj.obs).reshape(N_WINDOWS, HORIZON, -1, n_agents, traj.obs.shape[-1])
+    return x[:, 0, ..., :OBS_DIM], x[:, 0, ..., OBS_DIM : OBS_DIM + 2]
+
+
+def test_redecide_is_off_by_default_and_needs_forks():
+    from algorithms.simplified_feudal_mappo_jax.run import make_feudal_config
+
+    base = dict(hidden_dim=8, goal_horizon=32, waypoint_radius=0.15)
+    assert Model_Params(**base).intervention_redecide == "none"
+    assert make_feudal_config(_params(), Model_Params(**base), 32).intervention_redecide == "none"
+    for mode in ("focal", "all"):
+        own = make_feudal_config(
+            _params(),
+            Model_Params(**base, interventions=True, intervention_redecide=mode),
+            n_envs=32,
+        )
+        assert own.intervention_redecide == mode
+        with pytest.raises(ValueError, match="no effect without"):
+            make_train(_config(intervention_redecide=mode), StubEnv(3))
+    # A stale boolean (B1's original yaml value) or a typo fails loudly.
+    for bad in (True, "True", "everyone"):
+        with pytest.raises(ValueError, match="unknown intervention_redecide"):
+            make_train(_config(interventions=True, intervention_redecide=bad), StubEnv(3))
+
+
+@pytest.mark.parametrize("mode", ["focal", "all"])
+@pytest.mark.parametrize("interval", [1, 2])
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_redecide_keeps_the_main_rollout_and_the_placement(n_agents, interval, mode):
+    """Only what happens after the teleport changes: the main rollout, the focal
+    agent, N, placement success and every post-teleport position equal the
+    default fork's at the same seed."""
+    _, _, (_, base, _, _), _ = _forks(StubEnv(n_agents), intervention_interval=interval)
+    _, _, (_, ours, _, _), _ = _forks(
+        StubEnv(n_agents), intervention_interval=interval, intervention_redecide=mode
+    )
+    assert _tree_max_diff(ours.worker, base.worker) == 0.0
+    for field in ("obs", "action", "log_prob", "reward", "done"):
+        np.testing.assert_array_equal(
+            getattr(ours.manager, field), getattr(base.manager, field), field
+        )
+    a, b = ours.intervention, base.intervention
+    for field in ("focal", "n_recruits", "valid"):
+        np.testing.assert_array_equal(getattr(a, field), getattr(b, field), field)
+    pos_a = _first_step(a.worker, n_agents)[0][..., :2]
+    pos_b = _first_step(b.worker, n_agents)[0][..., :2]
+    applied = iv.applied_windows(N_WINDOWS, interval)
+    np.testing.assert_array_equal(pos_a[applied], pos_b[applied])
+
+
+@pytest.mark.parametrize("bound", ["clip", "tanh"])
+def test_redecide_stores_the_post_teleport_decision(bound):
+    """Agent i's fork record is a fresh sample on the post-teleport input (so the
+    PPO ratio is 1 and the input shows the recruits); the critic reads the
+    post-teleport state; every other agent's row is the main decision's."""
+    n_agents = 3
+    _, _, (rs, rollout, _, _), _ = _forks(
+        StubEnv(n_agents), bound=bound, intervention_redecide="focal"
+    )
+    fork, actor = rollout.intervention, rs.train_state.manager.actor_ts
+    obs, _ = _first_step(fork.worker, n_agents)  # post-teleport observation
+    lanes, focal = np.arange(N_ENVS), np.asarray(fork.focal)
+    base = wp.input_dims(OBS_DIM, OBS_DIM * n_agents, n_agents, 2)["manager_critic"]
+    for w in range(N_WINDOWS):
+        gs = jnp.asarray(obs[w]).reshape(N_ENVS, -1)  # the stub has no hook
+        pos = jnp.asarray(obs[w][..., :2])
+        expected = np.asarray(wp.manager_actor_input(gs, pos))
+        stored = np.asarray(fork.manager.obs[w])
+        np.testing.assert_allclose(
+            stored[lanes, focal[w]], expected[lanes, focal[w]], atol=1e-6
+        )
+        others = np.eye(n_agents)[focal[w]] == 0
+        main = np.asarray(rollout.manager.obs[w])
+        np.testing.assert_array_equal(stored[others], main[others])
+        # The recruits moved, so agent i's input is not its main row's.
+        assert np.abs(stored[lanes, focal[w]] - main[lanes, focal[w]]).max() > 0
+        np.testing.assert_allclose(
+            np.asarray(fork.manager.global_state[w])[:, :base],
+            np.asarray(wp.manager_critic_input(gs, pos)),
+            atol=1e-6,
+        )
+    d = fork.manager.obs.shape[-1]
+    log_prob, _ = evaluate_action(
+        actor.apply_fn, actor.params, fork.manager.obs.reshape(-1, d),
+        fork.manager.action.reshape(-1, 2), discrete=False,
+    )
+    np.testing.assert_allclose(
+        log_prob, np.asarray(fork.manager.log_prob).reshape(-1), atol=1e-5
+    )
+    np.testing.assert_array_equal(
+        fork.manager.active_mask, np.eye(n_agents)[focal]
+    )
+
+
+@pytest.mark.parametrize("env", [StubEnv(3), EdgeTeleport(3)], ids=["stub", "edge"])
+def test_redecide_drives_the_focal_agent_and_the_recruits_with_the_new_goal(env):
+    """At the fork's first step agent i's error is the offset of its STORED
+    (re-decided) action, each recruit's is that offset clipped to the arena from
+    its new position, and every other agent keeps its main waypoint."""
+    n_agents, bound = 3, "clip"
+    _, _, (_, rollout, _, _), _ = _forks(env, intervention_redecide="focal")
+    fork = rollout.intervention
+    obs_f, err_f = _first_step(fork.worker, n_agents)
+    obs_m, err_m = _first_step(rollout.worker, n_agents)
+    pos_f, pos_m = obs_f[..., :2], obs_m[..., :2]
+    lanes, focal = np.arange(N_ENVS), np.asarray(fork.focal)
+    n_clipped = 0
+    for w in range(N_WINDOWS):
+        own = np.asarray(
+            wp.waypoint_offset(
+                jnp.asarray(pos_f[w]), fork.manager.action[w], RADIUS, bound
+            )
+        )[lanes, focal[w]]  # (L, 2)
+        np.testing.assert_allclose(err_f[w][lanes, focal[w]], own, atol=1e-5)
+        moved = np.abs(pos_f[w] - pos_m[w]).max(-1) > 0
+        for lane in range(N_ENVS):
+            for j in range(n_agents):
+                if j == focal[w][lane]:
+                    continue
+                if moved[lane, j]:
+                    target = pos_f[w][lane, j] + RADIUS * own[lane]
+                    n_clipped += int((np.abs(target) > 0.5).any())
+                    expected = (np.clip(target, -0.5, 0.5) - pos_f[w][lane, j]) / RADIUS
+                else:
+                    expected = err_m[w][lane, j]
+                np.testing.assert_allclose(err_f[w][lane, j], expected, atol=1e-5)
+    if isinstance(env, EdgeTeleport):
+        assert n_clipped > 0  # the clip branch was exercised
+
+
+def test_imposed_manager_actions_carry_no_gradient_under_redecide():
+    n_agents = 3
+    _, _, (runner_state, rollout, last, _), (update_fn, _) = _forks(
+        StubEnv(n_agents), intervention_redecide="focal"
+    )
+    fork = rollout.intervention
+    focal = np.eye(n_agents)[np.asarray(fork.focal)][..., None]
+    edited_action = jnp.where(focal > 0, fork.manager.action, fork.manager.action + 3.0)
+    edited = rollout._replace(
+        intervention=fork._replace(manager=fork.manager._replace(action=edited_action))
+    )
+    a, _ = update_fn(runner_state, rollout, last)
+    b, _ = update_fn(runner_state, edited, last)
+    assert _tree_max_diff(a.train_state, b.train_state) == 0.0
+
+
+@pytest.mark.parametrize("interval", [1, 2])
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_redecide_collect_update_eval_end_to_end(n_agents, interval):
+    _, runner_state, (rs, rollout, last, _), (update_fn, eval_fn) = _forks(
+        EdgeTeleport(n_agents, max_steps=10),
+        intervention_interval=interval,
+        intervention_redecide="focal",
+    )
+    new_state, losses = update_fn(rs, rollout, last)
+    shift = float(losses["intervention_redecide_mean_shift"])
+    clip = float(losses["intervention_redecide_recruit_clip_frac"])
+    assert np.isfinite(shift) and shift > 0.0  # the input changed, so the mean did
+    assert 0.0 < clip <= 1.0
+    assert np.isfinite(float(losses["manager_policy_loss"]))
+    before = runner_state.train_state.manager.actor_ts.params
+    assert _tree_max_diff(before, new_state.train_state.manager.actor_ts.params) > 0.0
+    assert np.isfinite(float(eval_fn(new_state.train_state, jax.random.PRNGKey(1))))
+    # The default fork logs no redecide keys, and the checkpoint trees match.
+    _, base_state, (_, base_rollout, base_last, _), (base_update, _) = _forks(
+        StubEnv(n_agents, max_steps=10), intervention_interval=interval
+    )
+    _, base_losses = base_update(base_state, base_rollout, base_last)
+    assert not any(k.startswith("intervention_redecide") for k in base_losses)
+    assert jax.tree.structure(runner_state.train_state.manager.critic_ts.params) == (
+        jax.tree.structure(base_state.train_state.manager.critic_ts.params)
+    )
+    for x, y in zip(
+        jax.tree.leaves(runner_state.train_state), jax.tree.leaves(base_state.train_state)
+    ):
+        assert np.shape(x) == np.shape(y)
+
+
+# ------------------------------------- every agent re-decides (redecide: all)
+
+
+def _stub_successor(fork, t):
+    """`(obs (L, N, OBS_DIM), pos (L, N, 2))` of the stub state after fork step
+    `t`, rebuilt from the stored position and action (the stub moves
+    `SPEED * clip(action)`). Needed at a window's last step, whose successor is
+    not stored."""
+    pos = np.asarray(fork.worker.obs)[t, ..., :2]
+    nxt = pos + SPEED * np.clip(np.asarray(fork.worker.action)[t], -1.0, 1.0)
+    return np.concatenate([nxt, np.sin(3.0 * nxt)], axis=-1), nxt
+
+
+def _continuing_value(train_state, obs, pos, n_agents):
+    """V^M with the zero (main-row) context, the value a fork bootstraps with."""
+    gs = jnp.asarray(obs).reshape(obs.shape[0], -1)  # the stub has no hook
+    critic_in = jnp.concatenate(
+        [wp.manager_critic_input(gs, jnp.asarray(pos)), jnp.zeros((obs.shape[0], n_agents + 2))],
+        axis=-1,
+    )
+    critic = train_state.manager.critic_ts
+    return np.asarray(critic.apply_fn(critic.params, critic_in))
+
+
+@pytest.mark.parametrize("bound", ["clip", "tanh"])
+def test_redecide_all_stores_every_agents_post_teleport_decision(bound):
+    """Every agent's fork record is a fresh sample on its post-teleport input
+    (PPO ratio 1), it drives that agent (nothing is copied), every agent carries
+    actor weight, and the critic reads the post-teleport state."""
+    n_agents = 3
+    _, _, (rs, rollout, _, _), _ = _forks(
+        StubEnv(n_agents), bound=bound, intervention_redecide="all"
+    )
+    fork, actor = rollout.intervention, rs.train_state.manager.actor_ts
+    obs, err = _first_step(fork.worker, n_agents)
+    base = wp.input_dims(OBS_DIM, OBS_DIM * n_agents, n_agents, 2)["manager_critic"]
+    for w in range(N_WINDOWS):
+        gs = jnp.asarray(obs[w]).reshape(N_ENVS, -1)
+        pos = jnp.asarray(obs[w][..., :2])
+        np.testing.assert_allclose(
+            fork.manager.obs[w], wp.manager_actor_input(gs, pos), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            np.asarray(fork.manager.global_state[w])[:, :base],
+            wp.manager_critic_input(gs, pos),
+            atol=1e-6,
+        )
+        own = wp.waypoint_offset(pos, fork.manager.action[w], RADIUS, bound)
+        np.testing.assert_allclose(err[w], own, atol=1e-5)
+    # The recruits' inputs changed, so no agent's record is its main row's.
+    assert np.abs(np.asarray(fork.manager.obs) - np.asarray(rollout.manager.obs)).max() > 0
+    d = fork.manager.obs.shape[-1]
+    log_prob, _ = evaluate_action(
+        actor.apply_fn, actor.params, fork.manager.obs.reshape(-1, d),
+        fork.manager.action.reshape(-1, 2), discrete=False,
+    )
+    np.testing.assert_allclose(
+        log_prob, np.asarray(fork.manager.log_prob).reshape(-1), atol=1e-5
+    )
+    valid = np.asarray(fork.valid, np.float32)
+    assert valid.all()
+    np.testing.assert_array_equal(
+        fork.manager.active_mask, np.repeat(valid[..., None], n_agents, axis=-1)
+    )
+
+
+def test_every_fork_goal_is_trained_under_redecide_all():
+    """The inverse of `test_imposed_manager_actions_carry_no_gradient`: with no
+    imposed goals, editing a recruit's stored fork action changes the update."""
+    n_agents = 3
+    _, _, (runner_state, rollout, last, _), (update_fn, _) = _forks(
+        StubEnv(n_agents), intervention_redecide="all"
+    )
+    fork = rollout.intervention
+    focal = np.eye(n_agents)[np.asarray(fork.focal)][..., None]
+    edited_action = jnp.where(focal > 0, fork.manager.action, fork.manager.action + 3.0)
+    edited = rollout._replace(
+        intervention=fork._replace(manager=fork.manager._replace(action=edited_action))
+    )
+    a, _ = update_fn(runner_state, rollout, last)
+    b, _ = update_fn(runner_state, edited, last)
+    assert _tree_max_diff(
+        a.train_state.manager.actor_ts.params, b.train_state.manager.actor_ts.params
+    ) > 0.0
+
+
+def test_redecide_all_bootstraps_the_window_end():
+    """A fork still running at its window end returns the discounted team reward
+    plus gamma_M^c V^M(s_end) with the zero context; the default fork returns
+    the bare sum."""
+    n_agents = 3
+    config, rs, (_, rollout, _, _), _ = _forks(StubEnv(n_agents), intervention_redecide="all")
+    fork, gamma = rollout.intervention, config.worker.gamma
+    team = np.asarray(fork.worker.team_reward).reshape(N_WINDOWS, HORIZON, N_ENVS)
+    for w in range(N_WINDOWS):
+        plain = sum(gamma**k * team[w, k] for k in range(HORIZON))
+        end_obs, end_pos = _stub_successor(fork, w * HORIZON + HORIZON - 1)
+        v_end = _continuing_value(rs.train_state, end_obs, end_pos, n_agents)
+        assert np.abs(v_end).min() > 1e-4  # so the check can tell
+        np.testing.assert_allclose(
+            np.asarray(fork.manager.reward)[w], plain + gamma**HORIZON * v_end,
+            rtol=1e-5, atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize("max_steps", [6, 8])
+def test_redecide_all_keeps_the_time_limit_bootstraps(max_steps):
+    """The inverse of `test_no_time_limit_bootstrap_survives_in_fork_rewards`. A
+    time limit inside the window (step 5) or at its last step (step 7) is
+    bootstrapped EXACTLY once at the manager (the lane is then not alive at the
+    window end), and mid-window the worker bootstraps too, as on main rows."""
+    n_agents = 2
+    config, rs, (_, rollout, _, _), _ = _forks(
+        StubEnv(n_agents, max_steps=max_steps), intervention_redecide="all"
+    )
+    fork, gamma, ts = rollout.intervention, config.worker.gamma, rs.train_state
+    t = max_steps - 1
+    k, start = t % HORIZON, (t // HORIZON) * HORIZON
+    succ_obs, succ_pos = _stub_successor(fork, t)
+    team = np.asarray(fork.worker.team_reward)
+    plain = sum(gamma**j * team[start + j] for j in range(k + 1))
+    v_m = _continuing_value(ts, succ_obs, succ_pos, n_agents)
+    np.testing.assert_allclose(
+        np.asarray(fork.manager.reward)[t // HORIZON],
+        plain + gamma ** (k + 1) * v_m,
+        rtol=1e-5, atol=1e-6,
+    )
+    if k != HORIZON - 1:
+        # The frozen row after the time limit holds the true successor.
+        np.testing.assert_allclose(
+            np.asarray(fork.worker.obs)[t + 1, ..., :OBS_DIM], succ_obs, atol=1e-6
+        )
+        pos, waypoint = _stored_pos_and_waypoint(fork.worker)
+        r_int = (
+            np.linalg.norm(waypoint[t] - pos[t], axis=-1)
+            - np.linalg.norm(waypoint[t] - succ_pos, axis=-1)
+        ) / RADIUS
+        v_w = ts.worker.critic_ts.apply_fn(
+            ts.worker.critic_ts.params,
+            wp.worker_critic_input(
+                jnp.asarray(succ_obs).reshape(N_ENVS, -1),
+                wp.goal_error(waypoint[t], succ_pos, RADIUS),
+                wp.remaining_fraction(k + 1, HORIZON),
+            ),
+        )
+        np.testing.assert_allclose(
+            np.asarray(fork.worker.reward)[t], r_int + gamma * np.asarray(v_w), atol=1e-5
+        )
+
+
+@pytest.mark.parametrize("interval", [1, 2])
+@pytest.mark.parametrize("n_agents", [2, 3])
+def test_redecide_all_collect_update_eval_end_to_end(n_agents, interval):
+    _, runner_state, (rs, rollout, last, _), (update_fn, eval_fn) = _forks(
+        StubEnv(n_agents, max_steps=10),
+        intervention_interval=interval,
+        intervention_redecide="all",
+    )
+    new_state, losses = update_fn(rs, rollout, last)
+    for key in (
+        "intervention_redecide_mean_shift", "intervention_redecide_recruit_waypoint_gap",
+        "manager_policy_loss", "manager_explained_variance_fork",
+    ):
+        assert np.isfinite(float(losses[key])), key
+    assert float(losses["intervention_redecide_mean_shift"]) > 0.0
+    assert "intervention_redecide_recruit_clip_frac" not in losses  # nothing copied
+    applied = math.ceil(N_WINDOWS / interval)
+    assert float(losses["manager_eligible_fork"]) == applied * N_ENVS * n_agents
+    before = runner_state.train_state.manager.actor_ts.params
+    assert _tree_max_diff(before, new_state.train_state.manager.actor_ts.params) > 0.0
+    assert np.isfinite(float(eval_fn(new_state.train_state, jax.random.PRNGKey(1))))
+    _, base_state, _, _ = _forks(StubEnv(n_agents, max_steps=10), intervention_interval=interval)
+    for x, y in zip(
+        jax.tree.leaves(runner_state.train_state), jax.tree.leaves(base_state.train_state)
+    ):
+        assert np.shape(x) == np.shape(y)
 
 
 # ------------------------------------------------------------------ MJX hook

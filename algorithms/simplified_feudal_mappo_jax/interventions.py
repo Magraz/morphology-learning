@@ -13,7 +13,8 @@ drawn uniformly per env and window, before the first worker step of the window:
 * the fork runs one `goal_horizon` window with the same frozen policies and is
   then discarded. It is its own episode: its worker steps end with `done` on the
   window's last step, and its single manager transition is a terminal whose
-  return is the fork's discounted team reward. No time-limit bootstrap.
+  return is the fork's discounted team reward. No time-limit bootstrap (except
+  under `intervention_redecide: all`, below).
 
 Fork transitions join both levels' PPO batches as extra env columns
 (`types.Intervention`). Only agent i's manager action is a policy sample in its
@@ -22,6 +23,27 @@ weight there; every live agent's worker action is a real sample. The manager
 critic reads a context block (`critic_context`) so that it can tell a
 continuing main return from a one-window fork return. Execution and evaluation
 are unchanged. Plan: `plans/simplified_feudal_interventions_2026-10-05.md`.
+
+`intervention_redecide` (`REDECIDE_MODES`) sets who decides the fork's goals.
+In every mode the teleport is the same (same keys, and the placement filter uses
+the main decision's offset), so fork start states match across modes at a seed.
+
+* `none` (the default, the original fork): the fork's manager record is the main
+  decision itself. Agent i's goal was chosen in the pre-teleport state, so its
+  stored input shows no recruits: the same input as its main row, scored on a
+  different outcome.
+* `focal`: agent i samples a fresh goal from the post-teleport state. The
+  recruits copy that new offset, clipped to the arena (the placement filter only
+  guaranteed the old offset fits). Agent i's manager record and the critic input
+  are the post-teleport ones, so the actor sees the help it is credited for.
+  Every other agent keeps the main decision's waypoint.
+* `all`: every agent samples its own goal from the post-teleport state; nothing
+  is imposed, so every agent's manager row trains. The fork is then an ordinary
+  on-policy window from a teleported start state, and it bootstraps like the
+  main rollout: the time-limit bootstraps at both levels, plus the manager's
+  continuing value at the window end (`gamma_M^c V^M(s_end)`, zero context).
+  Its manager target is therefore the true return from the teleported state, not
+  a one-window return.
 
 The forks count TOWARD the per-update batch, not on top of it: the main rollout
 runs `main_envs(...)` envs, fewer than the env group's `n_envs`, so that its
@@ -40,14 +62,28 @@ import numpy as np
 # split of the main path's keys: the main rollout is unchanged by them.
 FORK_KEY_NAMESPACE = 0x51F0
 
+# `intervention_redecide`: who decides a fork's goals (see the module docstring).
+REDECIDE_MODES = ("none", "focal", "all")
+
 
 def validate_interventions(config, env, n_windows: int) -> None:
     """Raise on a fork configuration that cannot run as specified."""
     interval = config.intervention_interval
+    redecide = config.intervention_redecide
+    if redecide not in REDECIDE_MODES:
+        raise ValueError(
+            f"unknown intervention_redecide {redecide!r}; expected one of "
+            f"{REDECIDE_MODES}"
+        )
     if not config.interventions:
         if interval != 1:
             raise ValueError(
                 f"intervention_interval={interval} has no effect without "
+                "interventions: true (it would silently train the parent arm)"
+            )
+        if redecide != "none":
+            raise ValueError(
+                f"intervention_redecide={redecide!r} has no effect without "
                 "interventions: true (it would silently train the parent arm)"
             )
         return
@@ -94,8 +130,10 @@ def critic_context(n_agents: int, batch: int, focal=None, n_recruits=None):
 
     N is drawn independently of the manager's action, so conditioning the
     critic on it does not make the baseline depend on the action it credits.
-    The sampled goal and the post-teleport state are deliberately absent: both
-    depend on that action.
+    Under `intervention_redecide: none` the critic otherwise reads the
+    pre-teleport state, because the placement filter depends on the credited
+    (main) action. Under `focal` / `all` it reads the post-teleport state, which
+    is fixed before the credited (re-decided) actions are sampled.
     """
     if focal is None:
         return jnp.zeros((batch, n_agents + 2))
@@ -221,3 +259,24 @@ def fork_diagnostics(intervention, recruit_distance, interval: int, horizon: int
             tried.sum(), 1
         )
     return stats
+
+
+def redecide_diagnostics(valid, per_fork: dict):
+    """Per-rollout statistics of `intervention_redecide`: the mean of each
+    `(n_windows, n_lanes)` per-fork series over valid forks. Keys by mode:
+
+    * `intervention_redecide_mean_shift` (focal, all): how far the recruits moved
+      the focal agent's mean goal, `||b(mu_post) - b(mu_pre)||` in units of R.
+      Near 0 means the manager does not condition on the help, and the arm then
+      trains almost the same signal as the default fork.
+    * `intervention_redecide_recruit_clip_frac` (focal): share of recruits whose
+      copy of the new offset left the arena and was clipped, i.e. got a goal
+      that is not exactly the focal agent's.
+    * `intervention_redecide_recruit_waypoint_gap` (all): mean distance from each
+      recruit's own waypoint to the focal agent's, in units of R. About the
+      placement distance when they pick the same offset, near 0 when they pick
+      the same point, ~1 R and more when they choose independently.
+    """
+    valid_f = valid.astype(jnp.float32)
+    n_valid = jnp.maximum(valid_f.sum(), 1.0)
+    return {name: (x * valid_f).sum() / n_valid for name, x in per_fork.items()}

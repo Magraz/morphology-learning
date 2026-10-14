@@ -56,8 +56,9 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
     * `manager_credit` / `counterfactual_default` / `counterfactual_samples` /
       `dpp_coef` / `dpp_max_recruits` select the manager's credit assignment
       (`counterfactual.py`); "team" is the original behaviour.
-    * `interventions` / `intervention_radius` / `intervention_interval` switch
-      on the training forks (`interventions.py`); off is the original behaviour.
+    * `interventions` / `intervention_radius` / `intervention_interval` /
+      `intervention_redecide` switch on the training forks (`interventions.py`);
+      off is the original behaviour.
       Under forks `n_envs` is the BATCH's env count: the main rollout runs
       `interventions.main_envs(...)` of them, and the fork lanes fill the rest,
       so an update simulates the same steps as the parent's.
@@ -116,6 +117,7 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
         interventions=bool(model_params.interventions),
         intervention_radius=float(model_params.intervention_radius),
         intervention_interval=int(model_params.intervention_interval),
+        intervention_redecide=str(model_params.intervention_redecide),
     )
 
 
@@ -185,11 +187,17 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         print(f"  manager_credit={credit}")
         if self.feudal_config.interventions:
             batch_envs = env_config.get("n_envs")
+            goal_timing = {
+                "none": "focal goal chosen before the teleport",
+                "focal": "focal goal re-decided after the teleport",
+                "all": "every goal re-decided after the teleport, bootstrapped",
+            }[self.feudal_config.intervention_redecide]
             print(
                 f"  interventions: every {self.feudal_config.intervention_interval} "
                 f"decision(s), one fork per env around a random agent, "
                 f"N ~ U{{1..{self.env.n_agents - 1}}}, "
-                f"radius={self.feudal_config.intervention_radius} world units | "
+                f"radius={self.feudal_config.intervention_radius} world units, "
+                f"{goal_timing} | "
                 f"n_envs {batch_envs} -> {worker.n_envs} main | "
                 f"{self._steps_per_update()} simulator steps per update "
                 f"({n_steps * worker.n_envs} main; batch target "

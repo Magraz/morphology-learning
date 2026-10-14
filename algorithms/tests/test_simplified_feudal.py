@@ -156,6 +156,7 @@ def _config(
     interventions=False,
     intervention_radius=0.05,
     intervention_interval=1,
+    intervention_redecide="none",
 ):
     worker = MAPPOConfig(
         n_steps=n_steps,
@@ -186,6 +187,7 @@ def _config(
         interventions=interventions,
         intervention_radius=intervention_radius,
         intervention_interval=intervention_interval,
+        intervention_redecide=intervention_redecide,
     )
 
 

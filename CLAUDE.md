@@ -2215,6 +2215,74 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     - Each has a `_k2` child (`intervention_interval: 2`, forks at 17 of 33
       windows): 21 main envs, 33,600 simulator steps per update, 2976 updates
       at 1e8.
+  - **Who decides a fork's goals: `intervention_redecide: none | focal | all`**
+    (added 2026-10-13; `interventions.REDECIDE_MODES`). Default `none` is the
+    fork above. An unknown value raises, including a stale boolean, and so does
+    any other mode without `interventions: true`. Checkpoint shapes are
+    identical across modes (manager actor `(34, 168)`, critic `(40, 336)` at
+    2a/4o), so the model group name is the only record. Never set it on the CLI.
+    - **The problem.** Under `none` a fork row stores the main decision, made
+      before the teleport. So the manager actor gets the same input twice per
+      update: in its main row, scored on the real window, and in its fork row,
+      scored on a window where N teammates appear and copy its goal. The critic
+      separates the two through its context block; the actor cannot, so it can
+      only learn one compromise action for both.
+    - **Shared by both modes.** The teleport is unchanged: same keys, and the
+      placement filter still uses the main decision's offset. So fork start
+      states match across all three modes at a seed. The new goals come from one
+      `policy.decide` on the post-teleport state, and the fork's critic input is
+      the post-teleport one.
+    - **`focal`** (arm `simplified_feudal_tanh_relative_input_interventions_redecide`,
+      one key on the relative interval-1 fork arm): agent i re-samples its goal
+      and the recruits copy the new offset, clipped to the arena (the filter
+      only guaranteed the old one fits). Every other agent keeps its main
+      waypoint, and only agent i carries actor weight. It asks "what goal should
+      agent i pick when N teammates stand beside it and follow it?", no longer
+      the D++ question "would agent i's real goal pay off if help appeared?".
+    - **`all`** (arm `..._interventions_redecide_all`, a sibling with the same
+      parent): every agent re-samples its own goal and nothing is copied, so
+      every agent's manager row trains. The fork then bootstraps like the main
+      rollout: the time-limit bootstraps at both levels (`_worker_step(
+      bootstrap=True)`), plus the manager's continuing value at the window end,
+      `gamma_M^c V^M(s_end)` with the zero context, for lanes still alive there.
+      Its manager target is therefore the true return from the teleported state.
+      The forks become a restart-distribution curriculum, toward states where
+      teammates stand close, and reward nothing that cannot happen at
+      execution. Without the bootstrap they would optimize a one-window return.
+      Fork rows are half of the manager's actor rows at interval 1 (1056 main +
+      1056 fork agent-decisions, against 528 fork rows under `none` / `focal`).
+    - **Logged:** `intervention_redecide_mean_shift` in both modes (how far the
+      help moved agent i's mean goal, `||b(mu_post) - b(mu_pre)||` in units of
+      R; near 0, the manager ignores who stands beside it).
+      `intervention_redecide_recruit_clip_frac` (`focal`) is the share of
+      recruits clipped. `intervention_redecide_recruit_waypoint_gap` (`all`) is
+      each recruit's waypoint to agent i's, in units of R: about the placement
+      distance (≤ 1.5 world units, ~0.33 R at 2a/4o) for a shared offset, near 0
+      for a shared point, ~1 R or more when independent.
+      ⚠ Under `all`, `intervention_window_return` includes the bootstrapped
+      value, so it is not comparable with the other modes' bare window returns.
+    - **Verified 2026-10-13:**
+      - Bit-identity against the pre-change code: 0.0 maximum difference over
+        every array and loss. That covers 12 CPU-stub configurations: parent and
+        `none` forks (interval 1/2, N = 2/3, clip/tanh, global/relative, failed
+        placements, a time limit), and `focal` against its original boolean form
+        (including a stub that forces the recruit clip).
+      - Tests: 196 pass across `test_simplified_feudal_interventions.py` +
+        `test_simplified_feudal.py` + `test_smax_seams.py` +
+        `test_mjx_global_state.py`. The `all` seams pin:
+        - every agent's post-teleport record, with PPO ratio 1;
+        - no copying;
+        - a recruit's fork action is trained;
+        - the window-end bootstrap value;
+        - exactly one bootstrap at a mid-window and at a last-step time limit;
+        - no bootstrap after a termination.
+      - MJX smoke on `mjx_2a_4o_1122_1024_gs`: both arms train, and `all` also
+        resumes with `checkpoint=true` (all 9 history entries kept) and
+        evaluates. `manager_eligible_fork` reads 528 (`focal`) and 1056 (`all`).
+        Mean shift rose from 0.0003 to ~0.02 R over 9 updates in both modes.
+        `focal` clipped 3–5% of recruits; the `all` waypoint gap is 0.75–0.88 R,
+        i.e. independent goals at init.
+      - **No training result.**
   - **The `_n96` groups** (`mjx_2a_4o_1122_1024_gs_n96`, `mjx_6a_4o_1024_gs_n96`)
     were the extra-data control for the OLD appended design (they matched its
     2a/4o interval-1 updates and rows per update). Under the redesign they are

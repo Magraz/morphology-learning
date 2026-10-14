@@ -1,0 +1,48 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_redecide none -> all.
+#
+# The parent's fork imposes goals: agent i's goal is the one it chose BEFORE the
+# teleport, the recruits copy it, and only agent i's manager row trains. Its
+# sibling `..._redecide` (focal) re-samples agent i's goal after the teleport,
+# but the recruits still copy it.
+#
+# Here nothing is imposed. The teleport is identical (same keys, and the
+# placement filter still uses the main decision's offset, so fork start states
+# match both other arms at a seed). Then EVERY agent samples its own goal from
+# the post-teleport state, and every agent's manager row trains. The fork is an
+# ordinary on-policy window from a teleported start state, and it bootstraps like
+# the main rollout: the time-limit bootstraps at both levels, plus the manager's
+# continuing value at the window end (gamma_M^c V^M(s_end), zero context). Its
+# manager target is the true return from the teleported state, so the forks are a
+# restart-distribution curriculum: they move training toward states where
+# teammates stand close together, without rewarding behaviour that never happens
+# at execution.
+#
+# Batch and budget are the parent's (16 main envs, 33,792 simulator steps per
+# update at interval 1, 2959 updates at 1e8). Fork rows are now half of the
+# manager's actor rows at interval 1 (1056 main + 1056 fork agent-decisions,
+# against 1/3 for the parent and `..._redecide`). Execution and evaluation are
+# unchanged.
+#
+# Read first:
+#   * `intervention_redecide_mean_shift`: how far the recruits move agent i's
+#     mean goal (units of R). Near 0, the manager ignores who stands beside it.
+#   * `intervention_redecide_recruit_waypoint_gap`: each recruit's waypoint to
+#     agent i's (units of R). About the placement distance when they choose the
+#     same offset, near 0 for the same point, ~1 R or more when independent.
+# `intervention_window_return` includes the bootstrapped value here, so it is
+# not comparable with the other fork arms' bare one-window returns.
+#
+# Checkpoints are shape-identical to the parent's, so this model group name in
+# the results path is the only record of the setting. Never set it on the CLI.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_redecide_all trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_redecide: all    # every agent re-decides after the teleport

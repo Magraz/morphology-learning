@@ -1,0 +1,43 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_redecide none -> focal.
+#
+# The parent's fork credits agent i's goal as chosen BEFORE the teleport: the
+# fork's manager row stores the main decision's input, action and log-prob, so
+# the actor sees the same input in its main row (scored on the real window) and
+# in its fork row (scored on a window where N teammates appear beside it and
+# copy its goal). The critic can tell the two apart through its context block;
+# the actor cannot, so it can only learn one compromise action for both.
+#
+# Here the teleport is identical (same keys and placement filter), and then
+# agent i samples a FRESH goal from the post-teleport state, whose manager input
+# shows the recruits. The recruits copy that new offset from their own positions,
+# clipped to the arena (the placement filter only guaranteed the old offset
+# fits). The fork's manager row stores the post-teleport input, action and
+# log-prob, and the critic reads the post-teleport state plus the same context.
+# So the fork asks "what goal should agent i pick when N teammates stand next to
+# it and will follow it?" instead of "would agent i's real goal pay off if help
+# appeared?". Every other agent keeps the main decision's waypoint, and only
+# agent i's manager action carries actor weight, as in the parent.
+#
+# Batch and budget are the parent's (16 main envs, 33,792 simulator steps per
+# update at interval 1, 2959 updates at 1e8). Execution and evaluation are
+# unchanged. Read `intervention_redecide_mean_shift` first: it is how far the
+# recruits move agent i's mean goal (units of R). Near 0, the manager ignores
+# the help and the arm trains almost the same signal as the parent.
+#
+# Sibling: `..._interventions_redecide_all`, where every agent re-decides and
+# the fork bootstraps.
+#
+# Checkpoints are shape-identical to the parent's, so this model group name in
+# the results path is the only record of the setting. Never set it on the CLI.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_redecide trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_redecide: focal  # re-sample agent i's goal after the teleport
