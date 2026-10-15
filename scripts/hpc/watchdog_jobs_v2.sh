@@ -17,8 +17,10 @@ usage() {
 Usage: $(basename "$0") [algorithm_batch_name] [--dry-run] [--run-script PATH]
 
 Checks each expected job in a ledger and resubmits any job that is not
-currently present in squeue for this user, unless the ledger job already
-finished with state COMPLETED in sacct.
+currently present in squeue for this user, unless sacct shows it finished
+with state COMPLETED: either the ledger's job ID, or any job with the same
+job name submitted since the ledger was written (i.e. a resubmission).
+Exits without resubmitting anything if a sacct query fails.
 
 Options:
   algorithm_batch_name
@@ -108,28 +110,54 @@ if [[ ! -s "${WATCHDOG_LOG}" ]]; then
     echo "timestamp,job_name,batch_name,experiment,trial_id,status,old_job_id,new_job_id" > "${WATCHDOG_LOG}"
 fi
 
+# The name every launcher passes to `sbatch -J`; resubmissions reuse it.
+expected_job_name() {
+    local trial_id="$1" experiment="$2" algorithm="$3" batch_name="$4"
+    echo "${trial_id}_${experiment}_${algorithm}_${batch_name}"
+}
+
+join_by_comma() {
+    local IFS=,
+    echo "$*"
+}
+
 declare -A LEDGER_IDS
+declare -A LEDGER_NAMES
 declare -A COMPLETED_IDS
+declare -A COMPLETED_NAMES
 declare -A ACTIVE_IDS
 declare -A ACTIVE_NAMES
+LEDGER_START=""
 
 while IFS='|' read -r ACTIVE_ID ACTIVE_NAME; do
     [[ -n "${ACTIVE_ID}" ]] && ACTIVE_IDS["${ACTIVE_ID}"]=1
     [[ -n "${ACTIVE_NAME}" ]] && ACTIVE_NAMES["${ACTIVE_NAME}"]=1
 done < <(squeue -h -u "${USER}" -o "%A|%j")
 
-while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME _ENVIRONMENT _ALGORITHM _EXPERIMENT _TRIAL_ID _JOB_NAME JOB_ID _SUBMISSION_OK; do
+while IFS=',' read -r TIMESTAMP _RUN_ID BATCH_NAME _ENVIRONMENT ALGORITHM EXPERIMENT TRIAL_ID LEDGER_JOB_NAME JOB_ID _SUBMISSION_OK; do
     JOB_ID="${JOB_ID%$'\r'}"
     [[ "${JOB_ID}" =~ ^[0-9]+$ ]] && LEDGER_IDS["${JOB_ID}"]=1
+
+    [[ -z "${BATCH_NAME}" || "${BATCH_NAME}" == "batch_name" ]] && continue
+    LEDGER_NAMES["$(expected_job_name "${TRIAL_ID}" "${EXPERIMENT}" "${ALGORITHM}" "${BATCH_NAME}")"]=1
+    [[ -n "${LEDGER_JOB_NAME}" ]] && LEDGER_NAMES["${LEDGER_JOB_NAME}"]=1
+
+    # Ledger timestamps are local time with a %z offset; sacct -S takes local
+    # time without one. Same-format strings compare chronologically.
+    if [[ "${TIMESTAMP}" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+        if [[ -z "${LEDGER_START}" || "${BASH_REMATCH[1]}" < "${LEDGER_START}" ]]; then
+            LEDGER_START="${BASH_REMATCH[1]}"
+        fi
+    fi
 done < "${LEDGER_PATH}"
 
-LEDGER_JOB_IDS=("${!LEDGER_IDS[@]}")
-if [[ ${#LEDGER_JOB_IDS[@]} -gt 0 ]]; then
-    OLD_IFS="${IFS}"
-    IFS=,
-    JOB_ID_LIST="${LEDGER_JOB_IDS[*]}"
-    IFS="${OLD_IFS}"
-
+# A failed sacct query would leave the completed sets empty and resubmit every
+# finished job, so abort the cycle instead.
+if [[ ${#LEDGER_IDS[@]} -gt 0 ]]; then
+    if ! ACCOUNTING="$(sacct -n -P -X -j "$(join_by_comma "${!LEDGER_IDS[@]}")" -o JobIDRaw,State)"; then
+        echo "error: sacct query by job id failed; not resubmitting anything this cycle" >&2
+        exit 1
+    fi
     while IFS='|' read -r ACCOUNT_JOB_ID ACCOUNT_STATE; do
         ACCOUNT_JOB_ID="${ACCOUNT_JOB_ID%$'\r'}"
         ACCOUNT_STATE="${ACCOUNT_STATE%$'\r'}"
@@ -137,7 +165,31 @@ if [[ ${#LEDGER_JOB_IDS[@]} -gt 0 ]]; then
         if [[ "${ACCOUNT_STATE}" == COMPLETED* ]]; then
             COMPLETED_IDS["${ACCOUNT_JOB_ID}"]=1
         fi
-    done < <(sacct -n -P -X -j "${JOB_ID_LIST}" -o JobIDRaw,State 2>/dev/null)
+    done <<< "${ACCOUNTING}"
+fi
+
+# The ledger keeps the ID of the first submission only, so a job the watchdog
+# resubmitted can complete under an ID the ledger never sees. Match completed
+# jobs by name as well. Jobs from before this ledger was written are excluded,
+# so a relaunched batch is not satisfied by an older run with the same names.
+if [[ ${#LEDGER_NAMES[@]} -gt 0 && -z "${LEDGER_START}" ]]; then
+    echo "warning: no parseable timestamp in ${LEDGER_PATH}; checking completion by ledger job id only" >&2
+elif [[ ${#LEDGER_NAMES[@]} -gt 0 ]]; then
+    if ! ACCOUNTING="$(sacct -n -P -X -u "${USER}" -S "${LEDGER_START}" \
+            --name="$(join_by_comma "${!LEDGER_NAMES[@]}")" -o JobIDRaw,JobName,State)"; then
+        echo "error: sacct query by job name failed; not resubmitting anything this cycle" >&2
+        exit 1
+    fi
+    while IFS='|' read -r ACCOUNT_JOB_ID ACCOUNT_NAME ACCOUNT_STATE; do
+        ACCOUNT_STATE="${ACCOUNT_STATE%$'\r'}"
+        [[ "${ACCOUNT_JOB_ID}" =~ ^[0-9]+$ && -n "${ACCOUNT_NAME}" ]] || continue
+        [[ "${ACCOUNT_STATE}" == COMPLETED* ]] || continue
+        # Keep the most recent completed job for each name.
+        PREVIOUS_ID="${COMPLETED_NAMES[${ACCOUNT_NAME}]:-0}"
+        if (( ACCOUNT_JOB_ID > PREVIOUS_ID )); then
+            COMPLETED_NAMES["${ACCOUNT_NAME}"]="${ACCOUNT_JOB_ID}"
+        fi
+    done <<< "${ACCOUNTING}"
 fi
 
 TOTAL=0
@@ -161,8 +213,7 @@ while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERI
         continue
     fi
 
-    JOB_IDENTIFIER="${ALGORITHM}_${BATCH_NAME}"
-    JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${JOB_IDENTIFIER}"
+    JOB_NAME="$(expected_job_name "${TRIAL_ID}" "${EXPERIMENT}" "${ALGORITHM}" "${BATCH_NAME}")"
 
     TOTAL=$((TOTAL + 1))
 
@@ -187,10 +238,19 @@ while IFS=',' read -r _TIMESTAMP _RUN_ID BATCH_NAME ENVIRONMENT ALGORITHM EXPERI
         continue
     fi
 
+    # The job that completed it: the ledger's own ID, or a resubmission found by name.
+    COMPLETED_BY=""
     if [[ -n "${JOB_ID}" && "${JOB_ID}" != "UNKNOWN" && -n "${COMPLETED_IDS[${JOB_ID}]+x}" ]]; then
+        COMPLETED_BY="${JOB_ID}"
+    elif [[ -n "${COMPLETED_NAMES[${JOB_NAME}]+x}" ]]; then
+        COMPLETED_BY="${COMPLETED_NAMES[${JOB_NAME}]}"
+    elif [[ -n "${LEDGER_JOB_NAME}" && -n "${COMPLETED_NAMES[${LEDGER_JOB_NAME}]+x}" ]]; then
+        COMPLETED_BY="${COMPLETED_NAMES[${LEDGER_JOB_NAME}]}"
+    fi
+    if [[ -n "${COMPLETED_BY}" ]]; then
         COMPLETED=$((COMPLETED + 1))
-        echo "completed ${JOB_NAME} (${JOB_ID})"
-        echo "${LOG_TS},${JOB_NAME},${BATCH_NAME},${EXPERIMENT},${TRIAL_ID},completed,${JOB_ID}," >> "${WATCHDOG_LOG}"
+        echo "completed ${JOB_NAME} (${COMPLETED_BY})"
+        echo "${LOG_TS},${JOB_NAME},${BATCH_NAME},${EXPERIMENT},${TRIAL_ID},completed,${JOB_ID},${COMPLETED_BY}" >> "${WATCHDOG_LOG}"
         continue
     fi
 
