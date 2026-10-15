@@ -6,11 +6,27 @@
 # Each batch gets its own ledger, job_tracking/<algorithm>_<batch>_latest.csv,
 # because watchdog_jobs_v2.sh looks ledgers up by that identifier. A single
 # watchdog job is then submitted that cycles over all of the batches.
-#ENVIRONMENT=hrl_skill
-BATCH_NAMES=("mjx_16a_4o_drift")
-# EXPERIMENT_NAMES=("cg_agent_novelty" "cg_team_novelty" "gnn_critic" "mlp_shared" "cg_agent_novelty_dir_adj" "cg_team_novelty_dir_adj" "cg_agent_novelty_node_emb" "cg_team_novelty_node_emb")
-EXPERIMENT_NAMES=("mlp")
-ALGORITHM=mappo_jax
+
+BATCH_NAMES=(
+# "mjx_1a_3o_111_1024_gs" "mjx_1a_3o_111_1024_gs_sparse" "mjx_1a_3o_111_1024_gs_scale2" "mjx_1a_3o_111_1024_gs_sparse_scale2"
+"mjx_2a_4o_1122_1024_gs" "mjx_2a_4o_1122_1024_gs_sparse" "mjx_2a_4o_1122_1024_gs_scale2" "mjx_2a_4o_1122_1024_gs_sparse_scale2"
+"mjx_6a_4o_1024_gs" "mjx_6a_4o_1024_gs_sparse" "mjx_6a_4o_1024_gs_scale2" "mjx_6a_4o_1024_gs_sparse_scale2"
+)
+
+EXPERIMENT_NAMES=(
+# "simplified_feudal"
+# "simplified_feudal_tanh_relative_input" "simplified_feudal_tanh_local_input"
+# "simplified_feudal_tanh_relative_input_cf" "simplified_feudal_tanh_local_input_cf"
+# "simplified_feudal_tanh_relative_input_dpp" "simplified_feudal_tanh_local_input_dpp"
+"simplified_feudal_tanh_local_input_interventions" "simplified_feudal_tanh_relative_input_interventions"
+"simplified_feudal_tanh_local_input_interventions_k2" "simplified_feudal_tanh_relative_input_interventions_k2"
+"simplified_feudal_tanh_relative_input_interventions_redecide_all" "simplified_feudal_tanh_relative_input_interventions_redecide"
+)
+ALGORITHM=simplified_feudal_mappo_jax
+
+# EXPERIMENT_NAMES=("mlp")
+# ALGORITHM=mappo_jax
+
 TRIAL_START=0
 TRIAL_END=4
 SBATCH_SCRIPT="run_trial_gpu.sh"

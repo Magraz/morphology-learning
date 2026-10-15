@@ -17,10 +17,10 @@ sbatch <<EOT
 #SBATCH --partition=preempt
 #SBATCH -o ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.out
 #SBATCH -e ./logs/${BATCH_NAME}_${EXPERIMENT_NAME}_${TRIAL_ID}.err
-#SBATCH -c 8
+#SBATCH -c 4
 #SBATCH --cpu-freq=high
-#SBATCH --mem=16G
-#SBATCH --time=72:00:00
+#SBATCH --mem=10G
+#SBATCH --time=2:00:00
 #SBATCH --nodelist=dgxh-[1-4],cn-w-[1-2],cn-t-1,cn-r-[1-6],cn-s-[1-5],cn-gpu[5-7],cn-gpu[10-12],optimus,sail-gpu0,dgx2-[1-2],dgx2-[4-5],cn-x-[1-2],cn-m-[1-2]
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
