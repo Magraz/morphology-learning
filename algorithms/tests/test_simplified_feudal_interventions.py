@@ -646,6 +646,7 @@ def test_fork_collect_update_eval_end_to_end(n_agents, interval):
         "manager_eligible_main", "manager_eligible_fork",
         "worker_adv_std_main", "worker_adv_std_fork",
         "manager_explained_variance_main", "manager_explained_variance_fork",
+        *SHARE_KEYS,
     ):
         assert np.isfinite(float(losses[key])), key
     assert float(losses["intervention_attempted"]) == math.ceil(N_WINDOWS / interval) * lanes
@@ -684,6 +685,88 @@ def test_fork_checkpoints_round_trip():
     assert _tree_max_diff(
         restored["manager_critic_ts"].params, moved.train_state.manager.critic_ts.params
     ) == 0.0
+
+
+# ------------------------------------------------ fork and main return shares
+
+SHARE_KEYS = tuple(
+    f"{prefix}_{name}"
+    for prefix in ("intervention", "manager_window")
+    for name in ("return_nonzero_frac", "return_positive_frac", "delivery_frac")
+)
+
+
+def _share(mask, weight):
+    w = np.asarray(weight, np.float32)
+    return float((np.asarray(mask, np.float32) * w).sum() / max(w.sum(), 1.0))
+
+
+def test_return_shares_count_only_weighted_windows():
+    team_reward = jnp.array([[0.0, 2.0, -1.0], [5.0, 0.0, 3.0]])
+    delivered = jnp.array([[False, True, False], [True, False, True]])
+    weight = jnp.array([[1, 1, 1], [1, 0, 0]], dtype=bool)
+    shares = iv.return_shares("x", team_reward, delivered, weight)
+    assert float(shares["x_return_nonzero_frac"]) == pytest.approx(3 / 4)
+    assert float(shares["x_return_positive_frac"]) == pytest.approx(2 / 4)
+    assert float(shares["x_delivery_frac"]) == pytest.approx(2 / 4)
+    empty = iv.return_shares("x", team_reward, delivered, jnp.zeros_like(weight))
+    assert all(float(v) == 0.0 for v in empty.values())
+
+
+def test_window_delivered_reads_new_deliveries_only():
+    start = StubEnv(2).reset(jax.random.PRNGKey(0))[1]._replace(
+        delivered=jnp.array([True, False])
+    )
+    assert not bool(iv.window_delivered(start, start))
+    end = start._replace(delivered=jnp.array([True, True]))
+    assert bool(iv.window_delivered(start, end))
+
+
+def test_the_parent_logs_no_return_shares():
+    diagnostics = _parent(StubEnv(3), seed=0)[1].diagnostics
+    assert not set(SHARE_KEYS) & set(diagnostics)
+
+
+@pytest.mark.parametrize("interval", [1, 2])
+@pytest.mark.parametrize("mode", ["none", "focal", "all"])
+def test_return_shares_pair_each_fork_with_its_main_window(mode, interval):
+    """Both sets of shares are over the windows whose fork was placed, from the
+    bare team reward (never the bootstrapped manager reward), and the delivery
+    flags follow the stub's rule: box 0 is delivered at step 6, i.e. in window
+    1 for the main window and for the fork cut from it."""
+    _, _, (_, rollout, _, _), _ = _forks(
+        StubEnv(3, max_steps=10),
+        intervention_interval=interval,
+        intervention_redecide=mode,
+    )
+    d, fork = rollout.diagnostics, rollout.intervention
+    valid = np.asarray(fork.valid)
+    assert valid.sum() > 0
+    in_window_1 = np.broadcast_to((np.arange(N_WINDOWS) == 1)[:, None], valid.shape)
+    for prefix, team_reward in (
+        ("intervention", fork.manager.team_reward),
+        ("manager_window", rollout.manager.team_reward),
+    ):
+        team_reward = np.asarray(team_reward)
+        assert float(d[f"{prefix}_return_nonzero_frac"]) == pytest.approx(
+            _share(team_reward != 0, valid)
+        )
+        assert float(d[f"{prefix}_return_positive_frac"]) == pytest.approx(
+            _share(team_reward > 0, valid)
+        )
+        assert float(d[f"{prefix}_delivery_frac"]) == pytest.approx(
+            _share(in_window_1, valid)
+        )
+    # Interval 2 forks windows 0 and 2 only, so neither set saw the delivery.
+    assert (float(d["intervention_delivery_frac"]) > 0) == (interval == 1)
+
+
+def test_a_window_that_ends_before_the_delivery_does_not_count_it():
+    """Terminating at step 5 freezes window 1 (and its fork) one step before
+    box 0's delivery at step 6, and the reset restarts the clock."""
+    _, _, (_, rollout, _, _), _ = _forks(StubEnv(3, terminate_at=5))
+    assert float(rollout.diagnostics["intervention_delivery_frac"]) == 0.0
+    assert float(rollout.diagnostics["manager_window_delivery_frac"]) == 0.0
 
 
 # ------------------------------------------- re-decision (intervention_redecide)

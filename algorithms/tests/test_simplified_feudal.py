@@ -62,6 +62,7 @@ SPEED = 0.02  # position change per step at full action
 class StubState(NamedTuple):
     pos: jnp.ndarray  # (N, 2)
     t: jnp.ndarray
+    delivered: jnp.ndarray  # (2,) bool, latched, as in MultiBoxPushMJX's EnvState
 
 
 class StubEnv:
@@ -90,12 +91,14 @@ class StubEnv:
 
     def reset(self, key):
         pos = jax.random.uniform(key, (self.n_agents, 2), minval=-0.3, maxval=0.3)
-        state = StubState(pos=pos, t=jnp.zeros((), jnp.int32))
+        t = jnp.zeros((), jnp.int32)
+        state = StubState(pos=pos, t=t, delivered=self.delivered_at(t))
         return self._obs(state), state
 
     def step(self, state, actions):
         pos = state.pos + SPEED * jnp.clip(actions, -1.0, 1.0)
-        state = StubState(pos=pos, t=state.t + 1)
+        t = state.t + 1
+        state = StubState(pos=pos, t=t, delivered=self.delivered_at(t))
         reward = -jnp.linalg.norm(pos, axis=-1).mean()
         terminated = (
             state.t >= self.terminate_at
@@ -120,16 +123,22 @@ class StubEnv:
         moved = jnp.where(recruit_mask[:, None], target, state.pos)
         in_bounds = jnp.where(recruit_mask[:, None], jnp.abs(moved + offset) <= 0.5, True)
         valid = jnp.all(in_bounds) & (not self.fail_teleport)
-        new = StubState(pos=jnp.where(valid, moved, state.pos), t=state.t)
+        new = state._replace(pos=jnp.where(valid, moved, state.pos))
         return self._obs(new), new, valid
 
     # Two fixed boxes for `manager_input: relative`; box 0 counts as delivered
-    # from step 6 on, so the masking is exercised mid-rollout.
+    # from step 6 on, so the masking is exercised mid-rollout. The same rule
+    # sets the state's `delivered` flags, which the fork delivery shares read.
     BOX_POS = jnp.array([[0.2, 0.25], [-0.25, 0.1]])
+
+    @staticmethod
+    def delivered_at(t):
+        """(2,) bool: box 0 is delivered from step 6 on, box 1 never."""
+        return (jnp.arange(2) == 0) & (t >= 6)
 
     def entity_state(self, state):
         agents = jnp.concatenate([state.pos, jnp.zeros_like(state.pos)], axis=-1)
-        delivered = jnp.array([1.0, 0.0]) * (state.t >= 6)
+        delivered = self.delivered_at(state.t).astype(jnp.float32)
         boxes = jnp.concatenate(
             [
                 self.BOX_POS,
@@ -485,7 +494,10 @@ def test_relative_manager_stores_the_relative_view_of_the_true_state():
     pos, _ = _stored_pos_and_waypoint(rollout.worker)
     for w in range(N_STEPS // HORIZON):
         t = w * HORIZON
-        state = StubState(pos=jnp.asarray(pos[t]), t=jnp.full((N_ENVS,), t))
+        ts = jnp.full((N_ENVS,), t)
+        state = StubState(
+            pos=jnp.asarray(pos[t]), t=ts, delivered=jax.vmap(env.delivered_at)(ts)
+        )
         expected = wp.manager_actor_input_relative(*jax.vmap(env.entity_state)(state))
         np.testing.assert_allclose(m_obs[w], expected, atol=1e-6)
     live_slots = m_obs[..., 4:16].reshape(m_obs.shape[:3] + (2, 6))[..., 5].sum(-1)

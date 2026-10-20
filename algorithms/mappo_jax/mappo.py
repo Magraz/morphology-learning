@@ -190,57 +190,41 @@ def masked_explained_variance(returns, values, weight):
 # ---------------------------------------------------------------------------
 
 
-def ppo_update(
-    train_state: ActorCriticTrainState,
-    rng: jax.Array,
+class PPOSamples(NamedTuple):
+    """Prepared PPO samples: one per (step, env) element, carrying all agents
+    (`ppo_update`'s timestep-centric layout), with the advantage and return
+    targets already computed. `flatten_samples` builds them from a trajectory;
+    a caller with its own GAE (the simplified feudal stack's adaptive fork
+    collector) builds them directly and hands them to `optimize_samples`."""
+
+    obs: jnp.ndarray  # (S, n_agents, obs_dim)
+    global_state: jnp.ndarray  # (S, global_state_dim)
+    action: jnp.ndarray  # (S, n_agents, ...)
+    log_prob: jnp.ndarray  # (S, n_agents)
+    active_mask: jnp.ndarray  # (S, n_agents)
+    action_mask: Optional[jnp.ndarray]  # (S, n_agents, n_actions), or None
+    # (S,) one team advantage per sample, or (S, n_agents) per-agent actor
+    # advantages (per-agent rewards, or a corrected team advantage).
+    advantage: jnp.ndarray
+    # (S,) for the scalar team critic, or (S, n_agents) for a per-agent head.
+    returns: jnp.ndarray
+
+
+def prepare_advantages(
     trajectory: Transition,
     last_value: jnp.ndarray,
     config: MAPPOConfig,
-    discrete: bool,
-    squash: bool = False,
     advantage_correction: Optional[jnp.ndarray] = None,
     masked_statistics: bool = False,
-) -> Tuple[ActorCriticTrainState, dict]:
-    """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
+):
+    """`ppo_update`'s first stage: GAE, the pre-update explained variance and
+    the per-stream advantage normalization.
 
-    Args:
-        train_state: current actor/critic TrainState
-        rng: PRNG key
-        trajectory: Transition with leading dim n_steps
-        last_value: (n_envs,) bootstrap values (GAE masks dones internally)
-        config: hyperparameters
-        discrete: action space type
-        squash: the env applies `tanh` to the stored Gaussian sample, so the
-            entropy bonus is the squashed entropy (`evaluate_action`). Off by
-            default; off is byte-identical to the code before the flag.
-        advantage_correction: optional (n_steps, n_envs, n_agents) per-agent
-            term SUBTRACTED from the TEAM advantage, giving each agent its own
-            actor advantage while the critic keeps regressing the team return.
-            Team rewards only. Two uses, which differ in what they promise:
-            a correction that does not depend on agent i's own action is a
-            baseline and leaves the expected policy gradient unchanged (the
-            simplified feudal stack's `counterfactual` credit); one that does
-            depend on it is SHAPING and changes the objective on purpose (its
-            `dpp` credit, which passes the negated D++ term so that it is
-            added). See `simplified_feudal_mappo_jax.counterfactual`. None (the
-            default) is byte-identical to the code before the argument.
-        masked_statistics: let `active_mask` also govern three quantities that
-            are otherwise plain means over every row: the per-stream advantage
-            normalization (per (env, agent) under per-agent rewards, per env
-            over rows with any active agent otherwise; a stream with fewer than
-            two active rows is left unnormalized), the explained variance, and
-            the scalar team critic's loss (the per-agent critic is always
-            masked). Needed when a batch carries rows that are not samples at
-            all, e.g. the simplified feudal stack's placeholder fork rows, which
-            would otherwise shrink each stream's std and inflate its advantages.
-            Team rewards without `advantage_correction` only. Off (the default)
-            is byte-identical to the code before the argument.
-
-    Returns:
-        updated train_state, loss metrics dict
+    Returns `(advantage, returns, explained_variance)`. `advantage` is the
+    normalized actor advantage, `(n_steps, n_envs)` for a team reward or
+    `(n_steps, n_envs, n_agents)` per agent; `returns` is shaped like the
+    reward. The arguments mean what they mean in `ppo_update`.
     """
-    n_steps, n_envs, n_agents = trajectory.obs.shape[:3]
-    obs_dim = trajectory.obs.shape[3]
     # Static: (n_steps, n_envs, n_agents) rewards => per-agent credit path.
     per_agent = trajectory.reward.ndim == 3
     # Static: a per-agent correction of the team advantage => per-agent ACTOR
@@ -251,15 +235,10 @@ def ppo_update(
             "advantage_correction corrects a TEAM advantage; it cannot be combined "
             "with per-agent rewards"
         )
-    per_agent_adv = per_agent or corrected
     if masked_statistics and corrected:
         raise ValueError(
             "masked_statistics is not supported together with advantage_correction"
         )
-    # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked categorical.
-    # Envs without `avail_actions` store a scalar placeholder, so this is False and the
-    # update is byte-identical to the pre-masking code.
-    use_mask = trajectory.action_mask.ndim == 4
 
     dones = trajectory.done.astype(jnp.float32)
     advantages, returns = compute_gae(
@@ -306,31 +285,69 @@ def ppo_update(
         adv = (advantages - advantages.mean(axis=0)) / (
             advantages.std(axis=0, ddof=1) + 1e-8
         )
+    return adv, returns, explained_variance
 
-    # --- Timestep-centric flattening: one sample per (step, env) ---
+
+def flatten_samples(
+    trajectory: Transition, advantage: jnp.ndarray, returns: jnp.ndarray
+) -> PPOSamples:
+    """Timestep-centric flattening: one sample per (step, env), row-major."""
+    n_steps, n_envs, n_agents = trajectory.obs.shape[:3]
+    obs_dim = trajectory.obs.shape[3]
+    # Static: a real (n_steps, n_envs, n_agents, action_dim) mask => masked
+    # categorical. Envs without `avail_actions` store a scalar placeholder.
+    use_mask = trajectory.action_mask.ndim == 4
     total_ts = n_steps * n_envs
-    obs_ts = trajectory.obs.reshape(total_ts, n_agents, obs_dim)
-    gs_ts = trajectory.global_state.reshape(total_ts, -1)
-    act_ts = trajectory.action.reshape(
-        total_ts, n_agents, *trajectory.action.shape[3:]
+    return PPOSamples(
+        obs=trajectory.obs.reshape(total_ts, n_agents, obs_dim),
+        global_state=trajectory.global_state.reshape(total_ts, -1),
+        action=trajectory.action.reshape(
+            total_ts, n_agents, *trajectory.action.shape[3:]
+        ),
+        log_prob=trajectory.log_prob.reshape(total_ts, n_agents),
+        # Per-agent activity mask (1.0 for real decisions, 0.0 for offline
+        # agents under staggered starts). All-ones for every ordinary run — the
+        # masked means in `optimize_samples` then reduce to plain means.
+        active_mask=trajectory.active_mask.reshape(total_ts, n_agents),
+        # Legal-action mask, flattened like obs so it stays paired with its agent.
+        action_mask=(
+            trajectory.action_mask.reshape(total_ts, n_agents, -1) if use_mask else None
+        ),
+        advantage=(
+            advantage.reshape(total_ts, n_agents)
+            if advantage.ndim == 3
+            else advantage.reshape(total_ts)
+        ),
+        returns=(
+            returns.reshape(total_ts, n_agents)
+            if returns.ndim == 3
+            else returns.reshape(total_ts)
+        ),
     )
-    lp_ts = trajectory.log_prob.reshape(total_ts, n_agents)
-    # Per-agent activity mask (1.0 for real decisions, 0.0 for offline agents under
-    # staggered starts). All-ones for every ordinary run — the masked means below
-    # then reduce to plain means, keeping the update byte-identical.
-    active_ts = trajectory.active_mask.reshape(total_ts, n_agents)
-    # Legal-action mask, flattened like obs so it stays paired with its own agent.
-    mask_ts = (
-        trajectory.action_mask.reshape(total_ts, n_agents, -1) if use_mask else None
-    )
-    if per_agent_adv:
-        adv_ts = adv.reshape(total_ts, n_agents)
-    else:
-        adv_ts = adv.reshape(total_ts)
-    if per_agent:
-        ret_ts = returns.reshape(total_ts, n_agents)
-    else:
-        ret_ts = returns.reshape(total_ts)
+
+
+def optimize_samples(
+    train_state: ActorCriticTrainState,
+    rng: jax.Array,
+    samples: PPOSamples,
+    config: MAPPOConfig,
+    discrete: bool,
+    squash: bool = False,
+    masked_statistics: bool = False,
+) -> Tuple[ActorCriticTrainState, dict]:
+    """`ppo_update`'s second stage: multi-epoch timestep-centric minibatch steps
+    on prepared samples. Returns the train state and the mean losses over every
+    epoch and minibatch (without `explained_variance`, a pre-update statistic
+    of the trajectory). `masked_statistics` masks the scalar team critic's loss
+    to rows with an active agent, as in `ppo_update`."""
+    total_ts, n_agents, obs_dim = samples.obs.shape
+    obs_ts, gs_ts, act_ts = samples.obs, samples.global_state, samples.action
+    lp_ts, active_ts, mask_ts = samples.log_prob, samples.active_mask, samples.action_mask
+    adv_ts, ret_ts = samples.advantage, samples.returns
+    # Static: a per-agent value head, and per-agent actor advantages.
+    per_agent = ret_ts.ndim == 2
+    per_agent_adv = adv_ts.ndim == 2
+    use_mask = mask_ts is not None
 
     # minibatch_size agent-samples => minibatch_size // n_agents timesteps
     ts_minibatch_size = max(
@@ -454,6 +471,74 @@ def ppo_update(
 
     # Average losses across epochs and minibatches
     mean_losses = jax.tree.map(lambda x: x.mean(), epoch_losses)
-    mean_losses["explained_variance"] = explained_variance
+    return train_state, mean_losses
 
+
+def ppo_update(
+    train_state: ActorCriticTrainState,
+    rng: jax.Array,
+    trajectory: Transition,
+    last_value: jnp.ndarray,
+    config: MAPPOConfig,
+    discrete: bool,
+    squash: bool = False,
+    advantage_correction: Optional[jnp.ndarray] = None,
+    masked_statistics: bool = False,
+) -> Tuple[ActorCriticTrainState, dict]:
+    """Full PPO update: GAE → multi-epoch timestep-centric minibatch steps.
+
+    The composition `prepare_advantages` → `flatten_samples` →
+    `optimize_samples`; split so a caller with its own GAE can reuse the
+    optimization (`optimize_samples`), with this entry point and its math
+    unchanged for every other caller.
+
+    Args:
+        train_state: current actor/critic TrainState
+        rng: PRNG key
+        trajectory: Transition with leading dim n_steps
+        last_value: (n_envs,) bootstrap values (GAE masks dones internally)
+        config: hyperparameters
+        discrete: action space type
+        squash: the env applies `tanh` to the stored Gaussian sample, so the
+            entropy bonus is the squashed entropy (`evaluate_action`). Off by
+            default; off is byte-identical to the code before the flag.
+        advantage_correction: optional (n_steps, n_envs, n_agents) per-agent
+            term SUBTRACTED from the TEAM advantage, giving each agent its own
+            actor advantage while the critic keeps regressing the team return.
+            Team rewards only. Two uses, which differ in what they promise:
+            a correction that does not depend on agent i's own action is a
+            baseline and leaves the expected policy gradient unchanged (the
+            simplified feudal stack's `counterfactual` credit); one that does
+            depend on it is SHAPING and changes the objective on purpose (its
+            `dpp` credit, which passes the negated D++ term so that it is
+            added). See `simplified_feudal_mappo_jax.counterfactual`. None (the
+            default) is byte-identical to the code before the argument.
+        masked_statistics: let `active_mask` also govern three quantities that
+            are otherwise plain means over every row: the per-stream advantage
+            normalization (per (env, agent) under per-agent rewards, per env
+            over rows with any active agent otherwise; a stream with fewer than
+            two active rows is left unnormalized), the explained variance, and
+            the scalar team critic's loss (the per-agent critic is always
+            masked). Needed when a batch carries rows that are not samples at
+            all, e.g. the simplified feudal stack's placeholder fork rows, which
+            would otherwise shrink each stream's std and inflate its advantages.
+            Team rewards without `advantage_correction` only. Off (the default)
+            is byte-identical to the code before the argument.
+
+    Returns:
+        updated train_state, loss metrics dict
+    """
+    advantage, returns, explained_variance = prepare_advantages(
+        trajectory, last_value, config, advantage_correction, masked_statistics
+    )
+    train_state, mean_losses = optimize_samples(
+        train_state,
+        rng,
+        flatten_samples(trajectory, advantage, returns),
+        config,
+        discrete,
+        squash=squash,
+        masked_statistics=masked_statistics,
+    )
+    mean_losses["explained_variance"] = explained_variance
     return train_state, mean_losses

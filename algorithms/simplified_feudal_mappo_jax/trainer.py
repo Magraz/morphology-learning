@@ -44,6 +44,13 @@ columns. `worker.n_envs` is then the MAIN env count, already reduced by
 `run.make_feudal_config` so that main plus fork steps fill the parent's batch.
 The main rollout's random keys are unchanged by the forks, and evaluation is
 unchanged.
+
+Fork scheduling (`intervention_scheduler`): under "bandit" / "random" a scheduler
+decides at every decision whether to fork, and `adaptive_collection.py` collects
+instead of `collect_fn` below, from the same window and fork primitives
+(`_decide_window`, `_run_window`, `_fork_place`, `_fork_rollout`). Its update
+packs only the collected rows into the PPO batch and fits the bandit
+(`intervention_bandit.py`).
 """
 
 import math
@@ -58,9 +65,12 @@ from algorithms.mappo_jax.mappo import (
     ActorCriticTrainState,
     compute_gae,
     create_train_state,
+    flatten_samples,
     masked_explained_variance,
     masked_mean_std,
+    optimize_samples,
     ppo_update,
+    prepare_advantages,
 )
 from algorithms.mappo_jax.network import sample_action
 from algorithms.mappo_jax.trainer import (
@@ -69,7 +79,9 @@ from algorithms.mappo_jax.trainer import (
     global_state_fn,
 )
 from algorithms.mappo_jax.types import Transition
+from algorithms.simplified_feudal_mappo_jax import adaptive_collection as ac
 from algorithms.simplified_feudal_mappo_jax import counterfactual as cf
+from algorithms.simplified_feudal_mappo_jax import intervention_bandit as ib
 from algorithms.simplified_feudal_mappo_jax import interventions as iv
 from algorithms.simplified_feudal_mappo_jax import waypoints as wp
 from algorithms.simplified_feudal_mappo_jax.types import (
@@ -96,6 +108,33 @@ class HierTrainState(NamedTuple):
     # otherwise, so the default train state, and every checkpoint written from
     # it, is unchanged.
     manager_adv: object = None
+    # The fork scheduler's bandit (a flax TrainState, `intervention_bandit.py`),
+    # built only under `intervention_scheduler: bandit`; None otherwise.
+    bandit: object = None
+
+
+class Decision(NamedTuple):
+    """One manager decision for a batch of envs (`_decide_window`)."""
+
+    pos: jax.Array  # (B, N, 2) goal_state positions the waypoints start from
+    waypoint: jax.Array  # (B, N, 2)
+    actor_in: jax.Array  # (B, N, actor_dim) the manager actor's input
+    critic_base: jax.Array  # (B, critic_dim) critic input without fork context
+    action: jax.Array  # (B, N, 2) the raw Gaussian sample
+    log_prob: jax.Array  # (B, N)
+    critic_in: jax.Array  # (B, critic_dim [+ context]) the main row's critic input
+    value: jax.Array  # (B,)
+
+
+class Placement(NamedTuple):
+    """A fork's teleport (`_fork_place`), one row per fork lane."""
+
+    obs: jax.Array
+    state: object
+    valid: jax.Array  # (L,) bool: every recruit was placed
+    n_recruits: jax.Array  # (L,) int
+    recruit: jax.Array  # (L, N) bool
+    offset: jax.Array  # (L, 2) agent i's realized waypoint offset
 
 
 def validate_env(env) -> None:
@@ -211,7 +250,18 @@ def create_hier_train_state(rng, config: FeudalConfig, env) -> HierTrainState:
             config.manager,
             dims["manager_critic"] + int(env.goal_state_dim) * env.n_agents,
         )
-    return HierTrainState(worker=worker, manager=manager, manager_adv=manager_adv)
+    bandit = None
+    if config.intervention_scheduler == "bandit":
+        # It reads the manager actor's input; fold_in, so no other init moves.
+        bandit = ib.create_bandit_state(
+            jax.random.fold_in(rng, 3),
+            dims["manager_actor"],
+            config.intervention_bandit_hidden_dim,
+            config.intervention_bandit_lr,
+        )
+    return HierTrainState(
+        worker=worker, manager=manager, manager_adv=manager_adv, bandit=bandit
+    )
 
 
 def _act(ts: ActorCriticTrainState, x, rng, deterministic):
@@ -351,6 +401,8 @@ def make_train(config: FeudalConfig, env):
     # Static: training forks (interventions.py). False is the original code path.
     iv.validate_interventions(config, env, n_windows)
     forks_on = config.interventions
+    # Static: the adaptive fork collector (`adaptive_collection.py`).
+    adaptive_on = iv.adaptive(config)
     interval = config.intervention_interval
     # Static: who decides a fork's goals (interventions.REDECIDE_MODES). "none"
     # is the original fork, which credits the goal chosen before the teleport.
@@ -496,12 +548,32 @@ def make_train(config: FeudalConfig, env):
         carry = (env_state, obs, alive, m_reward, m_done, closest, rng)
         return carry, (transition, r_int)
 
-    def _fork(operand):
-        """One window of every fork lane, from the main decision's start state.
-        Lane e forks env e around a focal agent drawn uniformly.
+    def _fork_place(env_state, waypoint, pos, focal, k_recruit, k_place):
+        """The fork's teleport, for any number of lanes L (`focal.shape[0]`):
+        draw N and the recruits, and place them next to agent i with agent i's
+        realized waypoint offset (after the bound and arena clip). A failed
+        placement returns the state unchanged with `valid` False."""
+        n_l = focal.shape[0]
+        n_recruits, recruit = iv.sample_recruits(k_recruit, focal, n_agents)
+        lane = jnp.arange(n_l)
+        offset = waypoint[lane, focal] - pos[lane, focal]  # (L, 2)
+        f_obs, f_state, valid = v_teleport(
+            env_state, focal, recruit, offset, jax.random.split(k_place, n_l)
+        )
+        return Placement(
+            obs=f_obs, state=f_state, valid=valid, n_recruits=n_recruits,
+            recruit=recruit, offset=offset,
+        )
+
+    def _fork_rollout(
+        train_state, waypoint, m_actor_in, m_critic_base, m_action, m_log_prob,
+        focal, placement, key, k_scan,
+    ):
+        """One window of every placed fork lane (any number of lanes L).
 
         Returns `(worker Transition (H, L, ...), manager Transition (L, ...),
-        focal (L,), N (L,), valid (L,), recruit distance (L,))`, plus, unless
+        focal (L,), N (L,), valid (L,), recruit distance (L,), delivered (L,))`
+        (delivered: the fork delivered at least one box), plus, unless
         `redecide` is "none", a dict of `(L,)` per-fork diagnostics. Under
         "none" the manager record is the decision sampled in the ORIGINAL state
         (stored actor input, action and log-prob); under "focal" agent i's
@@ -511,18 +583,11 @@ def make_train(config: FeudalConfig, env):
         the fork bootstraps like the main rollout. The critic reads the fork
         context in every mode.
         """
-        (train_state, env_state, obs, waypoint, pos, m_actor_in, m_critic_base,
-         m_action, m_log_prob, key) = operand
-        k_focal, k_recruit, k_place, k_scan = jax.random.split(key, 4)
-        focal = iv.sample_focal(k_focal, n_envs, n_agents)  # (L,)
-        n_recruits, recruit = iv.sample_recruits(k_recruit, focal, n_agents)
-        lane = jnp.arange(n_lanes)
-        # Agent i's realized offset (after the bound and arena clip), copied to
-        # every recruit relative to its new position.
-        offset = waypoint[lane, focal] - pos[lane, focal]  # (L, 2)
-        f_obs, f_state, valid = v_teleport(
-            env_state, focal, recruit, offset, jax.random.split(k_place, n_lanes)
-        )
+        f_obs, f_state, valid = placement.obs, placement.state, placement.valid
+        n_recruits, recruit = placement.n_recruits, placement.recruit
+        offset = placement.offset
+        n_l = focal.shape[0]
+        lane = jnp.arange(n_l)
         f_gs, new_pos = policy.observe(f_obs, f_state)
         target = new_pos + offset[:, None, :]  # the recruits' waypoints
         extras = ()
@@ -596,8 +661,8 @@ def make_train(config: FeudalConfig, env):
             f_state,
             f_obs,
             valid,  # a failed placement never runs: masked from the start
-            jnp.zeros(n_lanes),
-            jnp.zeros(n_lanes, dtype=bool),
+            jnp.zeros(n_l),
+            jnp.zeros(n_l, dtype=bool),
             wp.distance_to_waypoint(f_waypoint, new_pos, radius),
             k_scan,
         )
@@ -625,12 +690,12 @@ def make_train(config: FeudalConfig, env):
                 f_alive.astype(jnp.float32) * jnp.power(m_gamma, horizon) * end_value
             )
         f_critic_in = m_critic_input(
-            m_critic_base, iv.critic_context(n_agents, n_lanes, focal, n_recruits)
+            m_critic_base, iv.critic_context(n_agents, n_l, focal, n_recruits)
         )
         valid_f = valid.astype(jnp.float32)
         # Manager actor weight: only agent i's sample, unless every goal is one.
         weight = (
-            jnp.ones((n_lanes, n_agents))
+            jnp.ones((n_l, n_agents))
             if redecide == "all"
             else jax.nn.one_hot(focal, n_agents)
         )
@@ -639,7 +704,7 @@ def make_train(config: FeudalConfig, env):
             global_state=f_critic_in,
             action=m_action,
             reward=f_m_reward,
-            done=jnp.ones(n_lanes, dtype=bool),
+            done=jnp.ones(n_l, dtype=bool),
             log_prob=m_log_prob,
             value=_value(train_state.manager, f_critic_in),
             team_reward=f_w_traj.team_reward.sum(axis=0),
@@ -648,7 +713,24 @@ def make_train(config: FeudalConfig, env):
         )
         moved = jnp.linalg.norm(new_pos - new_pos[lane, focal][:, None], axis=-1)
         recruit_distance = world_scale * (moved * recruit).sum(-1) / n_recruits
-        return (f_w_traj, f_m, focal, n_recruits, valid, recruit_distance) + extras
+        delivered = iv.window_delivered(f_state, f_end_state)
+        return (
+            f_w_traj, f_m, focal, n_recruits, valid, recruit_distance, delivered
+        ) + extras
+
+    def _fork(operand):
+        """One window of every fork lane of the fixed scheduler, from the main
+        decision's start state: lane e forks env e around a focal agent drawn
+        uniformly (`_fork_place`, then `_fork_rollout`)."""
+        (train_state, env_state, obs, waypoint, pos, m_actor_in, m_critic_base,
+         m_action, m_log_prob, key) = operand
+        k_focal, k_recruit, k_place, k_scan = jax.random.split(key, 4)
+        focal = iv.sample_focal(k_focal, n_envs, n_agents)  # (L,)
+        placement = _fork_place(env_state, waypoint, pos, focal, k_recruit, k_place)
+        return _fork_rollout(
+            train_state, waypoint, m_actor_in, m_critic_base, m_action, m_log_prob,
+            focal, placement, key, k_scan,
+        )
 
     def _skip(operand):
         """`_fork`'s output for a window the interval skips: fully masked
@@ -662,24 +744,108 @@ def make_train(config: FeudalConfig, env):
             f_m._replace(done=jnp.ones_like(f_m.done)),
         ) + out[2:]
 
-    def _window(carry, w):
-        """One manager decision followed by `horizon` worker steps (and, on an
-        intervention window, the forks)."""
-        train_state, env_state, obs, rng = carry
-        rng, manager_rng, reset_rng = jax.random.split(rng, 3)
-
+    def _decide_window(train_state, env_state, obs, manager_rng):
+        """The manager's decision at a window start, for any batch width, with
+        the main row's critic input (zero fork context) and value."""
         gs, pos = policy.observe(obs, env_state)
         waypoint, m_actor_in, m_critic_base, m_action, m_log_prob = policy.decide(
             train_state.manager, obs, gs, pos, env_state, manager_rng
         )
         m_critic_in = m_critic_input(m_critic_base)
         m_value = _value(train_state.manager, m_critic_in)  # (E,)
+        return Decision(
+            pos=pos, waypoint=waypoint, actor_in=m_actor_in,
+            critic_base=m_critic_base, action=m_action, log_prob=m_log_prob,
+            critic_in=m_critic_in, value=m_value,
+        )
+
+    def _run_window(train_state, env_state, obs, d, rng, reset_rng):
+        """`horizon` worker steps under decision `d` (any batch width), the
+        window's records, and the reset of the envs whose episode ended in it.
+
+        Returns `(env_state, obs, rng, (worker Transition (H, B, ...), manager
+        Transition (B, ...), diagnostics, goal))`; the returned state is the
+        next window's start state.
+        """
+        n = obs.shape[0]
+        start_state = env_state
+        inner = (
+            env_state,
+            obs,
+            jnp.ones(n, dtype=bool),  # alive
+            jnp.zeros(n),  # manager reward
+            jnp.zeros(n, dtype=bool),  # episode ended in this window
+            wp.distance_to_waypoint(d.waypoint, d.pos, radius),  # closest approach
+            rng,
+        )
+        (env_state, obs, _, m_reward, m_done, closest, rng), (w_traj, r_int) = (
+            jax.lax.scan(
+                partial(_worker_step, train_state, d.waypoint),
+                inner,
+                jnp.arange(horizon),
+            )
+        )
+
+        # Frozen envs hold their last live state, so this is where each
+        # commitment actually ended.
+        _, end_pos = policy.observe(obs, env_state)
+        diagnostics = {
+            "offset": wp.distance_to_waypoint(d.waypoint, d.pos, radius),
+            "final_error": wp.distance_to_waypoint(d.waypoint, end_pos, radius),
+            "reached": (closest <= WAYPOINT_REACHED_TOL).astype(jnp.float32),
+            "intrinsic_sum": r_int.sum(),
+        }
+        if forks_on:
+            # The paired baseline for the forks' delivery share: a frozen env
+            # holds its last live state, so this covers a mid-window ending.
+            diagnostics["delivered"] = iv.window_delivered(start_state, env_state)
+
+        m_transition = Transition(
+            obs=d.actor_in,
+            global_state=d.critic_in,
+            action=d.action,
+            reward=m_reward,
+            done=m_done,
+            log_prob=d.log_prob,
+            value=d.value,
+            team_reward=w_traj.team_reward.sum(axis=0),
+            active_mask=jnp.ones((n, n_agents)),
+            action_mask=no_mask,
+        )
+        # The decision's goals, for the counterfactual advantage model: the
+        # positions the waypoints are measured from and the realized offsets
+        # (equal to `wp.waypoint_offset(pos, m_action, ...)`).
+        goal = (
+            ManagerGoal(pos=d.pos, offset=wp.goal_error(d.waypoint, d.pos, radius))
+            if credit_on
+            else None
+        )
+
+        # Reset the envs whose episode ended during this window.
+        def _restart(operand):
+            cur_obs, cur_state = operand
+            reset_obs, reset_state = v_reset(jax.random.split(reset_rng, n))
+            return _select(m_done, reset_obs, cur_obs), _select(
+                m_done, reset_state, cur_state
+            )
+
+        obs, env_state = jax.lax.cond(
+            m_done.any(), _restart, lambda operand: operand, (obs, env_state)
+        )
+        return env_state, obs, rng, (w_traj, m_transition, diagnostics, goal)
+
+    def _window(carry, w):
+        """One manager decision followed by `horizon` worker steps (and, on an
+        intervention window, the forks)."""
+        train_state, env_state, obs, rng = carry
+        rng, manager_rng, reset_rng = jax.random.split(rng, 3)
+        d = _decide_window(train_state, env_state, obs, manager_rng)
 
         fork = None
         if forks_on:
             operand = (
-                train_state, env_state, obs, waypoint, pos, m_actor_in,
-                m_critic_base, m_action, m_log_prob,
+                train_state, env_state, obs, d.waypoint, d.pos, d.actor_in,
+                d.critic_base, d.action, d.log_prob,
                 # fold_in, so the main path's splits are unchanged.
                 jax.random.fold_in(manager_rng, iv.FORK_KEY_NAMESPACE),
             )
@@ -690,72 +856,10 @@ def make_train(config: FeudalConfig, env):
                 # fork physics.
                 fork = jax.lax.cond(w % interval == 0, _fork, _skip, operand)
 
-        inner = (
-            env_state,
-            obs,
-            jnp.ones(n_envs, dtype=bool),  # alive
-            jnp.zeros(n_envs),  # manager reward
-            jnp.zeros(n_envs, dtype=bool),  # episode ended in this window
-            wp.distance_to_waypoint(waypoint, pos, radius),  # closest approach
-            rng,
+        env_state, obs, rng, records = _run_window(
+            train_state, env_state, obs, d, rng, reset_rng
         )
-        (env_state, obs, _, m_reward, m_done, closest, rng), (w_traj, r_int) = (
-            jax.lax.scan(
-                partial(_worker_step, train_state, waypoint),
-                inner,
-                jnp.arange(horizon),
-            )
-        )
-
-        # Frozen envs hold their last live state, so this is where each
-        # commitment actually ended.
-        _, end_pos = policy.observe(obs, env_state)
-        diagnostics = {
-            "offset": wp.distance_to_waypoint(waypoint, pos, radius),
-            "final_error": wp.distance_to_waypoint(waypoint, end_pos, radius),
-            "reached": (closest <= WAYPOINT_REACHED_TOL).astype(jnp.float32),
-            "intrinsic_sum": r_int.sum(),
-        }
-
-        m_transition = Transition(
-            obs=m_actor_in,
-            global_state=m_critic_in,
-            action=m_action,
-            reward=m_reward,
-            done=m_done,
-            log_prob=m_log_prob,
-            value=m_value,
-            team_reward=w_traj.team_reward.sum(axis=0),
-            active_mask=jnp.ones((n_envs, n_agents)),
-            action_mask=no_mask,
-        )
-        # The decision's goals, for the counterfactual advantage model: the
-        # positions the waypoints are measured from and the realized offsets
-        # (equal to `wp.waypoint_offset(pos, m_action, ...)`).
-        goal = (
-            ManagerGoal(pos=pos, offset=wp.goal_error(waypoint, pos, radius))
-            if credit_on
-            else None
-        )
-
-        # Reset the envs whose episode ended during this window.
-        def _restart(operand):
-            cur_obs, cur_state = operand
-            reset_obs, reset_state = v_reset(jax.random.split(reset_rng, n_envs))
-            return _select(m_done, reset_obs, cur_obs), _select(
-                m_done, reset_state, cur_state
-            )
-
-        obs, env_state = jax.lax.cond(
-            m_done.any(), _restart, lambda operand: operand, (obs, env_state)
-        )
-        return (train_state, env_state, obs, rng), (
-            w_traj,
-            m_transition,
-            diagnostics,
-            goal,
-            fork,
-        )
+        return (train_state, env_state, obs, rng), records + (fork,)
 
     @jax.jit
     def collect_fn(runner_state: RunnerState):
@@ -804,9 +908,10 @@ def make_train(config: FeudalConfig, env):
         }
         intervention = None
         if forks_on:
-            f_w_traj, f_m_traj, focal, n_recruits, valid, recruit_distance, *extras = (
-                fork
-            )
+            (
+                f_w_traj, f_m_traj, focal, n_recruits, valid, recruit_distance,
+                fork_delivered, *extras,
+            ) = fork
             intervention = Intervention(
                 worker=flatten_windows(f_w_traj),
                 manager=f_m_traj,
@@ -819,6 +924,18 @@ def make_train(config: FeudalConfig, env):
             )
             if redecide != "none":
                 diagnostics.update(iv.redecide_diagnostics(valid, extras[0]))
+            # Both shares over the same (window, env) pairs: the windows whose
+            # fork was placed, each fork against the main window it was cut from.
+            diagnostics.update(
+                iv.return_shares(
+                    "intervention", f_m_traj.team_reward, fork_delivered, valid
+                )
+            )
+            diagnostics.update(
+                iv.return_shares(
+                    "manager_window", m_traj.team_reward, diag["delivered"], valid
+                )
+            )
             diagnostics.update(
                 {
                     "worker_eligible_main": w_traj.active_mask.sum(),
@@ -927,9 +1044,68 @@ def make_train(config: FeudalConfig, env):
         stats["manager_cf_model_loss"] = model_loss
         return correction, manager_adv, stats
 
+    def _adaptive_update(train_state, rng, rollout):
+        """The update under the adaptive collector: GAE per source on the padded
+        buffers (`adaptive_collection.adaptive_batches`), then exactly the
+        collected rows into PPO, then the bandit (last, on its own loss)."""
+        rng, worker_rng, manager_rng = jax.random.split(rng, 3)
+        worker_batch, worker_rows, manager_batch, manager_rows, sources = (
+            ac.adaptive_batches(rollout, config, no_mask)
+        )
+        stats = {}
+        for (level, source), traj in sources.items():
+            cfg = wcfg if level == "worker" else mcfg
+            # Every source ends in a recursion cut (the main manager's boundary
+            # bootstrap is already folded in), so no last value is read.
+            std, ev = _source_stats(traj, jnp.zeros(traj.reward.shape[1:]), cfg)
+            stats[f"{level}_adv_std_{source}"] = std
+            stats[f"{level}_explained_variance_{source}"] = ev
+            stats[f"{level}_eligible_{source}"] = traj.active_mask.sum()
+        slots = ac.window_slots(config)
+        updated = {}
+        for level, ts, batch, rows, size, cfg, key in (
+            ("worker", train_state.worker, worker_batch, worker_rows,
+             slots * horizon, wcfg, worker_rng),
+            ("manager", train_state.manager, manager_batch, manager_rows,
+             slots, mcfg, manager_rng),
+        ):
+            adv, ret, ev = prepare_advantages(
+                batch, jnp.zeros(batch.reward.shape[1:]), cfg, masked_statistics=True
+            )
+            samples = ac.pack(flatten_samples(batch, adv, ret), rows, size)
+            new_ts, level_losses = optimize_samples(
+                ts, key, samples, cfg, discrete=False,
+                squash=level == "manager" and config.manager_action_bound == "tanh",
+                masked_statistics=True,
+            )
+            level_losses["explained_variance"] = ev
+            updated[level] = (new_ts, level_losses)
+        bandit = train_state.bandit
+        if config.intervention_scheduler == "bandit":
+            ad = rollout.adaptive
+            bandit, loss, steps = ib.fit_bandit(
+                bandit, ad.label_x, ad.label_y, ad.label_count,
+                jax.random.fold_in(manager_rng, ac.NS_BANDIT),
+            )
+            stats["bandit_loss"] = loss
+            stats["bandit_steps"] = steps.astype(jnp.float32)
+        losses = {f"worker_{k}": v for k, v in updated["worker"][1].items()}
+        losses.update({f"manager_{k}": v for k, v in updated["manager"][1].items()})
+        losses.update(rollout.diagnostics)
+        losses.update(stats)
+        train_state = HierTrainState(
+            worker=updated["worker"][0],
+            manager=updated["manager"][0],
+            manager_adv=train_state.manager_adv,
+            bandit=bandit,
+        )
+        return RunnerState(train_state=train_state, rng=rng), losses
+
     @jax.jit
     def update_fn(runner_state: RunnerState, rollout: Rollout, last_values):
         train_state, rng = runner_state
+        if adaptive_on:
+            return _adaptive_update(train_state, rng, rollout)
         rng, worker_rng, manager_rng = jax.random.split(rng, 3)
         worker_batch, worker_last = rollout.worker, last_values.worker
         manager_batch, manager_last = rollout.manager, last_values.manager
@@ -990,7 +1166,10 @@ def make_train(config: FeudalConfig, env):
         return (
             RunnerState(
                 train_state=HierTrainState(
-                    worker=worker, manager=manager, manager_adv=manager_adv
+                    worker=worker,
+                    manager=manager,
+                    manager_adv=manager_adv,
+                    bandit=train_state.bandit,
                 ),
                 rng=rng,
             ),
@@ -1037,5 +1216,29 @@ def make_train(config: FeudalConfig, env):
             _eval_window, init, None, length=n_eval_windows
         )
         return returns.mean()
+
+    if adaptive_on:
+
+        def _final_value(train_state, env_state, obs):
+            """The manager's value of each env's state (zero fork context), as
+            the fixed collector's `last_values.manager`."""
+            gs, pos = policy.observe(obs, env_state)
+            return _value(
+                train_state.manager, m_critic_input(wp.manager_critic_input(gs, pos))
+            )
+
+        collect_fn = ac.make_collect(
+            config,
+            env,
+            ac.Primitives(
+                decide_window=_decide_window,
+                run_window=_run_window,
+                fork_place=_fork_place,
+                fork_rollout=_fork_rollout,
+                final_value=_final_value,
+            ),
+            m_gamma,
+            SATURATION_TOL,
+        )
 
     return init_fn, collect_fn, update_fn, eval_fn, num_updates

@@ -1,0 +1,21 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions_bandit`:
+# intervention_bandit_zero_reward_penalty 5.0 -> 0.0.
+#
+# The bandit's target without the zero-reward penalty: the plain paired gain
+# (fork window return minus its main window's). Measured offline on the 2a/4o
+# pairs, this target is mostly predictable as loss avoidance and its greedy fork
+# rate is unstable (34-65% across fits), because most contexts sit near zero
+# gain. Run it next to the penalized arm to attribute any difference to the
+# penalty.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_bandit_no_zero_penalty \
+#       trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions_bandit
+  - _self_
+
+model_params:
+  intervention_bandit_zero_reward_penalty: 0.0

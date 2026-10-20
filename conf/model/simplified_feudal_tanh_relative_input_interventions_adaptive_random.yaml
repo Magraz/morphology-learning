@@ -1,0 +1,21 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_scheduler fixed -> random, at intervention_random_rate 0.5.
+#
+# The adaptive collector with forks proposed uniformly at random, at a fixed
+# rate per main decision: the bandit arm's selection control. 0.5 is a
+# placeholder; to match the bandit, set the rate in a one-key child group to the
+# bandit arm's realized `scheduler_proposal_rate` (forks proposed per candidate
+# decision; `scheduler_fork_slot_frac` is the resulting share of the budget).
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_adaptive_random \
+#       trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_scheduler: random
+  intervention_random_rate: 0.5

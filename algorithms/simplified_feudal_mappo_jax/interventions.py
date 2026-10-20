@@ -50,13 +50,23 @@ runs `main_envs(...)` envs, fewer than the env group's `n_envs`, so that its
 steps plus the fork steps equal the batch the parent collects
 (`n_steps * n_envs`). Updates, gradient steps and simulator steps per update
 then match the parent; the fork arm simply collects fewer fresh episodes.
+
+`intervention_scheduler` (`intervention_bandit.SCHEDULERS`) sets who decides
+which windows fork. `fixed` is everything above. `bandit` and `random` run the
+adaptive collector (`adaptive_collection.py`): half of the batch's envs are
+persistent main streams, a scheduler decides at each main decision whether to
+fork it, and a skipped fork is replaced by an extra main window, so every update
+still collects exactly `n_steps * batch_envs` simulator steps.
 """
 
+import dataclasses
 import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from algorithms.simplified_feudal_mappo_jax import intervention_bandit as ib
 
 # `fold_in` constant for every fork random draw, so enabling forks consumes no
 # split of the main path's keys: the main rollout is unchanged by them.
@@ -66,8 +76,96 @@ FORK_KEY_NAMESPACE = 0x51F0
 REDECIDE_MODES = ("none", "focal", "all")
 
 
+# Scheduler fields and the schedulers they act under. A field set away from its
+# default under any other scheduler would silently do nothing, so it raises.
+_SCHEDULER_FIELDS = {
+    "intervention_bandit_hidden_dim": ("bandit",),
+    "intervention_bandit_epsilon": ("bandit",),
+    "intervention_bandit_lr": ("bandit",),
+    # The target is also logged under `random`, as a diagnostic.
+    "intervention_bandit_cost_coef": ("bandit", "random"),
+    "intervention_bandit_zero_reward_penalty": ("bandit", "random"),
+    "intervention_random_rate": ("random",),
+}
+
+
+def adaptive(config) -> bool:
+    """True under the adaptive fork collector (`bandit` / `random` scheduler)."""
+    return config.intervention_scheduler in ib.ADAPTIVE_SCHEDULERS
+
+
+def adaptive_main_envs(batch_envs: int) -> int:
+    """Persistent main streams of the adaptive collector: half the batch, so an
+    update that forks every window still fits (one fork per main window)."""
+    if int(batch_envs) != batch_envs or batch_envs < 2 or batch_envs % 2:
+        raise ValueError(
+            "an adaptive intervention_scheduler needs an even env-group n_envs >= 2 "
+            f"(half of it are the main streams), got {batch_envs}"
+        )
+    return int(batch_envs) // 2
+
+
+def _validate_scheduler(config) -> None:
+    scheduler = config.intervention_scheduler
+    if scheduler not in ib.SCHEDULERS:
+        raise ValueError(
+            f"unknown intervention_scheduler {scheduler!r}; expected one of "
+            f"{ib.SCHEDULERS}"
+        )
+    defaults = {f.name: f.default for f in dataclasses.fields(type(config))}
+    for name, schedulers in _SCHEDULER_FIELDS.items():
+        if scheduler not in schedulers and getattr(config, name) != defaults[name]:
+            raise ValueError(
+                f"{name}={getattr(config, name)} has no effect under "
+                f"intervention_scheduler={scheduler!r}"
+            )
+    if scheduler == "fixed":
+        return
+    if not config.interventions:
+        raise ValueError(
+            f"intervention_scheduler={scheduler!r} has no effect without "
+            "interventions: true (it would silently train the parent arm)"
+        )
+    if config.intervention_interval != 1:
+        raise ValueError(
+            f"intervention_scheduler={scheduler!r} decides at every manager "
+            f"decision; intervention_interval must be 1, got "
+            f"{config.intervention_interval}"
+        )
+    batch = config.intervention_batch_envs
+    if batch is None or adaptive_main_envs(batch) != config.worker.n_envs:
+        raise ValueError(
+            f"intervention_scheduler={scheduler!r} runs batch_envs / 2 main streams; "
+            f"got intervention_batch_envs={batch} and worker.n_envs="
+            f"{config.worker.n_envs} (build the config with make_feudal_config)"
+        )
+    if not 0.0 <= config.intervention_bandit_epsilon <= 1.0:
+        raise ValueError(
+            f"intervention_bandit_epsilon must be in [0, 1], got "
+            f"{config.intervention_bandit_epsilon}"
+        )
+    if not 0.0 <= config.intervention_random_rate <= 1.0:
+        raise ValueError(
+            f"intervention_random_rate must be in [0, 1], got "
+            f"{config.intervention_random_rate}"
+        )
+    if int(config.intervention_bandit_hidden_dim) < 1:
+        raise ValueError(
+            f"intervention_bandit_hidden_dim must be >= 1, got "
+            f"{config.intervention_bandit_hidden_dim}"
+        )
+    if not config.intervention_bandit_lr > 0:
+        raise ValueError(
+            f"intervention_bandit_lr must be > 0, got {config.intervention_bandit_lr}"
+        )
+    for name in ("intervention_bandit_cost_coef", "intervention_bandit_zero_reward_penalty"):
+        if getattr(config, name) < 0:
+            raise ValueError(f"{name} must be >= 0, got {getattr(config, name)}")
+
+
 def validate_interventions(config, env, n_windows: int) -> None:
     """Raise on a fork configuration that cannot run as specified."""
+    _validate_scheduler(config)
     interval = config.intervention_interval
     redecide = config.intervention_redecide
     if redecide not in REDECIDE_MODES:
@@ -205,6 +303,10 @@ def simulator_steps_per_update(config) -> int:
     share when the interval does not divide evenly).
     """
     worker = config.worker
+    if adaptive(config):
+        # The adaptive collector fills exactly the batch's window slots, with
+        # main windows or forks (`adaptive_collection.py`).
+        return worker.n_steps * config.intervention_batch_envs
     main = worker.n_steps * worker.n_envs
     if not config.interventions:
         return main
@@ -259,6 +361,45 @@ def fork_diagnostics(intervention, recruit_distance, interval: int, horizon: int
             tried.sum(), 1
         )
     return stats
+
+
+def window_delivered(start_state, end_state):
+    """`(B,)` True where at least one box was delivered between two env states.
+
+    Reads the env state's latched `delivered` flags (`MultiBoxPushMJX`'s
+    `EnvState`, the only env with the `teleport_agents` hook): a box delivered in
+    the window is flagged at the end and not at the start. Exact, unlike a
+    threshold on the window reward, whose dense shaping can push a delivery
+    window below the +100 bonus.
+    """
+    return jnp.any(end_state.delivered & ~start_state.delivered, axis=-1)
+
+
+def return_shares(prefix: str, team_reward, delivered, weight):
+    """Shares of windows by outcome, over the rows where the 0/1 `weight` is set.
+
+    `team_reward` is each window's summed team reward over its live steps, with
+    no discount and no bootstrapped value (`Transition.team_reward`), so the
+    shares mean the same under every `intervention_redecide` mode; the manager's
+    `reward` adds a bootstrap under `all` and at a time limit. Keys:
+
+    * `{prefix}_return_nonzero_frac`: team reward is not exactly 0. On dense
+      groups that means some box moved (a box at rest pays exactly 0 shaping);
+      on sparse groups it equals the delivery share.
+    * `{prefix}_return_positive_frac`: net progress (team reward > 0).
+    * `{prefix}_delivery_frac`: at least one box delivered (`window_delivered`).
+    """
+    w = weight.astype(jnp.float32)
+    n = jnp.maximum(w.sum(), 1.0)
+
+    def share(mask):
+        return (mask.astype(jnp.float32) * w).sum() / n
+
+    return {
+        f"{prefix}_return_nonzero_frac": share(team_reward != 0),
+        f"{prefix}_return_positive_frac": share(team_reward > 0),
+        f"{prefix}_delivery_frac": share(delivered),
+    }
 
 
 def redecide_diagnostics(valid, per_fork: dict):

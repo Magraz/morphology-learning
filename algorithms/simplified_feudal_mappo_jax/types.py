@@ -93,6 +93,26 @@ class Model_Params:
     #           rollout (an on-policy window from a teleported start state).
     # Checkpoint-identical across modes: set it in a model group, never on the CLI.
     intervention_redecide: str = "none"
+    # Who schedules the forks (`intervention_bandit.SCHEDULERS`):
+    #   fixed  — the original fork at every `intervention_interval`-th decision;
+    #   bandit — a learned contextual bandit decides at each decision whether to
+    #            fork (`intervention_bandit.py`), and skipped forks are replaced
+    #            by extra main windows (`adaptive_collection.py`);
+    #   random — the same adaptive collector, forks proposed with probability
+    #            `intervention_random_rate` (0 never forks: the all-skip control).
+    # The adaptive schedulers need `interventions: true`, interval 1, team
+    # credit and an even env-group `n_envs` (half of it are the main streams).
+    # Plan: plans/intervention_contextual_bandit_2026-10-16.md.
+    intervention_scheduler: str = "fixed"
+    intervention_bandit_hidden_dim: int = 32
+    intervention_bandit_epsilon: float = 0.1
+    intervention_bandit_lr: float = 3e-4
+    # Task-return units, per executed fork.
+    intervention_bandit_cost_coef: float = 0.0
+    # Task-return units, subtracted from the target of a fork whose every raw
+    # step earned exactly 0 reward. 0 turns the penalty off.
+    intervention_bandit_zero_reward_penalty: float = 5.0
+    intervention_random_rate: float = 0.5
 
 
 @dataclass
@@ -134,6 +154,18 @@ class FeudalConfig:
     intervention_radius: float = 1.5
     intervention_interval: int = 1
     intervention_redecide: str = "none"
+    # Fork scheduling (see Model_Params and `intervention_bandit.py`). "fixed" is
+    # the original code path. `intervention_batch_envs` is the env group's batch
+    # width, set only for the adaptive schedulers, whose `worker.n_envs` is the
+    # number of persistent main streams (half of it).
+    intervention_scheduler: str = "fixed"
+    intervention_batch_envs: Optional[int] = None
+    intervention_bandit_hidden_dim: int = 32
+    intervention_bandit_epsilon: float = 0.1
+    intervention_bandit_lr: float = 3e-4
+    intervention_bandit_cost_coef: float = 0.0
+    intervention_bandit_zero_reward_penalty: float = 5.0
+    intervention_random_rate: float = 0.5
 
 
 class ManagerGoal(NamedTuple):
@@ -159,6 +191,36 @@ class Rollout(NamedTuple):
     diagnostics: dict  # scalar rollout diagnostics, merged into the losses
     manager_goal: object = None  # ManagerGoal under counterfactual / dpp credit, else None
     intervention: object = None  # Intervention under `interventions: true`, else None
+    # AdaptiveBatch under an adaptive `intervention_scheduler`, else None.
+    adaptive: object = None
+
+
+class AdaptiveBatch(NamedTuple):
+    """What the adaptive fork collector adds to a `Rollout` (`adaptive_collection.py`).
+
+    The main and fork buffers (`Rollout.worker` / `.manager` and
+    `Rollout.intervention`) have a fixed number of round rows, `2 * n_windows`,
+    and one column per main stream; rows that were never collected are masked
+    placeholders. Exactly `n_windows * batch_envs` window slots are collected per
+    update: `main_collected.sum() + fork_executed.sum()`.
+    """
+
+    main_collected: jax.Array  # (rounds, streams) bool: a main window was collected
+    fork_executed: jax.Array  # (rounds, streams) bool: a fork ran from that window
+    last_row: jax.Array  # (streams,) int: each stream's last collected round
+    final_value: jax.Array  # (streams,) the manager's value of each stream's final state
+    label_x: jax.Array  # (capacity, actor_dim) bandit inputs of the attempted forks
+    label_y: jax.Array  # (capacity,) their targets (0 for a failed placement)
+    label_count: jax.Array  # () int: labelled rows; the rest is padding
+    # Where each label came from: the round and stream of its main window, its
+    # focal agent, and whether its placement succeeded (its fork ran).
+    label_round: jax.Array  # (capacity,) int
+    label_stream: jax.Array  # (capacity,) int
+    label_focal: jax.Array  # (capacity,) int
+    label_placed: jax.Array  # (capacity,) bool
+    # The bandit's prediction at the decision, before this update's fit (0 under
+    # the random scheduler).
+    label_q: jax.Array  # (capacity,)
 
 
 class Intervention(NamedTuple):

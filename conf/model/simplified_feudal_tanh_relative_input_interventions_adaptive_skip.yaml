@@ -1,0 +1,22 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_scheduler fixed -> random, at intervention_random_rate 0.
+#
+# The adaptive collector's never-fork control: 16 persistent main streams run
+# 66 windows each per update (33,792 simulator steps, as the parent), no fork
+# ever runs. It differs from the parent `simplified_feudal_tanh_relative_input`
+# only in the collector: half the streams, each twice as long (about 2 episodes
+# per stream per update instead of about 1), and the manager critic's unused
+# fork context block. So it separates "the collector changed" from "the
+# scheduler chose forks" for the bandit arm.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_adaptive_skip trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_scheduler: random
+  intervention_random_rate: 0.0

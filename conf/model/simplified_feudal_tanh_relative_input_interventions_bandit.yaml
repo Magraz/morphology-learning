@@ -1,0 +1,49 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_scheduler fixed -> bandit.
+#
+# A learned contextual bandit decides at every manager decision whether to fork
+# the window around a uniformly drawn focal agent i, reading only agent i's
+# manager actor input (algorithms/simplified_feudal_mappo_jax/
+# intervention_bandit.py). A skipped fork runs no physics and takes no slot: the
+# adaptive collector (adaptive_collection.py) fills the batch with extra main
+# windows instead. Every update still collects exactly the parent's 33,792
+# simulator steps (33 windows x 32 envs at 2a/4o), on 16 persistent main
+# streams, so updates and budget match the parent.
+#
+# Bandit target per attempted fork: discounted raw team return of the fork
+# window minus that of its main window, minus `zero_reward_penalty` when every
+# fork step earned 0, minus `cost_coef`. Greedy: fork iff the prediction > 0
+# (it starts at exactly 0, i.e. skip); epsilon of the decisions are a fair coin.
+# Offline check (2026-10-19, intervention_headroom_probe.py): this target with
+# penalty 0 fails its pre-registered rule; penalty 5 removes nearly all
+# zero-reward forks on dense groups and skips almost every fork on sparse ones.
+#
+# Read first: `scheduler_proposal_rate`, `scheduler_fork_slot_frac`,
+# `bandit_zero_reward_frac`, then whether it selects anything:
+# `bandit_gain_greedy` against `bandit_gain_explored` (its own picks against
+# the epsilon coin's random sample, NaN when there were none) and
+# `bandit_explained_variance` (held out; blind to an offset, so read
+# `bandit_predicted_utility_executed` against `bandit_target` too). Controls on the same
+# env group: `..._adaptive_skip` (never fork, the same collector) and
+# `..._adaptive_random` (forks at a fixed rate; set it to this arm's realized
+# `scheduler_proposal_rate` in a child group). The bandit's knobs leave the
+# parameter shapes unchanged: set them in a one-key child group, never on the
+# CLI (an adaptive checkpoint records them and refuses another setting).
+# Plan: plans/intervention_contextual_bandit_2026-10-16.md.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_bandit trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_scheduler: bandit
+  # Defaults, declared so the values are visible and child groups can set them.
+  intervention_bandit_hidden_dim: 32
+  intervention_bandit_epsilon: 0.1
+  intervention_bandit_lr: 3.0e-4
+  intervention_bandit_cost_coef: 0.0          # task-return units per fork
+  intervention_bandit_zero_reward_penalty: 5.0  # task-return units; 0 = off

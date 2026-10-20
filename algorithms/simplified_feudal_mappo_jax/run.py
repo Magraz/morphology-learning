@@ -14,11 +14,12 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from flax.serialization import from_bytes, to_bytes
+from flax.serialization import from_bytes, msgpack_restore, to_bytes
 
 from algorithms.mappo_jax.run import MAPPO_JAX_Runner, make_env
 from algorithms.mappo_jax.trainer import RunnerState, global_state_dim
 from algorithms.mappo_jax.types import MAPPOConfig
+from algorithms.simplified_feudal_mappo_jax import intervention_bandit as ib
 from algorithms.simplified_feudal_mappo_jax import interventions as iv
 from algorithms.simplified_feudal_mappo_jax.trainer import (
     HierTrainState,
@@ -62,10 +63,20 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
       Under forks `n_envs` is the BATCH's env count: the main rollout runs
       `interventions.main_envs(...)` of them, and the fork lanes fill the rest,
       so an update simulates the same steps as the parent's.
+    * `intervention_scheduler` and its `intervention_bandit_*` /
+      `intervention_random_rate` knobs choose who decides which windows fork
+      (`intervention_bandit.py`); "fixed" is the original behaviour. The adaptive
+      schedulers keep the batch width in `intervention_batch_envs` and run half
+      of it as persistent main streams (`adaptive_collection.py`).
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
-    if model_params.interventions:
+    scheduler = str(model_params.intervention_scheduler)
+    batch_envs = None
+    if model_params.interventions and scheduler in ib.ADAPTIVE_SCHEDULERS:
+        batch_envs = int(n_envs)
+        n_envs = iv.adaptive_main_envs(batch_envs)
+    elif model_params.interventions:
         n_envs = iv.main_envs(
             n_envs, n_steps // horizon, model_params.intervention_interval
         )
@@ -118,6 +129,16 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
         intervention_radius=float(model_params.intervention_radius),
         intervention_interval=int(model_params.intervention_interval),
         intervention_redecide=str(model_params.intervention_redecide),
+        intervention_scheduler=scheduler,
+        intervention_batch_envs=batch_envs,
+        intervention_bandit_hidden_dim=int(model_params.intervention_bandit_hidden_dim),
+        intervention_bandit_epsilon=float(model_params.intervention_bandit_epsilon),
+        intervention_bandit_lr=float(model_params.intervention_bandit_lr),
+        intervention_bandit_cost_coef=float(model_params.intervention_bandit_cost_coef),
+        intervention_bandit_zero_reward_penalty=float(
+            model_params.intervention_bandit_zero_reward_penalty
+        ),
+        intervention_random_rate=float(model_params.intervention_random_rate),
     )
 
 
@@ -192,17 +213,41 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 "focal": "focal goal re-decided after the teleport",
                 "all": "every goal re-decided after the teleport, bootstrapped",
             }[self.feudal_config.intervention_redecide]
-            print(
-                f"  interventions: every {self.feudal_config.intervention_interval} "
-                f"decision(s), one fork per env around a random agent, "
-                f"N ~ U{{1..{self.env.n_agents - 1}}}, "
-                f"radius={self.feudal_config.intervention_radius} world units, "
-                f"{goal_timing} | "
-                f"n_envs {batch_envs} -> {worker.n_envs} main | "
-                f"{self._steps_per_update()} simulator steps per update "
-                f"({n_steps * worker.n_envs} main; batch target "
-                f"{n_steps * batch_envs})"
-            )
+            fc = self.feudal_config
+            if iv.adaptive(fc):
+                rule = (
+                    f"bandit (hidden={fc.intervention_bandit_hidden_dim}, "
+                    f"epsilon={fc.intervention_bandit_epsilon}, "
+                    f"lr={fc.intervention_bandit_lr}, "
+                    f"zero_reward_penalty={fc.intervention_bandit_zero_reward_penalty}, "
+                    f"cost={fc.intervention_bandit_cost_coef})"
+                    if fc.intervention_scheduler == "bandit"
+                    else f"random (rate={fc.intervention_random_rate})"
+                )
+                total = int(worker.n_total_steps)
+                per_update = self._steps_per_update()
+                print(
+                    f"  interventions: adaptive scheduler {rule}, one candidate per "
+                    f"main decision around a random agent, "
+                    f"N ~ U{{1..{self.env.n_agents - 1}}}, "
+                    f"radius={fc.intervention_radius} world units, {goal_timing} | "
+                    f"n_envs {batch_envs} -> {worker.n_envs} persistent main streams | "
+                    f"{per_update} simulator steps per update (main windows + "
+                    f"executed forks) | unused budget remainder "
+                    f"{total - (total // per_update) * per_update} steps"
+                )
+            else:
+                print(
+                    f"  interventions: every {fc.intervention_interval} "
+                    f"decision(s), one fork per env around a random agent, "
+                    f"N ~ U{{1..{self.env.n_agents - 1}}}, "
+                    f"radius={fc.intervention_radius} world units, "
+                    f"{goal_timing} | "
+                    f"n_envs {batch_envs} -> {worker.n_envs} main | "
+                    f"{self._steps_per_update()} simulator steps per update "
+                    f"({n_steps * worker.n_envs} main; batch target "
+                    f"{n_steps * batch_envs})"
+                )
         print(
             f"  centralized input: gs_dim={global_state_dim(self.env)} "
             f"(env hook: {hasattr(self.env, 'global_state')})"
@@ -234,6 +279,8 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         }
         if train_state.manager_adv is not None:
             tree["manager_adv"] = train_state.manager_adv.params
+        if train_state.bandit is not None:
+            tree["bandit"] = train_state.bandit.params
         return tree
 
     def save_params(self, train_state, path):
@@ -253,17 +300,81 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         }
         if ts.manager_adv is not None:
             tree["manager_adv_ts"] = ts.manager_adv
+        if ts.bandit is not None:
+            tree["bandit_ts"] = ts.bandit
+        return tree
+
+    # The fork scheduler's settings change no parameter shape, so a checkpoint
+    # alone cannot tell which scheduler wrote it. Adaptive runs therefore store
+    # them (`scheduler_meta`), and a resume under other settings raises. Fixed-
+    # scheduler checkpoints carry no such entry and are written as before.
+    _SCHEDULER_META_FIELDS = (
+        "intervention_scheduler", "intervention_batch_envs",
+        "intervention_bandit_hidden_dim", "intervention_bandit_epsilon",
+        "intervention_bandit_lr", "intervention_bandit_cost_coef",
+        "intervention_bandit_zero_reward_penalty", "intervention_random_rate",
+        "intervention_redecide",
+    )
+
+    def _scheduler_meta(self):
+        config = self.feudal_config
+        if not iv.adaptive(config):
+            return None
+        codes = {
+            "intervention_scheduler": ib.SCHEDULERS,
+            "intervention_redecide": iv.REDECIDE_MODES,
+        }
+        return np.array(
+            [
+                codes[name].index(getattr(config, name))
+                if name in codes
+                else float(getattr(config, name))
+                for name in self._SCHEDULER_META_FIELDS
+            ],
+            np.float64,
+        )
+
+    def _check_scheduler_meta(self, raw: dict, path):
+        meta, stored = self._scheduler_meta(), raw.get("scheduler_meta")
+        if meta is None and stored is None:
+            return
+        if meta is None:
+            raise ValueError(
+                f"{path} was written by an adaptive fork-scheduler run; this "
+                "config uses intervention_scheduler='fixed'"
+            )
+        if stored is None:
+            raise ValueError(
+                f"{path} has no fork-scheduler record (a fixed-scheduler or "
+                "no-fork run wrote it); this config uses intervention_scheduler="
+                f"{self.feudal_config.intervention_scheduler!r}"
+            )
+        stored = np.asarray(stored, np.float64)
+        if stored.shape != meta.shape or not np.array_equal(stored, meta):
+            raise ValueError(
+                f"{path} was written under other fork-scheduler settings: "
+                f"{dict(zip(self._SCHEDULER_META_FIELDS, stored.tolist()))} vs "
+                f"this config's {dict(zip(self._SCHEDULER_META_FIELDS, meta.tolist()))} "
+                "(scheduler and redecide are codes into intervention_bandit."
+                "SCHEDULERS and interventions.REDECIDE_MODES)"
+            )
+
+    def _full_checkpoint_tree(self, runner_state, eval_rng) -> dict:
+        tree = self._checkpoint_tree(runner_state, eval_rng)
+        meta = self._scheduler_meta()
+        if meta is not None:
+            tree["scheduler_meta"] = meta
         return tree
 
     def _save_train_checkpoint(self, runner_state, eval_rng, path):
         with open(path, "wb") as f:
-            f.write(to_bytes(self._checkpoint_tree(runner_state, eval_rng)))
+            f.write(to_bytes(self._full_checkpoint_tree(runner_state, eval_rng)))
 
     def _load_train_checkpoint(self, runner_state, eval_rng, path):
         with open(path, "rb") as f:
-            loaded = from_bytes(
-                self._checkpoint_tree(runner_state, eval_rng), f.read()
-            )
+            data = f.read()
+        self._check_scheduler_meta(msgpack_restore(data), path)
+        loaded = from_bytes(self._full_checkpoint_tree(runner_state, eval_rng), data)
         print(f"Train state loaded from {path}")
         ts = runner_state.train_state
         train_state = HierTrainState(
@@ -276,6 +387,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 critic_ts=loaded["manager_critic_ts"],
             ),
             manager_adv=loaded.get("manager_adv_ts"),
+            bandit=loaded.get("bandit_ts"),
         )
         return RunnerState(train_state=train_state, rng=loaded["rng"]), loaded[
             "eval_rng"
@@ -292,9 +404,11 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             params = from_bytes(self._params_tree(train_state), f.read())
         print(f"Params loaded from {path}")
         worker, manager = train_state.worker, train_state.manager
-        manager_adv = train_state.manager_adv
+        manager_adv, bandit = train_state.manager_adv, train_state.bandit
         if manager_adv is not None:
             manager_adv = manager_adv.replace(params=params["manager_adv"])
+        if bandit is not None:
+            bandit = bandit.replace(params=params["bandit"])
         return HierTrainState(
             worker=worker._replace(
                 actor_ts=worker.actor_ts.replace(params=params["worker_actor"]),
@@ -305,6 +419,7 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 critic_ts=manager.critic_ts.replace(params=params["manager_critic"]),
             ),
             manager_adv=manager_adv,
+            bandit=bandit,
         )
 
     # ------------------------------------------------------------------ view
