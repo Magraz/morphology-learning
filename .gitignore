@@ -15,4 +15,6 @@
 *.TXT
 outputs
 logs
+feudal_goal_analysis
+presentations
 __pycache__
