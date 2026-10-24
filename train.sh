@@ -17,5 +17,13 @@ uv run python3 ${SCRIPT_DIR}/train.py \
     algorithm=${ALGORITHM} \
     trial_id=${TRIAL_ID} \
     checkpoint=true
+STATUS=$?
 
-echo "Finished trial ${BATCH}_${EXP_NAME}_${TRIAL_ID}"
+# Exit with the trainer's status so callers (train_batches.sh, parallel) can tell
+# a failed trial from a finished one.
+if [[ ${STATUS} -eq 0 ]]; then
+    echo "Finished trial ${BATCH}_${EXP_NAME}_${TRIAL_ID}"
+else
+    echo "FAILED trial ${BATCH}_${EXP_NAME}_${TRIAL_ID} (exit ${STATUS})" >&2
+fi
+exit ${STATUS}

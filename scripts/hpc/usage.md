@@ -8,6 +8,27 @@
 - skips jobs that already finished with `COMPLETED` in `sacct`
 - resubmits missing jobs through a submission script (default: `run_trial_gpu.sh`)
 
+A job counts as finished when `sacct` reports `COMPLETED` for either:
+
+- the job ID recorded in the ledger, or
+- any job with the same job name (`<trial>_<model>_<algorithm>_<batch>`)
+  submitted since the ledger's earliest timestamp.
+
+The name match is needed because the ledger is written once, at launch, and
+keeps the original job ID. A job that hit `TIMEOUT` and was resubmitted
+finishes under a new ID. Before the name match existed, such a job was
+resubmitted every cycle forever: each rerun loaded the finished checkpoint,
+did nothing and exited 0. The time bound means relaunching a batch with a new
+ledger is not satisfied by an older run with the same names.
+
+`COMPLETED` only means the job script exited 0, i.e. `train.py` exited 0. Any
+other final state is resubmitted, including a config error that fails on every
+attempt.
+
+If either `sacct` query fails (for example the accounting database is down),
+the watchdog exits with code 1 and resubmits nothing that cycle. Otherwise
+every finished job would look unfinished and be resubmitted.
+
 It also writes an action log CSV under `scripts/hpc/job_tracking/`.
 
 ## Prerequisites
@@ -88,5 +109,7 @@ Columns:
 - `experiment`
 - `trial_id`
 - `status` (`running`, `completed`, `would_resubmit`, `resubmitted`, `resubmit_failed`)
-- `old_job_id`
-- `new_job_id`
+- `old_job_id` (the ledger's job ID)
+- `new_job_id` (for `resubmitted`, the new job's ID; for `completed`, the ID
+  of the job that completed, which differs from `old_job_id` when a
+  resubmission finished it)

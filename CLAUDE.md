@@ -142,9 +142,96 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   `self.env_name`/`self.env_variant` wiring. The convenience wrappers `train.sh` /
   `scripts/evaluate.sh` translate `(BATCH, ALGORITHM, ENVIRONMENT, TRIAL_ID,
   EXP_NAME)` positional args into Hydra overrides (`env=$BATCH model=$EXP_NAME
-  algorithm=$ALGORITHM ...`); `$ENVIRONMENT` is vestigial. The `scripts/hpc/*`
-  launchers still reference the removed `run_trial.py` and must be updated to
-  `train.py` before use.
+  algorithm=$ALGORITHM ...`); `$ENVIRONMENT` is vestigial.
+- **HPC launch (`scripts/hpc/`, see `usage.md`).** `run_trial_gpu.sh` /
+  `run_trial_gpu_wildwood.sh` submit `train.py ... checkpoint=true` under the
+  job name `<trial>_<model>_<algorithm>_<batch>`. `run_trial_cpu.sh` and
+  `run_trial_cpu_evaluate.sh` still call the removed `run_trial.py` and must be
+  updated before use. `experiment_batch.sh` writes a ledger,
+  `job_tracking/<algorithm>_<batch>_latest.csv`, once at launch, and starts
+  `watchdog_loop.py`, which runs `watchdog_jobs_v2.sh` every 10 minutes. A
+  ledger job counts as done when `sacct` reports `COMPLETED` for its ledger ID
+  **or** for any job with its name submitted since the ledger's timestamp.
+  Before 2026-10-15 only the ledger ID was checked, so a job the watchdog had
+  resubmitted (e.g. after `TIMEOUT`) was resubmitted every cycle forever. From
+  the `mappo_jax` resume code (and the runners that inherit it), each such rerun
+  loads the finished checkpoint, runs no updates, rewrites the `*_finished`
+  files and exits 0, so results should be unaffected. This was not checked on
+  the cluster logs. A failed `sacct` query now aborts the cycle, rather than
+  resubmitting every finished job.
+- **Local multi-trial launch (`train_batches.sh`, repo root).** The local
+  counterpart of `experiment_batch.sh`: edit `BATCH_NAMES` / `EXPERIMENT_NAMES` /
+  `ALGORITHM` / `TRIAL_START..TRIAL_END` at its top, then `bash train_batches.sh`
+  (`N_PARALLEL=<k>` runs k trials at once, `DRY_RUN=1` only lists them). It
+  calls `train.sh` once per trial, so `checkpoint=true` applies and a re-run
+  resumes unfinished trials. Each trial logs to
+  `logs/train_batches/<timestamp>/<batch>__<experiment>__<trial>.log`, with a
+  `summary.tsv` of exit statuses. A failed trial does not stop the rest. A
+  trial whose `train.py` command line is already running (an earlier run, or a
+  hand-started one) is skipped, so two processes never share a results
+  directory. At startup it warns about any process holding >= 500 MiB of GPU
+  memory. Ctrl-C (or TERM/HUP/QUIT) stops every running trial's process tree
+  (each runs in its own process group). Further signals are ignored during that
+  cleanup, and groups still alive after 10 s are SIGKILLed. On 2026-10-21 trials
+  of a stopped run survived, held 14.5 GB, and made every trial of the next run
+  fail at startup; the exact cause was not reproduced.
+  - **GPU memory with `N_PARALLEL > 1`:** unless a JAX memory variable is
+    already set, it exports `XLA_PYTHON_CLIENT_PREALLOCATE=false` (JAX otherwise
+    reserves 75% of the GPU per process). Its first version split the GPU with
+    `XLA_PYTHON_CLIENT_MEM_FRACTION = 0.85 / N`. That failed. XLA's CUDA graphs
+    ("command buffers") and cuSolver handles need memory outside that pool. At
+    0.28 per trial, bandit trials died after 1–4 minutes (`ran out of memory
+    trying to instantiate command buffer`, 131 live graphs). At ~0.17, trials
+    died at init (`gpusolverDnCreate ... cuSolver internal error`).
+  - Verified with real trials (2 bandit trials at 2a/4o, under a pty): one
+    Ctrl-C during compile and two during training both left no process. Side
+    by side with on-demand memory, each used ~626 MiB and both trained.
+  - It exports `PYTHONUNBUFFERED=1`. Otherwise Python buffers output to the log
+    file, so logs show no progress until exit and a stopped trial loses its
+    last lines.
+  - `train.sh` now exits with the trainer's status; it used to always exit 0.
+  - Both launchers share the config existence check in
+    `scripts/check_conf_groups.sh`.
+  - **CPU slots (`CPU_SLOTS`, added 2026-10-24).** `N_PARALLEL=2
+    CPU_SLOTS="4 6" bash train_batches.sh` runs two trials on the GPU and two on
+    the CPU. Each space-separated entry is one slot: the logical CPUs its trial
+    may use, comma-separated, as `taskset -c` and `lscpu -e=CPU,CORE` number
+    them. A CPU trial runs under `JAX_PLATFORMS=cpu` and `taskset -c <CPUs>`;
+    such a process holds no GPU memory (checked with `nvidia-smi`), so the GPU
+    memory settings above concern GPU slots only. Each trial goes to the first
+    free slot, GPU slots first. `N_PARALLEL=0` runs on the CPU only.
+    - `summary.tsv` gains a `device` column (`gpu` / `cpu:<CPUs>`), the only
+      record of which backend trained a trial: results paths and checkpoints are
+      identical across backends.
+    - At startup it refuses a malformed slot, a CPU the script cannot run on,
+      and a CPU listed twice. It warns about efficiency cores (from
+      `/sys/devices/cpu_atom/cpus` on Intel hybrid CPUs), and when 4.5 GB per
+      concurrent trial exceeds `MemAvailable` (CPU trials peaked at 3.0–3.7 GB
+      in short runs; a GPU `adaptive_random` trial held 5.2 GB after 4 h).
+    - Only the JAX algorithms change backend; the torch ones use `device` from
+      `conf/config.yaml` (`cpu`) in every slot, but are still pinned.
+    - **Why: `nvidia-smi` utilization misreads the small MJX groups.** With 2
+      trials on `mjx_3a_1o_1024_gs` it read 99% while the GPU drew ~60 W of its
+      320 W limit (i9-14900KF + RTX 4080 SUPER): the MJX solver's small kernels
+      keep the GPU busy without loading it. Seconds per update, trained
+      policies:
+
+      | model group | GPU, 2 trials sharing | CPU, 1 P-core | CPU, 2 P-cores |
+      |---|---|---|---|
+      | `simplified_feudal_tanh_relative_input` | 6.9 | 4.6 | 3.8 |
+      | `..._interventions_adaptive_skip` | 6.4 | 8.7 | 8.8 |
+
+      4 CPU trials beside the 2 GPU trials left the GPU trials' collection at
+      6.1–6.7 s, unchanged. Collection is effectively single-threaded on the
+      CPU; only the update uses more threads. Unpinned (all 32 threads) was
+      slower than one pinned P-core (2.5 vs 1.5 s collection at init).
+      Efficiency cores were ~2x slower. Peak RSS 3.0–3.7 GB per CPU trial. The
+      backend changes floating-point rounding only, not the batch. **Not
+      measured on larger groups** (e.g. 16a/4o), where the GPU may win.
+    - Tested on a stub repo (fake `train.sh`/`train.py`): per-slot peak
+      concurrency never exceeded the slot count, each CPU trial saw
+      `JAX_PLATFORMS=cpu` and exactly its CPUs, the skip and failure paths
+      record the device, and TERM stopped trials in both kinds of slot.
 
 ## Plotting (`plotting/plot_training_stats.ipynb` + `plotting/config.yaml`)
 
@@ -2282,7 +2369,8 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
         Mean shift rose from 0.0003 to ~0.02 R over 9 updates in both modes.
         `focal` clipped 3–5% of recruits; the `all` waypoint gap is 0.75–0.88 R,
         i.e. independent goals at init.
-      - **No training result.**
+      - Trained 2026-10-16: no mode beats the parent. See the fixed-batch
+        MEASURED block below.
   - **The `_n96` groups** (`mjx_2a_4o_1122_1024_gs_n96`, `mjx_6a_4o_1024_gs_n96`)
     were the extra-data control for the OLD appended design (they matched its
     2a/4o interval-1 updates and rows per update). Under the redesign they are
@@ -2294,7 +2382,31 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
     - `intervention_sim_steps` (live) and `_stepped_lanes`;
     - `{worker,manager}_eligible_{main,fork}`;
     - `{worker,manager}_{adv_std,explained_variance}_{main,fork}`, from
-      separate per-source GAE.
+      separate per-source GAE;
+    - outcome shares (added 2026-10-16), `intervention_*` for the forks and
+      `manager_window_*` for main windows:
+      - `_return_nonzero_frac`: share of windows whose team reward is not 0;
+      - `_return_positive_frac`: share with team reward above 0;
+      - `_delivery_frac`: share that delivered at least one box.
+
+      Both sets cover the same (window, env) pairs, the windows whose fork was
+      placed, so each fork is paired with the main window it was cut from. They
+      use `Transition.team_reward` (undiscounted, no bootstrapped value), so
+      `all` is comparable with the other modes. Delivery is exact, read from the
+      env state's latched `delivered` flags (`iv.window_delivered`), not from a
+      reward threshold, because dense shaping can push a delivery window below
+      +100. On dense groups `_nonzero_frac` counts windows in which some box
+      moved (a box at rest pays exactly 0 shaping): 2–5% of windows at
+      initialization on `mjx_2a_4o_1122_1024_gs`. On sparse groups it equals
+      the delivery share. Logged only with forks on; runs before this date lack
+      the keys.
+    - Verified 2026-10-16:
+      - The training path is bit-identical: 0.0 maximum difference over every
+        rollout, loss, parameter and eval array, in 8 CPU-stub configurations.
+      - 10 new seam tests; 206 pass across the four simplified-feudal suites.
+      - On MJX, `window_delivered` matches the env's own delivery count in all
+        24 windows of a scripted 2a/4o rollout.
+      - A 3-update MJX smoke writes all six keys to the stats pickle.
 
     Read placement success per N first: the geometric filter can reshape the
     realized N distribution.
@@ -2390,6 +2502,309 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       arms: interval 1 needs ~224 envs, interval 2 ~131.
     - Inference, not measured: the separating test is fork rows in the worker
       update only (manager update on main rows).
+  - **MEASURED 2026-10-16, FIXED-BATCH DESIGN (2959 / 2976 updates, as the
+    parent): no fork arm beats the parent; on most groups they lose.** Relative
+    input, 1e8 simulator steps, 5 seeds (10 for `none` interval 1 / 2), mean of
+    the last 10% of evals, difference to the parent with a seed-bootstrap 95% CI.
+    Figure: `plotting/feudal_goal_analysis/simplified_feudal_interventions_2026-10-16.png`.
+
+    | group | parent | `none` k1 | `none` k2 | `focal` | `all` |
+    |---|---|---|---|---|---|
+    | 2a/4o dense | 294 | −32 [−52, −12] | −22 [−55, +5] | −49 [−95, −13] | −46 [−68, −26] |
+    | 2a/4o sparse | 135 | +13 [−40, +63] | +23 [−1, +51] | +7 [−73, +77] | +8 [−17, +33] |
+    | 2a/4o `scale2` | 176 | −95 | −67 | −137 | −106 (all CIs exclude 0) |
+    | 6a/4o dense | not on disk | 41 | 187 | 112 | 175 (absolute) |
+
+    The four other `_gs` groups (2a `sparse_scale2`, 6a `sparse` / `scale2` /
+    `sparse_scale2`) are uninformative: the parent never earns reward there.
+    - **The arms are mostly DELAYED.** Median takeoff (first update with a
+      20-update-smoothed eval of at least 100 on 2a dense, 50 elsewhere): 2a
+      dense parent 779, `none` k1 1402, k2 1295, `focal` 1737, `all` 768; 2a
+      `scale2` parent 1103, forks 1734–2395; 6a dense `all` 1012, k2 1608,
+      `focal` 2135, `none` k1 2637 (4/10 seeds never). The manager's squashed
+      entropy (−`manager_entropy_loss`) stays on a plateau near +0.3 until
+      takeoff, while the parent's falls about 20M steps earlier.
+    - **`none` / `focal` fork rows are mostly critic error early.** The median
+      `manager_explained_variance_fork` is −0.5 to −1.3 (dense) and below −3
+      (sparse) for the first ~25% of training. Every column is normalized to
+      unit std, so those rows carry a third of the manager actor's weight. A
+      likely cause, not tested: their target is a one-window return (~5) while
+      main rows regress the continuing return (~25), and the critic must switch
+      on one context bit. `all`, whose fork target bootstraps to the continuing
+      scale, has fork EV 0.2–0.4 from the start and takes off on the parent's
+      schedule on 2a dense and 6a dense. On 2a `scale2` every arm is delayed,
+      `all` included.
+    - **The help costs and is barely used.** With goals unchanged, fork window
+      returns are 0.72–0.75 of main window returns at 2a dense and 0.58–0.74 at
+      2a sparse, falling over training (6a and `scale2`: ~1.0 early, 0.64–0.82
+      late). The focal agent's mean goal moves 0.09–0.16 R when help appears at
+      2a (0.3–0.4 R at 6a). Under `all`, recruits end 0.34 R from the focal
+      agent's waypoint against 0.27 R for a copied offset (0.75–0.88 R at
+      init): co-located agents already pick the same goal.
+    - **What the forks cost:** half the fresh main episodes (45k vs 90k) and
+      half the main manager rows per update (1056 vs 2112 at k1). At equal main
+      episodes the fork arms match or beat the parent, but by then they have
+      had about twice the updates, so that does not credit the fork rows.
+    - **Missing control:** the parent at `n_envs: 16` with the same update
+      count (5e7 steps). It matches `none` k1's main data and updates without
+      fork rows, so it separates "fork rows hurt" from "fork rows are worth
+      nothing".
+  - **MEASURED 2026-10-19: offline headroom check for a learned fork scheduler
+    (`intervention_headroom_probe.py`). It does not pass its pre-registered rule.**
+    It tests the target of `plans/intervention_contextual_bandit_2026-10-16.md`
+    without training. The target is the in-window gain
+    `y = sum_k 0.99^k (fork - main raw team reward)` of a fork over the main
+    window it was cut from. The probe asks whether the focal agent's manager
+    actor input predicts that gain.
+    - **Method.** The unmodified fork `collect_fn` (interval 1) ran on 2a/4o,
+      dense and sparse, 5 seeds each, with 64 calls per checkpoint, giving 33,792
+      pairs per checkpoint. Four policy sources: both fork arms (`none` and
+      `all`) under their own semantics, and the no-fork parent under each
+      semantics. For the parent, the manager critic's first kernel is
+      zero-padded for the fork context block, so main-row values are unchanged.
+      Fitted network: the plan's 2x32 tanh network, scored on held-out calls.
+      Rule: the top 10% predicted must show a gain above 0 with a 95% interval
+      that resamples calls, on at least 4 of 5 seeds (parent, `none` semantics,
+      within-seed fit).
+    - **Decision: STOP.** Dense passes on 2/5 seeds and sparse on 1/5. On dense
+      the top-decile mean is positive on all 5 seeds (+0.06 to +0.34), and
+      4/5 pass when the network trains on the other four seeds. The dense miss
+      is therefore partly power.
+    - **The mean gain is negative everywhere:** dense -1.3 to -1.7 per window
+      (G main ~8), sparse -0.8 to -1.0. Almost all of it comes from the
+      8-9% of windows with a delivery, where the gain is -17 to -19. In
+      windows without a delivery the gain is -0.02 to -0.04.
+    - **What the input predicts is loss avoidance, not gain.** Held-out R² is
+      0.09-0.13 within seed and 0.19-0.29 across seeds.
+      - Decile curve: flat near 0 for deciles 1-8, with -3 and -11 to -14 in
+        the bottom two.
+      - Bottom 10% (parent): the main window was about to deliver (0.50
+        deliveries per window against 0.04 elsewhere), and the fork removes
+        ~40% of those deliveries. The teammate is closer: 0.17 against 0.23
+        normalized.
+      - Top 10%: +0.46 / +0.61 (`none` / `all`). The fork delivers more than
+        main in only ~1% of those pairs.
+      - The predicted-positive set (43-47% of contexts) realizes +0.16 / +0.23.
+
+      So a bandit on this target would fork in ~45% of decisions and mostly
+      learn "do not fork when a delivery is imminent". Its forks would be
+      near-neutral in-window and would avoid the reward-rich states (inference,
+      not measured).
+    - **Sparse:** 97-98% of pairs have `y` exactly 0. The top decile is about 0,
+      and the sign of the prediction is close to noise. The target cannot steer
+      selection there.
+    - **Huber vs MSE.** On dense, Huber with delta 1 on raw `y` ranks the top
+      decile better than MSE (+0.57 to +0.83 against +0.19 to +0.36): the ±100
+      delivery swings are mostly unpredictable noise. On sparse it is worse
+      (-0.24 against -0.04), because deliveries are the only signal there.
+    - **Fork-arm policies vs the parent.** The fork arms lose less per fork
+      (-1.3 / -1.5 against -1.7 on dense), but deliver less in the main window
+      too (G main 6.9-7.0 against 8.1).
+    - Results: `plotting/feudal_goal_analysis/intervention_headroom_20261019/`
+      (`summary.md`, `deciles.png`, `report.json`; the per-pair `.npz` files are
+      git-ignored). About 2 h on one GPU (~2.6 s per call).
+      `--analyze-only` / `--summarize-only` rerun the fits / tables from disk.
+      ```
+      uv run python -m algorithms.simplified_feudal_mappo_jax.intervention_headroom_probe
+      ```
+- **Adaptive fork scheduler (`intervention_scheduler`, added 2026-10-19):
+  implemented per `plans/intervention_contextual_bandit_2026-10-16.md`.
+  Trained 2026-10-24: no scheduler helps; see the MEASURED block at the end of
+  this section.** `fixed` (default) is the fork scheduling above.
+  - **Modes.**
+    - `bandit` (`intervention_bandit.py`): a learned contextual bandit decides,
+      at every main decision, whether to fork the window.
+    - `random`: forks proposed with probability `intervention_random_rate`.
+      Rate 0 never forks, the collector's own control.
+  - **Shared requirements.** `interventions: true`, interval 1, team credit and
+    an even env-group `n_envs`. Scheduler knobs that cannot act under the chosen
+    scheduler raise, rather than silently doing nothing.
+  - **Collector (`adaptive_collection.py`).** A host loop around jitted
+    primitives.
+    - `n_envs / 2` persistent main streams are reset at the start of every
+      collection and again when an episode ends.
+    - Each round advances every stream by one window. Then, per window, it draws
+      a focal agent uniformly and asks the scheduler whether to fork.
+    - It admits at most the remaining slots (a random subset if more were
+      proposed), places the admitted forks, and runs only the placed ones.
+    - An update stops at exactly `K = n_windows * n_envs` window slots, the
+      parent's 33,792 simulator steps at 2a/4o, so the update count matches the
+      parent's. A main window or an executed fork takes one slot and `H`
+      simulator calls. A skipped fork or failed placement takes none and runs no
+      physics.
+    - Never forking gives `2 * n_windows` windows per stream; always forking
+      gives `n_windows` windows plus `n_windows` forks per stream.
+    - Lanes run the trainer's own `_decide_window` / `_run_window` /
+      `_fork_place` / `_fork_rollout` as a batch of one under `vmap`. Each lane's
+      keys are folded from (stream, round), so compaction cannot change a draw.
+    - Running lane sets go in exact power-of-two widths, one compile per width.
+  - **Bandit.**
+    - Input: agent i's manager actor input from the actual main decision, i.e.
+      before the teleport, in every redecide mode. It never reads the sampled
+      action, so the selected forks stay on-policy for the manager's PPO.
+    - Network: 2x32 tanh with a zero-initialized output, so it starts at
+      "skip". Forks with `q > 0`; epsilon 0.1 of decisions are a fair coin.
+    - Target for an attempted fork: discounted raw team return of the fork
+      window minus its main window's, minus
+      `intervention_bandit_zero_reward_penalty` (default 5; 0 turns it off)
+      when every raw fork step earned 0, minus `intervention_bandit_cost_coef`.
+      A failed placement is labelled 0.
+    - Skipped decisions are never labelled.
+    - Training: fitted after PPO, one pass in minibatches of 128 with a Huber
+      loss (delta 1), Adam 3e-4. A minibatch with no label is skipped entirely.
+  - **Update.**
+    - GAE runs per source on the padded buffers, rows `(2 * n_windows,
+      streams)`.
+    - Each stream's last window is bootstrapped from its final state:
+      `gamma_M^c V^M` is added to that row's reward unless the episode ended,
+      and the row becomes a recursion cut.
+    - Exactly K manager rows and `K * H` worker rows are packed and passed to
+      `mappo_jax.mappo.optimize_samples`.
+  - **Shared change.** `ppo_update` is now `prepare_advantages` →
+    `flatten_samples` → `optimize_samples`. A before/after snapshot (3,611
+    arrays on the CPU stub: every legacy `ppo_update` mode, plus collect/update/
+    eval for the parent, all fork modes and both credits) shows 0.0 maximum
+    difference, as does the trainer's `_window` / `_fork` factoring.
+  - **Checkpoints.** The bandit's params and train state join both trees.
+    Adaptive train checkpoints also store `scheduler_meta`, the scheduler
+    settings, which leave every shape unchanged. A resume under other settings,
+    or across fixed and adaptive, raises. Fixed-scheduler checkpoints are
+    byte-identical to before.
+  - **Arms** (one key each):
+    - `simplified_feudal_tanh_relative_input_interventions_bandit`;
+    - `..._bandit_no_zero_penalty` (penalty 0);
+    - `..._adaptive_skip` (random, rate 0: the collector's never-fork control);
+    - `..._adaptive_random` (rate 0.5, a placeholder; match it to the bandit's
+      realized `scheduler_proposal_rate` in a child group).
+  - **Logged per update**, besides the fixed collector's series:
+    - `scheduler_{candidates, proposed, proposal_rate, explored, policy_skips,
+      budget_denied, forced_skips, admitted, invalid, executed, fork_slot_frac,
+      propensity, rounds}`. Policy rates are over candidates; validity is over
+      admitted attempts.
+    - `bandit_{predicted_utility, predicted_utility_executed, target, gain,
+      g_main, g_fork, zero_reward_frac, main_zero_reward_frac, penalty, cost,
+      labels, loss, steps}`.
+    - **Is the bandit selecting anything?** (added 2026-10-20) Executed forks are
+      split into *greedy* (the bandit's own choice) and *explored* (the epsilon
+      coin's). The coin ignores `q`, so the explored forks are a random sample of
+      decisions within the same run, and every `random`-scheduler fork counts as
+      explored.
+      - `bandit_{gain, target}_{greedy, explored}`: their difference is the
+        selection value on the bandit's own target.
+      - `bandit_{greedy, explored}_forks` and `bandit_greedy_fork_frac`. Pool
+        across updates by count-weighting the means: per update there are few
+        forks.
+      - `bandit_explained_variance`: `1 - Var(y - q) / Var(y)` on the update's
+        labels. The labels' predictions `q` were made before this update's fit
+        (`AdaptiveBatch.label_q`), so the score is held out.
+      - **It ignores an offset**: a constant `q` scores 0 whatever its level. Read
+        the level from `bandit_predicted_utility_executed` against `bandit_target`.
+      - These keys are NaN when undefined (no fork of that kind, fewer than two
+        labels), never 0.
+      - Measured on the MJX smoke: in the first updates every fork is explored
+        (the zero-initialized bandit picks nothing), the greedy keys are NaN and
+        the explained variance is about 0.
+      - None of these says whether the bandit helps training. That is the
+        evaluation `reward` against `_adaptive_random` (matched rate) and
+        `_adaptive_skip`.
+    - `main_{windows, episodes, sim_steps, valid_steps}`,
+      `fork_{sim_steps, valid_steps}`, and `{worker,manager}_eligible_*`.
+  - Tests: `uv run pytest algorithms/tests/test_intervention_bandit.py -q`
+    (59 tests, CPU stub). They cover:
+    - input equality for every manager input and redecide mode;
+    - epsilon and propensity;
+    - learning, padding and no-label invariance of the fit;
+    - raw paired targets, early ends and failed placements;
+    - an exact budget in all-skip / all-fork / mixed / all-invalid runs, with
+      dispatch recorded through `adaptive_collection.DISPATCH_HOOK`;
+    - GAE against independently computed ragged trajectories in all three
+      redecide modes, and no advantage crossing between sources;
+    - prepared PPO equal to `ppo_update` bit for bit;
+    - exact checkpoint resume and the scheduler record;
+    - evaluation never reading the bandit;
+    - the greedy/explored split (all-coin, all-bandit, random scheduler; the
+      split recombines into the overall mean) and the held-out explained
+      variance.
+  - **MJX smoke, 2026-10-19** (`mjx_2a_4o_1122_1024_gs`, the bandit arm,
+    `trial_id=smoke_bandit`): trained to 2e5, resumed with `checkpoint=true` to
+    3e5 (it continued from step 168,960), and evaluated with `evaluate=true`.
+    Every update collected exactly 33,792 simulator steps. Every placement was
+    valid.
+    - **What the bandit did:** it forked only through exploration (42–60 of
+      ~1,000 candidates per update) and took one optimizer step per update.
+    - **Zero-reward forks:** 92–97% of forks earned exactly 0 with the untrained
+      policy, so the target sat near −4.8 and predictions drifted negative
+      (−0.011 after 5 updates). Expect the penalized bandit to skip almost
+      everywhere until boxes move.
+    - **Warm collection per update** (median of updates 2–7, same env group):
+
+      | arm | seconds per update |
+      |---|---|
+      | parent | ~0.76 |
+      | fixed forks, interval 1 | ~1.3 |
+      | `_adaptive_skip` | ~1.3 |
+      | bandit | ~1.8 |
+      | `_adaptive_random` (0.5) | ~2.3 |
+
+      The update itself takes 0.06 s. The adaptive collector's cost is
+      sequential depth (2 x the parent's windows per stream) plus one host sync
+      and power-of-two dispatches per round. The bandit run had compile logging
+      on and preallocation off.
+    - **Compiles:** the first update compiles in 69–77 s for the adaptive arms
+      (20 s fixed, 13 s parent). New lane widths compile lazily later (~20 s
+      each). In 7 updates: 5 `main_round`, 3 `place` and 3 `fork` widths.
+    - **Peak GPU memory:** ~630 MiB above idle without preallocation.
+  - **MEASURED 2026-10-24: no scheduler makes the forks help.** Read from the
+    logged series of all four adaptive arms, 5 seeds each, on the 2a/4o, 6a/4o
+    and 3a/1o `_gs` groups. Several runs were unfinished (57–100M steps), so
+    returns are compared at steps every seed reached.
+    - **Compare against `_adaptive_skip`, not only the parent.** The no-fork
+      collector already differs from the parent: on 2a dense it trails by −72
+      [−111, −28] at 75M, with shorter waypoints (offset 0.71 vs 0.94 R) and less
+      negative squashed entropy (−2.06 vs −3.04) on 4 of 5 seeds; on 2a sparse
+      it leads by +27 [+8, +48]; on 2a `scale2` it ties. Cause not identified.
+      6a dense has no parent run on disk; there skip reaches 309 against `mlp`
+      318 at 90M.
+    - **Returns against skip** (seed-bootstrap 95% intervals): 2a dense at 75M
+      +19 to +23 for the bandits, −29 for random (all intervals span 0); 2a
+      sparse +22 to +36 (lower bounds ≈ 0); 2a `scale2` −20 (bandits) and −68
+      [−99, −38] (random); 6a dense at 60M −46 to −124 (all exclude 0). 3a/1o:
+      every arm, `mlp` included, saturates at ~109 (one box), so it cannot
+      show a gain. 2a `sparse_scale2` and 6a `sparse` / `scale2` /
+      `sparse_scale2`: the parent earns ~0, and on the sparse ones 100% of fork
+      and main windows earn exactly 0.
+    - **Forks delay takeoff in proportion to how many run.** Spearman
+      correlation of a seed's fork slot share with its takeoff step: +0.29 to
+      +0.71 on the five groups (p < 0.05 on four). Random (33% of slots) takes
+      off last everywhere.
+    - **The fork windows are worth less than the windows they were cut from.**
+      `bandit_g_fork / bandit_g_main` is 0.73–0.86 late in training, and
+      `intervention_delivery_frac` is 20–25% below the paired
+      `manager_window_delivery_frac`, on every group and scheduler.
+    - **The bandit finds harmless forks, not helpful ones.** Its median
+      `bandit_explained_variance` is 0.000–0.027. Without the penalty, its own
+      (greedy) forks gain −0.26 to +0.14 per window against −0.8 to −2.1 for
+      the explored ones, i.e. loss avoidance, as the headroom probe predicted.
+    - **The zero-reward penalty labels quiet states, not useless forks.**
+      `bandit_zero_reward_frac` exceeds `bandit_main_zero_reward_frac` by only
+      0.01–0.03: a fork earns 0 when its main window would have. So: (a) on
+      sparse groups 96–100% of forks earn 0, every prediction goes to ≈ −5, the
+      greedy share is 0.000 for the whole run, and the arm is a 5% random
+      scheduler (proposal rate exactly ε/2 = 0.050); (b) on dense groups it
+      steers the bandit to windows where boxes are moving, where forks cost
+      most: greedy forks gain −3.6 vs −0.7 explored at 20–40M on 2a dense, and
+      on 6a dense they never beat the explored ones (−0.5 to −1.2 vs −0.03 to
+      −0.9).
+    - **Fork rows are a small share of the manager's data and fit worse.**
+      `manager_eligible_fork` is 1–8% of manager actor rows (penalized bandit),
+      4–12% (no penalty) and 7–20% (random). Median
+      `manager_explained_variance_fork` is 0.03–0.43 against 0.46–0.76 on main
+      rows. (Its per-update mean is dominated by updates whose forks all return
+      0, where the metric degenerates; read the median.)
+    - **The cost is paid on every fork.** Main windows per update fall from
+      1056 to ~1000 / ~860 / ~707 (penalized bandit / no penalty / random),
+      and finished main episodes from 32 to 16–18: each stream's second episode
+      is cut short.
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
   90 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;

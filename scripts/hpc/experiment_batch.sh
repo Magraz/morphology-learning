@@ -41,20 +41,12 @@ if [[ ${#BATCH_NAMES[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Check every Hydra config group exists before submitting anything. A misspelled
-# name would otherwise queue jobs that fail at config composition, and the
-# watchdog resubmits every job that did not finish COMPLETED, indefinitely.
-MISSING=()
-[[ -f "${CONF_DIR}/algorithm/${ALGORITHM}.yaml" ]] || MISSING+=("algorithm/${ALGORITHM}.yaml")
-for BATCH_NAME in "${BATCH_NAMES[@]}"; do
-    [[ -f "${CONF_DIR}/env/${BATCH_NAME}.yaml" ]] || MISSING+=("env/${BATCH_NAME}.yaml")
-done
-for EXPERIMENT in "${EXPERIMENT_NAMES[@]}"; do
-    [[ -f "${CONF_DIR}/model/${EXPERIMENT}.yaml" ]] || MISSING+=("model/${EXPERIMENT}.yaml")
-done
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo "error: config files not found under ${CONF_DIR}:" >&2
-    printf '  %s\n' "${MISSING[@]}" >&2
+# Check every Hydra config group exists before submitting anything.
+source "${SCRIPT_DIR}/../check_conf_groups.sh"
+if ! check_conf_groups "${CONF_DIR}" \
+        "algorithm/${ALGORITHM}" \
+        "${BATCH_NAMES[@]/#/env/}" \
+        "${EXPERIMENT_NAMES[@]/#/model/}"; then
     echo "nothing was submitted" >&2
     exit 1
 fi

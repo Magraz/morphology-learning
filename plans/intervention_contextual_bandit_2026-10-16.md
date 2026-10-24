@@ -397,7 +397,8 @@ Verification:
 - **Before/after snapshot** on the CPU stub: 3,611 arrays, 0.0 maximum
   difference. It covers every legacy `ppo_update` mode, plus collect/update/
   eval of the parent, every fork mode at intervals 1 and 2, and both credits.
-- **New tests:** 56 in `test_intervention_bandit.py`, all passing.
+- **New tests:** 59 in `test_intervention_bandit.py`, all passing (3 added
+  2026-10-20 with the greedy/explored and explained-variance logs).
 - **Existing suites:** 504 pass across the simplified-feudal, interventions,
   SMAX, global-state, D++ probe, FeUdal seam and visualization suites.
   `test_mjx_sector_counts.py` has 4 failures that also fail on a clean `HEAD`
