@@ -192,6 +192,34 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   - `train.sh` now exits with the trainer's status; it used to always exit 0.
   - Both launchers share the config existence check in
     `scripts/check_conf_groups.sh`.
+  - **Progress (added 2026-10-24).** Every `PROGRESS_INTERVAL` seconds
+    (default 300, `0` turns it off) a background job prints a count of trials
+    per state and one row per running trial: percentage, a 20-character bar,
+    time left, device and trial name. `bash scripts/train_batches_progress.sh
+    [logs/train_batches/<timestamp>]` prints every trial of a run (default the
+    latest), including done, failed and queued, and can run from a second
+    terminal. Both use the same `print_progress`.
+    - The percentage is the last `Steps: <done>/<total>` line in the trial's
+      log (mappo, mappo_vanilla, ippo and the JAX stacks print one per
+      update). dcg prints no total, so its trials show `-`. Time left is the
+      remaining steps over the speed across the last 100 such lines. Checked
+      against a hand calculation on a real interventions log: 5165 steps/s,
+      4h13m left.
+    - It reads three files the launcher now writes into the log directory:
+      `trials.tsv` (the trial list), `train_batches.pid` (to tell a live run
+      from a stopped one) and `summary.tsv`. Runs started before this change
+      have no `trials.tsv`, and the helper refuses them. Each trial log's
+      first line is now `train_batches.sh: started <time>, device <device>`.
+    - The final wait loops `wait -n` over the slots, because a plain `wait`
+      would also wait for the monitor. `wait -n` returns at once for a job that
+      ended before the call (checked on bash 5.2), so the last trial cannot be
+      missed. The monitor sleeps in the background and exits 0 on TERM;
+      otherwise killing it printed `Terminated`.
+    - Tested on a stub repo (fake `train.sh`). Checked: percentages, a resumed
+      trial starting at 40%, a failed trial and a no-progress-line trial; the
+      script exits as soon as the last trial ends; SIGINT leaves no process;
+      the helper then reports `stopped` / `not run`; and single-slot `tee`
+      mode works.
   - **CPU slots (`CPU_SLOTS`, added 2026-10-24).** `N_PARALLEL=2
     CPU_SLOTS="4 6" bash train_batches.sh` runs two trials on the GPU and two on
     the CPU. Each space-separated entry is one slot: the logical CPUs its trial
@@ -2805,6 +2833,268 @@ uv run python train.py algorithm=simplified_feudal_mappo_jax \
       1056 to ~1000 / ~860 / ~707 (penalized bandit / no penalty / random),
       and finished main episodes from 32 to 16–18: each stream's second episode
       is cut short.
+- **Heuristic fork rule (`intervention_scheduler: heuristic`, added 2026-10-24):
+  wired and smoke-tested. No training result.** Plan:
+  `/home/magraz/.claude/plans/peaceful-stargazing-meteor.md`. Code:
+  `intervention_heuristic.py` plus branches in `trainer.py`. Arm:
+  `simplified_feudal_tanh_relative_input_interventions_heuristic`, two keys on
+  `..._interventions` (scheduler + `intervention_redecide: all`), with the
+  budget and margin declared.
+  - **The rule.** Forks happen only where help is structurally missing.
+    - **When:** at any primitive step of the main rollout, mid-window included.
+      The candidate is the PRE-step state, one the main rollout visits.
+    - **Focal agent:** one whose closest undelivered box (by surface distance)
+      is within touch range plus `intervention_heuristic_trigger_margin`
+      (default 0.5 world units; touching counts), and whose box does not have
+      its coupling met. One such agent per env and step, drawn uniformly.
+    - **Recruits:** N = the box's coupling minus the agents touching it, the
+      focal agent counted. The N teammates nearest the focal agent among those
+      not touching the box are teleported next to it (`teleport_agents`, zero
+      offset). Boxes that need one agent never qualify.
+    - **Goals:** every agent re-decides from the post-teleport state, as in
+      `intervention_redecide: all` (required; anything else raises). The fork
+      runs one goal horizon and bootstraps like the main rollout.
+    - **Budget:** each main env keeps a uniform random sample of at most
+      `intervention_heuristic_budget` (default 5) of its rollout's qualifying
+      moments, by bottom-K priority sampling (`reservoir_update`).
+  - **Collection.** This uses the fixed collector; the adaptive one is untouched.
+    - `_run_window(..., tracker=None)` calls a tracker on every pre-step state.
+      `_heuristic_window` uses it to feed each env's sample, which stores the
+      full env state and observation.
+    - After the main scan, `_heuristic_forks` runs all E·K slots as one vmapped
+      batch through `_place` (factored out of `_fork_place`, bit-identical) and
+      the unchanged `_fork_rollout`. `_fork_rollout` gained an optional
+      `extra_fn` for per-fork outcomes.
+    - Draws use `fold_in` namespaces, so the main rollout equals the parent's at
+      the same env count and seed (pinned).
+  - **Packing** (`intervention_heuristic.pack`). Forks go into extra env columns,
+    valid ones first, each column holding one fork per manager row.
+    - A column left with exactly one valid fork is masked. `masked_normalize`
+      leaves a stream with fewer than two rows unnormalized, which would give
+      that row a raw, unit-free advantage.
+    - `Intervention.step` / `.env` record each packed fork's source moment; they
+      are None for the fixed forks.
+  - **Env hook `MultiBoxPushMJX.box_contacts(state) -> BoxContacts`**:
+    `agent_pos`, `clearance` (surface distance minus touch range, `<= 0` exactly
+    where touching), `touching` (`_touch_matrix` itself), `coupling`,
+    `delivered`, `goal_distance`. It is unconditional, like `entity_state`. The
+    validator raises for an env without it.
+  - **Batch accounting.** `interventions.heuristic_main_envs` makes the forks
+    count toward the batch: at 33 windows and budget 5, 28 of 32 main envs, so
+    34,048 simulator steps per update (parent 33,792) and 2937 updates at 1e8.
+    Every fork lane is stepped and charged, empty and failed slots included.
+    `iv.main_envs` now shares `_fill_envs` with it.
+  - **Checkpoints.** Heuristic checkpoints write their own record
+    (`_HEURISTIC_META_FIELDS`: scheduler, budget, margin, redecide), and a
+    resume under other settings raises. The adaptive record and the
+    `SCHEDULERS` codes are unchanged (pinned), so in-progress bandit runs still
+    resume. `"heuristic"` is appended to `SCHEDULERS`.
+  - **Logged per update** (keys `intervention_*`):
+    - the moments: `events`, `event_rate`, `attempted`, `budget_frac`;
+    - placement: `valid_frac` and per-N attempts / validity, `dropped_singleton`;
+    - the fork moment: `n_recruits_mean`, `focal_touching_frac`,
+      `focal_clearance`, `window_step_mean`, `window_start_frac`;
+    - the focal box: `start_met_frac` (coupling met right after the teleport),
+      `box_delivered_frac`, `box_progress`;
+    - the paired comparison: `g_fork`, `g_main`, `paired_gain`, `paired`. This
+      is fork minus the main env's discounted raw team reward over the same
+      steps, cut at the episode end, exact even when the episode ends on a
+      window's last step. It mixes the help with the immediate re-decision;
+      there is no no-teleport control lane;
+    - the existing re-decision, return-share and eligibility series.
+  - **Verified 2026-10-24:**
+    - Every existing path is bit-identical: 0.0 maximum difference over 6,718
+      arrays from 22 CPU-stub configurations (parent ×12, both credits, fixed
+      forks at interval 1/2 × three redecide modes, bandit / random / skip).
+    - 33 new tests in `algorithms/tests/test_intervention_heuristic.py`; the 265
+      existing ones across the five simplified-feudal suites pass.
+    - On real 6a/4o states (a noisy scripted partition, 400 steps × 16 envs),
+      `box_contacts` agrees exactly with `_touch_matrix` and the touch counts of
+      `entity_state`. 87% of (env, step) pairs qualify once agents reach boxes;
+      the focal agent already touches its box in 95%; N = 1 / 2 / 3 in
+      45 / 46 / 8%; placement succeeds in 98–100%.
+    - ⚠ **The coupling is met right after the teleport in only 3% of forks.**
+      Recruits land 0.85–1.5 units from the focal agent and must keep 0.45 clear
+      of box surfaces, so they usually still have to step onto the box.
+    - Smoke on `mjx_6a_4o_1024_gs` (GPU shared with two training trials):
+      - train to 2e5, `checkpoint=true` resume to 3e5 and `evaluate=true` work;
+        every `total_steps` increment is 34,048;
+      - from an untrained policy the budget fills to 100% within 7 updates,
+        with forks starting at a window boundary in only 0–12% of cases;
+      - warm collection 2.45–3.85 s per update against 2.30–3.30 s for the
+        parent; the first-update compile takes 30 s vs 16.5 s;
+      - peak GPU memory ~572 MiB vs ~562 MiB.
+  - **Full runs for the user to launch** (5 seeds, 1e8): the arm and its parent
+    `simplified_feudal_tanh_relative_input` on `mjx_6a_4o_1024_gs` (no parent run
+    is on disk there) and on `mjx_2a_4o_1122_1024_gs`.
+- **Anytime fork scheduler (`intervention_scheduler: anytime | anytime_random`,
+  added 2026-10-25): wired and smoke-tested. No training result.** Plan:
+  `/home/magraz/.claude/plans/i-want-to-create-breezy-wind.md`. Code:
+  `anytime_scheduler.py` (network, policy, reward, PPO) and
+  `anytime_collection.py` (collector), plus branches in `trainer.py`.
+  - **What it adds over the bandit.** The bandit decided only whether to fork at
+    a manager decision, around a random agent with random recruits, for one
+    window, and trained only that agent's manager row. Here a learned scheduler:
+    - may launch at **any step** of a main window, from the pre-step state;
+    - **chooses** the focal agent, the recruits (at least one) and the fork's
+      length `k` in goal windows;
+    - sees its **remaining budget**;
+    - has **every agent re-decide** at the fork's start, then runs `k` whole
+      windows from there (no partial windows);
+    - trains **every agent** on the fork's rows, at both levels.
+  - **Budget and batch (decided with the author).**
+    - `intervention_fork_budget` `B` counts fork windows per main stream per
+      update; None = `n_windows` (33), so forks can take at most half the batch.
+    - Each of the `batch_envs / 2` persistent streams owns `2 * n_windows`
+      slots, filled by its main windows plus the fork windows it commits. Main
+      windows run until the two add up, so **unspent budget becomes main
+      windows**, and every update is exactly the parent's 33,792 steps at 2a/4o.
+    - `kmax = min(B - committed, slots left after this window, ceil((max_steps
+      - t) / c))`: no fork window starts past the episode's time limit.
+    - A placed fork commits its `k` slots. A failed placement commits nothing.
+      A fork whose episode ends early keeps its slots: its unrun windows stay
+      masked placeholder rows and run no physics (the frozen-step convention).
+    - At most one launch per stream per main window (one snapshot slot).
+  - **The scheduler** (`SchedulerNet`, shared and equivariant over agents).
+    - Input: every agent's manager actor input (`Policy.actor_input`, factored
+      out of `decide`), the pairwise goal-state offsets `pos_j - pos_i`, and
+      `[budget_left / B, slots_left / (2 n_windows), t / max_steps, step / c]`.
+      A training-time device only; evaluation never reads it (pinned).
+    - Action:
+      - one categorical over `{skip, agent_1..agent_N}`;
+      - the recruits: a product of Bernoullis conditioned on at least one. It is
+        sampled exactly (smallest member first), its log-prob subtracts
+        `log(1 - P(nobody))`, and its entropy is in closed form;
+      - the length: a categorical over `1..B`, masked to `kmax`.
+    - Output layers start at zero, so at init the focal agent, recruits (p = 1/2)
+      and length are uniform. The skip bias makes a decision launch with
+      probability `init_forks / (2 n_steps)`
+      (`intervention_scheduler_init_forks`, default 2 launches per stream per
+      update).
+    - It takes `HierTrainState.bandit`'s slot, so the checkpoint I/O is
+      unchanged. `anytime_random` samples from it frozen at initialization: the
+      matched control.
+  - **Reward (decided with the author): the bootstrapped paired gain.** For a
+    placed fork, over `L = min(k c, main steps left in the stream's rollout)`:
+    `Δ = Σ_{j<L} γ_M^j (r_fork[j] − r_main[τ+j]) + γ_M^L (V^M(fork_L) − V^M(main_τ+L))`.
+    - `r` is the raw team reward.
+    - Each side stops at its own episode's end (termination or time limit), and
+      a side that ended drops its value term.
+    - Main's post-reset steps are excluded.
+    - `V^M` is the pre-update manager critic, recorded at every step.
+    - A skip earns 0. So does a failed placement.
+    - There is no zero-reward penalty.
+    - ⚠ The value terms use `V^M` at mid-window and post-teleport states. The
+      critic is trained on window starts only.
+  - **Learning (decided with the author): sequential.** PPO over each stream's
+    decisions within a rollout. GAE (`mappo.compute_gae` on the compacted
+    decisions) uses `intervention_scheduler_gamma` (default 1) and `_lambda`
+    (0.95). The terminal value is 0, since unspent budget is worth 0 against the
+    main windows that replace it. The value `V(context, budget)` can therefore
+    price the budget. Gamma 0 is a one-step bandit. The loss is PPO-clip plus
+    value plus entropy (`intervention_scheduler_ent_coef`), with 4 epochs × 4
+    minibatches. Cells without a decision carry weight 0 (pinned: garbage there
+    changes nothing).
+  - **Fork rows** reuse `_decide_window` / `_run_window` unchanged; the
+    teleport is the heuristic's `_place` with a zero offset.
+    - At a fork's last window, unless its episode ended,
+      `gamma_M^c V^M(end)` is added to the manager reward and the row becomes a
+      recursion cut. So two forks in one column never share an advantage
+      (pinned).
+    - Every agent's manager row has weight 1, and the PPO ratio is 1 at both
+      levels.
+    - **No fork context block**: every fork row bootstraps to the continuing
+      return, so the manager critic is the parent's width (`iv.context_dim` is
+      0 under anytime).
+  - **Execution.** A host loop like the adaptive collector's.
+    - One pool of env states holds the main streams and up to `S·B` running
+      forks.
+    - Each round runs every active lane for one window. Each lane is a batch
+      of one under `vmap`, keyed by (stream, main window) or (fork, window).
+    - A window dispatch on the GPU costs about the same at any width (16–20 ms
+      from 1 to 16 lanes at 2a/4o). So on an accelerator a round is ONE
+      dispatch, padded to a power of two with lanes that write nowhere. On the
+      CPU, where compute dominates, the lanes run in exact power-of-two
+      chunks (`anytime_collection.PAD_LANES`, chosen by device). Both paths
+      give the same rollout (pinned). The first version used exact chunks
+      everywhere: ~170 dispatches per update and 3.2–3.4 s of warm collection
+      on the GPU, against 66 dispatches and 1.6 s padded.
+    - Launch states go to a per-stream snapshot buffer, so placement compiles
+      once per launch count. Taking them from each window chunk's output
+      recompiled for every (chunk width, launch count) pair, at 5 s each.
+    - The scheduler runs inside `_run_window`'s existing `tracker` hook.
+    - After the rollout, the host computes the gains and the GAE.
+    - Main windows do not depend on the forks (pinned: identical rows with
+      never- and always-launch schedulers).
+  - **Config.** The knobs that cannot act raise:
+    - the bandit's epsilon / penalty / cost / random rate under anytime;
+    - the learning knobs under `anytime_random`;
+    - the anytime knobs under any other scheduler.
+
+    Requires `intervention_redecide: all`, team credit, interval 1 and an even
+    `n_envs`. Checkpoints write `_ANYTIME_META_FIELDS`. The bandit's nine-field
+    record and the `SCHEDULERS` codes are unchanged (`anytime` = 4,
+    `anytime_random` = 5).
+  - **Arms:** `simplified_feudal_tanh_relative_input_interventions_anytime`
+    (scheduler key on `..._interventions_redecide_all`, knobs declared) and its
+    one-key child `..._anytime_random`. The existing `..._adaptive_skip` runs
+    are the no-fork control on the same 16 × 66 main schedule (only init draws
+    differ: their critic has zero context columns).
+  - **Logged per update:**
+    - `scheduler_{decisions, launched, launch_rate, executed, fork_windows,
+      fork_slot_frac, budget_spent_frac, mean_duration, mean_kmax,
+      launch_step_mean, window_start_frac, value_mean, rounds}`;
+    - `anytime_{gain, g_main, g_fork, bootstrap, span, gain_positive_frac}`;
+    - `intervention_{attempted, valid_frac, n_recruits_mean, recruit_distance,
+      fork_length, window_return, delivery_frac}`;
+    - `main_*` / `fork_*` step counts;
+    - the per-source EV/std/eligible series;
+    - under `anytime`, `scheduler_{policy_loss, value_loss, entropy,
+      clip_frac, steps, value_explained_variance}`.
+
+    Means over launches or forks are NaN when there was none
+    (`anytime_collection.NAN_WHEN_EMPTY`).
+  - **Verified 2026-10-25:**
+    - Every existing path is bit-identical: 0.0 maximum difference over 7,538
+      arrays from 26 CPU-stub configurations (parent ×12, three credits, fixed
+      forks in all redecide modes and interval 2, bandit / random / skip /
+      failed placements, heuristic).
+    - 51 new tests in `algorithms/tests/test_anytime_scheduler.py`:
+      - the recruit sampler and log-prob against exact enumeration;
+      - the entropy against Monte Carlo;
+      - the span return against a step-by-step reference;
+      - the launch reward against an independent recomputation;
+      - the budget exact in never / always / mixed / all-invalid runs;
+      - a mid-window launch starting from main's pre-step state with exactly
+        the chosen recruits;
+      - the end bootstrap and column independence;
+      - early-ended forks running no physics;
+      - the time cap;
+      - decision GAE against a ragged reference;
+      - stored log-probs reproducing;
+      - checkpoint resume and its record.
+    - The 308 existing tests across the simplified-feudal, interventions,
+      bandit, heuristic, SMAX, global-state and dpp-probe suites pass.
+    - **MJX smoke, `mjx_2a_4o_1122_1024_gs`** (non-numeric `trial_id`, GPU):
+      - train to 2e5, `checkpoint=true` resume to 3e5 (it continued from
+        168,960) and `evaluate=true` all work; every `total_steps` increment is
+        33,792, and every update takes 66 rounds;
+      - 21–24 launches per update from the untrained scheduler (`init_forks` 2
+        per stream would be 32; forks shorten the main rollouts), mean length
+        7–10 windows, 15–20% of the slots on forks, 0–9% of launches at a
+        window start, every placement valid;
+      - `anytime_random` runs too (22–27 launches, no fit);
+      - warm collection 1.4–1.9 s per update, against ~1.8 s for the bandit
+        arm and ~0.8 s for the parent. The first update compiles for ~80 s, and
+        each new lane width compiles lazily later (~12 s, at most six widths);
+      - peak GPU memory ~1.4 GB above idle.
+    - **One `mjx_6a_4o_1024_gs` run of 2 updates:** 2.6–2.7 recruits per fork
+      (the conditioned Bernoulli(1/2) over 5 teammates has mean 2.58), every
+      placement valid, and warm collection 2.1 s.
+  - **Full runs for the user to launch** (5 seeds, 1e8): `..._anytime` and
+    `..._anytime_random` on `mjx_2a_4o_1122_1024_gs`, its `_sparse` twin and
+    `mjx_6a_4o_1024_gs`. Compare them with the existing `_adaptive_skip` and
+    parent runs. Read `scheduler_launched` and `anytime_gain` before return.
 - **Checks:** `uv run pytest algorithms/tests/test_simplified_feudal.py -q` runs
   90 tests on a CPU stub env, each at N=1 and N=3 where relevant. They cover:
   - waypoints are fixed within a window and redrawn between windows;

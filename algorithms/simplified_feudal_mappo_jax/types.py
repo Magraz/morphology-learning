@@ -99,10 +99,20 @@ class Model_Params:
     #            fork (`intervention_bandit.py`), and skipped forks are replaced
     #            by extra main windows (`adaptive_collection.py`);
     #   random — the same adaptive collector, forks proposed with probability
-    #            `intervention_random_rate` (0 never forks: the all-skip control).
-    # The adaptive schedulers need `interventions: true`, interval 1, team
-    # credit and an even env-group `n_envs` (half of it are the main streams).
-    # Plan: plans/intervention_contextual_bandit_2026-10-16.md.
+    #            `intervention_random_rate` (0 never forks: the all-skip control);
+    #   heuristic — a fixed rule forks at any step where an agent is near or
+    #            touching its closest undelivered box and that box's coupling is
+    #            not met, teleporting exactly the missing agents
+    #            (`intervention_heuristic.py`). Needs `intervention_redecide: all`;
+    #   anytime — a learned scheduler may fork at any step of a main window and
+    #            chooses the focal agent, the recruits and the fork's length in
+    #            windows, from a per-stream budget (`anytime_scheduler.py`,
+    #            `anytime_collection.py`). Needs `intervention_redecide: all`;
+    #   anytime_random — the same collector with that scheduler frozen at its
+    #            initialization (its matched control).
+    # The adaptive and anytime schedulers need `interventions: true`, interval
+    # 1, team credit and an even env-group `n_envs` (half of it are the main
+    # streams). Plan: plans/intervention_contextual_bandit_2026-10-16.md.
     intervention_scheduler: str = "fixed"
     intervention_bandit_hidden_dim: int = 32
     intervention_bandit_epsilon: float = 0.1
@@ -113,6 +123,26 @@ class Model_Params:
     # step earned exactly 0 reward. 0 turns the penalty off.
     intervention_bandit_zero_reward_penalty: float = 5.0
     intervention_random_rate: float = 0.5
+    # `heuristic` scheduler only (`intervention_heuristic.py`): at most this
+    # many forks per main env per update, a uniform sample of the qualifying
+    # moments of its rollout.
+    intervention_heuristic_budget: int = 5
+    # World units beyond touch range: an agent qualifies as a focal agent once
+    # its closest undelivered box is within touch range plus this margin.
+    intervention_heuristic_trigger_margin: float = 0.5
+    # `anytime` / `anytime_random` only (`anytime_scheduler.py`). The budget is
+    # in goal windows per main stream per update (None = n_windows, so forks
+    # can take at most half the batch); unspent budget becomes main windows.
+    intervention_fork_budget: Optional[int] = None
+    # The scheduler's own PPO over its decisions within a rollout (`anytime`
+    # only): discount and GAE lambda per decision (gamma 0 is a one-step
+    # bandit), and its entropy coefficient.
+    intervention_scheduler_gamma: float = 1.0
+    intervention_scheduler_lambda: float = 0.95
+    intervention_scheduler_ent_coef: float = 0.01
+    # Expected launches per main stream per update at initialization (sets the
+    # scheduler's initial skip probability).
+    intervention_scheduler_init_forks: float = 2.0
 
 
 @dataclass
@@ -166,6 +196,14 @@ class FeudalConfig:
     intervention_bandit_cost_coef: float = 0.0
     intervention_bandit_zero_reward_penalty: float = 5.0
     intervention_random_rate: float = 0.5
+    intervention_heuristic_budget: int = 5
+    intervention_heuristic_trigger_margin: float = 0.5
+    # The anytime scheduler (see Model_Params and `anytime_scheduler.py`).
+    intervention_fork_budget: Optional[int] = None
+    intervention_scheduler_gamma: float = 1.0
+    intervention_scheduler_lambda: float = 0.95
+    intervention_scheduler_ent_coef: float = 0.01
+    intervention_scheduler_init_forks: float = 2.0
 
 
 class ManagerGoal(NamedTuple):
@@ -191,8 +229,10 @@ class Rollout(NamedTuple):
     diagnostics: dict  # scalar rollout diagnostics, merged into the losses
     manager_goal: object = None  # ManagerGoal under counterfactual / dpp credit, else None
     intervention: object = None  # Intervention under `interventions: true`, else None
-    # AdaptiveBatch under an adaptive `intervention_scheduler`, else None.
+    # AdaptiveBatch under an adaptive or anytime `intervention_scheduler`, else None.
     adaptive: object = None
+    # SchedulerBatch under `intervention_scheduler: anytime`, else None.
+    scheduler: object = None
 
 
 class AdaptiveBatch(NamedTuple):
@@ -203,24 +243,50 @@ class AdaptiveBatch(NamedTuple):
     and one column per main stream; rows that were never collected are masked
     placeholders. Exactly `n_windows * batch_envs` window slots are collected per
     update: `main_collected.sum() + fork_executed.sum()`.
+
+    The anytime collector (`anytime_collection.py`) fills the first four fields
+    the same way (a fork row there is one window of a fork, in the column of the
+    stream it was cut from) and leaves the bandit's labels None.
     """
 
     main_collected: jax.Array  # (rounds, streams) bool: a main window was collected
     fork_executed: jax.Array  # (rounds, streams) bool: a fork ran from that window
     last_row: jax.Array  # (streams,) int: each stream's last collected round
     final_value: jax.Array  # (streams,) the manager's value of each stream's final state
-    label_x: jax.Array  # (capacity, actor_dim) bandit inputs of the attempted forks
-    label_y: jax.Array  # (capacity,) their targets (0 for a failed placement)
-    label_count: jax.Array  # () int: labelled rows; the rest is padding
+    label_x: jax.Array = None  # (capacity, actor_dim) bandit inputs of the attempted forks
+    label_y: jax.Array = None  # (capacity,) their targets (0 for a failed placement)
+    label_count: jax.Array = None  # () int: labelled rows; the rest is padding
     # Where each label came from: the round and stream of its main window, its
     # focal agent, and whether its placement succeeded (its fork ran).
-    label_round: jax.Array  # (capacity,) int
-    label_stream: jax.Array  # (capacity,) int
-    label_focal: jax.Array  # (capacity,) int
-    label_placed: jax.Array  # (capacity,) bool
+    label_round: jax.Array = None  # (capacity,) int
+    label_stream: jax.Array = None  # (capacity,) int
+    label_focal: jax.Array = None  # (capacity,) int
+    label_placed: jax.Array = None  # (capacity,) bool
     # The bandit's prediction at the decision, before this update's fit (0 under
     # the random scheduler).
-    label_q: jax.Array  # (capacity,)
+    label_q: jax.Array = None  # (capacity,)
+
+
+class SchedulerBatch(NamedTuple):
+    """The anytime scheduler's decisions of one rollout (`anytime_collection.py`),
+    on the main buffers' grid `(rounds, streams, goal_horizon, ...)`: one cell
+    per main step. `weight` is 1 on the cells where the scheduler decided and 0
+    elsewhere (no decision, or an uncollected window). `advantage` / `returns`
+    come from GAE over each stream's decisions in time order."""
+
+    x: jax.Array  # (..., N, actor_dim) every agent's manager actor input
+    pair: jax.Array  # (..., N, N, 2) pos_j - pos_i, goal_state units
+    glob: jax.Array  # (..., G) budget, slots, episode time, step in window
+    choice: jax.Array  # (...,) int: 0 skip, i + 1 a fork around agent i
+    recruit: jax.Array  # (..., N) bool
+    duration: jax.Array  # (...,) int: the fork's windows minus 1
+    kmax: jax.Array  # (...,) int: the longest allowed fork, in windows
+    log_prob: jax.Array  # (...,) at the decision
+    value: jax.Array  # (...,) the scheduler's value at the decision
+    reward: jax.Array  # (...,) the fork's paired gain at a placed launch, else 0
+    advantage: jax.Array  # (...,)
+    returns: jax.Array  # (...,)
+    weight: jax.Array  # (...,) float 0/1
 
 
 class Intervention(NamedTuple):
@@ -228,13 +294,22 @@ class Intervention(NamedTuple):
     env COLUMNS with the main buffers' time length, so `update_fn` can append
     them to the main batch along the env axis. Column e holds env e's forks, one
     per forked window, each around that window's focal agent; a window skipped by
-    `intervention_interval` holds fully masked placeholder rows."""
+    `intervention_interval` holds fully masked placeholder rows.
+
+    Under `intervention_scheduler: heuristic` the columns are packed instead
+    (`intervention_heuristic.pack`): row w of column c holds one fork, whatever
+    env and step it came from, recorded in `step` / `env`; unused rows are
+    masked."""
 
     worker: object  # mappo_jax Transition, (n_steps, n_envs, ...)
     manager: object  # mappo_jax Transition, (n_windows, n_envs, ...)
     focal: jax.Array  # (n_windows, L) int — agent i of each fork, 0 on skipped windows
     n_recruits: jax.Array  # (n_windows, L) int — N, 0 on skipped windows
     valid: jax.Array  # (n_windows, L) bool — placement succeeded (False if skipped)
+    # Heuristic only (None otherwise): each fork's main-rollout step (window *
+    # goal_horizon + k) and main env.
+    step: object = None
+    env: object = None
 
 
 class LastValues(NamedTuple):

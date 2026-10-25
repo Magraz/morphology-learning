@@ -7,6 +7,7 @@
 #   N_PARALLEL=2 bash train_batches.sh     # two trials at once, sharing the GPU
 #   N_PARALLEL=2 CPU_SLOTS="4 6" bash train_batches.sh   # and two on the CPU
 #   DRY_RUN=1 bash train_batches.sh        # list the trials, run nothing
+#   PROGRESS_INTERVAL=60 bash train_batches.sh   # progress every minute (0: off)
 #
 # train.sh passes checkpoint=true, so re-running this script resumes unfinished
 # trials. A finished trial loads its checkpoint, runs no updates and exits 0 (it
@@ -35,6 +36,18 @@
 # status and the slot it ran in, and the script exits 1 if any trial failed. A
 # trial that is already being trained by another process is skipped. Ctrl-C
 # stops every running trial.
+#
+# Every PROGRESS_INTERVAL seconds (default 300) the script prints how far each
+# running trial is, e.g.
+#
+#   [16:30:05] progress of 25 trials: 4 running, 10 done, 11 queued
+#     21.4% [####----------------] 2h05m left     gpu      <batch> / <experiment> / <trial>
+#
+# The percentage is the trainer's own "Steps: <done>/<total>" line, and the time
+# left comes from the speed over the trial's last 100 such lines. To see every
+# trial (done, failed and queued too) at any time, run
+#   bash scripts/train_batches_progress.sh [logs/train_batches/<timestamp>]
+# which reads the run's log directory (default: the latest run).
 
 BATCH_NAMES=(
 "mjx_3a_1o_1024_gs"
@@ -57,9 +70,11 @@ TRIAL_END=4
 N_PARALLEL=${N_PARALLEL:-1}
 CPU_SLOTS=${CPU_SLOTS:-}
 DRY_RUN=${DRY_RUN:-0}
+PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-300}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_DIR="${SCRIPT_DIR}/conf"
+source "${SCRIPT_DIR}/scripts/train_batches_progress.sh"
 
 # Check every Hydra config group exists before running anything.
 source "${SCRIPT_DIR}/scripts/check_conf_groups.sh"
@@ -73,6 +88,10 @@ fi
 
 if ! [[ "${N_PARALLEL}" =~ ^(0|[1-9][0-9]*)$ ]]; then
     echo "error: N_PARALLEL must be a non-negative integer, got '${N_PARALLEL}'" >&2
+    exit 1
+fi
+if ! [[ "${PROGRESS_INTERVAL}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "error: PROGRESS_INTERVAL must be a non-negative integer (seconds), got '${PROGRESS_INTERVAL}'" >&2
     exit 1
 fi
 
@@ -218,7 +237,15 @@ LOG_DIR="${SCRIPT_DIR}/logs/train_batches/${RUN_TIMESTAMP}"
 SUMMARY="${LOG_DIR}/summary.tsv"
 mkdir -p "${LOG_DIR}"
 printf 'status\tbatch\texperiment\ttrial\tdevice\tminutes\n' > "${SUMMARY}"
+# scripts/train_batches_progress.sh reads the trial list, and this script's pid
+# to tell a running run from one that was stopped.
+{
+    printf 'batch\texperiment\ttrial\n'
+    printf '%s\n' "${TRIALS[@]}" | tr ' ' '\t'
+} > "${LOG_DIR}/trials.tsv"
+echo $$ > "${LOG_DIR}/train_batches.pid"
 echo "logs: ${LOG_DIR}"
+echo "progress of every trial: bash scripts/train_batches_progress.sh ${LOG_DIR}"
 
 run_trial() {
     local batch=$1 experiment=$2 trial=$3 device=$4
@@ -230,14 +257,16 @@ run_trial() {
         launch=(env JAX_PLATFORMS=cpu taskset -c "${device#cpu:}")
     fi
     start=$(date +%s)
+    # The progress report reads the device of a running trial from this line.
+    echo "train_batches.sh: started $(date '+%F %T'), device ${device}" > "${log}"
     if (( ${#SLOT_DEVICE[@]} == 1 )); then
         # One trial at a time: also show its output live.
         "${launch[@]}" bash "${SCRIPT_DIR}/train.sh" "${batch}" "${ALGORITHM}" "" "${trial}" "${experiment}" 2>&1 \
-            | tee "${log}"
+            | tee -a "${log}"
         status=${PIPESTATUS[0]}
     else
         "${launch[@]}" bash "${SCRIPT_DIR}/train.sh" "${batch}" "${ALGORITHM}" "" "${trial}" "${experiment}" \
-            > "${log}" 2>&1
+            >> "${log}" 2>&1
         status=$?
     fi
     result=OK
@@ -284,17 +313,34 @@ already_running() {
 # SLOT_PID[i] is the job running in slot i (empty before its first trial).
 SLOT_PID=()
 
-# Sets SLOT to the first free slot, or to "" if every slot is busy. A slot is
-# free when its job is no longer among the running jobs.
+# True while slot $1's job is among the running jobs.
+slot_busy() {
+    [[ -n "${SLOT_PID[$1]}" && " $(jobs -rp | tr '\n' ' ') " == *" ${SLOT_PID[$1]} "* ]]
+}
+
+# Sets SLOT to the first free slot, or to "" if every slot is busy.
 find_free_slot() {
-    local i running
-    running=" $(jobs -rp | tr '\n' ' ') "
+    local i
     SLOT=""
     for i in "${!SLOT_DEVICE[@]}"; do
-        if [[ -z "${SLOT_PID[i]}" || "${running}" != *" ${SLOT_PID[i]} "* ]]; then
+        if ! slot_busy "${i}"; then
             SLOT=${i}
             return
         fi
+    done
+}
+
+# Prints the running trials' progress every PROGRESS_INTERVAL seconds, until it
+# is sent TERM. Sleeping in the background and waiting for it lets the TERM
+# trap run at once and exit quietly; a killed foreground sleep would print
+# "Terminated".
+progress_monitor() {
+    local nap
+    trap 'kill "${nap}" 2> /dev/null; exit 0' TERM
+    while :; do
+        sleep "${PROGRESS_INTERVAL}" & nap=$!
+        wait "${nap}" || exit 0
+        print_progress "${LOG_DIR}" running
     done
 }
 
@@ -302,6 +348,13 @@ find_free_slot() {
 # the whole tree (bash -> uv -> python) and not just the subshell.
 set -m
 trap stop_all INT TERM HUP QUIT
+
+# The monitor is a job too, so stop_all stops it with the trials.
+MONITOR_PID=""
+if (( PROGRESS_INTERVAL > 0 )); then
+    progress_monitor < /dev/null &
+    MONITOR_PID=$!
+fi
 
 for TRIAL in "${TRIALS[@]}"; do
     read -r BATCH_NAME EXPERIMENT TRIAL_ID <<< "${TRIAL}"
@@ -319,7 +372,18 @@ for TRIAL in "${TRIALS[@]}"; do
     run_trial "${BATCH_NAME}" "${EXPERIMENT}" "${TRIAL_ID}" "${SLOT_DEVICE[SLOT]}" < /dev/null &
     SLOT_PID[SLOT]=$!
 done
-wait
+# Wait for the last trials. A plain `wait` would also wait for the monitor,
+# which runs until it is stopped. wait -n returns at once for a job that ended
+# before it was called (checked on bash 5.2), so this cannot miss the last one.
+for i in "${!SLOT_DEVICE[@]}"; do
+    while slot_busy "${i}"; do
+        wait -n
+    done
+done
+if [[ -n "${MONITOR_PID}" ]]; then
+    kill "${MONITOR_PID}" 2> /dev/null
+    wait "${MONITOR_PID}"
+fi
 
 echo
 column -t -s $'\t' "${SUMMARY}" 2>/dev/null || cat "${SUMMARY}"

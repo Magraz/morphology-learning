@@ -57,6 +57,24 @@ adaptive collector (`adaptive_collection.py`): half of the batch's envs are
 persistent main streams, a scheduler decides at each main decision whether to
 fork it, and a skipped fork is replaced by an extra main window, so every update
 still collects exactly `n_steps * batch_envs` simulator steps.
+
+`heuristic` (`intervention_heuristic.py`) keeps the fixed collector but forks at
+any primitive step, mid-window included: wherever an agent is near or touching
+its closest undelivered box and that box's coupling is not met. Exactly the
+missing agents (the box's coupling minus the agents touching it, the focal agent
+counted) are teleported: the nearest teammates not touching the box. Every agent
+then re-decides its goal (`intervention_redecide: all` is required). Each main
+env keeps a uniform sample of at most `intervention_heuristic_budget` qualifying
+moments of its rollout, and those forks run after the main rollout. Their steps
+count toward the batch as above (`heuristic_main_envs`).
+
+`anytime` (`anytime_scheduler.py`, `anytime_collection.py`) runs persistent main
+streams like the adaptive collector, but a learned scheduler may launch a fork at
+any step of a main window: it picks the focal agent, the recruits and the fork's
+length in windows, from a budget of fork windows per stream. Every agent
+re-decides its goal at the fork's start (`intervention_redecide: all` is
+required), and the fork runs whole windows from there, bootstrapped at its end.
+`anytime_random` is the same with the scheduler frozen at its initialization.
 """
 
 import dataclasses
@@ -66,6 +84,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from algorithms.simplified_feudal_mappo_jax import anytime_scheduler as asch
 from algorithms.simplified_feudal_mappo_jax import intervention_bandit as ib
 
 # `fold_in` constant for every fork random draw, so enabling forks consumes no
@@ -79,19 +98,44 @@ REDECIDE_MODES = ("none", "focal", "all")
 # Scheduler fields and the schedulers they act under. A field set away from its
 # default under any other scheduler would silently do nothing, so it raises.
 _SCHEDULER_FIELDS = {
-    "intervention_bandit_hidden_dim": ("bandit",),
+    # The anytime schedulers size and train their own network with these two.
+    "intervention_bandit_hidden_dim": ("bandit",) + asch.ANYTIME_SCHEDULERS,
     "intervention_bandit_epsilon": ("bandit",),
-    "intervention_bandit_lr": ("bandit",),
+    "intervention_bandit_lr": ("bandit", "anytime"),
     # The target is also logged under `random`, as a diagnostic.
     "intervention_bandit_cost_coef": ("bandit", "random"),
     "intervention_bandit_zero_reward_penalty": ("bandit", "random"),
     "intervention_random_rate": ("random",),
+    "intervention_heuristic_budget": ("heuristic",),
+    "intervention_heuristic_trigger_margin": ("heuristic",),
+    "intervention_fork_budget": asch.ANYTIME_SCHEDULERS,
+    "intervention_scheduler_gamma": ("anytime",),
+    "intervention_scheduler_lambda": ("anytime",),
+    "intervention_scheduler_ent_coef": ("anytime",),
+    "intervention_scheduler_init_forks": asch.ANYTIME_SCHEDULERS,
 }
 
 
 def adaptive(config) -> bool:
     """True under the adaptive fork collector (`bandit` / `random` scheduler)."""
     return config.intervention_scheduler in ib.ADAPTIVE_SCHEDULERS
+
+
+def heuristic(config) -> bool:
+    """True under the heuristic fork rule (`intervention_heuristic.py`)."""
+    return config.interventions and config.intervention_scheduler == "heuristic"
+
+
+def anytime(config) -> bool:
+    """True under the anytime fork collector (`anytime` / `anytime_random`)."""
+    return config.intervention_scheduler in asch.ANYTIME_SCHEDULERS
+
+
+def streams(config) -> bool:
+    """True when the batch runs as `batch_envs / 2` persistent main streams whose
+    unspent fork capacity becomes main windows (the adaptive and anytime
+    collectors)."""
+    return adaptive(config) or anytime(config)
 
 
 def adaptive_main_envs(batch_envs: int) -> int:
@@ -132,6 +176,9 @@ def _validate_scheduler(config) -> None:
             f"decision; intervention_interval must be 1, got "
             f"{config.intervention_interval}"
         )
+    if scheduler == "heuristic":
+        _validate_heuristic(config)
+        return
     batch = config.intervention_batch_envs
     if batch is None or adaptive_main_envs(batch) != config.worker.n_envs:
         raise ValueError(
@@ -161,6 +208,64 @@ def _validate_scheduler(config) -> None:
     for name in ("intervention_bandit_cost_coef", "intervention_bandit_zero_reward_penalty"):
         if getattr(config, name) < 0:
             raise ValueError(f"{name} must be >= 0, got {getattr(config, name)}")
+    if anytime(config):
+        _validate_anytime(config)
+
+
+def _validate_anytime(config) -> None:
+    scheduler = config.intervention_scheduler
+    if config.intervention_redecide != "all":
+        raise ValueError(
+            f"intervention_scheduler={scheduler!r} re-decides every agent's goal in "
+            "the fork; intervention_redecide must be 'all', got "
+            f"{config.intervention_redecide!r}"
+        )
+    n_windows = config.worker.n_steps // config.goal_horizon
+    budget = config.intervention_fork_budget
+    if budget is not None and (int(budget) != budget or not 1 <= budget <= n_windows):
+        raise ValueError(
+            f"intervention_fork_budget must be an integer in [1, n_windows={n_windows}] "
+            f"(or None = n_windows), got {budget}"
+        )
+    for name in ("intervention_scheduler_gamma", "intervention_scheduler_lambda"):
+        if not 0.0 <= getattr(config, name) <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {getattr(config, name)}")
+    if not config.intervention_scheduler_ent_coef >= 0:
+        raise ValueError(
+            "intervention_scheduler_ent_coef must be >= 0, got "
+            f"{config.intervention_scheduler_ent_coef}"
+        )
+    # The initial launch probability per decision, init_forks / (2 n_steps).
+    init_forks = config.intervention_scheduler_init_forks
+    if not 0 < init_forks < 2 * config.worker.n_steps:
+        raise ValueError(
+            "intervention_scheduler_init_forks must be in (0, 2 * n_steps = "
+            f"{2 * config.worker.n_steps}), got {init_forks}"
+        )
+
+
+def _validate_heuristic(config) -> None:
+    if config.intervention_redecide != "all":
+        raise ValueError(
+            "intervention_scheduler='heuristic' re-decides every agent's goal in "
+            "the fork; intervention_redecide must be 'all', got "
+            f"{config.intervention_redecide!r}"
+        )
+    if config.intervention_batch_envs is not None:
+        raise ValueError(
+            "intervention_scheduler='heuristic' runs the fixed collector; "
+            f"intervention_batch_envs must be None, got {config.intervention_batch_envs}"
+        )
+    budget = config.intervention_heuristic_budget
+    if int(budget) != budget or budget < 1:
+        raise ValueError(
+            f"intervention_heuristic_budget must be an integer >= 1, got {budget}"
+        )
+    if not config.intervention_heuristic_trigger_margin >= 0:
+        raise ValueError(
+            "intervention_heuristic_trigger_margin must be >= 0, got "
+            f"{config.intervention_heuristic_trigger_margin}"
+        )
 
 
 def validate_interventions(config, env, n_windows: int) -> None:
@@ -204,6 +309,12 @@ def validate_interventions(config, env, n_windows: int) -> None:
             f"interventions need an env with a `teleport_agents` hook; "
             f"{type(env).__name__} has none. Supported: multi_box_push_mjx."
         )
+    if heuristic(config) and not hasattr(env, "box_contacts"):
+        raise ValueError(
+            "intervention_scheduler='heuristic' needs an env with a "
+            f"`box_contacts` hook; {type(env).__name__} has none. Supported: "
+            "multi_box_push_mjx."
+        )
     if int(interval) != interval or interval < 1:
         raise ValueError(f"intervention_interval must be an integer >= 1, got {interval}")
     if math.ceil(n_windows / interval) < 2:
@@ -217,8 +328,10 @@ def validate_interventions(config, env, n_windows: int) -> None:
 
 
 def context_dim(config, n_agents: int) -> int:
-    """Width of the manager critic's context block: 0 when forks are off."""
-    return n_agents + 2 if config.interventions else 0
+    """Width of the manager critic's context block: 0 when forks are off, and
+    under the anytime schedulers, whose every fork row bootstraps to the
+    continuing return, the target of a main row."""
+    return n_agents + 2 if config.interventions and not anytime(config) else 0
 
 
 def critic_context(n_agents: int, batch: int, focal=None, n_recruits=None):
@@ -287,7 +400,23 @@ def main_envs(n_envs: int, n_windows: int, interval: int) -> int:
     """
     if int(interval) != interval or interval < 1:
         raise ValueError(f"intervention_interval must be an integer >= 1, got {interval}")
-    forked = forked_windows(n_windows, int(interval))
+    return _fill_envs(n_envs, n_windows, forked_windows(n_windows, int(interval)))
+
+
+def heuristic_main_envs(n_envs: int, n_windows: int, budget: int) -> int:
+    """Main-rollout envs under the heuristic fork rule: every main env carries
+    `budget` fork lanes of one window each (`intervention_heuristic.py`), so E
+    main envs cost `E * (n_windows + budget)` window-lengths."""
+    if int(budget) != budget or budget < 1:
+        raise ValueError(
+            f"intervention_heuristic_budget must be an integer >= 1, got {budget}"
+        )
+    return _fill_envs(n_envs, n_windows, int(budget))
+
+
+def _fill_envs(n_envs: int, n_windows: int, forked: int) -> int:
+    """The env count E whose `E * (n_windows + forked)` window-lengths come
+    nearest the parent's `n_envs * n_windows` (at least one env)."""
     return max(1, round(n_envs * n_windows / (n_windows + forked)))
 
 
@@ -303,13 +432,19 @@ def simulator_steps_per_update(config) -> int:
     share when the interval does not divide evenly).
     """
     worker = config.worker
-    if adaptive(config):
-        # The adaptive collector fills exactly the batch's window slots, with
-        # main windows or forks (`adaptive_collection.py`).
+    if streams(config):
+        # The adaptive and anytime collectors fill exactly the batch's window
+        # slots, with main windows or fork windows (`adaptive_collection.py`,
+        # `anytime_collection.py`).
         return worker.n_steps * config.intervention_batch_envs
     main = worker.n_steps * worker.n_envs
     if not config.interventions:
         return main
+    if heuristic(config):
+        # Every fork lane is stepped, empty and failed ones included (masked).
+        return main + worker.n_envs * config.intervention_heuristic_budget * (
+            config.goal_horizon
+        )
     n_windows = worker.n_steps // config.goal_horizon
     n_forked = forked_windows(n_windows, config.intervention_interval)
     return main + n_forked * worker.n_envs * config.goal_horizon

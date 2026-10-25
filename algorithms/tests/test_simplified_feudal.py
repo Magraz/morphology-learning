@@ -65,6 +65,17 @@ class StubState(NamedTuple):
     delivered: jnp.ndarray  # (2,) bool, latched, as in MultiBoxPushMJX's EnvState
 
 
+class StubContacts(NamedTuple):
+    """The fields of `multi_box_push_mjx.BoxContacts`, for the stub's boxes."""
+
+    agent_pos: jnp.ndarray  # (N, 2)
+    clearance: jnp.ndarray  # (N, 2)
+    touching: jnp.ndarray  # (N, 2) bool
+    coupling: jnp.ndarray  # (2,) int
+    delivered: jnp.ndarray  # (2,) bool
+    goal_distance: jnp.ndarray  # (2,)
+
+
 class StubEnv:
     """Point agents that move `SPEED * clip(action)` per step.
 
@@ -150,6 +161,24 @@ class StubEnv:
             axis=-1,
         )
         return agents, boxes
+
+    # The heuristic fork rule's hook: the boxes as discs of radius BOX_HALF,
+    # touched within TOUCH_REACH of their surface (`box_contacts`).
+    BOX_HALF = 0.05
+    TOUCH_REACH = 0.05
+    COUPLING = (2, 3)
+
+    def box_contacts(self, state):
+        dist = jnp.linalg.norm(state.pos[:, None] - self.BOX_POS[None], axis=-1)
+        clearance = jnp.maximum(dist - self.BOX_HALF, 0.0) - self.TOUCH_REACH
+        return StubContacts(
+            agent_pos=state.pos,
+            clearance=clearance,
+            touching=clearance <= 0,
+            coupling=jnp.asarray(self.COUPLING, jnp.int32),
+            delivered=state.delivered,
+            goal_distance=0.5 - self.BOX_POS[:, 1],
+        )
 
 
 def _config(

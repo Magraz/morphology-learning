@@ -1,0 +1,22 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions_anytime`:
+# intervention_scheduler anytime -> anytime_random.
+#
+# The matched control of the anytime scheduler: the same collector, budget,
+# forks and update, with the scheduler frozen at its initialization. It
+# launches at the rate `intervention_scheduler_init_forks` sets (~2 per stream
+# per update), around a uniformly drawn focal agent, each teammate recruited
+# with probability 1/2 (conditioned on at least one), for a uniform length in
+# 1..kmax windows. Set `intervention_scheduler_init_forks` in a child group to
+# match the learned arm's realized `scheduler_launched` per stream.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_anytime_random \
+#       trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions_anytime
+  - _self_
+
+model_params:
+  intervention_scheduler: anytime_random

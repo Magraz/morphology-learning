@@ -1,0 +1,53 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions`:
+# intervention_scheduler fixed -> heuristic, intervention_redecide none -> all.
+#
+# A fixed coalition rule chooses where training forks start
+# (algorithms/simplified_feudal_mappo_jax/intervention_heuristic.py):
+#   * at ANY primitive step of the main rollout, mid goal horizon included;
+#   * the focal agent is one whose closest undelivered box is within touch
+#     range + `intervention_heuristic_trigger_margin` world units (touching
+#     included) and whose box does not have its coupling met;
+#   * N = the box's coupling minus the agents touching it (the focal agent
+#     counted), and the N teammates nearest the focal agent among those not
+#     touching the box are teleported next to it;
+#   * every agent then re-decides its goal from the post-teleport state, every
+#     agent's manager row trains, and the fork bootstraps like the main rollout
+#     (one goal horizon of steps, then gamma_M^c V^M);
+#   * each main env keeps a uniform random sample of at most
+#     `intervention_heuristic_budget` of its rollout's qualifying moments.
+# Boxes that need one agent never qualify, so on 2a/4o `1122` only the
+# coupling-2 boxes fork (N = 1); on 6a/4o `[4,3,3,2]` N is 1 to 3.
+#
+# The forks count toward the batch: at 33 windows and budget 5 the main rollout
+# runs 28 of the env group's 32 envs, 34,048 simulator steps per update (main
+# plus 140 fork lanes; parent 33,792), 2937 updates at 1e8. Matched control:
+# the parent `simplified_feudal_tanh_relative_input` on the same env group.
+# Execution and evaluation are unchanged.
+#
+# Read first: `intervention_event_rate` and `intervention_budget_frac` (does the
+# rule find moments?), `intervention_valid_frac` and its per-N split (can the
+# recruits be placed beside a box?), `intervention_window_start_frac` (forks
+# should mostly start mid-window), then the outcomes:
+# `intervention_start_met_frac` (coupling met right after the teleport),
+# `intervention_box_delivered_frac`, `intervention_box_progress`, and
+# `intervention_paired_gain` (fork minus the main env's discounted team reward
+# over the same steps; it mixes the help with the immediate re-decision).
+#
+# The knobs leave checkpoints shape-identical; a heuristic checkpoint records
+# them and refuses a resume under other settings. Set them in a child model
+# group, never on the CLI.
+# Plan: /home/magraz/.claude/plans/peaceful-stargazing-meteor.md (2026-10-24).
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_6a_4o_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_heuristic trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions
+  - _self_
+
+model_params:
+  intervention_scheduler: heuristic
+  intervention_redecide: all    # every agent re-decides after the teleport
+  intervention_heuristic_budget: 5            # forks per main env per update
+  intervention_heuristic_trigger_margin: 0.5  # world units beyond touch range

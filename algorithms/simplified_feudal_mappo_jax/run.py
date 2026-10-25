@@ -19,6 +19,7 @@ from flax.serialization import from_bytes, msgpack_restore, to_bytes
 from algorithms.mappo_jax.run import MAPPO_JAX_Runner, make_env
 from algorithms.mappo_jax.trainer import RunnerState, global_state_dim
 from algorithms.mappo_jax.types import MAPPOConfig
+from algorithms.simplified_feudal_mappo_jax import anytime_scheduler as asch
 from algorithms.simplified_feudal_mappo_jax import intervention_bandit as ib
 from algorithms.simplified_feudal_mappo_jax import interventions as iv
 from algorithms.simplified_feudal_mappo_jax.trainer import (
@@ -67,15 +68,27 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
       `intervention_random_rate` knobs choose who decides which windows fork
       (`intervention_bandit.py`); "fixed" is the original behaviour. The adaptive
       schedulers keep the batch width in `intervention_batch_envs` and run half
-      of it as persistent main streams (`adaptive_collection.py`).
+      of it as persistent main streams (`adaptive_collection.py`). The
+      "heuristic" scheduler and its `intervention_heuristic_*` knobs fork by a
+      fixed coalition rule (`intervention_heuristic.py`); its main rollout runs
+      `interventions.heuristic_main_envs(...)` envs. The "anytime" schedulers
+      and their `intervention_fork_budget` / `intervention_scheduler_*` knobs
+      run persistent main streams like the adaptive ones
+      (`anytime_collection.py`).
     """
     horizon = int(model_params.goal_horizon)
     n_steps = math.ceil(params.n_steps / horizon) * horizon
     scheduler = str(model_params.intervention_scheduler)
     batch_envs = None
-    if model_params.interventions and scheduler in ib.ADAPTIVE_SCHEDULERS:
+    if model_params.interventions and (
+        scheduler in ib.ADAPTIVE_SCHEDULERS or scheduler in asch.ANYTIME_SCHEDULERS
+    ):
         batch_envs = int(n_envs)
         n_envs = iv.adaptive_main_envs(batch_envs)
+    elif model_params.interventions and scheduler == "heuristic":
+        n_envs = iv.heuristic_main_envs(
+            n_envs, n_steps // horizon, model_params.intervention_heuristic_budget
+        )
     elif model_params.interventions:
         n_envs = iv.main_envs(
             n_envs, n_steps // horizon, model_params.intervention_interval
@@ -139,6 +152,21 @@ def make_feudal_config(params: Params, model_params: Model_Params, n_envs: int):
             model_params.intervention_bandit_zero_reward_penalty
         ),
         intervention_random_rate=float(model_params.intervention_random_rate),
+        intervention_heuristic_budget=int(model_params.intervention_heuristic_budget),
+        intervention_heuristic_trigger_margin=float(
+            model_params.intervention_heuristic_trigger_margin
+        ),
+        intervention_fork_budget=(
+            None
+            if model_params.intervention_fork_budget is None
+            else int(model_params.intervention_fork_budget)
+        ),
+        intervention_scheduler_gamma=float(model_params.intervention_scheduler_gamma),
+        intervention_scheduler_lambda=float(model_params.intervention_scheduler_lambda),
+        intervention_scheduler_ent_coef=float(model_params.intervention_scheduler_ent_coef),
+        intervention_scheduler_init_forks=float(
+            model_params.intervention_scheduler_init_forks
+        ),
     )
 
 
@@ -214,7 +242,43 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
                 "all": "every goal re-decided after the teleport, bootstrapped",
             }[self.feudal_config.intervention_redecide]
             fc = self.feudal_config
-            if iv.adaptive(fc):
+            if iv.anytime(fc):
+                rule = (
+                    f"learned (hidden={fc.intervention_bandit_hidden_dim}, "
+                    f"lr={fc.intervention_bandit_lr}, "
+                    f"gamma={fc.intervention_scheduler_gamma}, "
+                    f"lambda={fc.intervention_scheduler_lambda}, "
+                    f"ent_coef={fc.intervention_scheduler_ent_coef})"
+                    if fc.intervention_scheduler == "anytime"
+                    else "random (frozen at initialization)"
+                )
+                print(
+                    f"  interventions: anytime scheduler {rule}, may fork at any "
+                    f"step of a main window, choosing the focal agent, the recruits "
+                    f"and 1..{asch.fork_budget(fc)} windows from a budget of "
+                    f"{asch.fork_budget(fc)} fork windows per stream "
+                    f"(~{fc.intervention_scheduler_init_forks} launches per stream "
+                    f"at init), radius={fc.intervention_radius} world units, every "
+                    f"goal re-decided at the fork's start | n_envs {batch_envs} -> "
+                    f"{worker.n_envs} persistent main streams | "
+                    f"{self._steps_per_update()} simulator steps per update (main "
+                    f"windows + fork windows)"
+                )
+            elif iv.heuristic(fc):
+                print(
+                    f"  interventions: heuristic, up to "
+                    f"{fc.intervention_heuristic_budget} forks per main env per update "
+                    f"at any step where an agent is within touch range + "
+                    f"{fc.intervention_heuristic_trigger_margin} world units of its "
+                    f"closest undelivered box and that box is short of agents; N = "
+                    f"the missing agents (nearest teammates), "
+                    f"radius={fc.intervention_radius} world units, {goal_timing} | "
+                    f"n_envs {batch_envs} -> {worker.n_envs} main | "
+                    f"{self._steps_per_update()} simulator steps per update "
+                    f"({n_steps * worker.n_envs} main; batch target "
+                    f"{n_steps * batch_envs})"
+                )
+            elif iv.adaptive(fc):
                 rule = (
                     f"bandit (hidden={fc.intervention_bandit_hidden_dim}, "
                     f"epsilon={fc.intervention_bandit_epsilon}, "
@@ -305,9 +369,10 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         return tree
 
     # The fork scheduler's settings change no parameter shape, so a checkpoint
-    # alone cannot tell which scheduler wrote it. Adaptive runs therefore store
-    # them (`scheduler_meta`), and a resume under other settings raises. Fixed-
-    # scheduler checkpoints carry no such entry and are written as before.
+    # alone cannot tell which scheduler wrote it. Adaptive and heuristic runs
+    # therefore store them (`scheduler_meta`, each its own field list), and a
+    # resume under other settings raises. Fixed-scheduler checkpoints carry no
+    # such entry and are written as before.
     _SCHEDULER_META_FIELDS = (
         "intervention_scheduler", "intervention_batch_envs",
         "intervention_bandit_hidden_dim", "intervention_bandit_epsilon",
@@ -316,23 +381,47 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         "intervention_redecide",
     )
 
-    def _scheduler_meta(self):
+    _HEURISTIC_META_FIELDS = (
+        "intervention_scheduler", "intervention_heuristic_budget",
+        "intervention_heuristic_trigger_margin", "intervention_redecide",
+    )
+
+    # `intervention_fork_budget` is recorded resolved (None = n_windows).
+    _ANYTIME_META_FIELDS = (
+        "intervention_scheduler", "intervention_batch_envs", "intervention_redecide",
+        "intervention_radius", "intervention_fork_budget",
+        "intervention_bandit_hidden_dim", "intervention_bandit_lr",
+        "intervention_scheduler_gamma", "intervention_scheduler_lambda",
+        "intervention_scheduler_ent_coef", "intervention_scheduler_init_forks",
+    )
+
+    def _scheduler_meta_fields(self):
         config = self.feudal_config
-        if not iv.adaptive(config):
+        if iv.adaptive(config):
+            return self._SCHEDULER_META_FIELDS
+        if iv.heuristic(config):
+            return self._HEURISTIC_META_FIELDS
+        if iv.anytime(config):
+            return self._ANYTIME_META_FIELDS
+        return None
+
+    def _scheduler_meta(self):
+        config, fields = self.feudal_config, self._scheduler_meta_fields()
+        if fields is None:
             return None
         codes = {
             "intervention_scheduler": ib.SCHEDULERS,
             "intervention_redecide": iv.REDECIDE_MODES,
         }
-        return np.array(
-            [
-                codes[name].index(getattr(config, name))
-                if name in codes
-                else float(getattr(config, name))
-                for name in self._SCHEDULER_META_FIELDS
-            ],
-            np.float64,
-        )
+
+        def value(name):
+            if name in codes:
+                return codes[name].index(getattr(config, name))
+            if name == "intervention_fork_budget":
+                return asch.fork_budget(config)
+            return float(getattr(config, name))
+
+        return np.array([value(name) for name in fields], np.float64)
 
     def _check_scheduler_meta(self, raw: dict, path):
         meta, stored = self._scheduler_meta(), raw.get("scheduler_meta")
@@ -340,8 +429,9 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
             return
         if meta is None:
             raise ValueError(
-                f"{path} was written by an adaptive fork-scheduler run; this "
-                "config uses intervention_scheduler='fixed'"
+                f"{path} was written by an adaptive fork-scheduler run (or a "
+                "heuristic or anytime one); this config uses "
+                "intervention_scheduler='fixed'"
             )
         if stored is None:
             raise ValueError(
@@ -353,8 +443,8 @@ class Simplified_Feudal_MAPPO_JAX_Runner(MAPPO_JAX_Runner):
         if stored.shape != meta.shape or not np.array_equal(stored, meta):
             raise ValueError(
                 f"{path} was written under other fork-scheduler settings: "
-                f"{dict(zip(self._SCHEDULER_META_FIELDS, stored.tolist()))} vs "
-                f"this config's {dict(zip(self._SCHEDULER_META_FIELDS, meta.tolist()))} "
+                f"{stored.tolist()} vs this config's "
+                f"{dict(zip(self._scheduler_meta_fields(), meta.tolist()))} "
                 "(scheduler and redecide are codes into intervention_bandit."
                 "SCHEDULERS and interventions.REDECIDE_MODES)"
             )

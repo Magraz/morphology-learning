@@ -30,8 +30,12 @@ import optax
 from flax.training.train_state import TrainState
 
 # `intervention_scheduler`: "fixed" is the original fork at every
-# `intervention_interval`-th decision; the other two run the adaptive collector.
-SCHEDULERS = ("fixed", "bandit", "random")
+# `intervention_interval`-th decision; "bandit" and "random" run the adaptive
+# collector; "heuristic" forks by a fixed coalition rule at any step of the
+# fixed collector (`intervention_heuristic.py`); "anytime" / "anytime_random"
+# run the anytime collector (`anytime_collection.py`). Append new names:
+# checkpoints record a scheduler by its index here.
+SCHEDULERS = ("fixed", "bandit", "random", "heuristic", "anytime", "anytime_random")
 ADAPTIVE_SCHEDULERS = ("bandit", "random")
 
 # The bandit's optimizer and loss, in one place (the plan's defaults). One pass

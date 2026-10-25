@@ -94,6 +94,8 @@ Demo / sanity check (no display needed):
 import dataclasses
 import math
 from enum import StrEnum
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import mujoco
@@ -159,6 +161,19 @@ class VARIANTS(StrEnum):
 
     TRUNC = "trunc"  # boundary hits are inert (never end the episode); no drift
     DRIFT = "drift"  # the above + uncoupled boxes decay toward the bottom wall
+
+
+class BoxContacts(NamedTuple):
+    """Agent-to-box contact geometry of one UNBATCHED state (`box_contacts`)."""
+
+    agent_pos: jax.Array  # (A, 2) world units
+    # (A, O) surface distance minus touch range (agent radius + touch eps):
+    # <= 0 exactly where `touching` is set.
+    clearance: jax.Array
+    touching: jax.Array  # (A, O) bool, the env's own touch test
+    coupling: jax.Array  # (O,) int, agents a box needs at once
+    delivered: jax.Array  # (O,) bool, latched
+    goal_distance: jax.Array  # (O,) signed distance to the goal, world units
 
 
 @jax.tree_util.register_dataclass
@@ -702,6 +717,31 @@ class MultiBoxPushMJX:
         if active is not None:
             touch = touch & active[:, None]
         return touch.sum(axis=0) >= self._coupling  # (O,)
+
+    def box_contacts(self, state: EnvState) -> BoxContacts:
+        """Agent-to-box contact geometry for one UNBATCHED `EnvState`.
+
+        The simplified feudal stack's heuristic fork rule
+        (`simplified_feudal_mappo_jax/intervention_heuristic.py`) reads it to
+        find agents near an under-staffed box. `touching` is `_touch_matrix`
+        itself, and `clearance` is measured from the same surface distance
+        (`observation.box_surface_distance`), so the rule and the coupling
+        mechanic agree on who is touching. An unconditional method, like
+        `entity_state`: nothing tests for it with `hasattr` to size a network.
+        """
+        d = state.data
+        agent_pos = self._agent_pos(d)  # (A, 2)
+        box_pos, box_yaw = self._box_pose(d)
+        reach = self.obs_builder.agent_radius + self.obs_builder.touch_eps
+        dist = box_surface_distance(agent_pos, box_pos, box_yaw, self._box_half)
+        return BoxContacts(
+            agent_pos=agent_pos,
+            clearance=dist - reach,
+            touching=self._touch_matrix(agent_pos, box_pos, box_yaw),
+            coupling=self._coupling,
+            delivered=state.delivered,
+            goal_distance=self._box_goal_distance(box_pos),
+        )
 
     def _drift_force(self, data, met, delivered) -> jnp.ndarray:
         """(O,) <= 0 generalized force on each box's world-y slide DOF.

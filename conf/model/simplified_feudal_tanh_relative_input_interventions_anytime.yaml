@@ -1,0 +1,56 @@
+# @package _global_
+# Delta from `simplified_feudal_tanh_relative_input_interventions_redecide_all`:
+# intervention_scheduler fixed -> anytime.
+#
+# A learned scheduler (algorithms/simplified_feudal_mappo_jax/
+# anytime_scheduler.py) may launch a training fork at ANY step of a main window,
+# not only at a manager decision. At each step it either skips or picks:
+#   * the focal agent i;
+#   * the teammates to teleport next to agent i (at least one);
+#   * the fork's length k in goal windows, 1..kmax, where kmax is the stream's
+#     remaining budget, capped by its free slots and the windows left before
+#     the episode's time limit.
+# The budget is `intervention_fork_budget` fork windows per main stream per
+# update (null = n_windows); unspent budget becomes ordinary main windows, so
+# every update is exactly the parent's 33,792 simulator steps (2a/4o), on 16
+# persistent main streams (anytime_collection.py).
+#
+# At the fork's start every agent re-decides its goal from the post-teleport
+# state, and the fork runs k whole windows from there, bootstrapped at its end.
+# Every agent's fork rows train both levels. The manager critic reads no fork
+# context block (every fork row's target is a continuing return), so its
+# width is the parent's.
+#
+# The scheduler's reward per placed fork is the paired gain: the fork's
+# discounted raw team reward minus the main rollout's over the same span from
+# the same state, plus the difference of their manager values at the span's
+# end. It is trained by PPO with GAE over its own decisions within a rollout,
+# so its value can price the budget.
+#
+# Read first: `scheduler_launched`, `scheduler_fork_slot_frac`,
+# `scheduler_mean_duration`, then `anytime_gain` / `anytime_gain_positive_frac`.
+# Controls on the same env group: `..._interventions_anytime_random` (the same
+# collector, scheduler frozen at initialization) and `..._adaptive_skip` (the
+# same 16 x 66 main schedule, never forks). The knobs below leave the parameter
+# shapes unchanged except `intervention_fork_budget` and the hidden width: set
+# them in a one-key child group, never on the CLI (the checkpoint records them
+# and refuses another setting).
+# Plan: /home/magraz/.claude/plans/i-want-to-create-breezy-wind.md.
+#
+#   uv run python train.py algorithm=simplified_feudal_mappo_jax \
+#       env=mjx_2a_4o_1122_1024_gs \
+#       model=simplified_feudal_tanh_relative_input_interventions_anytime trial_id=0
+defaults:
+  - simplified_feudal_tanh_relative_input_interventions_redecide_all
+  - _self_
+
+model_params:
+  intervention_scheduler: anytime
+  # Defaults, declared so the values are visible and child groups can set them.
+  intervention_fork_budget: null          # fork windows per stream; null = n_windows
+  intervention_scheduler_gamma: 1.0       # per decision; 0 = a one-step bandit
+  intervention_scheduler_lambda: 0.95
+  intervention_scheduler_ent_coef: 0.01
+  intervention_scheduler_init_forks: 2.0  # launches per stream per update at init
+  intervention_bandit_hidden_dim: 32
+  intervention_bandit_lr: 3.0e-4
