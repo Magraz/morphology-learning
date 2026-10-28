@@ -9,6 +9,28 @@ conda install -c conda-forge libspatialindex
 
 uv pip install -r requirements.txt 
 
+### Trained rover trajectories
+
+Render saved `rmappo` and `mappo_mlp` policies with the normal view command
+(both model groups use `algorithm=rmappo_jax`):
+
+```bash
+uv run python train.py -m algorithm=rmappo_jax env=rover_2poi_c2 \
+  model=rmappo,mappo_mlp trial_id=0 view=true
+```
+
+Each trial writes `arena.png` and three `trajectory_seed<seed>.png` files to
+`experiments/results/<env>/<model>/<trial_id>/logs/rover/`. The trajectory plots
+show rover paths, POI payouts and cumulative team reward. Actions are
+deterministic; the recurrent policy keeps its GRU state across steps and resets
+it between episodes. Reset seeds are the trial's training seed + 1, + 2 and + 3,
+so the two models use the same starts when comparing the same trial.
+
+Change `env` and `trial_id` to select another trained run. The loader uses
+`models_finished.msgpack` if present, otherwise `models_checkpoint.msgpack`.
+Use the same environment and model overrides as training. For CPU rendering,
+prefix the command with `JAX_PLATFORMS=cpu`.
+
 ### Feudal goal visualization
 
 Calling `view()` with `feudal_mappo_jax` saves one plot per agent as

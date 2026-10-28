@@ -5,18 +5,7 @@ hydra:
     dir: .
     subdir: .
   launcher:
-    _target_: hydra_plugins.hydra_joblib_launcher.joblib_launcher.JoblibLauncher
-    n_jobs: ${n_jobs}
-    backend: null
-    prefer: processes
-    require: null
-    verbose: 0
-    timeout: null
-    pre_dispatch: 2*n_jobs
-    batch_size: auto
-    temp_folder: null
-    max_nbytes: null
-    mmap_mode: r
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
   sweeper:
     _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
     max_batch_size: null
@@ -118,22 +107,17 @@ hydra:
   output_subdir: null
   overrides:
     hydra:
-    - hydra/launcher=joblib_auto
     - hydra.mode=MULTIRUN
     task:
-    - algorithm=mappo
-    - env=multi_box_push_9a_3o
-    - model=mlp_shared,mlp
+    - algorithm=rmappo_jax
+    - env=rover_2poi_c8
+    - model=rmappo,mappo_mlp
     - trial_id=0
-    - device=cpu
-    - n_jobs=2
-    - env.n_envs=2
-    - params.n_steps=64
-    - params.n_total_steps=256
+    - view=true
   job:
     name: train
     chdir: false
-    override_dirname: algorithm=mappo,device=cpu,env.n_envs=2,env=multi_box_push_9a_3o,model=mlp_shared,mlp,n_jobs=2,params.n_steps=64,params.n_total_steps=256,trial_id=0
+    override_dirname: algorithm=rmappo_jax,env=rover_2poi_c8,model=rmappo,mappo_mlp,trial_id=0,view=true
     id: ???
     num: ???
     config_name: config
@@ -162,8 +146,8 @@ hydra:
     choices:
       seeds: standard
       model: mlp_shared
-      env: multi_box_push_9a_3o
-      algorithm: mappo
+      env: rover_2poi_c8
+      algorithm: rmappo_jax
       hydra/env: default
       hydra/callbacks: null
       hydra/job_logging: default
@@ -171,22 +155,37 @@ hydra:
       hydra/hydra_help: default
       hydra/help: default
       hydra/sweeper: basic
-      hydra/launcher: joblib_auto
+      hydra/launcher: basic
       hydra/output: default
   verbose: false
-algorithm: mappo
+algorithm: rmappo_jax
 params:
-  n_epochs: 6
-  n_total_steps: 256
-  n_minibatches: 8
-  n_steps: 64
+  n_epochs: 15
+  n_minibatches: 1
+  n_steps: 200
+  n_total_steps: 10000000.0
   parameter_sharing: true
-  lr: 0.0003
+  lr: 0.0005
+  critic_lr: 0.0005
+  opti_eps: 1.0e-05
   gamma: 0.99
   lmbda: 0.95
   eps_clip: 0.2
   ent_coef: 0.01
-  grad_clip: 0.5
+  val_coef: 1.0
+  use_max_grad_norm: true
+  grad_clip: 10.0
+  use_valuenorm: true
+  use_huber_loss: true
+  huber_delta: 10.0
+  use_clipped_value_loss: true
+  use_value_active_masks: true
+  use_policy_active_masks: true
+  use_proper_time_limits: false
+  use_linear_lr_decay: false
+  data_chunk_length: 10
+  n_eval_episodes: 32
+  eval_interval: 25
   random_seeds:
   - 118
   - 1234
@@ -219,26 +218,49 @@ params:
   - 1390
   - 5571
 model_params:
-  hidden_dim: 168
+  hidden_size: 64
+  layer_N: 1
+  use_ReLU: true
+  use_feature_normalization: true
+  gain: 0.01
+  recurrent_N: 1
   critic_type: mlp
 env:
-  environment: multi_box_push
-  n_agents: 9
-  n_objects: 3
-  reward_mode: dense
-  n_envs: 2
-hyperedges:
-  proximity:
-  - proximity
-  contact:
-  - contact
-  mix:
-  - proximity
-  - contact
+  environment: rover
+  n_envs: 32
+  n_agents: 16
+  max_steps: 100
+  world_size:
+  - 10.0
+  - 10.0
+  spawn_region: null
+  dynamics:
+    max_speed: 0.5
+    max_turn: 0.7853981633974483
+  observation:
+    type: sector_density
+    n_sectors: 8
+    sensor_radius: 3.0
+  reward:
+    type: coupling_depletion
+  pois:
+    type: static
+    radius: 1.0
+    value: 1.0
+    rate: 0.05
+    entries:
+    - position:
+      - 2.0
+      - 8.0
+      coupling: 8
+    - position:
+      - 8.0
+      - 2.0
+      coupling: 8
 device: cpu
 trial_id: 0
-view: false
+view: true
 checkpoint: false
 evaluate: false
 debug: false
-n_jobs: 2
+n_jobs: 1

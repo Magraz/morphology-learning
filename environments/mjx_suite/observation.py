@@ -41,6 +41,7 @@ import numpy as np
 from mujoco import mjx
 
 from environments.box2d_suite.observation import BASE_OBS_DIM, N_LIDAR_RAYS, OBS_DIM
+from environments.sectors import sector_onehot
 
 __all__ = [
     "BASE_OBS_DIM",
@@ -198,13 +199,12 @@ class MJXObservationBuilder:
         """
         R = self.sector_sensor_radius
         shift = jnp.radians(22.5)
-        step = 2 * jnp.pi / N_SECTORS
 
         def sector_block(rel, in_range):
             # rel (A, N, 2), in_range (A, N) -> (A, 8)
-            ang = (jnp.arctan2(rel[..., 1], rel[..., 0]) - shift) % (2 * jnp.pi)
-            sect = (ang // step).astype(jnp.int32) % N_SECTORS
-            onehot = jax.nn.one_hot(sect, N_SECTORS) * in_range[..., None]  # (A,N,8)
+            onehot = sector_onehot(
+                jnp.arctan2(rel[..., 1], rel[..., 0]) - shift, in_range, N_SECTORS
+            )  # (A,N,8)
             count = onehot.sum(axis=1)  # (A, 8)
             sum_rel = jnp.einsum("ans,anc->asc", onehot, rel)  # (A, 8, 2)
             centroid_dist = jnp.linalg.norm(

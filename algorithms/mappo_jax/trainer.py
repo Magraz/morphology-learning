@@ -16,7 +16,7 @@ The structure deliberately mirrors ``mappo_vanilla``'s trainer components:
   per-episode returns accumulated until each episode first finishes.
 """
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,110 @@ def global_state_fn(env):
         _v_gs = jax.vmap(env.global_state)
         return lambda obs, env_state: _v_gs(env_state)
     return lambda obs, env_state: obs.reshape(obs.shape[0], -1)
+
+
+def per_agent_rewards(env) -> bool:
+    """Whether `env`'s `step` reward is per agent rather than a team scalar.
+
+    The macro wrapper says so directly (`per_agent_rewards`); the box-push envs
+    are per agent only under `reward_mode="difference_rewards"`. An env with
+    neither attribute (the rover domain) returns a team scalar.
+    """
+    return bool(
+        getattr(
+            env,
+            "per_agent_rewards",
+            getattr(env, "reward_mode", None) == "difference_rewards",
+        )
+    )
+
+
+def restart_done_envs(v_reset, reset_rng, n_envs, done, obs, env_state):
+    """Restart every env whose episode ended this step.
+
+    The MJX envs do not auto-reset, so the collector restarts finished envs to
+    keep the rollout going with fresh episodes (vanilla's gymnasium vec env does
+    this). `lax.cond` skips the reset work on the common no-done step. Shared by
+    every collector built on this stack (`mappo_jax`, `rmappo_jax`).
+
+    Args:
+        v_reset: `jax.vmap(env.reset)`
+        reset_rng: key split into one reset key per env
+        done: (n_envs,) bool — which envs finished this step
+        obs, env_state: the post-step observation and state to select into
+    """
+
+    def _restart(operand):
+        cur_obs, cur_state = operand
+        reset_obs, reset_state = v_reset(jax.random.split(reset_rng, n_envs))
+
+        def _select(r, c):
+            d = done.reshape((-1,) + (1,) * (c.ndim - 1))
+            return jnp.where(d, r, c)
+
+        return _select(reset_obs, cur_obs), jax.tree.map(
+            _select, reset_state, cur_state
+        )
+
+    return jax.lax.cond(
+        done.any(), _restart, lambda operand: operand, (obs, env_state)
+    )
+
+
+class EvalPolicy(NamedTuple):
+    """The deterministic policy `make_eval_fn` runs.
+
+    `init(train_state, n_episodes) -> carry` builds the policy's per-episode
+    state (`None` for a feedforward policy, the zeroed GRU hidden states for a
+    recurrent one) and `act(train_state, carry, obs, env_state) -> (carry,
+    actions)` takes one deterministic step. `env_state` is passed so a policy can
+    fetch the legal-action mask of the state it acts from.
+    """
+
+    init: Callable
+    act: Callable
+
+
+def make_eval_fn(env, n_episodes: int, policy: EvalPolicy):
+    """Jitted `eval_fn(train_state, rng) -> mean team return` over `n_episodes`
+    deterministic parallel episodes (PolicyEvaluator parity).
+
+    Each env runs one episode for exactly `env.max_steps` steps (jit needs a
+    static bound); finished episodes keep stepping with their rewards masked
+    out, like vanilla's `finished`. Shared by `mappo_jax` and `rmappo_jax`.
+    """
+
+    @jax.jit
+    def eval_fn(train_state, rng: jax.Array):
+        keys = jax.random.split(rng, n_episodes)
+        obs, env_state = jax.vmap(env.reset)(keys)
+        finished = jnp.zeros(n_episodes, dtype=bool)
+        episode_rewards = jnp.zeros(n_episodes)
+        carry = policy.init(train_state, n_episodes)
+
+        def _eval_step(scan_carry, _):
+            obs, env_state, finished, episode_rewards, carry = scan_carry
+            carry, actions = policy.act(train_state, carry, obs, env_state)
+            next_obs, next_env_state, _, terminated, truncated, info = jax.vmap(
+                env.step
+            )(env_state, actions)
+            # Always score eval on the team reward: under difference rewards the
+            # env's `reward` is per-agent, and a policy must still be judged by
+            # what the team achieved.
+            reward = info["task_reward"]
+            episode_rewards = episode_rewards + jnp.where(finished, 0.0, reward)
+            finished = finished | terminated | truncated
+            return (next_obs, next_env_state, finished, episode_rewards, carry), None
+
+        (_, _, _, episode_rewards, _), _ = jax.lax.scan(
+            _eval_step,
+            (obs, env_state, finished, episode_rewards, carry),
+            None,
+            length=env.max_steps,
+        )
+        return episode_rewards.mean()
+
+    return eval_fn
 
 
 def make_train(config: MAPPOConfig, env):
@@ -218,24 +322,8 @@ def make_train(config: MAPPOConfig, env):
 
         # The MJX env does not auto-reset; restart finished envs so the rollout
         # continues with fresh episodes (vanilla's gymnasium vec env does this).
-        # lax.cond skips the reset work on the common no-done step.
-        def _restart_done(operand):
-            cur_obs, cur_state = operand
-            reset_obs, reset_state = v_reset(
-                jax.random.split(reset_rng, config.n_envs)
-            )
-
-            def _select(r, c):
-                d = done.reshape((-1,) + (1,) * (c.ndim - 1))
-                return jnp.where(d, r, c)
-
-            return _select(reset_obs, cur_obs), jax.tree.map(
-                _select, reset_state, cur_state
-            )
-
-        next_obs, next_env_state = jax.lax.cond(
-            done.any(), _restart_done, lambda operand: operand,
-            (next_obs, next_env_state),
+        next_obs, next_env_state = restart_done_envs(
+            v_reset, reset_rng, config.n_envs, done, next_obs, next_env_state
         )
 
         # Per-agent activity mask. SyncMacroMJX's staggered-starts mode emits
@@ -348,45 +436,25 @@ def make_train(config: MAPPOConfig, env):
 
     # ------------------------------------------------------------------ eval
 
-    @jax.jit
-    def eval_fn(train_state: ActorCriticTrainState, rng: jax.Array):
-        """Deterministic parallel-episode evaluation (PolicyEvaluator parity)."""
-        keys = jax.random.split(rng, config.n_eval_episodes)
-        obs, env_state = jax.vmap(env.reset)(keys)
-        finished = jnp.zeros(config.n_eval_episodes, dtype=bool)
-        episode_rewards = jnp.zeros(config.n_eval_episodes)
-
-        def _eval_step(carry, _):
-            obs, env_state, finished, episode_rewards = carry
-            # The mask matters more here than in collection: an unmasked argmax picks
-            # the single highest logit even when that action is illegal, so eval would
-            # score a policy the env never actually runs.
-            actions, _ = _actor_forward(
-                train_state,
-                obs,
-                jax.random.PRNGKey(0),
-                deterministic=True,
-                action_mask=_avail(env_state),
-            )
-            next_obs, next_env_state, _, terminated, truncated, info = jax.vmap(
-                env.step
-            )(env_state, actions)
-            # Always score eval on the team reward: under difference rewards the
-            # env's `reward` is per-agent, and a policy must still be judged by
-            # what the team achieved.
-            reward = info["task_reward"]
-            episode_rewards = episode_rewards + jnp.where(finished, 0.0, reward)
-            finished = finished | terminated | truncated
-            return (next_obs, next_env_state, finished, episode_rewards), None
-
-        # Fixed-length scan (jit needs static bounds); finished episodes keep
-        # stepping but their rewards are masked out, like vanilla's `finished`.
-        (_, _, _, episode_rewards), _ = jax.lax.scan(
-            _eval_step,
-            (obs, env_state, finished, episode_rewards),
-            None,
-            length=env.max_steps,
+    def _eval_act(train_state, carry, obs, env_state):
+        # The mask matters more here than in collection: an unmasked argmax picks
+        # the single highest logit even when that action is illegal, so eval would
+        # score a policy the env never actually runs.
+        actions, _ = _actor_forward(
+            train_state,
+            obs,
+            jax.random.PRNGKey(0),
+            deterministic=True,
+            action_mask=_avail(env_state),
         )
-        return episode_rewards.mean()
+        return carry, actions
+
+    # Deterministic parallel-episode evaluation (PolicyEvaluator parity). The
+    # actor is feedforward, so the policy carries no state.
+    eval_fn = make_eval_fn(
+        env,
+        config.n_eval_episodes,
+        EvalPolicy(init=lambda train_state, n: None, act=_eval_act),
+    )
 
     return init_fn, collect_fn, update_fn, eval_fn, num_updates

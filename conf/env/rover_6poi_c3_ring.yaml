@@ -1,0 +1,19 @@
+# @package _global_
+# Rover domain: 6 rovers, 6 POIs of coupling 3 on a ring of radius 3.5 around
+# the arena centre (60 degrees apart). Two POIs can be worked at once, so the
+# team must split in halves and cover the ring in three rounds.
+# Everything else is the default rover_2poi_c2.
+defaults:
+  - rover_2poi_c2
+  - _self_
+
+env:
+  n_agents: 6
+  pois:
+    entries:
+      - {position: [8.5, 5.0], coupling: 3}
+      - {position: [6.75, 8.03], coupling: 3}
+      - {position: [3.25, 8.03], coupling: 3}
+      - {position: [1.5, 5.0], coupling: 3}
+      - {position: [3.25, 1.97], coupling: 3}
+      - {position: [6.75, 1.97], coupling: 3}

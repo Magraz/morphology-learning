@@ -1,0 +1,5 @@
+# @package _global_
+# rmappo_jax with on-policy's default recurrent policy (algorithm_name: rmappo):
+# a GRU in the actor and the critic, trained on chunks of data_chunk_length steps.
+model_params:
+  use_recurrent_policy: true

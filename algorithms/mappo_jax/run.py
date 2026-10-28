@@ -22,7 +22,12 @@ import numpy as np
 from flax.serialization import from_bytes, to_bytes
 
 from algorithms.mappo_jax.mappo import create_train_state
-from algorithms.mappo_jax.trainer import RunnerState, global_state_dim, make_train
+from algorithms.mappo_jax.trainer import (
+    RunnerState,
+    global_state_dim,
+    make_train,
+    per_agent_rewards,
+)
 from algorithms.mappo_jax.types import Experiment, MAPPOConfig, Model_Params, Params
 from environments.mjx_suite.multi_box_multi_goal_push_mjx import (
     MultiBoxMultiGoalPushMJX,
@@ -35,6 +40,43 @@ def set_seeds(seed: int):
     """Set Python and NumPy seeds. JAX uses explicit PRNG keys."""
     random.seed(seed)
     np.random.seed(seed)
+
+
+class StatelessViewPolicy:
+    """`view()`'s deterministic policy for a feedforward actor.
+
+    The interface every runner's `_view_policy` returns: `reset()` at the start
+    of each rendered episode, then `policy(obs, mask=None) -> actions` once per
+    decision. A feedforward actor has no state, so `reset` does nothing; a
+    recurrent runner returns an object that carries its hidden state instead.
+    """
+
+    def __init__(self, train_state, env):
+        from algorithms.mappo_jax.network import sample_action
+
+        discrete = getattr(env, "discrete", False)
+        n_agents, obs_dim = env.n_agents, env.observation_dim
+
+        @jax.jit
+        def act(obs, mask):
+            actions, _ = sample_action(
+                jax.random.PRNGKey(0),
+                train_state.actor_ts.apply_fn,
+                train_state.actor_ts.params,
+                obs.reshape(n_agents, obs_dim),
+                discrete=discrete,
+                deterministic=True,
+                action_mask=None if mask is None else mask.reshape(n_agents, -1),
+            )
+            return actions
+
+        self._act = act
+
+    def reset(self):
+        pass
+
+    def __call__(self, obs, mask=None):
+        return self._act(obs, mask)
 
 
 def make_env(env_config: dict):
@@ -132,12 +174,20 @@ def make_env(env_config: dict):
             walls_cause_death=env_config.get("walls_cause_death", True),
             use_self_play_reward=env_config.get("use_self_play_reward", False),
         )
+    elif environment == EnvironmentEnum.ROVER:
+        # The pure-JAX rover domain (environments/rover): team reward, continuous
+        # turn/speed actions, no global-state hook (the critic reads the
+        # concatenated observations). Its own builder validates the whole `env:`
+        # block and raises on an unknown key.
+        from environments.rover.config import make_rover_env
+
+        env = make_rover_env(env_config)
     else:
         raise ValueError(
             f"mappo_jax supports only '{EnvironmentEnum.MULTI_BOX_MJX}', "
             f"'{EnvironmentEnum.MULTI_BOX_MULTI_GOAL_MJX}', "
-            f"'{EnvironmentEnum.MACRO_MJX}' and '{EnvironmentEnum.SMAX}' "
-            f"(functional JAX API); got {environment!r}"
+            f"'{EnvironmentEnum.MACRO_MJX}', '{EnvironmentEnum.SMAX}' and "
+            f"'{EnvironmentEnum.ROVER}' (functional JAX API); got {environment!r}"
         )
     return env
 
@@ -169,9 +219,7 @@ class MAPPO_JAX_Runner:
         # the critic to a per-agent value head and runs GAE on the agent axis (see
         # MAPPOConfig.per_agent_rewards). The macro wrapper exposes the flag
         # directly; the base env is per-agent only under "difference_rewards".
-        per_agent_rewards = getattr(
-            self.env, "per_agent_rewards", self.env.reward_mode == "difference_rewards"
-        )
+        per_agent = per_agent_rewards(self.env)
 
         n_envs = env_config.get("n_envs")
         n_steps = self.params.n_steps
@@ -193,14 +241,14 @@ class MAPPO_JAX_Runner:
             n_total_steps=int(self.params.n_total_steps),
             parameter_sharing=self.params.parameter_sharing,
             hidden_dim=self.model_params.hidden_dim,
-            per_agent_rewards=per_agent_rewards,
+            per_agent_rewards=per_agent,
             n_eval_episodes=self.params.n_eval_episodes,
         )
 
         print(
             f"JAX MAPPO | env={environment} | n_envs={self.config.n_envs} | "
             f"n_steps={self.config.n_steps} | total={self.config.n_total_steps} | "
-            f"reward_mode={self.env.reward_mode} | "
+            f"reward_mode={getattr(self.env, 'reward_mode', 'team')} | "
             f"backend={jax.default_backend()}"
         )
         # Nothing validates the `env:` block (CLAUDE.md), so a misspelled or
@@ -257,6 +305,16 @@ class MAPPO_JAX_Runner:
         step with its `make_train`'s `num_updates`."""
         return self.config.n_steps * self.config.n_envs
 
+    def _eval_every(self) -> int:
+        """Updates between deterministic evals (the last update always evals).
+        A subclass with a different update size overrides it."""
+        return 10
+
+    def _view_policy(self, train_state):
+        """The deterministic policy `view()` renders (see `StatelessViewPolicy`
+        for the interface). A recurrent subclass overrides it."""
+        return StatelessViewPolicy(train_state, self.env)
+
     def train(self):
         from algorithms.mappo_vanilla.trainer_components import TrainingStatsTracker
 
@@ -305,7 +363,7 @@ class MAPPO_JAX_Runner:
         # truncation), so unlike vanilla it only runs every k updates; the
         # recorded `reward` stat carries the last eval forward in between to
         # keep the per-iteration series aligned.
-        eval_every = 10
+        eval_every = self._eval_every()
         eval_reward = (
             stats_tracker.training_stats["reward"][-1]
             if checkpoint_loaded and stats_tracker.training_stats["reward"]
@@ -474,6 +532,11 @@ class MAPPO_JAX_Runner:
 
     def view(self):
         """Render deterministic episodes with the trained policy (vanilla view)."""
+        from environments.rover.base import BaseRoverEnv
+
+        if isinstance(self.env, BaseRoverEnv):
+            return self._view_rover()
+
         # Envs that bring their own renderer (SMAX) take a separate path: the MJX
         # renderers below are not generic — they read world_width, sector_sensor_radius,
         # objects_push_coupling_list, _build_xml(), state.data.qpos and hardcoded MJX
@@ -484,11 +547,10 @@ class MAPPO_JAX_Runner:
         import imageio
         import matplotlib.pyplot as plt
 
-        from algorithms.mappo_jax.network import sample_action
         from environments.mjx_suite.renderer import MJXRenderer, MuJoCoNativeRenderer
 
         train_state = self._load_train_state()
-        discrete = getattr(self.env, "discrete", False)
+        policy_fn = self._view_policy(train_state)
         # The macro env's state is the base EnvState, so the renderers (which
         # expect a MultiBoxPushMJX) run on the wrapped base env.
         is_macro = hasattr(self.env, "macro_len")
@@ -501,18 +563,6 @@ class MAPPO_JAX_Runner:
             native_renderer = None
         reset_fn = jax.jit(self.env.reset)
         step_fn = jax.jit(self.env.step)
-
-        @jax.jit
-        def policy_fn(obs):
-            actions, _ = sample_action(
-                jax.random.PRNGKey(0),
-                train_state.actor_ts.apply_fn,
-                train_state.actor_ts.params,
-                obs,
-                discrete=discrete,
-                deterministic=True,
-            )
-            return actions
 
         def _draw(state, obs):
             """Append one rendered frame (+ native) for the given base state."""
@@ -533,6 +583,7 @@ class MAPPO_JAX_Runner:
         for episode in range(10):
             key = jax.random.PRNGKey(int(np.random.randint(0, 2**31)))
             obs, state = reset_fn(key)
+            policy_fn.reset()
             # Under staggered starts the macro state wraps the base EnvState; the
             # low-level renderer drives the base env directly (stagger masking is
             # not reflected in the video).
@@ -598,6 +649,31 @@ class MAPPO_JAX_Runner:
                 imageio.mimwrite(native_path, native_frames, fps=30, macro_block_size=1)
                 print(f"Native video saved to {native_path}")
 
+    def _view_rover(self, n_episodes: int = 3):
+        """Save arena and trained-policy trajectory PNGs in this trial's logs."""
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from environments.rover.rollout import rollout_view_policy
+        from environments.rover.visualize import plot_arena, plot_trajectory, save_figure
+
+        train_state = self._load_train_state()
+        policy = self._view_policy(train_state)
+        out = self.dirs["logs"] / "rover"
+        label = f"{self.trial_dir.parent.name} · trial {self.trial_id}"
+        paths = [save_figure(plot_arena(self.env, label), out / "arena.png")]
+        print(paths[0])
+        for episode in range(n_episodes):
+            seed = self.rng_seed + 1 + episode
+            traj = rollout_view_policy(self.env, policy, jax.random.PRNGKey(seed))
+            fig = plot_trajectory(
+                self.env, traj, f"{label} · deterministic · seed {seed}"
+            )
+            path = save_figure(fig, out / f"trajectory_seed{seed}.png")
+            paths.append(path)
+            print(f"{path} (return {float(traj.episode_return):.2f})")
+        return paths
+
     def _view_with_env_renderer(self, n_episodes: int = 3):
         """Render episodes using the env's own renderer (SMAX -> SMAXVisualizer).
 
@@ -611,30 +687,15 @@ class MAPPO_JAX_Runner:
         """
         import matplotlib.pyplot as plt
 
-        from algorithms.mappo_jax.network import sample_action
-
         train_state = self._load_train_state()
-        n_agents = self.env.n_agents
-        obs_dim = self.env.observation_dim
+        policy_fn = self._view_policy(train_state)
         reset_fn = jax.jit(self.env.reset)
         step_fn = jax.jit(self.env.step)
         avail_fn = jax.jit(self.env.avail_actions)
 
-        @jax.jit
-        def policy_fn(obs, mask):
-            actions, _ = sample_action(
-                jax.random.PRNGKey(0),
-                train_state.actor_ts.apply_fn,
-                train_state.actor_ts.params,
-                obs.reshape(n_agents, obs_dim),
-                discrete=True,
-                deterministic=True,
-                action_mask=mask.reshape(n_agents, -1),
-            )
-            return actions
-
         for episode in range(n_episodes):
             obs, state = reset_fn(jax.random.PRNGKey(self.rng_seed + episode))
+            policy_fn.reset()
             # SMAXVisualizer replays the raw jaxmarl states, not the adapter's wrapper.
             state_seq, rewards = [], []
             for _ in range(self.env.max_steps):

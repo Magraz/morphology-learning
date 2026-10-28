@@ -1,0 +1,50 @@
+# @package _global_
+# rmappo_jax (algorithms/rmappo_jax): the reference MAPPO, marlbenchmark/on-policy
+# (`main`), in JAX over the functional envs. Every value below is on-policy's
+# config.py default unless noted; the key map is in algorithms/rmappo_jax/types.py.
+# Pair with model=rmappo (GRU, on-policy's `rmappo`) or model=mappo_mlp
+# (feedforward, on-policy's `mappo`): use_recurrent_policy has no default here,
+# so `model=mlp` (mappo_jax's group) is rejected instead of sharing its results
+# directory.
+algorithm: rmappo_jax
+params:
+  n_epochs: 15                  # ppo_epoch
+  n_minibatches: 1              # num_mini_batch
+  # episode_length. Rollouts persist across updates, so this need not cover an
+  # episode. Env groups that set params.n_steps override it, as for every
+  # algorithm; under the GRU it is rounded up to a multiple of data_chunk_length.
+  n_steps: 200
+  # An experiment budget, not an algorithm default: the repo's 1e8 (on-policy's
+  # num_env_steps is 10e6). Env groups override it.
+  n_total_steps: 10000000.0
+  parameter_sharing: true       # share_policy; the only implemented path
+  lr: 0.0005
+  critic_lr: 0.0005
+  opti_eps: 0.00001
+  gamma: 0.99
+  lmbda: 0.95                   # gae_lambda
+  eps_clip: 0.2                 # clip_param (policy ratio and value clip)
+  ent_coef: 0.01
+  val_coef: 1.0                 # value_loss_coef
+  use_max_grad_norm: true
+  grad_clip: 10.0               # max_grad_norm
+  use_valuenorm: true
+  use_huber_loss: true
+  huber_delta: 10.0
+  use_clipped_value_loss: true
+  use_value_active_masks: true
+  use_policy_active_masks: true
+  # false: a time-limit truncation is a terminal (on-policy's default). true:
+  # this repo's bootstrap of the real successor, NOT on-policy's bad_masks path.
+  use_proper_time_limits: false
+  use_linear_lr_decay: false
+  data_chunk_length: 10
+  n_eval_episodes: 32           # eval_episodes (deterministic, as on-policy's eval)
+  eval_interval: 25             # updates between evals
+model_params:
+  hidden_size: 64
+  layer_N: 1
+  use_ReLU: true
+  use_feature_normalization: true
+  gain: 0.01
+  recurrent_N: 1

@@ -58,9 +58,9 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
      *total* step count (`while total_step_count <= max_steps`), so it gathers
      `batch_size` steps however many envs run in parallel; `n_envs` is now purely
      a speed knob there. (`params.n_steps` no longer exists for these two
-     stacks.) `mappo_jax` keeps `params.n_steps` — it is the static length of the
-     jitted collect scan and must stay per-env — but its `n_envs` is a literal,
-     so its batch is likewise fixed by config alone.
+     stacks.) `mappo_jax` (and `rmappo_jax`) keeps `params.n_steps` — it is the
+     static length of the jitted collect scan and must stay per-env — but its
+     `n_envs` is a literal, so its batch is likewise fixed by config alone.
   2. **`n_envs` lives in the env group, never in `_self_`.** `conf/config.yaml`
      deliberately does **not** set `env.n_envs`; being last in the defaults list
      it would override every group. Each `conf/env/*.yaml` declares its own, and
@@ -535,6 +535,11 @@ efc contact-force decode).
   teammates in one sector gives 2.0). The existing centroid calculation already
   needs these counts, so `_density_sensors_and_counts` computes both in one pass.
   The original 40 fields, including lidar at `24:40`, retain their positions.
+- **Sector binning is shared** with the rover domain through the pure-jnp
+  `environments/sectors.py:sector_onehot(angle, in_range, n_sectors)`
+  (2026-10-27). `_density_sensors_and_counts` calls it with
+  `angle = atan2(rel) - 22.5°`. Verified bit-identical: a 0.0 maximum
+  difference over 60 arrays (1a/3o, 16a/4o, 6a/0o; eager and jitted).
 - **Generalizes past multi_box_push**, mirroring the Box2D fallbacks: `n_objects=0`
   (scatter/rendezvouz) zeros the object density block, `is_touching_object`,
   `nearest_box_vec` and the contact force; `goal_coord=None` (contact/scatter/
@@ -616,6 +621,9 @@ dataclass holding `mjx.Data` + step counter + per-box `prev_box_goal_dist` /
   Checks (the builder option itself, still tested): `JAX_PLATFORMS=cpu .venv/bin/python -m pytest
   algorithms/tests/test_mjx_sector_counts.py -q` covers multiplicity, range,
   sector alignment, fixed scaling, preserved fields, and JIT/vmap/wrapper shapes.
+  ⚠ Only its 3 builder-level tests pass. The other 4 read the env's own
+  builder and still assert the 48-dim width, so they have failed since
+  `b6bf344` (checked 2026-10-27).
 - **Parity with Box2D.** Same world sizing, spawn regions, coupling list, box
   sizing, target band, reward (shaping + one-time +100/box, dense/sparse),
   boundary-contact termination, and the original 40-dim observation prefix
@@ -1492,6 +1500,8 @@ drop-in comparable:
   `run.make_env(env_config)` has one `elif` per supported env group
   (`MULTI_BOX_MJX` / `MULTI_BOX_MULTI_GOAL_MJX` / `MACRO_MJX` / `SMAX`), each passing its
   constructor arguments explicitly — deliberately not a shared kwargs helper.
+  The exception is `ROVER` (added 2026-10-27), which hands the whole block to
+  rover's own validating builder, `make_rover_env`.
   It is module-level (moved out of `MAPPO_JAX_Runner.__init__` on 2026-09-25) so
   `simplified_feudal_mappo_jax` builds envs through the same code; the feudal
   stack still has its own copy in its `run.py`.
@@ -1500,6 +1510,18 @@ drop-in comparable:
     `make_train(self.config, self.env)`, called by `train()` and `evaluate()`).
     `train()` treats the trajectory and bootstrap value opaquely, so a subclass
     can return any structure its own `update_fn` accepts.
+  - **More hooks, added 2026-10-27 for `rmappo_jax`** (behaviour-preserving:
+    `mappo_jax` init → two collect/update rounds → eval on two CPU stubs is
+    bit-identical before and after, 0.0 max difference over 101 arrays):
+    - `trainer.restart_done_envs(...)`: the mid-rollout restart of finished
+      envs, moved out of `_env_step`.
+    - `trainer.make_eval_fn(env, n_episodes, EvalPolicy(init, act))`: the
+      deterministic eval scan. The policy may carry state (`mappo_jax` passes
+      `None`; `rmappo_jax` its GRU hidden states).
+    - `MAPPO_JAX_Runner._eval_every()` (default 10, the old hardcoded value)
+      and `_view_policy(train_state)`, which returns the object both `view()`
+      paths call (`reset()` per episode, then `policy(obs, mask=None)`);
+      `StatelessViewPolicy` is the default.
   - `MAPPOCritic.keep_output_axis` / `create_train_state(...,
     keep_critic_output_axis=)` (default `False`) keep a width-1 per-agent value
     head's trailing axis. It only skips the squeeze, so the param tree is
@@ -1541,6 +1563,198 @@ drop-in comparable:
     assignment structure **and** the geometry, and the group's docstring says so.
   - Under `even`, `coupling_fraction` (the multi-goal obs extra) is the constant
     0.25; an explicit unequal list is now what makes it informative.
+
+## Reference MAPPO (`algorithms/rmappo_jax/`, added 2026-10-27)
+
+`algorithm=rmappo_jax` (`AlgorithmEnum.RMAPPO_JAX`) reimplements the reference
+MAPPO code in JAX over the same functional envs as `mappo_jax`. The reference is
+marlbenchmark/on-policy (`main`, `onpolicy/algorithms/r_mappo`; Yu et al. 2022,
+"The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games").
+- `mappo_jax` and `mappo_vanilla` are plain PPO with a centralized critic. They
+  lack value normalization, Huber and clipped value losses, batch-wide
+  advantage normalization, persistent rollouts and the GRU.
+- This stack is the one to cite as MAPPO.
+- It was ported from the source files themselves, read on 2026-10-27:
+  `config.py`, `r_mappo.py`, `r_actor_critic.py`, `mlp.py`, `rnn.py`,
+  `act.py`, `distributions.py`, `valuenorm.py`, `shared_buffer.py` and
+  `mpe_runner.py`.
+
+```
+uv run python train.py algorithm=rmappo_jax env=mjx_2a_4o_1122_1024_gs \
+    model=rmappo trial_id=0       # GRU (on-policy's algorithm_name: rmappo)
+uv run python train.py algorithm=rmappo_jax env=mjx_2a_4o_1122_1024_gs \
+    model=mappo_mlp trial_id=0    # feedforward (on-policy's: mappo)
+```
+
+- **Defaults are on-policy's `config.py`** (the author's choice), in
+  `conf/algorithm/rmappo_jax.yaml`:
+  - networks: `hidden_size` 64, `layer_N` 1, ReLU, LayerNorm after every layer
+    and on the input;
+  - optimizers: lr and critic_lr 5e-4, Adam ε 1e-5, gradient-norm clip 10;
+  - PPO: 15 epochs × 1 minibatch, clip 0.2, entropy 0.01, value coefficient 1,
+    γ 0.99, λ 0.95;
+  - the tricks: ValueNorm, Huber (δ 10), clipped value loss, and active masks
+    in both losses;
+  - rollouts: `episode_length` 200, and GRU chunks of 10 steps.
+
+  `n_total_steps` stays the repo's 1e8 (on-policy's `num_env_steps` is an
+  experiment budget).
+- **Key names.** on-policy's names are kept, except where this repo's other
+  algorithm groups already have a key: `n_steps` (= `episode_length`),
+  `n_epochs` (= `ppo_epoch`), `n_minibatches` (= `num_mini_batch`), `eps_clip`
+  (= `clip_param`), `ent_coef`, `val_coef`, `grad_clip` (= `max_grad_norm`),
+  `lmbda` and `n_eval_episodes`. Env-group `n_steps` / `n_total_steps`
+  overrides therefore reach it. The full map is in `types.py`.
+- **Model groups `rmappo` / `mappo_mlp`** set only `use_recurrent_policy`, which
+  has no default. So `model=mlp` raises a `TypeError` before any results
+  directory exists, instead of writing into `mappo_jax`'s directory.
+
+**Reproduced from the source:**
+- **Persistent rollouts.** Envs are reset once (`warmup`). Env states,
+  observations, both GRU hidden states and the episode mask carry over between
+  updates in `RunnerState`, like `after_update` copying the buffer's last row to
+  its first. A finished env restarts at once; its hidden states are zeroed and
+  its next mask is 0 (`insert`).
+- **Critic input** follows on-policy's MPE runner.
+  - Every agent row gets the env's centralized state: the env's own state where
+    it publishes one (SMAX, the `_gs` groups), else the concatenated
+    observations (`mappo_jax.trainer.global_state_fn`).
+  - The critic emits one value per (env, agent) row, and every agent receives
+    the team reward.
+  - The state is stored once per (step, env) and repeated per agent only when a
+    minibatch is gathered.
+- **GAE on denormalized values**, per agent: `mappo_jax.mappo.compute_gae`,
+  whose `1 - done[t]` is on-policy's `masks[t + 1]`.
+- **Advantage normalization** is batch-wide: mean and population std
+  (`np.nanstd`) over active rows of the whole (time × env × agent) batch, with
+  `+ 1e-5` on the std. `mappo_jax` normalizes each env stream separately
+  instead.
+- **Samplers** (`mappo.gather_minibatch`):
+  - Recurrent: each (env, agent) trajectory is cut into `data_chunk_length`
+    chunks in on-policy's (env, agent, time) order. Each chunk starts from the
+    hidden state stored at its first step.
+  - Feedforward: chunks of length 1.
+  - Both: a fresh permutation every epoch, with the remainder dropped.
+  - Inside a chunk a `lax.scan` applies `h ← h · mask_t` at every step. This is
+    the same computation as `RNNLayer`'s segment loop (tested against it).
+- **Losses** (`policy_objective`, `value_objective`):
+  - Actor: PPO-clip minus `ent_coef ×` entropy, both averaged over active rows.
+  - Critic: `max(huber(e), huber(e_clipped))`. The prediction is clipped within
+    `eps_clip` of the stored normalized value. The loss is averaged over active
+    rows and scaled by `val_coef`; `mse` is `e²/2`, as in on-policy.
+  - Separate Adams and separate gradient-norm clips. The logged grad norms are
+    taken before clipping, as torch's `clip_grad_norm_` reports them.
+- **ValueNorm** (`value_norm.py`: β 0.99999, ε 1e-5, variance floor 1e-2) is
+  updated from **every minibatch's** returns, inactive rows included, **before**
+  that minibatch's critic loss, as `cal_value_loss` does. Before the first update
+  `denormalize(v) = 0.1 v`; on-policy starts the same way.
+- **Networks** (`network.py`):
+  - `MLPBase`: orthogonal init at the activation's gain (√2 ReLU, 5/3 tanh),
+    zero biases, LayerNorm ε 1e-5 (torch's value, not flax's 1e-6).
+  - GRU: torch's layout (stacked r, z, n kernels, two biases, orthogonal over
+    the stacked matrix), then a LayerNorm.
+  - Action head: orthogonal at gain 0.01. The continuous head uses a learned
+    state-independent `log_std` initialized at **0** (std 1), with no clamp.
+    (`mappo_jax` starts at −0.5 and clamps.) Unavailable discrete actions get
+    logit −1e10.
+  - Critic head: orthogonal at gain 1. Actor and critic are the same width.
+- **Time limits are terminal** (`use_proper_time_limits: false`, on-policy's
+  default and the author's choice). With `true`, this repo's bootstrap is used
+  instead:
+  - the real successor is valued before the restart, through the critic's
+    advanced hidden state;
+  - `γ · denormalize(V)` is added to the reward.
+
+  That is NOT on-policy's own `true` path, which multiplies the truncated
+  step's GAE by `bad_masks`.
+- **`use_linear_lr_decay`**: `lr · (1 − update / num_updates)`, constant within
+  an update (`update_linear_schedule`).
+
+**Deviations, all deliberate:**
+- The `reward` series is this repo's deterministic eval (`n_eval_episodes` 32,
+  every `eval_interval` = 25 updates). It does not affect training, and plots
+  stay comparable with the other stacks.
+- **`n_steps` is rounded up** to a multiple of `data_chunk_length` under the
+  GRU, with a printed notice (env groups' 1024 → 1030, 128 → 130).
+  - on-policy silently builds chunks that span two trajectories instead.
+  - `validate` refuses a config that skips `make_config` and is not a multiple.
+- A `checkpoint=true` resume restores the networks, both Adam states, ValueNorm
+  and the RNG chains, but restarts episodes and hidden states.
+- The checkpoint stores `config_meta`, the shape-free settings in `run.META_FIELDS`.
+  A resume under different values raises and names them. on-policy has no such
+  check.
+- **Refused:**
+  - per-agent reward modes (difference rewards): every agent row has the same
+    critic input, so the critic could only learn the mean;
+  - `parameter_sharing: false`.
+- **Not ported:** PopArt, the naive recurrent policy, the CNN base, stacked
+  frames, other action spaces, `weight_decay`, Xavier init, and the env-side
+  SMAC options (agent-specific state, death masking).
+
+**Before comparing with `mappo_jax`:** a gap mixes hyperparameters with
+implementation.
+- On groups that do not set `n_steps`, the batch is 200 × 32 = 6,400 env-steps
+  per update, against `mappo_jax`'s 1048 × 32 = 33,536. That is ~5× the
+  updates, each of 15 full-batch epochs.
+- On groups that set `n_steps` (the 16a, SMAX and some 6a groups) the batches
+  are nearly equal.
+- To separate the two, add a model group carrying `mappo_jax`'s
+  hyperparameters, and keep the results-path rule: set them in a model group,
+  never on the CLI.
+
+**Checks:** `uv run pytest algorithms/tests/test_rmappo_jax.py -q` (28 tests,
+CPU stubs). They cover:
+- the GRU against torch's `nn.GRU` run through on-policy's `RNNLayer` sequence
+  branch: 1 and 2 layers, resets mid-sequence and at t = 0;
+- ValueNorm against a numpy transcription of on-policy's class;
+- Huber and mse;
+- the value loss's clipped `max`;
+- inactive rows leaving both objectives unchanged;
+- batch-wide advantage normalization (`np.nanstd`);
+- recurrent re-evaluation of every chunk from its stored hidden state
+  reproducing the rollout's log-probs and values to 1e-5, with a negative
+  control: ignoring the masks breaks it;
+- a first-minibatch ratio of exactly 1;
+- persistent rollouts;
+- both time-limit modes, including the exact bootstrap value;
+- no bootstrap after a termination;
+- masked actions;
+- end-to-end runs in both modes on both stubs;
+- the `n_steps` rounding;
+- the defaults equalling on-policy's;
+- the rejections;
+- the decay schedule;
+- the checkpoint round trip and the settings check.
+
+**Smoke-verified 2026-10-27** (non-numeric `trial_id=smoke`; GPU memory is the
+peak above idle, without preallocation):
+
+| group | model | checked | warm collect / update per update | GPU peak |
+|---|---|---|---|---|
+| `mjx_2a_4o_1122_1024_gs` | `rmappo` | train 2e5, `checkpoint=true` resume to 3e5, `evaluate=true`, `view=true` | 0.25 s / 0.07 s (6,400 steps) | ~0.6 GB |
+| `mjx_2a_4o_1122_1024_gs` | `mappo_mlp` | train, resume, evaluate | 0.27 s / 0.01 s | 0.6 GB |
+| `smax_3m` (CPU) | `rmappo` | train, evaluate (`n_steps` 128 → 130; critic reads the 72-dim world state) | 0.11 s / 0.94 s (4,160 steps) | — |
+| `macro_mjx_16a_4o_stagger` | `rmappo` | train, evaluate (`info["active"]`, discrete) | — | 4.9 GB |
+| `mjx_16a_4o_trunc_1024` | `rmappo` | train (`n_steps` 1024 → 1030) | 1.45 s / 1.75 s (32,960 steps) | **12.3 GB** |
+| `rover_2poi_c2` | `rmappo` | train, resume, evaluate; eval 2.00 of 2 by 128k steps (see the rover section) | 0.02 s / 0.09 s (6,400 steps) | 1.1 GB |
+
+- The resume continued at step 198,400, and all 46 stats series stayed the same
+  length.
+- Resuming with a changed `n_minibatches` raised and named it.
+- `view()` rendered 10 episodes, pygame and native.
+- After the `view()` hook refactor, `mappo_jax`'s trained
+  `mjx_2a_4o_1122_1024_gs/mlp/0` rendered 10 episodes returning 432–445, with
+  all boxes delivered.
+- ⚠ **Memory on concat groups with many agents.** At 16a/4o the critic's input
+  is the 640-dim concatenation, repeated for 16 agent rows. With on-policy's
+  single minibatch, that is 527k rows in one pass, so one trial fills most of a
+  16 GB GPU and blocks `train_batches.sh N_PARALLEL > 1`.
+  - `params.n_minibatches: 4` brings it to 5.4 GB at the same update time.
+  - Put that in a model group. It is a departure from on-policy's default, so
+    name it as one.
+  - The compact-state `_gs` groups are unaffected.
+
+**No training result.**
 
 ## Simplified Feudal MAPPO (`algorithms/simplified_feudal_mappo_jax/`)
 
@@ -5523,6 +5737,174 @@ write into the `mappo_jax` baseline's directory.
 final win rates or whether the hierarchy helps — every number above is a mechanism
 check. `use_self_play_reward=True` raises (the adapter reports one shared scalar and
 sets `per_agent_rewards=False`).
+
+## Rover domain (`environments/rover/`, added 2026-10-27)
+
+A pure-JAX, physics-free 2D multi-rover world. Rovers steer; points of interest
+(POIs) pay the team while enough rovers are near them.
+- **Trains with the JAX stacks only** (wired 2026-10-27): `algorithm=mappo_jax`
+  or `rmappo_jax`.
+  - `mappo_jax.run.make_env`'s `ROVER` branch calls `make_rover_env` on the env
+    block. `make_vec_env` has no branch, so the default `mappo` cannot build it.
+  - The base group sets a literal `n_envs: 32`, which every variant inherits.
+    `make_rover_env` accepts it as a runner key (`config._RUNNER_KEYS`) and
+    ignores it, so `load_rover_env` and the tests compose unchanged.
+  - The env has no `reward_mode`, so both runners use
+    `mappo_jax.trainer.per_agent_rewards(env)`. It reads a missing attribute as
+    a team reward.
+  - There is no global-state hook: the critic reads the concatenated
+    observations (64 dims at 4 rovers).
+  - `view=true` does not use the MJX renderers. `MAPPO_JAX_Runner._view_rover`
+    writes `logs/rover/arena.png` (`plot_arena`) and three deterministic
+    `trajectory_seed<k>.png` (`plot_trajectory`) into the trial directory.
+
+  ```
+  uv run python train.py algorithm=rmappo_jax env=rover_2poi_c2 \
+      model=rmappo trial_id=0
+  ```
+  - **Smoke result (2026-10-27, `trial_id=smoke`, 128k steps = 20 updates):**
+    `rmappo` reaches deterministic eval 2.00 of 2.00 at the 20th update (0.01
+    untrained, 1.81 at update 10).
+  - Replayed outside the training code (rover's rollout scan with the GRU state
+    carried, 256 episodes): mean return 1.998, with both POIs used up in 255 of
+    256 episodes.
+  - For comparison: the scripted coalition gets 2.000 and random 0.016.
+  - The learned policy is a sequential swarm: all four rovers work one POI,
+    then two cross to the other. It finishes in a median of 70 steps against
+    the scripted split's 28.
+  - `rover_6poi_c3_ring` (6 rovers) and `mappo_jax` (`model=mlp`) also
+    trained for 2 updates.
+- Outside training, build the env with
+  `environments.rover.config.load_rover_env(variant)`.
+- It has the functional contract of the MJX envs, so it serves evolutionary
+  algorithms (vmap a rollout over a population) and RL alike:
+  - `reset(key) -> (obs, state)`;
+  - `step(state, actions) -> (obs, state, reward, terminated, truncated, info)`;
+  - no auto-reset;
+  - `step` takes no PRNG key, because the dynamics are deterministic.
+- Contract attributes: `n_agents`, `n_pois`, `observation_dim`, `action_dim = 2`,
+  `discrete = False`, `max_steps`. `info` carries `task_reward`.
+
+```
+from environments.rover.config import load_rover_env
+env = load_rover_env("rover_2poi_c2", overrides=["env.n_agents=6"])
+```
+
+- **Dynamics** (`BaseRoverEnv.move`). The action is `a = [turn, speed]` in
+  `[-1, 1]²`:
+  - `heading <- wrap(heading + a0 * max_turn)`, wrapped to [-π, π);
+  - `speed = (a1 + 1)/2 * max_speed`, set directly each step and not
+    integrated, so `a1 = -1` stops the rover;
+  - the rover turns first, then moves along its new heading;
+  - its position is clipped to `[0, W] × [0, H]`.
+
+  Walls are inert and never end the episode (the repo's boundary-termination
+  lesson). State per rover is only `position (A,2)` and `heading (A,)`.
+- **Observation** (`SectorDensityObservation`, 16 dims): 8 agent sectors, then 8
+  POI sectors.
+  - **Sectors are heading-relative.** Sector 0 is centred on the heading and
+    spans [-22.5°, 22.5°); numbering runs counterclockwise, so sector 2 is to
+    the left and sector 6 to the right. The observation has no heading channel,
+    so with world-frame sectors a turn-based policy could not know which way to
+    turn.
+  - **Presence** is a distance-weighted share:
+    `Σ over entities in the sector with d < R of (1 − d/R)`, divided by
+    `n_agents − 1` (agent block) or `n_pois` (POI block). It is bounded in
+    [0, 1] and grows with both the number of entities and their closeness.
+  - The agent block excludes self **by index**, not `d > 0` as MJX does, so a
+    co-located teammate is sensed. All teammates on top of a rover give exactly
+    1.0.
+  - Used-up POIs are not sensed, but still count in the `n_pois` denominator.
+  - `sensor_radius: null` means the arena diagonal, i.e. global sensing.
+- **Default reward** (`CouplingDepletionReward`), on post-move positions:
+  - a POI is active when `≥ coupling` rovers are within its radius (inclusive)
+    and its `remaining` budget is > 0;
+  - an active POI pays `min(rate, remaining)` per step and its budget drops by
+    that much. Extra rovers beyond the coupling add nothing;
+  - the budget is snapped to 0 below 1e-6, so value 1.0 / rate 0.05 depletes in
+    exactly 20 coupled steps;
+  - `step` returns the team scalar `G` (sum of payouts);
+    `info["agent_rewards"]` splits each payout equally among the rovers
+    observing that POI, so it sums to `G`;
+  - `terminated` = every POI used up; `truncated = (t ≥ max_steps) &
+    ~terminated`, so the two flags never fire together;
+  - the reward model returns the updated `POIState`, since depletion is part of
+    its semantics.
+- **Pluggable components** (`components.py`): `BaseRoverEnv(n_agents, pois,
+  observation=None, reward=None, ...)` takes any
+  - `POIModel`: `init(key, env)`; `step(pois, rovers, t)`, identity by default
+    (the hook for moving POIs); `validate(env)`;
+  - `ObservationModel`: `obs_dim` and `__call__(env, state)`;
+  - `RewardModel`: `__call__(env, rovers, pois) -> RewardOutput(reward, pois,
+    terminated, info)`.
+
+  `__init__` checks the declared `obs_dim` against the emitted width with
+  `jax.eval_shape`. To make a new implementation selectable from yaml, register
+  it in `config.py` (`POI_MODELS` / `OBSERVATIONS` / `REWARDS`, keyed by the
+  block's `type:`).
+- **Config: one Hydra env group per POI layout (variant).**
+  `conf/env/rover_2poi_c2.yaml` is the default: 4 rovers, a 10×10 arena, spawn in
+  `[4,6]²`, 100 steps, POIs at (2,8) and (8,2) with coupling 2, radius 1, value 1,
+  rate 0.05. Variants inherit it with `defaults: [rover_2poi_c2, _self_]` and
+  override only what differs; a `pois.entries` override replaces the whole list.
+  - `rover_4poi_c1234`: 4 corner POIs with couplings 1/2/3/4.
+  - `rover_6poi_c3_ring`: 6 rovers, 6 POIs of coupling 3 on a radius-3.5 ring.
+
+  `load_env_config` composes `conf/config.yaml` with `env=<variant>`, the same
+  path as the probes. `make_rover_env` **raises on unknown `env:` keys**, unknown
+  `dynamics` keys, unknown component types and unknown POI entry keys.
+  `StaticPOIs` raises on a POI outside the arena or `coupling < 1`, and warns
+  when `coupling > n_agents` (that POI can never pay).
+- **Rollouts and policies.** `rollout(env, policy_fn, key, params=None)` is a
+  `lax.scan` over `max_steps`. The state is frozen after the episode ends and
+  later rewards are 0. It returns a `Trajectory` and vmaps over keys or over
+  policy parameters (evolutionary fitness). `policy_fn(params, key, obs, state)`.
+  `policies.py` has two demonstration policies:
+  - `random_policy`;
+  - `make_scripted_coalition_policy(env)`, which reads the privileged state.
+    Rovers fill undepleted POIs in index order, `coupling` rovers each, and
+    retarget when a POI is used up.
+
+  Measured (8 seeds): the scripted policy collects 2.0/2 in 26–29 steps on the
+  default, 6.0/6 in 89–92 on the ring, and 3.75–4.0/4 on `c1234`, where the
+  coupling-4 POI is often still paying at step 100. Random rovers collect 0 on
+  both coupling-2 and coupling-3 layouts.
+- **Figures** (`visualize.py`, matplotlib, dataviz reference palette). Run
+  `uv run python -m environments.rover.visualize [--variants ...] [--seeds 0 1]
+  [--policies random scripted] [--no-trajectories]`. It writes:
+  - `plotting/rover/arenas/<variant>.png` for **every** `conf/env/rover_*.yaml`.
+    Each shows the arena and each POI's radius disc, with its coupling written
+    inside and its value / rate below. Rover start positions are random, so they
+    are not drawn. `draw_sensing_radius` overlays one rover's sensing radius
+    (`env.observation.radius(env)`) as a dashed blue circle centred on the spawn
+    region's centre, with its radius labelled. When that radius covers the whole
+    arena from there (`sensor_radius: null`, R = the arena diagonal) the circle
+    would fall outside the plot, so only the centre dot and a "senses the whole
+    arena" label are drawn. The same figure is the `arena.png` that `view=true`
+    writes;
+  - `plotting/rover/trajectories/<variant>_<policy>_seed<k>.png`. Each shows
+    the rover paths (start dot, arrow at the final heading), used-up POIs drawn
+    hollow with their depletion step, the steps where each POI paid, and the
+    cumulative team reward.
+
+  Rover colours follow the categorical order; with more than 8 rovers all paths
+  are drawn in one neutral colour. POIs are neutral ink, so they never compete
+  with rover identity.
+- Checks: `uv run pytest algorithms/tests/test_rover_env.py -q` (32 tests, CPU).
+  They cover:
+  - shapes, jit and vmap;
+  - the sector frame and the ±22.5° boundaries; the exact presence values;
+    co-located teammates; used-up POIs being invisible; observations within
+    [0, 1] over random rollouts of every variant;
+  - turn/speed mapping, heading wrap, wall clip;
+  - coupling and the inclusive radius; the payout split; depletion after
+    exactly value/rate steps; termination needing every POI; truncation never
+    firing with termination;
+  - custom components and a wrong `obs_dim` being rejected;
+  - every variant composing; Hydra overrides; the bad-config errors;
+  - the scripted team collecting everything; the frozen rollout; population
+    vmap; determinism;
+  - the PNG writers for every variant.
 
 ## Coordination-graph novelty exploration (gnn critic)
 

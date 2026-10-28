@@ -49,17 +49,21 @@
 #   bash scripts/train_batches_progress.sh [logs/train_batches/<timestamp>]
 # which reads the run's log directory (default: the latest run).
 
+# N_PARALLEL=2 CPU_SLOTS="4 6 8" bash train_batches.sh
+
 BATCH_NAMES=(
-"mjx_3a_1o_1024_gs"
+"rover_2poi_c2" "rover_2poi_c8"
 )
 
 EXPERIMENT_NAMES=(
+"mappo_mlp"
+"rmappo"
 # "mlp"
-"simplified_feudal_tanh_relative_input"
-"simplified_feudal_tanh_relative_input_interventions_bandit" "simplified_feudal_tanh_relative_input_interventions_bandit_no_zero_penalty"
-"simplified_feudal_tanh_relative_input_interventions_adaptive_random" "simplified_feudal_tanh_relative_input_interventions_adaptive_skip"
+# "simplified_feudal_tanh_relative_input"
+# "simplified_feudal_tanh_relative_input_interventions_bandit" "simplified_feudal_tanh_relative_input_interventions_bandit_no_zero_penalty"
+# "simplified_feudal_tanh_relative_input_interventions_adaptive_random" "simplified_feudal_tanh_relative_input_interventions_adaptive_skip"
 )
-ALGORITHM=simplified_feudal_mappo_jax
+ALGORITHM=rmappo_jax
 
 # ALGORITHM=mappo_jax
 

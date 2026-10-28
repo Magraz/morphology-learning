@@ -1,0 +1,5 @@
+# @package _global_
+# rmappo_jax with on-policy's feedforward policy (algorithm_name: mappo): no GRU,
+# every (step, env, agent) row is an independent sample.
+model_params:
+  use_recurrent_policy: false

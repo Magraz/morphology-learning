@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - rover_2poi_c2
+  - _self_
+env:
+  n_agents: 16
+  spawn_region: null          # spawn anywhere, not clustered in the centre
+  observation:
+    sensor_radius: 3.0        # was the arena diagonal: every rover saw everything
+  pois:
+    entries:
+      - {position: [2.0, 8.0], coupling: 8}
+      - {position: [8.0, 2.0], coupling: 8}

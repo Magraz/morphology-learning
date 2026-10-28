@@ -36,3 +36,6 @@ class EnvironmentEnum(StrEnum):
     HRL_SKILL = "hrl_skill"
     # JAXMARL
     SMAX = "SMAX"
+    # Pure-JAX 2D rover domain with coupled points of interest
+    # (environments/rover; standalone, not wired into any algorithm yet)
+    ROVER = "rover"

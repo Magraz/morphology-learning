@@ -134,6 +134,28 @@ def _dispatch(
                 env_config,
             )
 
+        case AlgorithmEnum.RMAPPO_JAX:
+            # The reference MAPPO (marlbenchmark/on-policy) over the same
+            # functional JAX envs: value normalization, Huber + clipped value
+            # loss, batch-wide advantage normalization, persistent rollouts and
+            # a GRU policy/critic trained on chunks (model=rmappo / mappo_mlp).
+            from algorithms.rmappo_jax.run import RMAPPO_JAX_Runner
+            from algorithms.rmappo_jax.types import Experiment
+
+            if debug:
+                jax.config.update("jax_disable_jit", True)
+
+            exp_config = Experiment(**exp_dict)
+            runner = RMAPPO_JAX_Runner(
+                exp_config.device,
+                batch_dir,
+                results_dir,
+                trial_id,
+                checkpoint,
+                exp_config,
+                env_config,
+            )
+
         case AlgorithmEnum.DCG:
             from algorithms.dcg.run import DCG_Runner
             from algorithms.dcg.types import Experiment

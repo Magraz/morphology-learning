@@ -1,0 +1,37 @@
+# @package _global_
+# Rover domain, DEFAULT variant: 2 POIs, each needing 2 rovers at once.
+#
+# Pure-JAX, physics-free 2D world (environments/rover). Trains with the JAX
+# stacks only (`algorithm=mappo_jax` or `rmappo_jax`; the default `mappo` cannot
+# build it). Outside training, build it with
+# environments.rover.config.load_rover_env("rover_2poi_c2").
+#
+# Other rover_* variants inherit this file (`defaults: [rover_2poi_c2, _self_]`)
+# and override only what differs; a `pois.entries` override replaces the list.
+# Every key below is checked by make_rover_env, so a typo raises.
+env:
+  environment: rover
+  # vmap width of the JAX collectors (a hyperparameter: batch = n_steps * n_envs),
+  # read by the runners, ignored by the env. Keep it equal across compared arms.
+  n_envs: 32
+  n_agents: 4
+  max_steps: 100
+  world_size: [10.0, 10.0]           # arena width, height
+  spawn_region: [4.0, 6.0, 4.0, 6.0] # x_min, x_max, y_min, y_max (uniform)
+  dynamics:
+    max_speed: 0.5                   # distance per step at speed action +1
+    max_turn: 0.7853981633974483     # pi/4 rad per step at |turn action| = 1
+  observation:
+    type: sector_density             # 8 agent + 8 POI heading-relative sectors
+    n_sectors: 8
+    sensor_radius: null              # null = arena diagonal (sense everything)
+  reward:
+    type: coupling_depletion         # team reward; POIs pay until used up
+  pois:
+    type: static
+    radius: 1.0                      # defaults for every entry below
+    value: 1.0                       # total reward a POI can pay per episode
+    rate: 0.05                       # paid per step while coupling is met
+    entries:
+      - {position: [2.0, 8.0], coupling: 2}
+      - {position: [8.0, 2.0], coupling: 2}
