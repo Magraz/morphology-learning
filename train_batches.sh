@@ -468,6 +468,13 @@ progress_monitor() {
     done
 }
 
+# Waits 2 seconds. Sleeping in the background and waiting for it lets a signal
+# run the trap at once, as in the monitor.
+nap() {
+    sleep 2 &
+    wait $!
+}
+
 # Job control puts each trial in its own process group, so stop_all can stop
 # the whole tree (bash -> uv -> python) and not just the subshell.
 set -m
@@ -482,9 +489,11 @@ fi
 
 for TRIAL in "${TRIALS[@]}"; do
     read -r BATCH_NAME EXPERIMENT TRIAL_ID <<< "${TRIAL}"
+    # Check for a free slot every 2 s. Not `wait -n` (see below): it could
+    # leave a slot idle until another trial ended.
     find_free_slot
     while [[ -z "${SLOT}" ]]; do
-        wait -n
+        nap
         find_free_slot
     done
     if already_running "${BATCH_NAME}" "${EXPERIMENT}" "${TRIAL_ID}"; then
@@ -496,13 +505,15 @@ for TRIAL in "${TRIALS[@]}"; do
     run_trial "${BATCH_NAME}" "${EXPERIMENT}" "${TRIAL_ID}" "${SLOT_DEVICE[SLOT]}" < /dev/null &
     SLOT_PID[SLOT]=$!
 done
-# Wait for the last trials. A plain `wait` would also wait for the monitor,
-# which runs until it is stopped. wait -n returns at once for a job that ended
-# before it was called (checked on bash 5.2), so this cannot miss the last one.
-for i in "${!SLOT_DEVICE[@]}"; do
-    while slot_busy "${i}"; do
-        wait -n
-    done
+# Wait for the last trials, each by its process id; `wait <pid>` returns at
+# once for a job that has already ended. A plain `wait` would also wait for the
+# monitor, which runs until it is stopped. Until 2026-10-28 this loop used
+# `wait -n`, which before bash 5.3 skips a job whose end the shell has already
+# reported and waits for the next job to end instead. When that next job was
+# the monitor, the script never exited, and the monitor kept printing
+# "<N> done" every PROGRESS_INTERVAL.
+for pid in "${SLOT_PID[@]}"; do
+    wait "${pid}" 2> /dev/null
 done
 if [[ -n "${MONITOR_PID}" ]]; then
     kill "${MONITOR_PID}" 2> /dev/null
