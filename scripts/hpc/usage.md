@@ -92,6 +92,24 @@ At the end it prints a summary with:
 - would_resubmit (dry-run) or resubmitted
 - failed
 
+## Node jobs (all trials in one job)
+
+`experiment_batch_node.sh` trains a whole trial list in one job on a dgxh node
+(`run_node_gpu.sh`, which runs `train_batches.sh` there). Its ledger,
+`job_tracking/<algorithm>_node_<run name>_latest.csv`, has one row: the job
+`0_node_<algorithm>_<run name>`. The watchdog treats that row like any other,
+but must resubmit it with the node script:
+
+```bash
+bash scripts/hpc/watchdog_jobs_v2.sh rmappo_jax_node_rover --dry-run \
+    --run-script scripts/hpc/run_node_gpu.sh
+```
+
+`experiment_batch_node.sh` starts its watchdog that way
+(`run_watchdog.sh --run-script ... <identifier>`). The job counts as
+`COMPLETED` only when every trial on the list has finished. A resubmitted job
+runs the whole list again; finished trials load their checkpoint and exit.
+
 ## Watchdog action log
 
 All watchdog cycles append to:

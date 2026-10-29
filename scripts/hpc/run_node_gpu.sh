@@ -39,7 +39,7 @@ CPUS_PER_JOB=20            # one per trial, plus a few for compiling
 MEM_PER_JOB=96G            # going over it kills the job, i.e. every trial
 TIME_PER_JOB=24:00:00
 NODELIST="dgxh-[1-4]"
-PROGRESS_INTERVAL=600      # seconds between progress reports in the .out file
+PROGRESS_INTERVAL=600      # seconds between snapshots in the run's progress.log
 
 SCRATCH=/nfs/stak/users/agrazvam/hpc-share/tmp
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

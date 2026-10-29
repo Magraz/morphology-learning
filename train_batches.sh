@@ -7,7 +7,7 @@
 #   N_PARALLEL=2 bash train_batches.sh     # two trials at once, sharing the GPU
 #   N_PARALLEL=2 CPU_SLOTS="4 6" bash train_batches.sh   # and two on the CPU
 #   DRY_RUN=1 bash train_batches.sh        # list the trials, run nothing
-#   PROGRESS_INTERVAL=60 bash train_batches.sh   # progress every minute (0: off)
+#   PROGRESS_INTERVAL=60 bash train_batches.sh   # progress.log every minute (0: off)
 #   GPUS="0 1" N_PARALLEL=8 bash train_batches.sh  # 8 trials on each of GPUs 0, 1
 #   TRIALS_FILE=trials.tsv ALGORITHM=rmappo_jax bash train_batches.sh
 #
@@ -44,14 +44,19 @@
 # trials. Efficiency cores were about 2x slower than performance cores. The
 # CPU backend changes only floating-point rounding, not the batch.
 #
-# Each trial's output goes to
-# logs/train_batches/<timestamp>/<batch>__<experiment>__<trial>.log. A failed
-# trial does not stop the others. The summary at the end lists every trial's
-# status and the slot it ran in, and the script exits 1 if any trial failed. A
-# trial that is already being trained by another process is skipped. Ctrl-C
-# stops every running trial.
+# Once a run starts the script prints nothing on the terminal; only errors that
+# stop it before any trial runs, and the DRY_RUN listing, are printed. Everything
+# goes to the run's log directory, logs/train_batches/<timestamp>/:
+#   <batch>__<experiment>__<trial>.log   each trial's output
+#   train_batches.log   this script's messages (trial started / finished,
+#                       warnings, the final summary table)
+#   progress.log        a progress snapshot every PROGRESS_INTERVAL seconds
+#   summary.tsv         each finished trial's status and slot
+# A failed trial does not stop the others, and the script exits 1 if any trial
+# failed. A trial that is already being trained by another process is skipped.
+# Ctrl-C stops every running trial.
 #
-# Every PROGRESS_INTERVAL seconds (default 300) the script prints how far each
+# Every PROGRESS_INTERVAL seconds (default 300) progress.log gets how far each
 # running trial is, e.g.
 #
 #   [16:30:05] progress of 25 trials: 4 running, 10 done, 11 queued
@@ -283,6 +288,17 @@ if (( ${#GPU_LIST[@]} > 0 )); then
 else
     GPU_SLOTS_TEXT="${N_PARALLEL} on the GPU"
 fi
+
+# From here on a run prints nothing on the terminal: everything this script
+# prints goes to train_batches.log in the run's log directory. A dry run prints
+# it instead, as listing the run is all a dry run is for.
+if [[ "${DRY_RUN}" != "1" ]]; then
+    RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    LOG_DIR="${SCRIPT_DIR}/logs/train_batches/${RUN_TIMESTAMP}"
+    mkdir -p "${LOG_DIR}" || exit 1
+    exec > "${LOG_DIR}/train_batches.log" 2>&1
+fi
+
 if [[ -n "${TRIALS_FILE}" ]]; then
     echo "${#TRIALS[@]} trials of ${ALGORITHM} from ${TRIALS_FILE} (${#BATCH_NAMES[@]} batches," \
          "${#EXPERIMENT_NAMES[@]} experiments), ${#SLOT_DEVICE[@]} at a time" \
@@ -347,10 +363,7 @@ fi
 # would lose its last lines.
 export PYTHONUNBUFFERED=1
 
-RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="${SCRIPT_DIR}/logs/train_batches/${RUN_TIMESTAMP}"
 SUMMARY="${LOG_DIR}/summary.tsv"
-mkdir -p "${LOG_DIR}"
 printf 'status\tbatch\texperiment\ttrial\tdevice\tminutes\n' > "${SUMMARY}"
 # scripts/train_batches_progress.sh reads the trial list, and this script's
 # pid, host and SLURM job to tell a running run from one that was stopped. The
@@ -365,8 +378,6 @@ hostname > "${LOG_DIR}/train_batches.host"
 if [[ -n "${SLURM_JOB_ID}" ]]; then
     echo "${SLURM_JOB_ID} ${SLURM_RESTART_COUNT:-0}" > "${LOG_DIR}/slurm_job"
 fi
-echo "logs: ${LOG_DIR}"
-echo "progress of every trial: bash scripts/train_batches_progress.sh ${LOG_DIR}"
 
 run_trial() {
     local batch=$1 experiment=$2 trial=$3 device=$4
@@ -383,16 +394,9 @@ run_trial() {
     start=$(date +%s)
     # The progress report reads the device of a running trial from this line.
     echo "train_batches.sh: started $(date '+%F %T'), device ${device}" > "${log}"
-    if (( ${#SLOT_DEVICE[@]} == 1 )); then
-        # One trial at a time: also show its output live.
-        "${launch[@]}" bash "${SCRIPT_DIR}/train.sh" "${batch}" "${ALGORITHM}" "" "${trial}" "${experiment}" 2>&1 \
-            | tee -a "${log}"
-        status=${PIPESTATUS[0]}
-    else
-        "${launch[@]}" bash "${SCRIPT_DIR}/train.sh" "${batch}" "${ALGORITHM}" "" "${trial}" "${experiment}" \
-            >> "${log}" 2>&1
-        status=$?
-    fi
+    "${launch[@]}" bash "${SCRIPT_DIR}/train.sh" "${batch}" "${ALGORITHM}" "" "${trial}" "${experiment}" \
+        >> "${log}" 2>&1
+    status=$?
     result=OK
     (( status == 0 )) || result="FAILED(${status})"
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${result}" "${batch}" "${experiment}" "${trial}" "${device}" \
@@ -454,8 +458,8 @@ find_free_slot() {
     done
 }
 
-# Prints the running trials' progress every PROGRESS_INTERVAL seconds, until it
-# is sent TERM. Sleeping in the background and waiting for it lets the TERM
+# Appends the running trials' progress to progress.log every PROGRESS_INTERVAL
+# seconds, until it is sent TERM. Sleeping in the background and waiting for it lets the TERM
 # trap run at once and exit quietly; a killed foreground sleep would print
 # "Terminated".
 progress_monitor() {
@@ -483,7 +487,7 @@ trap stop_all INT TERM HUP QUIT
 # The monitor is a job too, so stop_all stops it with the trials.
 MONITOR_PID=""
 if (( PROGRESS_INTERVAL > 0 )); then
-    progress_monitor < /dev/null &
+    progress_monitor < /dev/null >> "${LOG_DIR}/progress.log" 2>&1 &
     MONITOR_PID=$!
 fi
 

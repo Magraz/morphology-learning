@@ -18,7 +18,9 @@
 #
 # Follow it from the login node with
 #   bash scripts/train_batches_progress.sh      # the latest train_batches run
-# and the job's own output in logs/node_<algorithm>_<RUN_NAME>.out.
+# The job's .out file (logs/node_<algorithm>_<RUN_NAME>.out) holds only its
+# setup checks; train_batches.sh writes its own messages and progress to
+# train_batches.log and progress.log in its run directory, logs/train_batches/.
 
 # Names this run's job (0_node_<algorithm>_<RUN_NAME>), trial list and ledger.
 # Letters, digits, '.', '_' and '-' only.

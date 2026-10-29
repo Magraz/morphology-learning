@@ -1,8 +1,8 @@
 #!/bin/bash
 # Progress of every trial of one train_batches.sh run, read from that run's log
 # directory (logs/train_batches/<timestamp>/). train_batches.sh sources this
-# file and prints the running trials every PROGRESS_INTERVAL seconds. Run it
-# directly to see every trial at any time, e.g. from a second terminal:
+# file and appends the running trials to that directory's progress.log every
+# PROGRESS_INTERVAL seconds. Run it directly to see every trial at any time:
 #
 #   bash scripts/train_batches_progress.sh               # the latest run
 #   bash scripts/train_batches_progress.sh logs/train_batches/<timestamp>
