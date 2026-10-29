@@ -159,6 +159,53 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   files and exits 0, so results should be unaffected. This was not checked on
   the cluster logs. A failed `sacct` query now aborts the cycle, rather than
   resubmitting every finished job.
+  - Shared pieces (2026-10-28): both GPU run scripts source
+    `gpu_job_preamble.sh` (job info, `module load`, `nvidia-smi` check), and
+    both launchers write ledger rows through `submit_and_record.sh`. The
+    generated per-trial job and the launcher's ledgers were checked unchanged
+    against the old copies with a fake `sbatch`. `experiment_set.sh` still has
+    its own copy of the submit loop.
+  - **All trials in one node job (`experiment_batch_node.sh`, added
+    2026-10-28).** For trials small enough that many share a GPU (rover).
+    Edit `RUN_NAME` and the lists at its top, then
+    `bash scripts/hpc/experiment_batch_node.sh`. It writes the trial list
+    `job_tracking/<algorithm>_node_<RUN_NAME>_trials.tsv`, submits one job
+    `0_node_<algorithm>_<RUN_NAME>` through `run_node_gpu.sh`, writes a one-row
+    ledger `<algorithm>_node_<RUN_NAME>_latest.csv`, and starts a watchdog
+    with `run_watchdog.sh --run-script run_node_gpu.sh`. It refuses to launch
+    while that job or its watchdog is in the queue: two jobs on one list
+    would train the same trials on two nodes into one results directory.
+    - The job runs `train_batches.sh` with `TRIALS_FILE`, `GPUS` from the
+      job's own `CUDA_VISIBLE_DEVICES`, and `N_PARALLEL=TRIALS_PER_GPU`. It
+      runs `uv sync` and a JAX GPU check once, then sets `UV_NO_SYNC=1` for
+      the trials.
+    - Resources are at the top of `run_node_gpu.sh`: 1 GPU on `dgxh-[1-4]`
+      (`preempt`), 16 trials per GPU, 20 cores, 96 GB, 24 h. Sizing, measured
+      on a 16-rover `rmappo` trial (5 sharing an RTX 4080 SUPER): 2.6 GB of GPU
+      memory, 2.4 GB of RAM and about one core per trial. Speed with 16
+      sharing an H100 is not measured.
+    - Restart: after a preemption `--requeue` reruns the job; after a timeout
+      or a failed trial the watchdog resubmits it (`COMPLETED` needs every
+      trial to finish). Both rerun the whole list with `checkpoint=true`, so
+      finished trials exit at once and the rest resume. A trial that fails on
+      every attempt keeps the job resubmitting, as for per-trial jobs.
+    - `run_node_gpu.sh` takes the watchdog's five ledger columns (run name,
+      `node`, algorithm, environment, `0`) and refuses any experiment column
+      other than `node`.
+    - Unverified on the cluster: `--nodelist=dgxh-[1-4]` with `--nodes=1` is
+      copied from `run_trial_gpu.sh`. Process groups: `train_batches.sh`
+      puts each trial in its own process group (this works without a
+      terminal); if the cluster uses `ProctrackType=proctrack/pgid`, SLURM's
+      kill would miss the trials (`scontrol show config | grep -i proctrack`;
+      `cgroup` is fine).
+    - Tested 2026-10-28 with fake `sbatch`/`squeue`/`sacct`: the launch,
+      the duplicate guard, and watchdog cycles (running → `TIMEOUT` → one
+      resubmission as a node job → `COMPLETED` by name). The generated job
+      script was also run on the local GPU (stub `module`/`showjob`, two
+      `rover_2poi_c2` trials). SIGTERM to every process in its session, as
+      SLURM sends on preemption, left no process and no GPU memory. A rerun as
+      a requeue resumed both trials from their checkpoints and exited 0, and
+      a further rerun with every trial finished exited 0 in 4 s.
 - **Local multi-trial launch (`train_batches.sh`, repo root).** The local
   counterpart of `experiment_batch.sh`: edit `BATCH_NAMES` / `EXPERIMENT_NAMES` /
   `ALGORITHM` / `TRIAL_START..TRIAL_END` at its top, then `bash train_batches.sh`
@@ -170,7 +217,22 @@ for `combined_affinities` checkpoint resolution (`batch_dir.parents[1]/results`)
   trial whose `train.py` command line is already running (an earlier run, or a
   hand-started one) is skipped, so two processes never share a results
   directory. At startup it warns about any process holding >= 500 MiB of GPU
-  memory. Ctrl-C (or TERM/HUP/QUIT) stops every running trial's process tree
+  memory.
+  - **`GPUS` and `TRIALS_FILE` (added 2026-10-28, used by the node job
+    above).** `GPUS="0 1" N_PARALLEL=8` runs 8 trials on each listed GPU, each
+    with `CUDA_VISIBLE_DEVICES` set to its slot's GPU; slots alternate between
+    GPUs, and `summary.tsv` records `gpu:<id>`. `TRIALS_FILE=<tsv>` with
+    `ALGORITHM` in the environment replaces the lists at the top: header
+    `batch<TAB>experiment<TAB>trial`, then one trial per line, the layout of
+    the run's own `trials.tsv`. Without them the script behaves as before:
+    the dry run, `summary.tsv`, `trials.tsv`, trial logs and output were
+    checked identical to the old version on a stub repo. It also writes
+    `train_batches.host` and, inside SLURM, `slurm_job` (job id and
+    `SLURM_RESTART_COUNT`), and the RAM warning uses the job's
+    `SLURM_MEM_PER_NODE` when that is lower. From another host the progress
+    helper calls the run live only while `scontrol` reports that job RUNNING
+    with the same restart count (a requeue starts a new run in a new log
+    directory), and says so when it cannot tell. Ctrl-C (or TERM/HUP/QUIT) stops every running trial's process tree
   (each runs in its own process group). Further signals are ignored during that
   cleanup, and groups still alive after 10 s are SIGKILLed. On 2026-10-21 trials
   of a stopped run survived, held 14.5 GB, and made every trial of the next run

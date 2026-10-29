@@ -41,6 +41,8 @@ if [[ ${#BATCH_NAMES[@]} -eq 0 ]]; then
     exit 1
 fi
 
+source "${SCRIPT_DIR}/submit_and_record.sh"
+
 # Check every Hydra config group exists before submitting anything.
 source "${SCRIPT_DIR}/../check_conf_groups.sh"
 if ! check_conf_groups "${CONF_DIR}" \
@@ -62,43 +64,12 @@ for BATCH_NAME in "${BATCH_NAMES[@]}"; do
     LATEST_LEDGER="${TRACKING_DIR}/${BATCH_IDENTIFIER}_latest.csv"
 
     echo "=== batch ${BATCH_NAME} ==="
-    echo "timestamp,run_id,batch_name,environment,algorithm,experiment,trial_id,job_name,job_id,submission_ok" > "${JOB_LEDGER}"
+    echo "${LEDGER_HEADER}" > "${JOB_LEDGER}"
 
     for EXPERIMENT in "${EXPERIMENT_NAMES[@]}"; do
         for TRIAL_ID in $(seq "${TRIAL_START}" "${TRIAL_END}"); do
-            JOB_NAME="${TRIAL_ID}_${EXPERIMENT}_${BATCH_IDENTIFIER}"
-            TIMESTAMP="$(date +%Y-%m-%dT%H:%M:%S%z)"
-
-            SUBMISSION_OUTPUT="$(
-                bash "${SCRIPT_DIR}/${SBATCH_SCRIPT}" \
-                    "${BATCH_NAME}" \
-                    "${EXPERIMENT}" \
-                    "${ALGORITHM}" \
-                    "${ENVIRONMENT}" \
-                    "${TRIAL_ID}" 2>&1
-            )"
-            SUBMIT_EXIT=$?
-
-            JOB_ID="$(printf '%s\n' "${SUBMISSION_OUTPUT}" | sed -n -E 's/.*Submitted batch job ([0-9]+).*/\1/p' | tail -n 1)"
-            if [[ -z "${JOB_ID}" ]]; then
-                # Handles sbatch --parsable output if used later.
-                JOB_ID="$(printf '%s\n' "${SUBMISSION_OUTPUT}" | sed -n -E 's/^([0-9]+)(;.*)?$/\1/p' | tail -n 1)"
-            fi
-
-            if [[ -z "${JOB_ID}" ]]; then
-                JOB_ID="UNKNOWN"
-            fi
-
-            if [[ ${SUBMIT_EXIT} -eq 0 ]]; then
-                SUBMISSION_OK=1
-                echo "submitted ${JOB_NAME} -> ${JOB_ID}"
-            else
-                SUBMISSION_OK=0
-                echo "failed ${JOB_NAME} -> ${JOB_ID}" >&2
-                echo "${SUBMISSION_OUTPUT}" >&2
-            fi
-
-            echo "${TIMESTAMP},${RUN_ID},${BATCH_NAME},${ENVIRONMENT},${ALGORITHM},${EXPERIMENT},${TRIAL_ID},${JOB_NAME},${JOB_ID},${SUBMISSION_OK}" >> "${JOB_LEDGER}"
+            submit_and_record "${JOB_LEDGER}" "${RUN_ID}" "${SCRIPT_DIR}/${SBATCH_SCRIPT}" \
+                "${BATCH_NAME}" "${EXPERIMENT}" "${ALGORITHM}" "${ENVIRONMENT}" "${TRIAL_ID}"
         done
     done
 

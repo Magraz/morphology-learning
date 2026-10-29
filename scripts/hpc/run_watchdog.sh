@@ -3,9 +3,21 @@
 set -u
 set -o pipefail
 
+# --run-script PATH: the script the watchdog resubmits jobs with (default
+# run_trial_gpu.sh). experiment_batch_node.sh passes run_node_gpu.sh.
+RUN_SCRIPT_ESCAPED=""
+if [[ "${1:-}" == "--run-script" ]]; then
+    if [[ $# -lt 2 ]]; then
+        echo "error: --run-script requires a path" >&2
+        exit 1
+    fi
+    RUN_SCRIPT_ESCAPED="--run-script $(printf '%q' "$2")"
+    shift 2
+fi
+
 BATCH_NAMES=("$@")
 if [[ ${#BATCH_NAMES[@]} -eq 0 ]]; then
-    echo "usage: $(basename "$0") <batch_name> [batch_name ...]" >&2
+    echo "usage: $(basename "$0") [--run-script PATH] <batch_name> [batch_name ...]" >&2
     exit 1
 fi
 
@@ -46,5 +58,5 @@ which sacct
 which python
 python --version
 
-DISPLAY=":0" uv run python3 $SCRIPT $BATCH_NAMES_ESCAPED
+DISPLAY=":0" uv run python3 $SCRIPT ${RUN_SCRIPT_ESCAPED} $BATCH_NAMES_ESCAPED
 EOT

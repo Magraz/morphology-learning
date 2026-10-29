@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - rover_2poi_c2
+  - _self_
+env:
+  n_agents: 16
+  world_size: [20.0, 20.0]           # arena width, height
+  spawn_region: [8.0, 12.0, 8.0, 12.0] # x_min, x_max, y_min, y_max (uniform)
+  observation:
+    sensor_radius: 4.0        # was the arena diagonal: every rover saw everything
+  pois:
+    entries:
+      - {position: [10.0, 12.0], coupling: 8}
+      - {position: [15.0, 17.0], coupling: 4}
+      - {position: [5.0, 17.0], coupling: 4}
+
+      - {position: [10.0, 8.0], coupling: 8}
+      - {position: [15.0, 3.0], coupling: 4}
+      - {position: [5.0, 3.0], coupling: 4}

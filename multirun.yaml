@@ -112,12 +112,12 @@ hydra:
     - algorithm=rmappo_jax
     - env=rover_2poi_c8
     - model=rmappo,mappo_mlp
-    - trial_id=0
+    - trial_id=8
     - view=true
   job:
     name: train
     chdir: false
-    override_dirname: algorithm=rmappo_jax,env=rover_2poi_c8,model=rmappo,mappo_mlp,trial_id=0,view=true
+    override_dirname: algorithm=rmappo_jax,env=rover_2poi_c8,model=rmappo,mappo_mlp,trial_id=8,view=true
     id: ???
     num: ???
     config_name: config
@@ -258,7 +258,7 @@ env:
       - 2.0
       coupling: 8
 device: cpu
-trial_id: 0
+trial_id: 8
 view: true
 checkpoint: false
 evaluate: false

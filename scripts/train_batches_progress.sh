@@ -25,7 +25,10 @@
 # trial (Ctrl-C), stopped (it had started) or not run.
 #
 # Needs the run's trials.tsv, summary.tsv and train_batches.pid, which
-# train_batches.sh writes since 2026-10-24.
+# train_batches.sh writes since 2026-10-24. Since 2026-10-28 it also writes
+# train_batches.host and, inside a SLURM job, slurm_job, so that a run on a
+# compute node (scripts/hpc/run_node_gpu.sh) can be followed from the login node
+# (see run_is_alive below).
 
 PROGRESS_SPEED_LINES=100
 PROGRESS_BAR_WIDTH=20
@@ -77,12 +80,38 @@ progress_row() {
     }'
 }
 
+# Returns 0 if the train_batches.sh run logged in directory $1 is still running,
+# 1 if it is not, and 2 if this host cannot tell. On the host the run is on, the
+# test is its pid. From another host, e.g. a SLURM login node looking at a run
+# on a compute node, it is the run's SLURM job: it must be RUNNING and not
+# requeued since the run started (a requeue keeps the job id but starts a new
+# run in a new log directory). Runs from before 2026-10-28 have no host file
+# and are checked by pid.
+run_is_alive() {
+    local dir=$1 host pid job restarts info state count
+    host=$(cat "${dir}/train_batches.host" 2> /dev/null)
+    if [[ -z "${host}" || "${host}" == "$(hostname)" ]]; then
+        pid=$(cat "${dir}/train_batches.pid" 2> /dev/null)
+        [[ -n "${pid}" ]] && ps -o args= -p "${pid}" 2> /dev/null | grep -q 'train_batches\.sh'
+        return
+    fi
+    if [[ ! -f "${dir}/slurm_job" ]] || ! command -v scontrol > /dev/null; then
+        return 2
+    fi
+    read -r job restarts < "${dir}/slurm_job"
+    # A job SLURM no longer knows (finished long enough ago) is not running.
+    info=$(scontrol show job -o "${job}" 2> /dev/null) || return 1
+    [[ "${info}" =~ (^|[[:space:]])JobState=([A-Z_]+) ]] && state=${BASH_REMATCH[2]}
+    [[ "${info}" =~ (^|[[:space:]])Restarts=([0-9]+) ]] && count=${BASH_REMATCH[2]}
+    [[ "${state}" == RUNNING && "${count}" == "${restarts}" ]]
+}
+
 # Prints the progress of the run logged in directory $1: a line counting the
 # trials in each state, then one row per trial, or with $2 = "running" one row
 # per running trial.
 print_progress() {
     local dir=$1 scope=${2:-all}
-    local alive=0 pid line batch experiment trial result device key log state class
+    local alive=0 note="" line batch experiment trial result device key log state class
     local -A result_of=() device_of=() count=()
     local -a rows=() progress
     if [[ ! -f "${dir}/trials.tsv" ]]; then
@@ -90,10 +119,11 @@ print_progress() {
         return 1
     fi
     # Once the run has ended, a trial with no summary row will not finish.
-    pid=$(cat "${dir}/train_batches.pid" 2> /dev/null)
-    if [[ -n "${pid}" ]] && ps -o args= -p "${pid}" 2> /dev/null | grep -q 'train_batches\.sh'; then
-        alive=1
-    fi
+    run_is_alive "${dir}"
+    case $? in
+        0) alive=1 ;;
+        2) note=" (the run is on $(cat "${dir}/train_batches.host"); this host cannot tell whether it is still running)" ;;
+    esac
     while IFS=$'\t' read -r result batch experiment trial device _; do
         result_of["${batch}/${experiment}/${trial}"]=${result}
         device_of["${batch}/${experiment}/${trial}"]=${device}
@@ -131,7 +161,7 @@ print_progress() {
     for class in running done FAILED skipped stopped queued "not run"; do
         [[ -n "${count["${class}"]}" ]] && line+="${line:+, }${count["${class}"]} ${class,,}"
     done
-    printf '%s\n' "[$(date +%H:%M:%S)] progress of $(( $(wc -l < "${dir}/trials.tsv") - 1 )) trials: ${line}" \
+    printf '%s\n' "[$(date +%H:%M:%S)] progress of $(( $(wc -l < "${dir}/trials.tsv") - 1 )) trials: ${line}${note}" \
         "${rows[@]}"
 }
 

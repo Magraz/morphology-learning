@@ -9,6 +9,8 @@ defaults:
 
 env:
   n_agents: 6
+  observation:
+    sensor_radius: 2.0
   pois:
     entries:
       - {position: [8.5, 5.0], coupling: 3}

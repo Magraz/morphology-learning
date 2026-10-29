@@ -7,6 +7,8 @@ defaults:
   - _self_
 
 env:
+  observation:
+      sensor_radius: 2.0
   pois:
     entries:
       - {position: [1.5, 1.5], coupling: 1}

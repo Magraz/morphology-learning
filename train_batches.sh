@@ -8,6 +8,20 @@
 #   N_PARALLEL=2 CPU_SLOTS="4 6" bash train_batches.sh   # and two on the CPU
 #   DRY_RUN=1 bash train_batches.sh        # list the trials, run nothing
 #   PROGRESS_INTERVAL=60 bash train_batches.sh   # progress every minute (0: off)
+#   GPUS="0 1" N_PARALLEL=8 bash train_batches.sh  # 8 trials on each of GPUs 0, 1
+#   TRIALS_FILE=trials.tsv ALGORITHM=rmappo_jax bash train_batches.sh
+#
+# GPUS spreads the GPU slots over several GPUs: N_PARALLEL slots per listed GPU,
+# each trial run with CUDA_VISIBLE_DEVICES set to its slot's GPU. The entries
+# are GPU ids as CUDA_VISIBLE_DEVICES names them. Without GPUS every GPU slot
+# uses the default GPU, as before. scripts/hpc/run_node_gpu.sh sets GPUS from
+# its SLURM job's own CUDA_VISIBLE_DEVICES.
+#
+# TRIALS_FILE replaces the BATCH_NAMES / EXPERIMENT_NAMES / TRIAL_START-END
+# lists below with an explicit list: a tab-separated file whose first line is
+# the header "batch<TAB>experiment<TAB>trial", then one trial per line (the layout of
+# the trials.tsv this script writes into its log directory). ALGORITHM must
+# then be set in the environment as well. scripts/hpc/run_node_gpu.sh uses it.
 #
 # train.sh passes checkpoint=true, so re-running this script resumes unfinished
 # trials. A finished trial loads its checkpoint, runs no updates and exits 0 (it
@@ -51,8 +65,12 @@
 
 # N_PARALLEL=2 CPU_SLOTS="4 6 8" bash train_batches.sh
 
+# With TRIALS_FILE, ALGORITHM comes from the environment. Keep it before the
+# assignment below overwrites it.
+ALGORITHM_FROM_ENV=${ALGORITHM:-}
+
 BATCH_NAMES=(
-"rover_2poi_c2" "rover_2poi_c8"
+"rover_2poi_c8"
 )
 
 EXPERIMENT_NAMES=(
@@ -67,18 +85,85 @@ ALGORITHM=rmappo_jax
 
 # ALGORITHM=mappo_jax
 
-TRIAL_START=0
-TRIAL_END=4
+TRIAL_START=4
+TRIAL_END=9
 
 # These can be set from the environment, as in the usage lines above.
 N_PARALLEL=${N_PARALLEL:-1}
 CPU_SLOTS=${CPU_SLOTS:-}
+GPUS=${GPUS:-}
+TRIALS_FILE=${TRIALS_FILE:-}
 DRY_RUN=${DRY_RUN:-0}
 PROGRESS_INTERVAL=${PROGRESS_INTERVAL:-300}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONF_DIR="${SCRIPT_DIR}/conf"
 source "${SCRIPT_DIR}/scripts/train_batches_progress.sh"
+
+# Reads TRIALS_FILE into TRIALS ("<batch> <experiment> <trial>" entries), and
+# BATCH_NAMES / EXPERIMENT_NAMES (each name once, in order of appearance) for the
+# config check. Returns 1 on a missing file, a wrong header or a malformed line.
+read_trials_file() {
+    local line batch experiment trial extra number=1
+    local -A seen_batch=() seen_experiment=()
+    if [[ ! -f "${TRIALS_FILE}" ]]; then
+        echo "error: TRIALS_FILE '${TRIALS_FILE}' not found" >&2
+        return 1
+    fi
+    IFS= read -r line < "${TRIALS_FILE}"
+    if [[ "${line%$'\r'}" != $'batch\texperiment\ttrial' ]]; then
+        echo "error: the first line of ${TRIALS_FILE} must be the header" \
+             "'batch<TAB>experiment<TAB>trial'" >&2
+        return 1
+    fi
+    BATCH_NAMES=()
+    EXPERIMENT_NAMES=()
+    while IFS=$'\t' read -r batch experiment trial extra; do
+        number=$(( number + 1 ))
+        trial=${trial%$'\r'}
+        [[ -z "${batch}${experiment}${trial}${extra}" ]] && continue
+        if [[ -n "${extra}" || ! "${batch}" =~ ^[^[:space:]]+$ \
+                || ! "${experiment}" =~ ^[^[:space:]]+$ || ! "${trial}" =~ ^[^[:space:]]+$ ]]; then
+            echo "error: line ${number} of ${TRIALS_FILE} is not three tab-separated" \
+                 "names without spaces" >&2
+            return 1
+        fi
+        TRIALS+=("${batch} ${experiment} ${trial}")
+        [[ -z "${seen_batch[${batch}]}" ]] && BATCH_NAMES+=("${batch}")
+        [[ -z "${seen_experiment[${experiment}]}" ]] && EXPERIMENT_NAMES+=("${experiment}")
+        seen_batch[${batch}]=1
+        seen_experiment[${experiment}]=1
+    done < <(tail -n +2 "${TRIALS_FILE}")
+}
+
+TRIALS=()
+if [[ -n "${TRIALS_FILE}" ]]; then
+    if [[ -z "${ALGORITHM_FROM_ENV}" ]]; then
+        echo "error: TRIALS_FILE needs ALGORITHM set in the environment" >&2
+        exit 1
+    fi
+    ALGORITHM=${ALGORITHM_FROM_ENV}
+    if ! read_trials_file; then
+        echo "nothing was run" >&2
+        exit 1
+    fi
+    if [[ ${#TRIALS[@]} -eq 0 ]]; then
+        echo "error: no trials in ${TRIALS_FILE}" >&2
+        exit 1
+    fi
+else
+    for BATCH_NAME in "${BATCH_NAMES[@]}"; do
+        for EXPERIMENT in "${EXPERIMENT_NAMES[@]}"; do
+            for TRIAL_ID in $(seq "${TRIAL_START}" "${TRIAL_END}"); do
+                TRIALS+=("${BATCH_NAME} ${EXPERIMENT} ${TRIAL_ID}")
+            done
+        done
+    done
+    if [[ ${#TRIALS[@]} -eq 0 ]]; then
+        echo "error: no trials (is a list empty, or TRIAL_START > TRIAL_END?)" >&2
+        exit 1
+    fi
+fi
 
 # Check every Hydra config group exists before running anything.
 source "${SCRIPT_DIR}/scripts/check_conf_groups.sh"
@@ -156,11 +241,34 @@ if ! check_cpu_slots; then
     exit 1
 fi
 
-# Slot i runs its trials on SLOT_DEVICE[i]: "gpu", or "cpu:<CPU list>". GPU
-# slots come first, so they are used first.
+read -ra GPU_LIST <<< "${GPUS}"
+declare -A SEEN_GPU=()
+for gpu in "${GPU_LIST[@]}"; do
+    if [[ "${gpu}" == *,* ]]; then
+        echo "error: GPUS is space-separated, got '${GPUS}'" >&2
+        exit 1
+    fi
+    if [[ -n "${SEEN_GPU[${gpu}]}" ]]; then
+        echo "error: GPU ${gpu} is listed twice in GPUS" >&2
+        exit 1
+    fi
+    SEEN_GPU[${gpu}]=1
+done
+if (( ${#GPU_LIST[@]} > 0 && N_PARALLEL == 0 )); then
+    echo "error: GPUS is set but N_PARALLEL=0 gives it no slots" >&2
+    exit 1
+fi
+
+# Slot i runs its trials on SLOT_DEVICE[i]: "gpu" (the default GPU), "gpu:<id>",
+# or "cpu:<CPU list>". GPU slots come first, so they are used first. With GPUS
+# they alternate between the GPUs, so the first trials spread over all of them.
 SLOT_DEVICE=()
 for (( i = 0; i < N_PARALLEL; i++ )); do
-    SLOT_DEVICE+=(gpu)
+    if (( ${#GPU_LIST[@]} > 0 )); then
+        SLOT_DEVICE+=("${GPU_LIST[@]/#/gpu:}")
+    else
+        SLOT_DEVICE+=(gpu)
+    fi
 done
 for slot in "${CPU_SLOT_LIST[@]}"; do
     SLOT_DEVICE+=("cpu:${slot}")
@@ -170,30 +278,32 @@ if [[ ${#SLOT_DEVICE[@]} -eq 0 ]]; then
     exit 1
 fi
 
-TRIALS=()
-for BATCH_NAME in "${BATCH_NAMES[@]}"; do
-    for EXPERIMENT in "${EXPERIMENT_NAMES[@]}"; do
-        for TRIAL_ID in $(seq "${TRIAL_START}" "${TRIAL_END}"); do
-            TRIALS+=("${BATCH_NAME} ${EXPERIMENT} ${TRIAL_ID}")
-        done
-    done
-done
-
-if [[ ${#TRIALS[@]} -eq 0 ]]; then
-    echo "error: no trials (is a list empty, or TRIAL_START > TRIAL_END?)" >&2
-    exit 1
+if (( ${#GPU_LIST[@]} > 0 )); then
+    GPU_SLOTS_TEXT="${N_PARALLEL} on each of GPUs ${GPU_LIST[*]}"
+else
+    GPU_SLOTS_TEXT="${N_PARALLEL} on the GPU"
 fi
-
-echo "${#TRIALS[@]} trials of ${ALGORITHM}: ${#BATCH_NAMES[@]} batches x" \
-     "${#EXPERIMENT_NAMES[@]} experiments x trials ${TRIAL_START}-${TRIAL_END}," \
-     "${#SLOT_DEVICE[@]} at a time (${N_PARALLEL} on the GPU, ${#CPU_SLOT_LIST[@]} on the CPU)"
+if [[ -n "${TRIALS_FILE}" ]]; then
+    echo "${#TRIALS[@]} trials of ${ALGORITHM} from ${TRIALS_FILE} (${#BATCH_NAMES[@]} batches," \
+         "${#EXPERIMENT_NAMES[@]} experiments), ${#SLOT_DEVICE[@]} at a time" \
+         "(${GPU_SLOTS_TEXT}, ${#CPU_SLOT_LIST[@]} on the CPU)"
+else
+    echo "${#TRIALS[@]} trials of ${ALGORITHM}: ${#BATCH_NAMES[@]} batches x" \
+         "${#EXPERIMENT_NAMES[@]} experiments x trials ${TRIAL_START}-${TRIAL_END}," \
+         "${#SLOT_DEVICE[@]} at a time (${GPU_SLOTS_TEXT}, ${#CPU_SLOT_LIST[@]} on the CPU)"
+fi
 echo "slots: ${SLOT_DEVICE[*]}"
 
 # Resident memory per trial on mjx_3a_1o_1024_gs: 3.0-3.7 GB for CPU trials in
 # short runs, up to 5.2 GB for a GPU trial after 4 hours. Running out of RAM
 # would kill trials, so warn when the trials that run at once may not fit.
+# Inside a SLURM job the limit is the job's memory request (--mem, in MiB), not
+# what the node has free; going over it kills the whole job.
 N_CONCURRENT=$(( ${#SLOT_DEVICE[@]} < ${#TRIALS[@]} ? ${#SLOT_DEVICE[@]} : ${#TRIALS[@]} ))
 AVAILABLE_MIB=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+if [[ "${SLURM_MEM_PER_NODE}" =~ ^[1-9][0-9]*$ ]] && (( SLURM_MEM_PER_NODE < AVAILABLE_MIB )); then
+    AVAILABLE_MIB=${SLURM_MEM_PER_NODE}
+fi
 if [[ -n "${AVAILABLE_MIB}" ]] && (( N_CONCURRENT * 4500 > AVAILABLE_MIB )); then
     echo "warning: ${N_CONCURRENT} trials at once may need about" \
          "$(( N_CONCURRENT * 4500 )) MiB of RAM, and ${AVAILABLE_MIB} MiB is available" >&2
@@ -209,7 +319,8 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 # JAX reserves 75% of GPU memory in every process at startup, so a second trial
-# on the same GPU would run out of memory. Unless a JAX memory setting is
+# on the same GPU would run out of memory. N_PARALLEL is the number of trials
+# per GPU, with or without GPUS. Unless a JAX memory setting is
 # already in the environment, each trial allocates only what it uses. A fixed
 # share per trial (XLA_PYTHON_CLIENT_MEM_FRACTION) does not work: the CUDA
 # graphs XLA builds need memory outside that share, and bandit trials ran out of
@@ -241,13 +352,19 @@ LOG_DIR="${SCRIPT_DIR}/logs/train_batches/${RUN_TIMESTAMP}"
 SUMMARY="${LOG_DIR}/summary.tsv"
 mkdir -p "${LOG_DIR}"
 printf 'status\tbatch\texperiment\ttrial\tdevice\tminutes\n' > "${SUMMARY}"
-# scripts/train_batches_progress.sh reads the trial list, and this script's pid
-# to tell a running run from one that was stopped.
+# scripts/train_batches_progress.sh reads the trial list, and this script's
+# pid, host and SLURM job to tell a running run from one that was stopped. The
+# job file holds the job id and SLURM_RESTART_COUNT: a requeued job keeps its id
+# but starts a new run in a new log directory.
 {
     printf 'batch\texperiment\ttrial\n'
     printf '%s\n' "${TRIALS[@]}" | tr ' ' '\t'
 } > "${LOG_DIR}/trials.tsv"
 echo $$ > "${LOG_DIR}/train_batches.pid"
+hostname > "${LOG_DIR}/train_batches.host"
+if [[ -n "${SLURM_JOB_ID}" ]]; then
+    echo "${SLURM_JOB_ID} ${SLURM_RESTART_COUNT:-0}" > "${LOG_DIR}/slurm_job"
+fi
 echo "logs: ${LOG_DIR}"
 echo "progress of every trial: bash scripts/train_batches_progress.sh ${LOG_DIR}"
 
@@ -256,9 +373,12 @@ run_trial() {
     local log="${LOG_DIR}/${batch}__${experiment}__${trial}.log"
     local start status result
     local -a launch=()
-    # A CPU slot keeps JAX off the GPU and pins the trial to the slot's CPUs.
+    # A CPU slot keeps JAX off the GPU and pins the trial to the slot's CPUs. A
+    # "gpu:<id>" slot (GPUS) shows the trial only its own GPU.
     if [[ "${device}" == cpu:* ]]; then
         launch=(env JAX_PLATFORMS=cpu taskset -c "${device#cpu:}")
+    elif [[ "${device}" == gpu:* ]]; then
+        launch=(env CUDA_VISIBLE_DEVICES="${device#gpu:}")
     fi
     start=$(date +%s)
     # The progress report reads the device of a running trial from this line.
